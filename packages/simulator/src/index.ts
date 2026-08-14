@@ -1,0 +1,1 @@
+export const SENTINEL_SIMULATOR_VERSION = '0.0.0';

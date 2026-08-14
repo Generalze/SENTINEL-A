@@ -1,0 +1,27 @@
+{
+  "name": "@sentinel/core-api",
+  "version": "0.0.0",
+  "description": "Core API service",
+  "main": "dist/main.js",
+  "type": "commonjs",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/main.js",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@nestjs/common": "^11",
+    "@nestjs/core": "^11",
+    "@nestjs/platform-express": "^11",
+    "reflect-metadata": "^0.2",
+    "rxjs": "^7"
+  },
+  "devDependencies": {
+    "@nestjs/testing": "^11",
+    "@types/node": "^22",
+    "typescript": "^5",
+    "vitest": "^2"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "version": "2",
+  "tasks": {
+    "build": {
+      "outputs": ["dist/**"],
+      "cache": false
+    },
+    "typecheck": {
+      "outputs": [],
+      "cache": false
+    },
+    "lint": {
+      "outputs": [],
+      "cache": false
+    },
+    "test": {
+      "outputs": [],
+      "cache": false
+    }
+  }
+}

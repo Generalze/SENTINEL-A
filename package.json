@@ -1,0 +1,29 @@
+{
+  "name": "sentinel",
+  "version": "0.0.0",
+  "private": true,
+  "description": "SENTINEL monorepo",
+  "packageManager": "pnpm@10.34.5",
+  "engines": {
+    "node": ">=22"
+  },
+  "workspaces": [
+    "apps/*",
+    "services/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "turbo run build",
+    "typecheck": "turbo run typecheck",
+    "lint": "turbo run lint",
+    "test": "turbo run test"
+  },
+  "devDependencies": {
+    "turbo": "^2",
+    "@typescript-eslint/eslint-plugin": "^7",
+    "@typescript-eslint/parser": "^7",
+    "eslint": "^9",
+    "prettier": "^3",
+    "typescript": "^5"
+  }
+}
