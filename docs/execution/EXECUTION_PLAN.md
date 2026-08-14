@@ -127,9 +127,12 @@ Wave 0  WP-00                                  (serial: everything depends on it
 Wave 1  WP-01 ∥ WP-02                          (contracts + skeleton)
 Wave 2  WP-03 ∥ WP-04 ∥ WP-06 ∥ WP-09          (independent domains, worktree-isolated)
 Wave 3  WP-05 ∥ WP-08 ∥ WP-10 ∥ WP-12          (fusion + ledger + simulator + realtime)
+Wave 3.5 WP-14                                 (security hardening — Wave 2 adversarial findings)
 Wave 4  WP-07 ∥ WP-11                          (orchestration + UI)
 Wave 5  WP-13                                  (lead-driven integration, hardening, regression)
 ```
+
+Actual note: an adversarial security review runs at each wave boundary. Wave 2's review produced WP-14 (`docs/execution/security/WAVE-2-FINDINGS.md`) — one CRITICAL cross-tenant idempotency defect and a cluster of wiring/hardening findings, all scheduled rather than hot-patched because the top fix is a contract change (forbidden mid-wave). This is the Asymmetry Doctrine in practice: the review found the hole before it went live.
 
 Parallel agents run in **isolated git worktrees**; the lead merges. Contract changes mid-wave are forbidden — a contract problem stops the wave and comes back to the lead.
 
