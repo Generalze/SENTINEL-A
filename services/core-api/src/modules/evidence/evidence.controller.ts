@@ -1,12 +1,12 @@
 import type { ServerResponse } from 'node:http';
-import { BadRequestException, Body, Controller, Get, HttpStatus, Inject, Logger, Param, Post, Query, Req, Res, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, HttpStatus, Inject, Logger, Param, Post, Query, Req, Res } from '@nestjs/common';
 import { z } from 'zod';
+import { RequiresAction } from '../../common/security/requires-action.decorator';
+import type { RequestWithPrincipal } from '../../common/security/principal';
 import { EVIDENCE_CLASSIFICATION_LEVELS } from './classification';
 import { ACTION_EVIDENCE_INGEST, ACTION_EVIDENCE_READ, ACTION_EVIDENCE_VERIFY, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT, PURPOSE_HEADER } from './evidence.constants';
 import { formatValidationIssues } from './evidence.mapper';
 import { EvidenceService } from './evidence.service';
-import { PrincipalActionGuard, RequiresAction } from './principal-action.guard';
-import type { RequestWithPrincipal } from './principal.types';
 import type { CustodyActor } from './evidence.types';
 
 const IngestBodySchema = z.object({
@@ -54,9 +54,9 @@ function purposeHeaderOf(req: RequestWithPrincipal): string | undefined {
   return value;
 }
 
-/** A human actor when the principal carries a known user id; otherwise a system actor (TODO-WIRED-IN-WAVE-4 dev bypass — see principal-action.guard.ts). */
+/** A human actor when the principal carries a known user id; otherwise a system actor (only reachable when no principal is attached, e.g. direct-constructed integration tests). */
 function actorFor(req: RequestWithPrincipal): CustodyActor {
-  const userId = req.principal?.user_id;
+  const userId = req.principal?.user.id;
   return userId ? { kind: 'user', id: userId } : { kind: 'system' };
 }
 
@@ -86,7 +86,6 @@ export class EvidenceController {
 
   /** Deliverable 2/7: ingest write path, exposed over HTTP. */
   @Post()
-  @UseGuards(PrincipalActionGuard)
   @RequiresAction(ACTION_EVIDENCE_INGEST)
   async ingest(@Req() req: RequestWithPrincipal, @Body() rawBody: unknown, @Res() res: ServerResponse): Promise<void> {
     const parsed = IngestBodySchema.safeParse(rawBody);
@@ -131,7 +130,6 @@ export class EvidenceController {
 
   /** Deliverable 7: tenant-scoped metadata list. No per-item custody logging — see EvidenceService.list's doc comment. */
   @Get()
-  @UseGuards(PrincipalActionGuard)
   @RequiresAction(ACTION_EVIDENCE_READ)
   async list(@Req() req: RequestWithPrincipal, @Query() rawQuery: Record<string, unknown>): Promise<{ items: unknown[] }> {
     const parsed = ListQuerySchema.safeParse(rawQuery);
@@ -151,7 +149,6 @@ export class EvidenceController {
 
   /** Deliverable 7: single-item metadata read. Writes VIEWED (deliverable 3). */
   @Get(':id')
-  @UseGuards(PrincipalActionGuard)
   @RequiresAction(ACTION_EVIDENCE_READ)
   async getMetadata(@Req() req: RequestWithPrincipal, @Param('id') id: string, @Query() rawQuery: Record<string, unknown>): Promise<unknown> {
     const parsed = OrgOnlyQuerySchema.safeParse(rawQuery);
@@ -169,7 +166,6 @@ export class EvidenceController {
    * be bypassed by a caller that reaches the service directly.
    */
   @Get(':id/content')
-  @UseGuards(PrincipalActionGuard)
   @RequiresAction(ACTION_EVIDENCE_READ)
   async downloadContent(
     @Req() req: RequestWithPrincipal,
@@ -195,7 +191,6 @@ export class EvidenceController {
 
   /** Deliverable 4: derived object write path, exposed over HTTP. */
   @Post(':id/derive')
-  @UseGuards(PrincipalActionGuard)
   @RequiresAction(ACTION_EVIDENCE_INGEST)
   async derive(@Req() req: RequestWithPrincipal, @Param('id') id: string, @Body() rawBody: unknown, @Query() rawQuery: Record<string, unknown>): Promise<unknown> {
     const queryParsed = OrgOnlyQuerySchema.safeParse(rawQuery);
@@ -222,7 +217,6 @@ export class EvidenceController {
 
   /** Deliverable 5: admin integrity-check endpoint. */
   @Post(':id/verify')
-  @UseGuards(PrincipalActionGuard)
   @RequiresAction(ACTION_EVIDENCE_VERIFY)
   async verify(@Req() req: RequestWithPrincipal, @Param('id') id: string, @Query() rawQuery: Record<string, unknown>): Promise<unknown> {
     const parsed = OrgOnlyQuerySchema.safeParse(rawQuery);

@@ -1,8 +1,8 @@
-import { BadRequestException, Controller, Get, Inject, Logger, Query, Req, UseGuards } from '@nestjs/common';
-import { PresenceActionGuard, RequiresRealtimeAction } from './presence-action.guard';
+import { BadRequestException, Controller, Get, Inject, Logger, Query, Req } from '@nestjs/common';
+import { RequiresAction } from '../../common/security/requires-action.decorator';
+import type { RequestWithPrincipal as RequestWithPresencePrincipal } from '../../common/security/principal';
 import { PresenceService, type PresenceEntry } from './presence.service';
 import { ACTION_PRESENCE_VIEW } from './realtime.constants';
-import type { RequestWithPresencePrincipal } from './realtime-http-principal.types';
 
 interface PresenceListResponse {
   organisation_id: string;
@@ -17,8 +17,7 @@ export class PresenceController {
 
   /** Deliverable #4: tenant-scoped presence list. */
   @Get()
-  @UseGuards(PresenceActionGuard)
-  @RequiresRealtimeAction(ACTION_PRESENCE_VIEW)
+  @RequiresAction(ACTION_PRESENCE_VIEW)
   async list(@Req() req: RequestWithPresencePrincipal, @Query() rawQuery: Record<string, unknown>): Promise<PresenceListResponse> {
     const principal = req.principal;
     let organisationId: string;

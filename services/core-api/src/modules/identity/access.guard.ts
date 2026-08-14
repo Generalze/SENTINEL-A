@@ -2,7 +2,7 @@ import { CanActivate, ExecutionContext, ForbiddenException, Inject, Injectable, 
 import { Reflector } from '@nestjs/core';
 import { PURPOSE_REQUIRED_FROM } from './classification';
 import type { RequestWithPrincipal } from './http-types';
-import { REQUIRES_ACTION_KEY, type RequiredActionMetadata } from './requires-action.decorator';
+import { IS_PUBLIC_KEY, REQUIRES_ACTION_KEY, type RequiredActionMetadata } from './requires-action.decorator';
 import { roleHasAction } from './roles';
 
 const PURPOSE_HEADER = 'x-purpose';
@@ -61,6 +61,16 @@ export class AccessGuard implements CanActivate {
   constructor(@Inject(Reflector) private readonly reflector: Reflector) {}
 
   canActivate(context: ExecutionContext): boolean {
+    // A @Public route is unauthenticated by design (DevAuthGuard attaches no
+    // principal); it is never action-gated.
+    const isPublic = this.reflector.getAllAndOverride<boolean | undefined>(IS_PUBLIC_KEY, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+    if (isPublic) {
+      return true;
+    }
+
     const required = this.reflector.getAllAndOverride<RequiredActionMetadata | undefined>(REQUIRES_ACTION_KEY, [
       context.getHandler(),
       context.getClass(),

@@ -66,6 +66,31 @@ describe('EventsPublishSweepService republishes overdue rows (live stack)', () =
     const row = await prisma.event.findUniqueOrThrow({ where: { id: created.id } });
     expect(row.publishedAt).not.toBeNull();
   }, 45_000);
+
+  // M5 regression (WP-14): a duplicate delivery row is never independently
+  // published, so its publishedAt stays null forever. Before the fix the
+  // sweep's overdue query did not filter `duplicateOfEventId: null`, so it
+  // would try to republish every redelivery on every tick. The overdue
+  // query must therefore never return a duplicate row.
+  it('M5: an overdue unpublished DUPLICATE row is never picked up by the retry sweep', async () => {
+    const orgId = trackOrg('m5-sweep-dup');
+    const event = makeNormalisedEvent({ organisation_id: orgId, source_id: 'cam-m5-sweep', event_id: 'evt_m5_sweep' });
+
+    const canonical = await repository.createCanonical(event, `it-sweep-dup-key-${Date.now()}`);
+    // A redelivery -> inserts a linked duplicate row (publishedAt null).
+    const duplicate = await repository.recordDuplicateDelivery(canonical.id, { ...event, trace_id: 'dup' });
+    // Backdate BOTH rows so they are "overdue" by the sweep's cutoff.
+    await prisma.event.updateMany({
+      where: { id: { in: [canonical.id, duplicate.id] } },
+      data: { createdAt: new Date(Date.now() - 20_000) },
+    });
+    // Mark the canonical as already published so only the duplicate could
+    // possibly be eligible — isolating the duplicate filter.
+    await repository.markPublished(canonical.id);
+
+    const overdue = await repository.findUnpublishedOlderThan(new Date(), 100);
+    expect(overdue.some((r) => r.id === duplicate.id)).toBe(false);
+  }, 45_000);
   // Generous timeout: this file's very first live `connect()` call can
   // observably take up to ~25-30s (instead of the 1.5s CONNECT_TIMEOUT_MS)
   // when other concurrently-running test files in this same vitest worker

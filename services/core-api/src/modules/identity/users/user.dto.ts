@@ -14,6 +14,13 @@ export const CreateUserSchema = z.object({
   /** 0-5, matching the classification scale (architecture §47). */
   clearance: z.number().int().min(0).max(5),
   roles: z.array(RoleAssignmentInputSchema).min(1, 'at least one role is required'),
+  /**
+   * WP-14/M1: creating a user is a `user.role.grant`, a Constitution-gated
+   * account-privilege change. The caller names the APPROVING user ids only —
+   * their approval AUTHORITY is resolved server-side from Identity, never
+   * trusted from the request body (M2). Absent/empty means "no approvals".
+   */
+  approvals: z.array(z.object({ user_id: z.string().min(1) })).optional(),
 });
 export type CreateUserDto = z.infer<typeof CreateUserSchema>;
 

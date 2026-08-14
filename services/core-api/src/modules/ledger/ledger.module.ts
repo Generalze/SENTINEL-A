@@ -12,14 +12,13 @@
 import { Module } from '@nestjs/common';
 import { PrismaModule } from '../../prisma/prisma.module';
 import { LedgerController } from './ledger.controller';
-import { LedgerPrincipalActionGuard } from './ledger-principal-action.guard';
 import { LedgerRepository } from './ledger.repository';
 import { LedgerService } from './ledger.service';
 
 @Module({
   imports: [PrismaModule],
   controllers: [LedgerController],
-  providers: [LedgerRepository, LedgerService, LedgerPrincipalActionGuard],
+  providers: [LedgerRepository, LedgerService],
   exports: [LedgerService],
 })
 export class LedgerModule {}

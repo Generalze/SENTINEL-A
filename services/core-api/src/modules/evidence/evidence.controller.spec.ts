@@ -3,7 +3,14 @@ import type { ServerResponse } from 'node:http';
 import { describe, expect, it, vi } from 'vitest';
 import { EvidenceController } from './evidence.controller';
 import type { EvidenceService } from './evidence.service';
-import type { RequestWithPrincipal } from './principal.types';
+import { buildPrincipal, type Principal, type RequestWithPrincipal } from '../../common/security/principal';
+
+/** A canonical principal for `org`, optionally carrying a user id (for custody-actor attribution).
+ * WP-14: an authenticated principal ALWAYS carries a user id, so custody is attributed to that
+ * user ({ kind: 'user' }); the { kind: 'system' } actor is only for principal-less calls. */
+function principalFor(org: string, userId = 'evidence-user'): Principal {
+  return buildPrincipal({ user: { id: userId, clearance: 5 }, organisation_id: org, roles: [{ role: 'evidence.custodian', site_id: null }] });
+}
 
 function makeRes(): ServerResponse & { statusCode: number; body?: string; endedBuffer?: Buffer; headers: Record<string, string> } {
   const headers: Record<string, string> = {};
@@ -48,7 +55,7 @@ describe('EvidenceController#ingest (POST /api/v1/evidence)', () => {
   it('returns 400 with field-level errors for an invalid body and never calls the service', async () => {
     const service = makeService();
     const controller = new EvidenceController(service);
-    const req = makeReq({ principal: { organisation_id: 'org-1', hasAction: () => true } });
+    const req = makeReq({ principal: principalFor('org-1') });
     const res = makeRes();
 
     await controller.ingest(req, { not: 'valid' }, res);
@@ -62,7 +69,7 @@ describe('EvidenceController#ingest (POST /api/v1/evidence)', () => {
   it('returns 404 and never calls the service when the body organisation does not match the principal', async () => {
     const service = makeService();
     const controller = new EvidenceController(service);
-    const req = makeReq({ principal: { organisation_id: 'org-principal', hasAction: () => true } });
+    const req = makeReq({ principal: principalFor('org-principal') });
     const res = makeRes();
 
     await controller.ingest(req, validIngestBody, res);
@@ -75,7 +82,7 @@ describe('EvidenceController#ingest (POST /api/v1/evidence)', () => {
     const service = makeService();
     vi.mocked(service.ingest).mockResolvedValue({ id: 'ev-1' } as never);
     const controller = new EvidenceController(service);
-    const req = makeReq({ principal: { organisation_id: 'org-1', hasAction: () => true } });
+    const req = makeReq({ principal: principalFor('org-1') });
     const res = makeRes();
 
     await controller.ingest(req, validIngestBody, res);
@@ -83,7 +90,7 @@ describe('EvidenceController#ingest (POST /api/v1/evidence)', () => {
     expect(res.statusCode).toBe(201);
     const call = vi.mocked(service.ingest).mock.calls[0][0];
     expect(call.content).toEqual(Buffer.from('hello', 'utf8'));
-    expect(call.actor).toEqual({ kind: 'system' });
+    expect(call.actor).toEqual({ kind: 'user', id: 'evidence-user' });
     expect(JSON.parse(res.body ?? '{}')).toEqual({ evidence: { id: 'ev-1' } });
   });
 
@@ -91,7 +98,7 @@ describe('EvidenceController#ingest (POST /api/v1/evidence)', () => {
     const service = makeService();
     vi.mocked(service.ingest).mockResolvedValue({ id: 'ev-1' } as never);
     const controller = new EvidenceController(service);
-    const req = makeReq({ principal: { organisation_id: 'org-1', user_id: 'user-7', hasAction: () => true } });
+    const req = makeReq({ principal: principalFor('org-1', 'user-7') });
     const res = makeRes();
 
     await controller.ingest(req, validIngestBody, res);
@@ -119,7 +126,7 @@ describe('EvidenceController#list (GET /api/v1/evidence)', () => {
     const service = makeService();
     vi.mocked(service.list).mockResolvedValue([]);
     const controller = new EvidenceController(service);
-    const req = makeReq({ principal: { organisation_id: 'org-principal', hasAction: () => true } });
+    const req = makeReq({ principal: principalFor('org-principal') });
 
     await controller.list(req, { organisation_id: 'org-attacker-supplied' });
 
@@ -138,7 +145,7 @@ describe('EvidenceController#list (GET /api/v1/evidence)', () => {
   it('rejects an out-of-range limit with a 400', async () => {
     const service = makeService();
     const controller = new EvidenceController(service);
-    const req = makeReq({ principal: { organisation_id: 'org-1', hasAction: () => true } });
+    const req = makeReq({ principal: principalFor('org-1') });
 
     await expect(controller.list(req, { limit: '99999' })).rejects.toThrow(BadRequestException);
   });
@@ -149,11 +156,11 @@ describe('EvidenceController#getMetadata (GET /api/v1/evidence/:id)', () => {
     const service = makeService();
     vi.mocked(service.getMetadata).mockResolvedValue({ id: 'ev-1' } as never);
     const controller = new EvidenceController(service);
-    const req = makeReq({ principal: { organisation_id: 'org-1', hasAction: () => true } });
+    const req = makeReq({ principal: principalFor('org-1') });
 
     const result = await controller.getMetadata(req, 'ev-1', {});
 
-    expect(service.getMetadata).toHaveBeenCalledWith('ev-1', 'org-1', { kind: 'system' });
+    expect(service.getMetadata).toHaveBeenCalledWith('ev-1', 'org-1', { kind: 'user', id: 'evidence-user' });
     expect(result).toEqual({ id: 'ev-1' });
   });
 });
@@ -166,12 +173,12 @@ describe('EvidenceController#downloadContent (GET /api/v1/evidence/:id/content)'
       content: Buffer.from('bytes'),
     });
     const controller = new EvidenceController(service);
-    const req = makeReq({ principal: { organisation_id: 'org-1', hasAction: () => true }, headers: { 'x-purpose': 'investigation' } });
+    const req = makeReq({ principal: principalFor('org-1'), headers: { 'x-purpose': 'investigation' } });
     const res = makeRes();
 
     await controller.downloadContent(req, 'ev-1', {}, res);
 
-    expect(service.downloadContent).toHaveBeenCalledWith('ev-1', 'org-1', 'investigation', { kind: 'system' });
+    expect(service.downloadContent).toHaveBeenCalledWith('ev-1', 'org-1', 'investigation', { kind: 'user', id: 'evidence-user' });
     expect(res.statusCode).toBe(200);
     expect(res.headers['content-type']).toBe('image/png');
     expect(res.headers['x-evidence-content-hash']).toBe('hash-1');
@@ -182,12 +189,12 @@ describe('EvidenceController#downloadContent (GET /api/v1/evidence/:id/content)'
     const service = makeService();
     vi.mocked(service.downloadContent).mockResolvedValue({ metadata: { content_type: 'text/plain', content_hash: 'h' } as never, content: Buffer.from('x') });
     const controller = new EvidenceController(service);
-    const req = makeReq({ principal: { organisation_id: 'org-1', hasAction: () => true } });
+    const req = makeReq({ principal: principalFor('org-1') });
     const res = makeRes();
 
     await controller.downloadContent(req, 'ev-1', {}, res);
 
-    expect(service.downloadContent).toHaveBeenCalledWith('ev-1', 'org-1', undefined, { kind: 'system' });
+    expect(service.downloadContent).toHaveBeenCalledWith('ev-1', 'org-1', undefined, { kind: 'user', id: 'evidence-user' });
   });
 });
 
@@ -196,7 +203,7 @@ describe('EvidenceController#derive (POST /api/v1/evidence/:id/derive)', () => {
     const service = makeService();
     vi.mocked(service.derive).mockResolvedValue({ id: 'ev-2' } as never);
     const controller = new EvidenceController(service);
-    const req = makeReq({ principal: { organisation_id: 'org-1', hasAction: () => true } });
+    const req = makeReq({ principal: principalFor('org-1') });
 
     const result = await controller.derive(
       req,
@@ -217,11 +224,11 @@ describe('EvidenceController#verify (POST /api/v1/evidence/:id/verify)', () => {
     const service = makeService();
     vi.mocked(service.verify).mockResolvedValue({ evidence_id: 'ev-1', verified: true } as never);
     const controller = new EvidenceController(service);
-    const req = makeReq({ principal: { organisation_id: 'org-1', hasAction: () => true } });
+    const req = makeReq({ principal: principalFor('org-1') });
 
     const result = await controller.verify(req, 'ev-1', {});
 
-    expect(service.verify).toHaveBeenCalledWith('ev-1', 'org-1', { kind: 'system' });
+    expect(service.verify).toHaveBeenCalledWith('ev-1', 'org-1', { kind: 'user', id: 'evidence-user' });
     expect(result).toEqual({ evidence_id: 'ev-1', verified: true });
   });
 });

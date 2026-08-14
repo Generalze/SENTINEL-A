@@ -117,6 +117,15 @@ export interface ActionCategory {
    * for ONE / TWO_PERSON categories — see `validatePolicy`.
    */
   readonly approval_roles: readonly string[];
+  /**
+   * WP-14/M2: when true, two-person control additionally requires APPROVER-ROLE
+   * DIVERSITY — the eligible approvers must cover at least `requiredApprovers`
+   * DISTINCT authorising roles, so two members of the same function cannot
+   * collude to satisfy the control. Opt-in per category ("where the policy
+   * demands it"): absent/false preserves the certified CERT-O behaviour of
+   * counting distinct approver identities only.
+   */
+  readonly require_role_diversity?: boolean;
 }
 
 /**
@@ -316,6 +325,8 @@ interface EvaluationContext {
   readonly requiredApprovers: number;
   /** The resolved category's approval authority list; empty when the category is unresolved. */
   readonly approvalRoles: readonly string[];
+  /** WP-14/M2: whether the resolved category demands approver-role diversity for two-person control. */
+  readonly requireRoleDiversity: boolean;
   /** Caller-resolved roles per approver user id; empty map when the caller supplied none. */
   readonly approverRoles: ApproverRoles;
 }
@@ -350,15 +361,31 @@ function result(
   };
 }
 
-/** Approvals that are not the actor's own and carry a usable user id. */
-function candidateApprovals(ctx: EvaluationContext): readonly Approval[] {
-  const actorId = ctx.request.actor.userId;
-  return ctx.approvals.filter((a) => a.userId !== actorId && a.userId.trim().length > 0);
+/**
+ * WP-14/M2: normalise a user id (trim + case-fold) before any identity
+ * comparison. Without this, an approval whose id differs from the actor's only
+ * by surrounding whitespace or letter-case would slip past self-exclusion, and
+ * two spellings of one person's id would each be counted as a distinct
+ * approver — defeating both the self-approval bar and two-person control.
+ */
+export function normaliseApproverId(id: string): string {
+  return id.trim().toLowerCase();
 }
 
-/** The roles the caller resolved for `userId`; `[]` when none were supplied. */
+/** Approvals that are not the actor's own and carry a usable user id (normalised comparison). */
+function candidateApprovals(ctx: EvaluationContext): readonly Approval[] {
+  const actorId = normaliseApproverId(ctx.request.actor.userId);
+  return ctx.approvals.filter((a) => normaliseApproverId(a.userId) !== actorId && a.userId.trim().length > 0);
+}
+
+/** The roles the caller resolved for `userId`; `[]` when none were supplied. Keyed on the normalised id. */
 function resolvedRolesFor(ctx: EvaluationContext, userId: string): readonly string[] {
-  return lookup(ctx.approverRoles, userId) ?? [];
+  return lookup(ctx.approverRoles, normaliseApproverId(userId)) ?? lookup(ctx.approverRoles, userId) ?? [];
+}
+
+/** The subset of an approver's resolved roles that carry approval authority for the action's category. */
+function authorisingRolesFor(ctx: EvaluationContext, userId: string): readonly string[] {
+  return resolvedRolesFor(ctx, userId).filter((role) => ctx.approvalRoles.includes(role));
 }
 
 /**
@@ -372,18 +399,20 @@ function isRoleAuthorisedApprover(ctx: EvaluationContext, userId: string): boole
   return resolvedRolesFor(ctx, userId).some((role) => ctx.approvalRoles.includes(role));
 }
 
-/** Approvals that may count: not the actor's own, usable user id, and role-authorised. */
+/** Approvals that may count: not the actor's own, usable user id, and role-authorised (deduped on the normalised id). */
 function eligibleApproverIds(ctx: EvaluationContext): readonly string[] {
   return uniqueSorted(
     candidateApprovals(ctx)
       .filter((a) => isRoleAuthorisedApprover(ctx, a.userId))
-      .map((a) => a.userId),
+      .map((a) => normaliseApproverId(a.userId)),
   );
 }
 
 function selfApprovalIds(ctx: EvaluationContext): readonly string[] {
-  const actorId = ctx.request.actor.userId;
-  return uniqueSorted(ctx.approvals.filter((a) => a.userId === actorId).map((a) => a.userId));
+  const actorId = normaliseApproverId(ctx.request.actor.userId);
+  return uniqueSorted(
+    ctx.approvals.filter((a) => normaliseApproverId(a.userId) === actorId).map((a) => normaliseApproverId(a.userId)),
+  );
 }
 
 /* -------------------------------------------------------------------------- */
@@ -620,7 +649,9 @@ const checkApprovalSelfExclusion: CheckFn = (ctx) => {
       approvalRequirement: ctx.requirement,
       requiredDistinctApprovers: ctx.requiredApprovers,
       suppliedApprovalCount: ctx.approvals.length,
-      selfApprovalCount: ctx.approvals.filter((a) => a.userId === ctx.request.actor.userId).length,
+      selfApprovalCount: ctx.approvals.filter(
+        (a) => normaliseApproverId(a.userId) === normaliseApproverId(ctx.request.actor.userId),
+      ).length,
       selfApproverIds: selfIds,
     },
     `approval.self_approval_not_permitted: actor '${ctx.request.actor.userId}' cannot approve ` +
@@ -640,12 +671,12 @@ const checkApprovalSelfExclusion: CheckFn = (ctx) => {
 const checkApprovalRoleAuthorised: CheckFn = (ctx) => {
   const approvalNeeded = ctx.requiredApprovers > 0;
   const candidates = candidateApprovals(ctx);
-  const candidateIds = uniqueSorted(candidates.map((a) => a.userId));
+  const candidateIds = uniqueSorted(candidates.map((a) => normaliseApproverId(a.userId)));
   const authorisedIds = eligibleApproverIds(ctx);
   const unauthorisedIds = candidateIds.filter((id) => !authorisedIds.includes(id));
   const passed = !approvalNeeded || unauthorisedIds.length === 0;
   const blankIdApprovalCount = ctx.approvals.filter(
-    (a) => a.userId !== ctx.request.actor.userId && a.userId.trim().length === 0,
+    (a) => normaliseApproverId(a.userId) !== normaliseApproverId(ctx.request.actor.userId) && a.userId.trim().length === 0,
   ).length;
 
   return result(
@@ -679,7 +710,17 @@ const checkApprovalRoleAuthorised: CheckFn = (ctx) => {
 
 const checkApprovalDistinctSufficient: CheckFn = (ctx) => {
   const eligible = eligibleApproverIds(ctx);
-  const passed = eligible.length >= ctx.requiredApprovers;
+  // WP-14/M2: two-person control additionally requires ROLE DIVERSITY — the
+  // eligible approvers must, between them, cover at least `requiredApprovers`
+  // distinct authorising roles, so two members of the same function cannot
+  // collude to satisfy a §58.2 two-person control. Single-approval categories
+  // and no-approval categories are unaffected (this only makes TWO_PERSON
+  // stricter, never looser — CERT-O deny-by-default is preserved).
+  const distinctAuthorisingRoles = uniqueSorted(eligible.flatMap((id) => [...authorisingRolesFor(ctx, id)]));
+  // Diversity is enforced ONLY when the category opts in (keeps CERT-O intact
+  // for every baseline category, which counts distinct identities only).
+  const roleDiverse = !ctx.requireRoleDiversity || distinctAuthorisingRoles.length >= ctx.requiredApprovers;
+  const passed = eligible.length >= ctx.requiredApprovers && roleDiverse;
   return result(
     'APPROVAL_DISTINCT_SUFFICIENT',
     'APPROVAL',
@@ -687,20 +728,23 @@ const checkApprovalDistinctSufficient: CheckFn = (ctx) => {
     ctx.requiredApprovers === 0
       ? `Action requires no approval.`
       : `Action requires ${ctx.requiredApprovers} distinct approver(s) other than the actor; ` +
-          `${eligible.length} supplied.`,
+          `${eligible.length} supplied${ctx.requirement === 'TWO_PERSON' ? `, covering ${distinctAuthorisingRoles.length} authorising role(s)` : ''}.`,
     {
       approvalRequirement: ctx.requirement,
       requiredDistinctApprovers: ctx.requiredApprovers,
       suppliedApprovalCount: ctx.approvals.length,
-      suppliedApproverIds: uniqueSorted(ctx.approvals.map((a) => a.userId)),
+      suppliedApproverIds: uniqueSorted(ctx.approvals.map((a) => normaliseApproverId(a.userId))),
       eligibleApproverIds: eligible,
       distinctEligibleApprovers: eligible.length,
+      distinctAuthorisingRoles,
+      roleDiverse,
       actorUserId: ctx.request.actor.userId,
     },
     ctx.requirement === 'TWO_PERSON'
       ? `approval.insufficient_distinct_approvers: two-person control requires ` +
-          `${ctx.requiredApprovers} distinct approvers other than the actor; ` +
-          `${eligible.length} eligible approval(s) supplied [${eligible.join(', ')}].`
+          `${ctx.requiredApprovers} distinct approvers other than the actor holding ` +
+          `${ctx.requiredApprovers} distinct authorising roles; ${eligible.length} eligible ` +
+          `approval(s) [${eligible.join(', ')}] covering ${distinctAuthorisingRoles.length} role(s).`
       : `approval.insufficient_distinct_approvers: ${ctx.requiredApprovers} approver(s) other ` +
           `than the actor required; ${eligible.length} eligible approval(s) supplied ` +
           `[${eligible.join(', ')}].`,
@@ -747,6 +791,7 @@ function buildContext(request: ConstitutionRequest, policy: Policy): EvaluationC
     requiredApprovers: requiredApproverCount(requirement),
     // An unresolved category authorises nobody: no approval roles at all.
     approvalRoles: category?.approval_roles ?? [],
+    requireRoleDiversity: category?.require_role_diversity === true,
     approverRoles: request.approver_roles ?? NO_APPROVER_ROLES,
   };
 }

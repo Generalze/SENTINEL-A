@@ -95,9 +95,3 @@ export {
 } from './decision-record';
 
 export { ConstitutionModule } from './constitution.module';
-export {
-  CONSTITUTION_POLICY_READER_ROLES,
-  ConstitutionAdminGuard,
-  extractPrincipal,
-  type ConstitutionPrincipal,
-} from './constitution-admin.guard';

@@ -115,6 +115,41 @@ describe('Event ingestion (live stack)', () => {
     expect(rows).toHaveLength(0);
   });
 
+  it('C1: an org-A ingest with a source/event id colliding with an org-B event cannot mark the org-B event a duplicate (cross-tenant suppression blocked)', async () => {
+    // Both tenants use the SAME source_id, event_id and occurred_at — the
+    // exact collision the pre-fix global idempotency key made exploitable.
+    const orgB = trackOrg('c1-victim');
+    const orgA = trackOrg('c1-attacker');
+    const occurredAt = '2026-08-14T10:00:00.000Z';
+    const shared = { source_id: 'camera-shared', event_id: 'evt_c1_shared', occurred_at: occurredAt, ingested_at: occurredAt };
+
+    // 1. org-B ingests the genuine event first -> canonical row.
+    const resB = makeCapturingRes();
+    await controller.ingest(principalRequest(orgB), makeNormalisedEvent({ organisation_id: orgB, ...shared }), resB);
+    expect(resB.statusCode).toBe(201);
+
+    // 2. org-A ingests an event with the SAME source/event id. It must be a
+    // brand-new canonical row for org-A (201), NOT a "duplicate" of org-B's.
+    const resA = makeCapturingRes();
+    await controller.ingest(principalRequest(orgA), makeNormalisedEvent({ organisation_id: orgA, ...shared }), resA);
+    expect(resA.statusCode).toBe(201);
+    const bodyA = JSON.parse(resA.body ?? '{}') as { duplicate: boolean };
+    expect(bodyA.duplicate).toBe(false);
+
+    // 3. org-B's event is untouched — still exactly one row, still canonical,
+    // receivedCount 1 (org-A's ingest did not increment it).
+    const rowsB = await prisma.event.findMany({ where: { organisationId: orgB } });
+    expect(rowsB).toHaveLength(1);
+    expect(rowsB[0]?.duplicateOfEventId).toBeNull();
+    expect(rowsB[0]?.receivedCount).toBe(1);
+
+    // 4. org-A got its own independent canonical row.
+    const rowsA = await prisma.event.findMany({ where: { organisationId: orgA } });
+    expect(rowsA).toHaveLength(1);
+    expect(rowsA[0]?.duplicateOfEventId).toBeNull();
+    expect(rowsA[0]?.idempotencyKey).not.toBeNull();
+  }, 45_000);
+
   it('AC3: an org-mismatch injection attempt is denied 404, nothing is persisted, and the denial is logged', async () => {
     const bodyOrg = trackOrg('ac3-body');
     const principalOrg = trackOrg('ac3-principal');

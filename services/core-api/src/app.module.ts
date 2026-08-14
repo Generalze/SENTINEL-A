@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import { Module } from '@nestjs/common';
+import { ThrottlerModule } from '@nestjs/throttler';
 import { LoggerModule } from 'nestjs-pino';
 import type { RequestWithTraceId } from './common/http-types';
 import { AppConfigService } from './config/config.service';
@@ -19,6 +20,10 @@ import { PrismaModule } from './prisma/prisma.module';
 @Module({
   imports: [
     ConfigModule,
+    // WP-14/M7+L2: a lenient default (only enforced on routes that opt in via
+    // @UseGuards(ThrottlerGuard) — events ingest and organisation creation),
+    // with per-route @Throttle overrides tightening specific endpoints.
+    ThrottlerModule.forRoot([{ ttl: 60_000, limit: 300 }]),
     LoggerModule.forRootAsync({
       inject: [AppConfigService],
       useFactory: (appConfig: AppConfigService) => ({

@@ -29,8 +29,3 @@ export { LedgerRepository, type InsertLedgerEntryData } from './ledger.repositor
 export { LedgerService, LedgerValidationError } from './ledger.service';
 export { LedgerController } from './ledger.controller';
 export { LedgerModule } from './ledger.module';
-export {
-  LedgerPrincipalActionGuard,
-  RequiresLedgerAction,
-} from './ledger-principal-action.guard';
-export type { LedgerPrincipal, RequestWithLedgerPrincipal } from './ledger.principal.types';

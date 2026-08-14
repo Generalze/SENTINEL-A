@@ -41,14 +41,18 @@ model Event {
 
   // --- Ingestion / delivery bookkeeping (§64.1 idempotency, §76 delivery states) ---
 
-  /// Derived by deriveIdempotencyKey(source_id, event_id, occurred_at, 5000ms).
-  /// Nullable + unique: only the canonical row for a given delivery
-  /// signature carries a value here. Duplicate rows (see `duplicateOf`)
-  /// store NULL, which Postgres treats as distinct from every other NULL
-  /// under a unique index — so redeliveries can each get their own row
-  /// (preserving the fact that multiple deliveries occurred, §64.1)
-  /// without ever colliding with the canonical row's unique key.
-  idempotencyKey String? @unique @map("idempotency_key")
+  /// Derived by deriveIdempotencyKey(organisation_id, site_id, source_id,
+  /// event_id, occurred_at, 5000ms) — WP-14/C1: the organisation id leads
+  /// the key so it can never collide across tenants.
+  /// Nullable: only the canonical row for a given delivery signature carries
+  /// a value here. Duplicate rows (see `duplicateOf`) store NULL, which
+  /// Postgres treats as distinct from every other NULL under a unique index
+  /// — so redeliveries can each get their own row (preserving the fact that
+  /// multiple deliveries occurred, §64.1) without ever colliding with the
+  /// canonical row's unique key. Uniqueness is the COMPOSITE
+  /// `@@unique([organisationId, idempotencyKey])` below (never global), so
+  /// one tenant's key can never suppress or reveal another tenant's event.
+  idempotencyKey String? @map("idempotency_key")
 
   /// Set only on duplicate rows; points at the canonical row's `id`.
   duplicateOfEventId String? @map("duplicate_of_event_id") @db.Uuid
@@ -72,6 +76,9 @@ model Event {
   /// publishes and as a stable secondary sort key.
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
 
+  /// WP-14/C1: idempotency is unique PER ORGANISATION, never globally, so a
+  /// key derived by one tenant cannot mark another tenant's event a duplicate.
+  @@unique([organisationId, idempotencyKey])
   @@index([organisationId, siteId, occurredAt])
   @@index([organisationId, sourceType, occurredAt])
   @@index([publishedAt])

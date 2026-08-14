@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { APP_GUARD } from '@nestjs/core';
 import { ConfigModule } from '../../config/config.module';
 import { PrismaModule } from '../../prisma/prisma.module';
+import { ConstitutionModule } from '../constitution/constitution.module';
 import { AccessGuard } from './access.guard';
 import { DevAuthGuard } from './dev-auth.guard';
 import { OrganisationsController } from './organisations/organisations.controller';
@@ -22,7 +23,7 @@ import { ZonesService } from './zones/zones.service';
  * module's own controllers.
  */
 @Module({
-  imports: [ConfigModule, PrismaModule],
+  imports: [ConfigModule, PrismaModule, ConstitutionModule],
   controllers: [OrganisationsController, SitesController, ZonesController, UsersController],
   providers: [
     OrganisationsService,

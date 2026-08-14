@@ -1,13 +1,14 @@
 import { BadRequestException, Body, Controller, Get, HttpStatus, Inject, Logger, Post, Query, Req, Res, UseGuards } from '@nestjs/common';
+import { ThrottlerGuard, Throttle } from '@nestjs/throttler';
 import type { ServerResponse } from 'node:http';
 import { NormalisedEventSchema } from '@sentinel/contracts';
 import { z } from 'zod';
+import { RequiresAction } from '../../common/security/requires-action.decorator';
+import type { RequestWithPrincipal } from '../../common/security/principal';
 import { ACTION_EVENT_INGEST, ACTION_EVENT_READ, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT } from './events.constants';
 import { formatValidationIssues } from './events.mapper';
 import { EventsService } from './events.service';
 import type { EventsListResult } from './events.types';
-import { PrincipalActionGuard, RequiresAction } from './principal-action.guard';
-import type { RequestWithPrincipal } from './principal.types';
 
 const ListQuerySchema = z.object({
   site_id: z.string().min(1).optional(),
@@ -45,7 +46,11 @@ export class EventsController {
    * match, and only then calls the service.
    */
   @Post()
-  @UseGuards(PrincipalActionGuard)
+  // WP-14/M7: rate-limit the raw ingest surface (per caller) so a single
+  // source cannot flood the pipeline. Generous enough for legitimate bulk
+  // ingest; the guard only runs on the real HTTP path.
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 600, ttl: 60_000 } })
   @RequiresAction(ACTION_EVENT_INGEST)
   async ingest(@Req() req: RequestWithPrincipal, @Body() rawBody: unknown, @Res() res: ServerResponse): Promise<void> {
     const parsed = NormalisedEventSchema.safeParse(rawBody);
@@ -87,7 +92,6 @@ export class EventsController {
 
   /** Deliverable #5: tenant-scoped, filterable, cursor-paginated, newest first. */
   @Get()
-  @UseGuards(PrincipalActionGuard)
   @RequiresAction(ACTION_EVENT_READ)
   async list(@Req() req: RequestWithPrincipal, @Query() rawQuery: Record<string, unknown>): Promise<EventsListResult> {
     const parsed = ListQuerySchema.safeParse(rawQuery);

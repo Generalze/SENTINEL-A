@@ -19,6 +19,7 @@ import {
   type Classification,
   type ConstitutionDecision,
   type ConstitutionRequest,
+  type Policy,
   type Target,
   type TraceEntry,
 } from './constitution.engine';
@@ -293,6 +294,100 @@ describe('APPROVAL_ROLE_AUTHORISED: unresolved categories authorise nobody', () 
     expect(entry.outcome).toBe('FAIL');
     expect(entry.values['category']).toBeNull();
     expect(entry.values['categoryApprovalRoles']).toEqual([]);
+  });
+});
+
+// M2 regression (WP-14): approver-id comparisons normalise (trim + case-fold)
+// before self-exclusion AND distinctness. Each of these would have behaved
+// differently (and less safely) before the fix.
+describe('M2: approver id normalisation', () => {
+  it('counts two spellings of one approver id (case only) as a SINGLE distinct approver', () => {
+    // Before the fix, 'u-1' and 'U-1' were two distinct approvers -> ALLOW.
+    const decision = evaluate(
+      request(TWO_PERSON_ACTION, officer(), [approval('u-1'), approval('U-1')], {
+        'u-1': ['security.officer'],
+        'U-1': ['site.commander'],
+      }),
+      SENTINEL_BASELINE_POLICY,
+    );
+
+    expect(decision.decision).toBe('REQUIRE_TWO_PERSON');
+    expect(traceEntry(decision, 'APPROVAL_DISTINCT_SUFFICIENT').values['distinctEligibleApprovers']).toBe(1);
+  });
+
+  it('excludes a self-approval whose id differs from the actor only by case/whitespace', () => {
+    // Actor is 'u-1'; the approval ' U-1 ' is the same person and must be excluded.
+    const decision = evaluate(
+      {
+        action: ONE_PERSON_ACTION,
+        actor: officer({ userId: 'u-1', roles: ['analyst'], clearance: 2 }),
+        target: target('SENSITIVE'),
+        approvals: [{ userId: ' U-1 ', role: 'platform.admin', at: '2026-08-14T10:00:00.000Z' }],
+        approver_roles: { 'u-1': ['platform.admin'] },
+      },
+      SENTINEL_BASELINE_POLICY,
+    );
+
+    expect(decision.decision).toBe('REQUIRE_APPROVAL');
+    expect(traceEntry(decision, 'APPROVAL_SELF_EXCLUSION').values['selfApprovalCount']).toBe(1);
+  });
+});
+
+// M2 regression (WP-14): opt-in approver-role DIVERSITY for two-person control.
+describe('M2: two-person role diversity (opt-in per category)', () => {
+  const DIVERSITY_POLICY: Policy = {
+    version: 'test-diversity-1',
+    categories: {
+      two_person_diverse: {
+        approval: 'TWO_PERSON',
+        description: 'requires two DIFFERENT authorising roles',
+        approval_roles: ['role.a', 'role.b'],
+        require_role_diversity: true,
+      },
+    },
+    actions: { 'act.diverse': 'two_person_diverse' },
+    roles: { actor_role: ['act.diverse'], 'role.a': [], 'role.b': [] },
+    prohibitedActions: [],
+  };
+
+  const diverseActor: Actor = {
+    userId: 'u-actor',
+    roles: ['actor_role'],
+    organisationId: ORG,
+    clearance: 1,
+    deviceTrust: 'TRUSTED',
+  };
+  const diverseTarget: Target = { organisationId: ORG, classification: 'INTERNAL', classificationLevel: 1 };
+
+  it('holds the action when two distinct approvers share a single authorising role (collusion blocked)', () => {
+    const decision = evaluate(
+      {
+        action: 'act.diverse',
+        actor: diverseActor,
+        target: diverseTarget,
+        approvals: [approval('u-1'), approval('u-2')],
+        approver_roles: { 'u-1': ['role.a'], 'u-2': ['role.a'] },
+      },
+      DIVERSITY_POLICY,
+    );
+
+    expect(decision.decision).toBe('REQUIRE_TWO_PERSON');
+    expect(traceEntry(decision, 'APPROVAL_DISTINCT_SUFFICIENT').values['roleDiverse']).toBe(false);
+  });
+
+  it('allows when the two distinct approvers hold DIFFERENT authorising roles', () => {
+    const decision = evaluate(
+      {
+        action: 'act.diverse',
+        actor: diverseActor,
+        target: diverseTarget,
+        approvals: [approval('u-1'), approval('u-2')],
+        approver_roles: { 'u-1': ['role.a'], 'u-2': ['role.b'] },
+      },
+      DIVERSITY_POLICY,
+    );
+
+    expect(decision.decision).toBe('ALLOW');
   });
 });
 

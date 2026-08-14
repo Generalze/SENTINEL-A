@@ -12,13 +12,13 @@
  * `app.useLogger(app.get(Logger))`.
  */
 
-import { BadRequestException, Controller, Get, Inject, Logger, Query, Req, UseGuards } from '@nestjs/common';
+import { BadRequestException, Controller, Get, Inject, Logger, Query, Req } from '@nestjs/common';
 import { z } from 'zod';
+import { RequiresAction } from '../../common/security/requires-action.decorator';
+import type { RequestWithPrincipal as RequestWithLedgerPrincipal } from '../../common/security/principal';
 import { ACTION_LEDGER_READ, ACTION_LEDGER_VERIFY, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT } from './ledger.constants';
-import { LedgerPrincipalActionGuard, RequiresLedgerAction } from './ledger-principal-action.guard';
 import { LedgerService } from './ledger.service';
 import type { LedgerListResult, VerifyChainResult } from './ledger.types';
-import type { RequestWithLedgerPrincipal } from './ledger.principal.types';
 
 const ListQuerySchema = z.object({
   decision_type: z.string().min(1).optional(),
@@ -58,8 +58,7 @@ export class LedgerController {
 
   /** Deliverable #4: tenant-scoped, filterable, cursor-paginated read, newest first. */
   @Get()
-  @UseGuards(LedgerPrincipalActionGuard)
-  @RequiresLedgerAction(ACTION_LEDGER_READ)
+  @RequiresAction(ACTION_LEDGER_READ)
   async list(@Req() req: RequestWithLedgerPrincipal, @Query() rawQuery: Record<string, unknown>): Promise<LedgerListResult> {
     const parsed = ListQuerySchema.safeParse(rawQuery);
     if (!parsed.success) {
@@ -86,8 +85,7 @@ export class LedgerController {
 
   /** Deliverable #5: admin endpoint exposing `LedgerService.verifyChain`. */
   @Get('verify')
-  @UseGuards(LedgerPrincipalActionGuard)
-  @RequiresLedgerAction(ACTION_LEDGER_VERIFY)
+  @RequiresAction(ACTION_LEDGER_VERIFY)
   async verify(@Req() req: RequestWithLedgerPrincipal, @Query() rawQuery: Record<string, unknown>): Promise<VerifyChainResult> {
     const queryOrganisationId = typeof rawQuery['organisation_id'] === 'string' ? (rawQuery['organisation_id'] as string) : undefined;
     const organisationId = resolveOrganisationId(req, queryOrganisationId);

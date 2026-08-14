@@ -1,5 +1,6 @@
-import { Body, Controller, Get, Param, Post, Req } from '@nestjs/common';
+import { Body, Controller, Get, Inject, Param, Post, Query, Req } from '@nestjs/common';
 import type { RequestWithPrincipal } from '../http-types';
+import { ListQuerySchema, type ListPageResponse } from '../list-query';
 import { requirePrincipal } from '../principal';
 import { RequiresAction } from '../requires-action.decorator';
 import { parseOrThrow } from '../validate';
@@ -14,7 +15,7 @@ import { ZonesService } from './zones.service';
  */
 @Controller('api/v1/sites/:siteId/zones')
 export class ZonesController {
-  constructor(private readonly zones: ZonesService) {}
+  constructor(@Inject(ZonesService) private readonly zones: ZonesService) {}
 
   @Post()
   @RequiresAction('site.admin')
@@ -31,9 +32,14 @@ export class ZonesController {
 
   @Get()
   @RequiresAction('site.admin')
-  async list(@Req() request: RequestWithPrincipal, @Param('siteId') siteId: string): Promise<ZoneResponse[]> {
+  async list(
+    @Req() request: RequestWithPrincipal,
+    @Param('siteId') siteId: string,
+    @Query() rawQuery: unknown,
+  ): Promise<ListPageResponse<ZoneResponse>> {
     const principal = requirePrincipal(request);
-    const zones = await this.zones.listForSite(principal, siteId);
-    return zones.map(toZoneResponse);
+    const query = parseOrThrow(ListQuerySchema, rawQuery);
+    const { items, next_cursor } = await this.zones.listForSite(principal, siteId, query);
+    return { items: items.map(toZoneResponse), next_cursor };
   }
 }

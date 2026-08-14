@@ -39,6 +39,8 @@ const ActionCategorySchema: z.ZodType<ActionCategory> = z.object({
   approval: z.enum(['NONE', 'ONE', 'TWO_PERSON']),
   description: z.string().min(1),
   approval_roles: z.array(z.string().min(1)),
+  // WP-14/M2: optional per-category opt-in to approver-role diversity.
+  require_role_diversity: z.boolean().optional(),
 });
 
 export const PolicyBodySchema = z.object({

@@ -137,5 +137,29 @@ describe('Event listing (live stack)', () => {
       };
       expect(result.items.every((item) => item.organisation_id === orgId)).toBe(true);
     });
+
+    // M5 regression (WP-14): duplicate rows are §64.1 delivery bookkeeping,
+    // not distinct events. Before the fix the list query did not filter
+    // `duplicateOfEventId: null`, so a redelivery surfaced as an extra list
+    // item. Here the same event is delivered 3x (1 canonical + 2 duplicate
+    // rows) and the list must still show exactly one item.
+    it('M5: duplicate delivery rows are never listed (only the canonical event appears)', async () => {
+      const dupOrg = trackOrg('m5-list-dup');
+      const req = principalRequest(dupOrg);
+      const event = makeNormalisedEvent({ organisation_id: dupOrg, site_id: 'site-dup', source_id: 'cam-m5', event_id: 'evt_m5_dup' });
+
+      for (let i = 0; i < 3; i += 1) {
+        const res = makeCapturingRes();
+        await controller.ingest(req, { ...event, trace_id: `m5-${i}` }, res);
+      }
+
+      // 3 physical rows exist (1 canonical + 2 duplicates)...
+      const rows = await prisma.event.findMany({ where: { organisationId: dupOrg } });
+      expect(rows).toHaveLength(3);
+
+      // ...but the list surfaces only the single canonical event.
+      const result = (await controller.list(req, {})) as { items: Array<{ id: string }> };
+      expect(result.items).toHaveLength(1);
+    }, 45_000);
   });
 });

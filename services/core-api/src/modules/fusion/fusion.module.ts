@@ -3,7 +3,6 @@ import { InfraModule } from '../../infra/infra.module';
 import { PrismaModule } from '../../prisma/prisma.module';
 import { FusionConsumerService } from './fusion-consumer.service';
 import { FusionController } from './fusion.controller';
-import { FusionPrincipalActionGuard } from './fusion-principal-action.guard';
 import { FusionPublisherService } from './fusion-publisher.service';
 import { FusionRepository } from './fusion.repository';
 import { FusionService } from './fusion.service';
@@ -24,7 +23,6 @@ import { FusionService } from './fusion.service';
     FusionPublisherService,
     FusionService,
     FusionConsumerService,
-    FusionPrincipalActionGuard,
   ],
   exports: [FusionService],
 })

@@ -55,10 +55,19 @@ export class EventsPublishSweepService implements OnModuleInit, OnModuleDestroy 
       let republished = 0;
       // Sequential on purpose: bounded batch size, avoid hammering NATS with a burst.
       for (const row of overdue) {
-        const published = await this.publisher.tryPublish(row.id, mapRowToNormalisedEvent(row));
-        if (published) {
-          await this.repository.markPublished(row.id);
-          republished += 1;
+        try {
+          const published = await this.publisher.tryPublish(row.id, mapRowToNormalisedEvent(row));
+          if (published) {
+            await this.repository.markPublished(row.id);
+            republished += 1;
+          }
+        } catch (error) {
+          // Best-effort catch-up: a single row failing (e.g. it was deleted or
+          // corrected between the find and the mark, or a transient publish
+          // error) must never abort the sweep or bubble out of this
+          // fire-and-forget timer as an unhandled rejection. Log and continue;
+          // a still-unpublished row is simply retried next tick.
+          this.logger.warn(`Publish retry sweep: skipping event ${row.id}: ${String(error)}`);
         }
       }
       if (overdue.length > 0) {

@@ -1,7 +1,7 @@
 import type { ServerResponse } from 'node:http';
 import type { AppConfig } from '../../config/env.schema';
 import type { AppConfigService } from '../../config/config.service';
-import type { RequestWithPrincipal } from './principal.types';
+import { buildPrincipal, type RequestWithPrincipal } from '../../common/security/principal';
 
 /**
  * Test-only support for the live-stack integration specs in this module.
@@ -45,7 +45,11 @@ export function uniqueOrgId(label: string): string {
 export function principalRequest(organisationId: string, traceId = 'it-trace'): RequestWithPrincipal {
   return {
     traceId,
-    principal: { organisation_id: organisationId, hasAction: () => true },
+    principal: buildPrincipal({
+      user: { id: `user_${organisationId}`, clearance: 5 },
+      organisation_id: organisationId,
+      roles: [{ role: 'operator', site_id: null }],
+    }),
   } as unknown as RequestWithPrincipal;
 }
 

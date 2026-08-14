@@ -20,9 +20,19 @@ export class EventsService {
   ) {}
 
   async ingest(event: NormalisedEvent): Promise<IngestResult> {
-    const idempotencyKey = deriveIdempotencyKey(event.source_id, event.event_id, event.occurred_at, IDEMPOTENCY_WINDOW_MS);
+    // WP-14/C1: organisation + site lead the idempotency key, and every
+    // lookup below is scoped to the event's organisation, so a colliding
+    // source/event id from another tenant can never mask this event.
+    const idempotencyKey = deriveIdempotencyKey(
+      event.organisation_id,
+      event.site_id,
+      event.source_id,
+      event.event_id,
+      event.occurred_at,
+      IDEMPOTENCY_WINDOW_MS,
+    );
 
-    const existing = await this.repository.findByIdempotencyKey(idempotencyKey);
+    const existing = await this.repository.findByIdempotencyKey(event.organisation_id, idempotencyKey);
     if (existing) {
       await this.repository.recordDuplicateDelivery(existing.id, event);
       return { duplicate: true, original_event_id: existing.eventId };
@@ -32,12 +42,12 @@ export class EventsService {
     try {
       canonical = await this.repository.createCanonical(event, idempotencyKey);
     } catch (error) {
-      // Two concurrent deliveries can both miss the findUnique above and
-      // race to insert; the loser hits the DB's unique constraint on
-      // idempotency_key. Treat that exactly like a duplicate found up
-      // front — never surface a 500 on replay (acceptance criterion 1).
+      // Two concurrent deliveries can both miss the findFirst above and
+      // race to insert; the loser hits the DB's composite unique constraint
+      // on (organisation_id, idempotency_key). Treat that exactly like a
+      // duplicate found up front — never surface a 500 on replay (AC1).
       if (isIdempotencyKeyConflict(error)) {
-        const winner = await this.repository.findByIdempotencyKey(idempotencyKey);
+        const winner = await this.repository.findByIdempotencyKey(event.organisation_id, idempotencyKey);
         if (winner) {
           await this.repository.recordDuplicateDelivery(winner.id, event);
           return { duplicate: true, original_event_id: winner.eventId };

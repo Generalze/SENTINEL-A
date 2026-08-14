@@ -22,6 +22,7 @@ import {
 import {
   ConstitutionNotLoadedError,
   ConstitutionService,
+  PLATFORM_ORGANISATION_ID,
   PolicyIntegrityError,
 } from './constitution.service';
 import { PolicyShapeError } from './constitution.policy';
@@ -134,10 +135,12 @@ function baselineCopy(version: string): Policy {
   return { ...copy, version };
 }
 
+// WP-14/M3: altering the constitution requires PLATFORM authority, so the
+// steward acts in the platform organisation (target is the platform singleton).
 const steward = (overrides: Partial<Actor> = {}): Actor => ({
   userId: 'u-steward',
   roles: ['constitution.steward'],
-  organisationId: ORG,
+  organisationId: PLATFORM_ORGANISATION_ID,
   clearance: 4,
   deviceTrust: 'TRUSTED',
   purpose: 'Adopt constitution 1.2.0 per change board CR-118',
@@ -420,6 +423,24 @@ describe('activation is gated by the constitution itself (§58.2)', () => {
 
     expect(result.activated).toBe(false);
     expect(result.decision.decision).toBe('DENY');
+    expect(service.activePolicy.version).toBe(SENTINEL_BASELINE_POLICY.version);
+  });
+
+  // M3 regression (WP-14): the constitution is a PLATFORM singleton. A tenant
+  // actor (organisation != platform) fails ORGANISATION_MATCH, so no tenant can
+  // alter the one global constitution — even with two authorised approvers.
+  // Before the fix the target org was the actor's own org, so this self-matched.
+  it('M3: a tenant actor (organisation != platform) is DENIED on ORGANISATION_MATCH and changes nothing', async () => {
+    const result = await service.activatePolicy({
+      version: NEXT_VERSION,
+      actor: steward({ organisationId: 'org-tenant-x' }),
+      ...TWO_AUTHORISED_APPROVERS,
+    });
+
+    expect(result.activated).toBe(false);
+    expect(result.decision.decision).toBe('DENY');
+    const orgCheck = result.decision.trace.find((e) => e.check === 'ORGANISATION_MATCH');
+    expect(orgCheck?.outcome).toBe('FAIL');
     expect(service.activePolicy.version).toBe(SENTINEL_BASELINE_POLICY.version);
   });
 

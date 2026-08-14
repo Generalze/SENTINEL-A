@@ -1,78 +1,17 @@
 /**
- * SENTINEL — `GET /api/v1/constitution/policy` and its admin gate.
+ * SENTINEL — `GET /api/v1/constitution/policy`.
  *
- * The guard is deliberately identity-agnostic (WP-03 is concurrent): it only requires that
- * *some* upstream layer attached a principal. These tests pin the fail-closed behaviour so the
- * lead's wiring cannot silently open the endpoint.
+ * WP-14: the bespoke `ConstitutionAdminGuard` is gone; the route is now gated
+ * by the ONE global AccessGuard via `@RequiresAction('constitution.policy.read')`
+ * (covered by identity/access.guard.spec.ts and the AppModule e2e). This spec
+ * pins the controller's own contract: it returns policy METADATA and never the
+ * policy body.
  */
 
-import { ForbiddenException, UnauthorizedException, type ExecutionContext } from '@nestjs/common';
 import { describe, expect, it } from 'vitest';
 
-import {
-  CONSTITUTION_POLICY_READER_ROLES,
-  ConstitutionAdminGuard,
-  extractPrincipal,
-} from './constitution-admin.guard';
 import { ConstitutionController } from './constitution.controller';
 import type { ActivePolicyMetadata, ConstitutionService } from './constitution.service';
-
-function context(request: unknown): ExecutionContext {
-  return {
-    switchToHttp: () => ({ getRequest: () => request }),
-  } as unknown as ExecutionContext;
-}
-
-const guard = new ConstitutionAdminGuard();
-
-describe('extractPrincipal', () => {
-  it('reads a principal from either conventional request property', () => {
-    expect(extractPrincipal({ principal: { userId: 'u-1', roles: ['viewer'] } })).toEqual({
-      userId: 'u-1',
-      roles: ['viewer'],
-    });
-    expect(extractPrincipal({ user: { user_id: 'u-2' } })).toEqual({ userId: 'u-2', roles: [] });
-    expect(extractPrincipal({ user: { sub: 'u-3', roles: ['analyst'] } })).toEqual({
-      userId: 'u-3',
-      roles: ['analyst'],
-    });
-  });
-
-  it('returns null for anything without a usable user id', () => {
-    expect(extractPrincipal(undefined)).toBeNull();
-    expect(extractPrincipal({})).toBeNull();
-    expect(extractPrincipal({ principal: null })).toBeNull();
-    expect(extractPrincipal({ principal: { userId: '   ' } })).toBeNull();
-    expect(extractPrincipal({ principal: { roles: ['platform.admin'] } })).toBeNull();
-  });
-
-  it('ignores non-string entries in the roles array', () => {
-    expect(extractPrincipal({ principal: { userId: 'u-1', roles: ['a', 7, null] } })).toEqual({
-      userId: 'u-1',
-      roles: ['a'],
-    });
-  });
-});
-
-describe('ConstitutionAdminGuard', () => {
-  it('rejects a request with no principal (401)', () => {
-    expect(() => guard.canActivate(context({}))).toThrow(UnauthorizedException);
-  });
-
-  it('rejects an authenticated principal without an administrative role (403)', () => {
-    expect(() =>
-      guard.canActivate(context({ principal: { userId: 'u-1', roles: ['analyst', 'viewer'] } })),
-    ).toThrow(ForbiddenException);
-  });
-
-  it('admits each administrative role', () => {
-    for (const role of CONSTITUTION_POLICY_READER_ROLES) {
-      expect(guard.canActivate(context({ principal: { userId: 'u-1', roles: [role] } }))).toBe(
-        true,
-      );
-    }
-  });
-});
 
 describe('ConstitutionController', () => {
   it('returns the active policy metadata, and never the policy body', () => {

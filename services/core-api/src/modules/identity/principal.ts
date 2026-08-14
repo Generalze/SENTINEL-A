@@ -1,32 +1,14 @@
-import { UnauthorizedException } from '@nestjs/common';
-import type { User } from '@prisma/client';
-import type { RequestWithPrincipal } from './http-types';
-
-/** One §62 role assignment for a user, optionally scoped to a single site. */
-export interface PrincipalRoleAssignment {
-  role: string;
-  site_id: string | null;
-}
-
 /**
- * The authenticated caller, attached to `request.principal` by
- * DevAuthGuard and consumed by AccessGuard and every identity controller.
+ * WP-14: the canonical Principal now lives in `common/security` (owned by no
+ * feature module) so every HTTP module shares ONE identity type. This file
+ * re-exports it to keep the identity module's existing `../principal` imports
+ * working unchanged.
  */
-export interface Principal {
-  user: User;
-  roles: PrincipalRoleAssignment[];
-  organisation_id: string;
-}
-
-/**
- * Narrows `request.principal` from optional to required. Safe to call in
- * any handler behind a route decorated with `@RequiresAction`, since
- * AccessGuard denies the request before the handler runs when no
- * principal is present. The throw here is defence in depth only.
- */
-export function requirePrincipal(request: RequestWithPrincipal): Principal {
-  if (!request.principal) {
-    throw new UnauthorizedException('No authenticated principal on request');
-  }
-  return request.principal;
-}
+export {
+  buildPrincipal,
+  requirePrincipal,
+  type BuildPrincipalInput,
+  type Principal,
+  type PrincipalRoleAssignment,
+  type RequestWithPrincipal,
+} from '../../common/security/principal';

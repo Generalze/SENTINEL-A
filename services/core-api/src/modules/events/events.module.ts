@@ -6,11 +6,10 @@ import { EventsPublishSweepService } from './events-publish-sweep.service';
 import { EventsPublisherService } from './events-publisher.service';
 import { EventsRepository } from './events.repository';
 import { EventsService } from './events.service';
-import { PrincipalActionGuard } from './principal-action.guard';
 
 @Module({
   imports: [PrismaModule, InfraModule],
   controllers: [EventsController],
-  providers: [EventsRepository, EventsPublisherService, EventsPublishSweepService, EventsService, PrincipalActionGuard],
+  providers: [EventsRepository, EventsPublisherService, EventsPublishSweepService, EventsService],
 })
 export class EventsModule {}

@@ -3,8 +3,14 @@ import type { ServerResponse } from 'node:http';
 import { describe, expect, it, vi } from 'vitest';
 import { EventsController } from './events.controller';
 import type { EventsService } from './events.service';
-import type { RequestWithPrincipal } from './principal.types';
+import { buildPrincipal, type Principal, type RequestWithPrincipal } from '../../common/security/principal';
 import { makeNormalisedEvent } from './test-fixtures';
+
+/** A canonical principal for `org`; the concrete roles are irrelevant to these
+ * controller tests (the global AccessGuard, not the controller, enforces actions). */
+function principalFor(org: string): Principal {
+  return buildPrincipal({ user: { id: `u_${org}`, clearance: 5 }, organisation_id: org, roles: [{ role: 'operator', site_id: null }] });
+}
 
 function makeRes(): ServerResponse & { statusCode: number; body?: string } {
   const res = {
@@ -29,7 +35,7 @@ describe('EventsController#ingest (POST /api/v1/events)', () => {
   it('returns 400 with field-level errors for an invalid body and never calls the service', async () => {
     const service = makeService();
     const controller = new EventsController(service);
-    const req = makeReq({ principal: { organisation_id: 'org-1', hasAction: () => true } });
+    const req = makeReq({ principal: principalFor('org-1') });
     const res = makeRes();
 
     await controller.ingest(req, { not: 'a valid event' }, res);
@@ -46,7 +52,7 @@ describe('EventsController#ingest (POST /api/v1/events)', () => {
     const service = makeService();
     const controller = new EventsController(service);
     const event = makeNormalisedEvent({ organisation_id: 'org-body' });
-    const req = makeReq({ principal: { organisation_id: 'org-principal', hasAction: () => true } });
+    const req = makeReq({ principal: principalFor('org-principal') });
     const res = makeRes();
 
     await controller.ingest(req, event, res);
@@ -60,7 +66,7 @@ describe('EventsController#ingest (POST /api/v1/events)', () => {
     vi.mocked(service.ingest).mockResolvedValue({ duplicate: true, original_event_id: 'evt_original' });
     const controller = new EventsController(service);
     const event = makeNormalisedEvent({ organisation_id: 'org-1' });
-    const req = makeReq({ principal: { organisation_id: 'org-1', hasAction: () => true } });
+    const req = makeReq({ principal: principalFor('org-1') });
     const res = makeRes();
 
     await controller.ingest(req, event, res);
@@ -75,7 +81,7 @@ describe('EventsController#ingest (POST /api/v1/events)', () => {
     vi.mocked(service.ingest).mockResolvedValue({ duplicate: false, event: stored });
     const controller = new EventsController(service);
     const event = makeNormalisedEvent({ organisation_id: 'org-1' });
-    const req = makeReq({ principal: { organisation_id: 'org-1', hasAction: () => true } });
+    const req = makeReq({ principal: principalFor('org-1') });
     const res = makeRes();
 
     await controller.ingest(req, event, res);
@@ -104,7 +110,7 @@ describe('EventsController#list (GET /api/v1/events)', () => {
     const service = makeService();
     vi.mocked(service.list).mockResolvedValue({ items: [], next_cursor: null });
     const controller = new EventsController(service);
-    const req = makeReq({ principal: { organisation_id: 'org-principal', hasAction: () => true } });
+    const req = makeReq({ principal: principalFor('org-principal') });
 
     await controller.list(req, { organisation_id: 'org-attacker-supplied', site_id: 'site-1' });
 
@@ -134,7 +140,7 @@ describe('EventsController#list (GET /api/v1/events)', () => {
   it('rejects an out-of-range limit with a 400', async () => {
     const service = makeService();
     const controller = new EventsController(service);
-    const req = makeReq({ principal: { organisation_id: 'org-1', hasAction: () => true } });
+    const req = makeReq({ principal: principalFor('org-1') });
 
     await expect(controller.list(req, { limit: '99999' })).rejects.toThrow(BadRequestException);
   });

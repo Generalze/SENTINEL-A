@@ -6,9 +6,13 @@ import { CLASSIFICATION_LEVELS } from './classification';
 import type { RequestWithPrincipal } from './http-types';
 import type { RequiredActionMetadata } from './requires-action.decorator';
 import type { Principal } from './principal';
+import { roleHasAction } from './roles';
 
+// AccessGuard reads @Public first (getAllAndOverride for IS_PUBLIC_KEY, then
+// REQUIRES_ACTION_KEY). These tests exercise action-gated routes only, so the
+// reflector reports "not public" (undefined) then the required metadata.
 function makeReflector(metadata: RequiredActionMetadata | undefined): Reflector {
-  return { getAllAndOverride: vi.fn(() => metadata) } as unknown as Reflector;
+  return { getAllAndOverride: vi.fn().mockReturnValueOnce(undefined).mockReturnValue(metadata) } as unknown as Reflector;
 }
 
 function makeContext(request: Partial<RequestWithPrincipal>): ExecutionContext {
@@ -20,19 +24,12 @@ function makeContext(request: Partial<RequestWithPrincipal>): ExecutionContext {
 }
 
 function makePrincipal(overrides: Partial<Principal> = {}): Principal {
+  const roles = overrides.roles ?? [{ role: 'operator', site_id: null }];
   return {
-    user: {
-      id: 'user_1',
-      organisationId: 'org_1',
-      email: 'a@b.test',
-      displayName: 'A B',
-      clearance: 3,
-      createdAt: new Date(),
-      updatedAt: new Date(),
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test fixture stands in for the Prisma User type
-    } as any,
-    roles: [{ role: 'operator', site_id: null }],
+    user: { id: 'user_1', clearance: 3 },
+    roles,
     organisation_id: 'org_1',
+    hasAction: (action: string): boolean => roles.some((assignment) => roleHasAction(assignment.role, action)),
     ...overrides,
   };
 }

@@ -1,7 +1,9 @@
 import { CanActivate, ExecutionContext, Inject, Injectable, Logger, UnauthorizedException } from '@nestjs/common';
+import { Reflector } from '@nestjs/core';
 import { AppConfigService } from '../../config/config.service';
 import { PrismaService } from '../../prisma/prisma.service';
-import type { RequestWithPrincipal } from './http-types';
+import { buildPrincipal, type RequestWithPrincipal } from '../../common/security/principal';
+import { IS_PUBLIC_KEY } from '../../common/security/requires-action.decorator';
 
 const DEV_USER_HEADER = 'x-dev-user-id';
 
@@ -17,8 +19,17 @@ const DEV_USER_HEADER = 'x-dev-user-id';
  * fully impersonate that user. This is acceptable ONLY because Milestone 1
  * has no real authentication surface yet, and ONLY while
  * `DEV_AUTH_ENABLED=true`, which must never be true outside local/dev
- * environments. When the flag is false, every request this guard sees is
- * rejected with 401 — there is no fallback identity.
+ * environments. When the flag is false, every NON-@Public request this guard
+ * sees is rejected with 401 — there is no fallback identity.
+ *
+ * WP-14: this is THE single global authentication guard (wired via APP_GUARD
+ * in identity.module.ts). It:
+ *   - honours `@Public()` so liveness/readiness probes work even when
+ *     `DEV_AUTH_ENABLED=false` (no principal is attached for a public route);
+ *   - reads the flag ONLY from the zod-validated `AppConfigService` (never
+ *     raw `process.env` — fixes L1);
+ *   - builds the ONE canonical Principal (common/security), the shape every
+ *     module now reads.
  *
  * Real authentication (OIDC) replaces this guard in a later milestone,
  * alongside device trust (Shield). See architecture §38, §62.
@@ -29,11 +40,22 @@ export class DevAuthGuard implements CanActivate {
   private readonly logger = new Logger(DevAuthGuard.name);
 
   constructor(
+    @Inject(Reflector) private readonly reflector: Reflector,
     @Inject(AppConfigService) private readonly appConfig: AppConfigService,
     @Inject(PrismaService) private readonly prisma: PrismaService,
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
+    const isPublic = this.reflector.getAllAndOverride<boolean | undefined>(IS_PUBLIC_KEY, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+    if (isPublic) {
+      // Public route: no authentication, no principal attached. Probes reach
+      // it even with DEV_AUTH_ENABLED=false.
+      return true;
+    }
+
     if (!this.appConfig.values.DEV_AUTH_ENABLED) {
       throw new UnauthorizedException('Authentication is not available (DEV_AUTH_ENABLED=false)');
     }
@@ -54,11 +76,11 @@ export class DevAuthGuard implements CanActivate {
       throw new UnauthorizedException('Unknown dev user');
     }
 
-    request.principal = {
-      user,
-      roles: user.roles.map((assignment) => ({ role: assignment.role, site_id: assignment.siteId })),
+    request.principal = buildPrincipal({
+      user: { id: user.id, clearance: user.clearance },
       organisation_id: user.organisationId,
-    };
+      roles: user.roles.map((assignment) => ({ role: assignment.role, site_id: assignment.siteId })),
+    });
     return true;
   }
 }

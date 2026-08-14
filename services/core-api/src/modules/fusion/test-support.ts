@@ -2,7 +2,7 @@ import type { ServerResponse } from 'node:http';
 import type { NormalisedEvent } from '@sentinel/contracts';
 import { loadConfig, type AppConfig } from '../../config/env.schema';
 import type { AppConfigService } from '../../config/config.service';
-import type { RequestWithPrincipal } from './fusion-principal.types';
+import { buildPrincipal, type RequestWithPrincipal } from '../../common/security/principal';
 import { CORRELATION_WINDOW_MS } from './fusion.constants';
 
 /**
@@ -121,7 +121,11 @@ export function makeEvent(overrides: EventOverrides = {}): NormalisedEvent {
 export function principalRequest(organisationId: string, traceId = 'wp05-trace'): RequestWithPrincipal {
   return {
     traceId,
-    principal: { organisation_id: organisationId, hasAction: () => true },
+    principal: buildPrincipal({
+      user: { id: `user_${organisationId}`, clearance: 5 },
+      organisation_id: organisationId,
+      roles: [{ role: 'investigator', site_id: null }],
+    }),
   } as unknown as RequestWithPrincipal;
 }
 

@@ -1,5 +1,6 @@
-import { Body, Controller, Get, Post, Req } from '@nestjs/common';
+import { Body, Controller, Get, Inject, Post, Query, Req } from '@nestjs/common';
 import type { RequestWithPrincipal } from '../http-types';
+import { ListQuerySchema, type ListPageResponse } from '../list-query';
 import { requirePrincipal } from '../principal';
 import { RequiresAction } from '../requires-action.decorator';
 import { parseOrThrow } from '../validate';
@@ -8,7 +9,7 @@ import { SitesService } from './sites.service';
 
 @Controller('api/v1/sites')
 export class SitesController {
-  constructor(private readonly sites: SitesService) {}
+  constructor(@Inject(SitesService) private readonly sites: SitesService) {}
 
   @Post()
   @RequiresAction('site.admin')
@@ -19,11 +20,13 @@ export class SitesController {
     return toSiteResponse(site);
   }
 
+  /** WP-14/M4+M6: intersected with the caller's site scope, capped + cursor-paged. */
   @Get()
   @RequiresAction('site.admin')
-  async list(@Req() request: RequestWithPrincipal): Promise<SiteResponse[]> {
+  async list(@Req() request: RequestWithPrincipal, @Query() rawQuery: unknown): Promise<ListPageResponse<SiteResponse>> {
     const principal = requirePrincipal(request);
-    const sites = await this.sites.listForOrganisation(principal);
-    return sites.map(toSiteResponse);
+    const query = parseOrThrow(ListQuerySchema, rawQuery);
+    const { items, next_cursor } = await this.sites.listForOrganisation(principal, query);
+    return { items: items.map(toSiteResponse), next_cursor };
   }
 }

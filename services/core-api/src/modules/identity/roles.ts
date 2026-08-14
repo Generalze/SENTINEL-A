@@ -38,12 +38,18 @@ export const ACTIONS = [
   'incident.close',
   'field.acknowledge',
   'event.ingest',
+  'event.read',
+  'evidence.ingest',
   'evidence.read',
+  'evidence.verify',
   'ledger.read',
+  'ledger.verify',
+  'hypothesis.read',
+  'presence.view',
+  'constitution.policy.read',
   'org.admin',
   'site.admin',
   'user.admin',
-  'presence.view',
 ] as const;
 
 export type Action = (typeof ACTIONS)[number];
@@ -61,20 +67,25 @@ export const ROLES = [
 export type Role = (typeof ROLES)[number];
 
 export const ROLE_ACTIONS: Readonly<Record<Role, readonly Action[]>> = {
-  'site.commander': ['incident.view', 'incident.close', 'field.acknowledge', 'evidence.read'],
-  operator: ['incident.view', 'presence.view', 'event.ingest'],
-  dispatcher: ['incident.view', 'presence.view'],
+  'site.commander': ['incident.view', 'incident.close', 'field.acknowledge', 'evidence.read', 'event.read', 'hypothesis.read'],
+  operator: ['incident.view', 'presence.view', 'event.ingest', 'event.read', 'hypothesis.read'],
+  dispatcher: ['incident.view', 'presence.view', 'event.read', 'hypothesis.read'],
   'field.operative': ['field.acknowledge', 'incident.view'],
-  investigator: ['evidence.read', 'ledger.read', 'incident.view'],
-  'evidence.custodian': ['evidence.read'],
-  admin: ['org.admin', 'site.admin', 'user.admin', 'incident.view'],
+  investigator: ['evidence.read', 'evidence.verify', 'ledger.read', 'ledger.verify', 'incident.view', 'event.read', 'hypothesis.read'],
+  'evidence.custodian': ['evidence.read', 'evidence.ingest', 'evidence.verify'],
+  admin: ['org.admin', 'site.admin', 'user.admin', 'incident.view', 'constitution.policy.read', 'ledger.verify'],
 };
 
 function isKnownRole(role: string): role is Role {
   return Object.prototype.hasOwnProperty.call(ROLE_ACTIONS, role);
 }
 
-/** True when `role` (an arbitrary string, e.g. from the DB) grants `action` per the §62 table above. */
-export function roleHasAction(role: string, action: Action): boolean {
-  return isKnownRole(role) && ROLE_ACTIONS[role].includes(action);
+/**
+ * True when `role` (an arbitrary string, e.g. from the DB) grants `action`
+ * per the §62 table above. `action` is a plain string (not the `Action`
+ * union) so the one canonical guard can enforce any module's action string;
+ * an unknown role or unknown action simply fails closed (returns false).
+ */
+export function roleHasAction(role: string, action: string): boolean {
+  return isKnownRole(role) && (ROLE_ACTIONS[role] as readonly string[]).includes(action);
 }

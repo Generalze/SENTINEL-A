@@ -35,12 +35,11 @@ import {
   Param,
   Query,
   Req,
-  UseGuards,
 } from '@nestjs/common';
 import { z } from 'zod';
+import { RequiresAction } from '../../common/security/requires-action.decorator';
+import type { RequestWithPrincipal } from '../../common/security/principal';
 import { ACTION_HYPOTHESIS_READ, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT } from './fusion.constants';
-import { FusionPrincipalActionGuard, RequiresAction } from './fusion-principal-action.guard';
-import type { RequestWithPrincipal } from './fusion-principal.types';
 import { FusionService } from './fusion.service';
 import type { HypothesisDetailView, HypothesisListResult } from './fusion.types';
 
@@ -74,7 +73,6 @@ export class FusionController {
   constructor(@Inject(FusionService) private readonly fusion: FusionService) {}
 
   @Get()
-  @UseGuards(FusionPrincipalActionGuard)
   @RequiresAction(ACTION_HYPOTHESIS_READ)
   async list(
     @Req() req: RequestWithPrincipal,
@@ -100,7 +98,6 @@ export class FusionController {
   }
 
   @Get(':id')
-  @UseGuards(FusionPrincipalActionGuard)
   @RequiresAction(ACTION_HYPOTHESIS_READ)
   async detail(
     @Req() req: RequestWithPrincipal,

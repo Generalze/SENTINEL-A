@@ -8,13 +8,22 @@ import type { EventsListFilter } from './events.types';
 
 const UNIQUE_CONSTRAINT_VIOLATION = 'P2002';
 
-/** True when `error` is the unique-constraint violation on `idempotency_key`. */
+/**
+ * True when `error` is the unique-constraint violation on the idempotency
+ * key. WP-14/C1: the constraint is now the COMPOSITE
+ * `@@unique([organisationId, idempotencyKey])`, so Prisma's `meta.target`
+ * may surface the column list (`['organisation_id','idempotency_key']`),
+ * the field list, or the constraint name — all of which mention
+ * "idempotency". We normalise to a string and match on that substring so
+ * the detection is robust across Prisma target-shape variations.
+ */
 export function isIdempotencyKeyConflict(error: unknown): boolean {
   if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== UNIQUE_CONSTRAINT_VIOLATION) {
     return false;
   }
   const target = error.meta?.target;
-  return Array.isArray(target) ? target.includes('idempotency_key') : target === 'idempotency_key';
+  const asText = Array.isArray(target) ? target.join(',') : String(target ?? '');
+  return asText.includes('idempotency');
 }
 
 /**
@@ -32,8 +41,16 @@ export function isIdempotencyKeyConflict(error: unknown): boolean {
 export class EventsRepository {
   constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
 
-  async findByIdempotencyKey(key: string): Promise<EventRow | null> {
-    return this.prisma.event.findUnique({ where: { idempotencyKey: key } });
+  /**
+   * WP-14/C1: the lookup is scoped to the caller's organisation and uses
+   * `findFirst`, never a global `findUnique` on `idempotencyKey`. Even
+   * though the derived key now leads with the organisation id, scoping the
+   * query by `organisationId` too is defence in depth: a canonical row is
+   * only ever matched within its own tenant, so a cross-tenant collision
+   * can neither suppress nor reveal another org's event.
+   */
+  async findByIdempotencyKey(organisationId: string, key: string): Promise<EventRow | null> {
+    return this.prisma.event.findFirst({ where: { organisationId, idempotencyKey: key } });
   }
 
   async findById(id: string): Promise<EventRow | null> {
@@ -80,7 +97,11 @@ export class EventsRepository {
 
   async findUnpublishedOlderThan(cutoff: Date, limit: number): Promise<EventRow[]> {
     return this.prisma.event.findMany({
-      where: { publishedAt: null, createdAt: { lt: cutoff } },
+      // WP-14/M5: only canonical rows are ever published. Duplicate rows
+      // (duplicateOfEventId set) are never independently published — their
+      // publishedAt stays null forever — so without this filter the retry
+      // sweep would try to republish every redelivery indefinitely.
+      where: { publishedAt: null, duplicateOfEventId: null, createdAt: { lt: cutoff } },
       orderBy: { createdAt: 'asc' },
       take: limit,
     });
@@ -89,6 +110,10 @@ export class EventsRepository {
   async list(filter: EventsListFilter): Promise<{ items: EventRow[]; nextCursor: string | null }> {
     const where: Prisma.EventWhereInput = {
       organisationId: filter.organisationId,
+      // WP-14/M5: list only canonical events. Duplicate rows are internal
+      // delivery bookkeeping (§64.1) and must never surface as if they were
+      // distinct events.
+      duplicateOfEventId: null,
       ...(filter.siteId ? { siteId: filter.siteId } : {}),
       ...(filter.sourceType ? { sourceType: filter.sourceType } : {}),
       ...(filter.occurredFrom || filter.occurredTo

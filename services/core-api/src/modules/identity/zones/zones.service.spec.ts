@@ -2,7 +2,8 @@ import { NotFoundException } from '@nestjs/common';
 import { describe, expect, it, vi } from 'vitest';
 import { ZonesService } from './zones.service';
 import type { PrismaService } from '../../../prisma/prisma.service';
-import type { Principal } from '../principal';
+import { buildPrincipal, type Principal } from '../principal';
+import type { PrincipalRoleAssignment } from '../principal';
 
 function makePrisma(site: unknown): {
   findFirst: ReturnType<typeof vi.fn>;
@@ -17,13 +18,8 @@ function makePrisma(site: unknown): {
   return { findFirst, findMany, create, prisma };
 }
 
-function makePrincipal(organisationId: string): Principal {
-  return {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test fixture stands in for the Prisma User type
-    user: { id: 'user_1', organisationId, clearance: 5 } as any,
-    roles: [{ role: 'admin', site_id: null }],
-    organisation_id: organisationId,
-  };
+function makePrincipal(organisationId: string, roles: PrincipalRoleAssignment[] = [{ role: 'admin', site_id: null }]): Principal {
+  return buildPrincipal({ user: { id: 'user_1', clearance: 5 }, organisation_id: organisationId, roles });
 }
 
 describe('ZonesService', () => {
@@ -46,6 +42,16 @@ describe('ZonesService', () => {
     await expect(service.create(principal, 'no_such_site', { name: 'Lobby' })).rejects.toBeInstanceOf(NotFoundException);
   });
 
+  // M4 regression (WP-14): a site-scoped site.admin gets the same 404 for a
+  // site that IS in its org but outside its granted sites.
+  it('M4: a site-scoped site.admin gets 404 for an in-org site outside its grants', async () => {
+    const { prisma } = makePrisma({ id: 'site_other', organisationId: 'org_alpha' });
+    const service = new ZonesService(prisma);
+    const principal = makePrincipal('org_alpha', [{ role: 'admin', site_id: 'site_hq' }]);
+
+    await expect(service.listForSite(principal, 'site_other')).rejects.toBeInstanceOf(NotFoundException);
+  });
+
   it('lists zones for a site that belongs to the caller\'s own organisation', async () => {
     const { findMany, prisma } = makePrisma({ id: 'site_hq', organisationId: 'org_alpha' });
     const service = new ZonesService(prisma);
@@ -53,7 +59,11 @@ describe('ZonesService', () => {
 
     await service.listForSite(principal, 'site_hq');
 
-    expect(findMany).toHaveBeenCalledWith({ where: { siteId: 'site_hq' } });
+    expect(findMany).toHaveBeenCalledWith({
+      where: { siteId: 'site_hq' },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: 51,
+    });
   });
 
   it('creates a zone under a site owned by the caller\'s organisation', async () => {

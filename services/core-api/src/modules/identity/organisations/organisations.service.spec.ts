@@ -1,22 +1,17 @@
 import { describe, expect, it, vi } from 'vitest';
 import { OrganisationsService } from './organisations.service';
 import type { PrismaService } from '../../../prisma/prisma.service';
-import type { Principal } from '../principal';
+import { buildPrincipal, type Principal } from '../principal';
 
-function makePrisma(): { findMany: ReturnType<typeof vi.fn>; create: ReturnType<typeof vi.fn>; prisma: PrismaService } {
-  const findMany = vi.fn(() => Promise.resolve([]));
+function makePrisma(rows: unknown[] = []): { findMany: ReturnType<typeof vi.fn>; create: ReturnType<typeof vi.fn>; prisma: PrismaService } {
+  const findMany = vi.fn(() => Promise.resolve(rows));
   const create = vi.fn((args: unknown) => Promise.resolve(args));
   const prisma = { organisation: { findMany, create } } as unknown as PrismaService;
   return { findMany, create, prisma };
 }
 
 function makePrincipal(organisationId: string): Principal {
-  return {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test fixture stands in for the Prisma User type
-    user: { id: 'user_1', organisationId, clearance: 5 } as any,
-    roles: [{ role: 'admin', site_id: null }],
-    organisation_id: organisationId,
-  };
+  return buildPrincipal({ user: { id: 'user_1', clearance: 5 }, organisation_id: organisationId, roles: [{ role: 'admin', site_id: null }] });
 }
 
 describe('OrganisationsService', () => {
@@ -27,7 +22,11 @@ describe('OrganisationsService', () => {
 
     await service.listOwnOrganisation(principal);
 
-    expect(findMany).toHaveBeenCalledWith({ where: { id: 'org_1' } });
+    expect(findMany).toHaveBeenCalledWith({
+      where: { id: 'org_1' },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: 51,
+    });
   });
 
   it('creates an organisation with the given name', async () => {

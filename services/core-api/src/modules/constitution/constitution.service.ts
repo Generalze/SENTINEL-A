@@ -42,6 +42,29 @@ import { LEDGER_SINK, type LedgerSink } from './ledger.sink';
 /** The constitution document itself, as an evaluation target. */
 const CONSTITUTION_TARGET_CLASSIFICATION: Classification = 'RESTRICTED';
 
+/**
+ * WP-14/M3 — PLATFORM-SINGLETON POLICY MODEL.
+ *
+ * For Milestone 1 the Constitution is a single platform-wide document, NOT a
+ * per-tenant policy (there is no `organisation_id` column on
+ * `constitution_policies`). Altering it must therefore require PLATFORM-level
+ * authority, not merely authority within some tenant.
+ *
+ * Before this fix, `activationRequest` set `target.organisationId =
+ * command.actor.organisationId`, so ORGANISATION_MATCH always compared a value
+ * to itself and passed — meaning ANY tenant's actor could clear the org check
+ * on a constitution change (finding M3). The target is now this fixed platform
+ * constant, so ORGANISATION_MATCH only passes for an actor whose
+ * organisationId IS the platform org — i.e. only platform authority can alter
+ * the one global constitution. A tenant admin (org != platform) is DENIED on
+ * ORGANISATION_MATCH.
+ *
+ * If per-tenant constitutions are ever wanted, add an `organisation_id` column
+ * to `constitution_policies` and scope the target to it — the lead decision
+ * for Milestone 1 is the platform singleton documented here.
+ */
+export const PLATFORM_ORGANISATION_ID = 'sentinel-platform';
+
 export interface LoadedPolicy {
   readonly policy: Policy;
   readonly version: string;
@@ -247,16 +270,19 @@ export class ConstitutionService implements OnModuleInit {
   /**
    * The request the activation gate evaluates.
    *
-   * The target is the constitution document of the actor's own organisation, classified
-   * RESTRICTED — so an activation additionally requires clearance >= 3, a stated purpose and a
-   * trusted (or at worst degraded) device, on top of the two-person approval.
+   * WP-14/M3: the target is the PLATFORM constitution document (a fixed
+   * platform-org constant), classified RESTRICTED — so an activation requires
+   * PLATFORM-level authority (ORGANISATION_MATCH only passes for a platform
+   * actor), clearance >= 3, a stated purpose and a trusted (or at worst
+   * degraded) device, on top of the two-person approval. A tenant actor is
+   * denied on the organisation match.
    */
   private activationRequest(command: ActivatePolicyCommand): ConstitutionRequest {
     return {
       action: CONSTITUTION_ALTER_ACTION,
       actor: command.actor,
       target: {
-        organisationId: command.actor.organisationId,
+        organisationId: PLATFORM_ORGANISATION_ID,
         classification: CONSTITUTION_TARGET_CLASSIFICATION,
         classificationLevel: CLASSIFICATION_LEVELS[CONSTITUTION_TARGET_CLASSIFICATION] ?? 3,
       },
