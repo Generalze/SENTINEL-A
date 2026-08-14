@@ -9,18 +9,28 @@
     "start": "node dist/main.js",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev"
   },
   "dependencies": {
     "@nestjs/common": "^11",
     "@nestjs/core": "^11",
     "@nestjs/platform-express": "^11",
+    "@prisma/client": "^6.19.3",
+    "ioredis": "^6",
+    "nats": "^2",
+    "nestjs-pino": "^4",
+    "pino": "^10",
+    "pino-http": "^11",
     "reflect-metadata": "^0.2",
-    "rxjs": "^7"
+    "rxjs": "^7",
+    "zod": "^3.23.8"
   },
   "devDependencies": {
     "@nestjs/testing": "^11",
     "@types/node": "^22",
+    "prisma": "^6.19.3",
     "typescript": "^5",
     "vitest": "^2"
   }

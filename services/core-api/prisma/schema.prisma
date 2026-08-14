@@ -1,0 +1,18 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Generic key/value store for platform-level metadata (schema version
+// markers, feature flags, etc). No business/domain tables in WP-02.
+model PlatformMeta {
+  key       String   @id @db.Text
+  value     Json
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@map("platform_meta")
+}
