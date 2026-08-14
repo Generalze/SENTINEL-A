@@ -1,0 +1,155 @@
+// Evidence Vault domain (WP-09, architecture §26.2, §26.3, §48, §72). Owned
+// exclusively by the evidence module — see
+// services/core-api/src/modules/evidence. Do not add unrelated models to
+// this file; the shared `generator`/`datasource` blocks live in base.prisma
+// and are merged automatically (Prisma multi-file schema folder).
+//
+// Deliberately no Prisma `@relation` to Organisation/Site/User/Incident:
+// organisationId/incidentId are plain scoping columns, the same convention
+// events.prisma uses, so this module stays decoupled from the concurrently
+// developed identity/incident schemas and migrations never collide.
+
+/// §47 data-classification levels, restricted to the handful this module's
+/// rows can ever carry. Canonical source of the full table is
+/// src/modules/identity/classification.ts (see the module's local
+/// classification.ts for the TODO-CONSOLIDATE note on why this is a
+/// separate, small, duplicated enum rather than an import).
+enum EvidenceClassification {
+  PUBLIC
+  INTERNAL
+  SENSITIVE
+  RESTRICTED
+  EVIDENCE
+  SECRETS
+
+  @@map("evidence_classification")
+}
+
+/// Chain-of-custody actor kind (architecture §26.3): a custody event is
+/// either something the system did on its own (ingest, automated
+/// integrity check) or something a specific authenticated user did (view,
+/// export request).
+enum EvidenceCustodyActorKind {
+  system
+  user
+
+  @@map("evidence_custody_actor_kind")
+}
+
+/// Chain-of-custody action vocabulary (directive WP-09 deliverable 3/5).
+/// EXPORT_REQUESTED/EXPORTED are recorded here for forward compatibility
+/// with the Milestone 2 export manifest generator (§72.3, explicitly out
+/// of scope for WP-09) — no code path in this module writes them yet.
+enum EvidenceCustodyAction {
+  INGESTED
+  VIEWED
+  DERIVED
+  EXPORT_REQUESTED
+  EXPORTED
+  VERIFIED
+  VERIFY_FAILED
+
+  @@map("evidence_custody_action")
+}
+
+/// Immutable evidence metadata (§26.2, §72.1: "large immutable evidence
+/// objects belong in object storage ... integrity hashes, manifests and
+/// custody events belong in a separate evidence metadata model with
+/// restricted write permissions"). The row is written exactly once, at
+/// ingest/derive time, by EvidenceRepository.create(); no code path
+/// anywhere in this module calls `.evidence.update(` or `.evidence.delete(`
+/// — enforced by evidence.append-only.spec.ts. Corrections/retractions are
+/// out of scope (evidence, unlike Event, has no concept of a superseding
+/// record within WP-09).
+model Evidence {
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id")
+
+  /// Identity of the device/system/user that produced the original
+  /// material (§48: "source and device identity on every record").
+  sourceId String @map("source_id")
+
+  /// S3/MinIO object key: `{organisation_id}/{evidence_id}`, unique by
+  /// construction (evidence_id is this row's own id). Originals and
+  /// derived objects never share a key — see derivedFromEvidenceId.
+  objectKey String @unique @map("object_key")
+
+  /// Hex-encoded SHA-256 over the exact bytes stored at objectKey (§48).
+  contentHash String @map("content_hash")
+
+  /// Object size in bytes. Int (not BigInt) caps this at ~2GiB, which is
+  /// acceptable for WP-09's scope (video evidence is explicitly out of
+  /// scope per the directive) but would need widening before this module
+  /// takes large video objects.
+  sizeBytes Int @map("size_bytes")
+
+  contentType String @map("content_type")
+
+  /// §47 classification. Object-storage/API access control keyed off this
+  /// column is Milestone 2 (identity's AccessGuard `classification`
+  /// parameter, deliberately not wired to this module in WP-09 — see the
+  /// module's principal-action.guard.ts doc comment).
+  classification EvidenceClassification
+
+  /// Set only on derived objects (enhancements/annotations/clips/event
+  /// snapshots); null on originals. Self-relation, no cross-module FK.
+  derivedFromEvidenceId String?    @map("derived_from_evidence_id") @db.Uuid
+  derivedFrom           Evidence?  @relation("EvidenceDerivations", fields: [derivedFromEvidenceId], references: [id])
+  derivatives            Evidence[] @relation("EvidenceDerivations")
+
+  /// Optional link to the incident this evidence was preserved for
+  /// (populated by preserveEventSnapshot and, in future, manual ingest
+  /// against a known incident). Plain string, no FK — see file header.
+  incidentId String? @map("incident_id")
+
+  /// Event ids (events.id, the Event model's uuid) this evidence item is
+  /// derived from or otherwise references. Populated by
+  /// preserveEventSnapshot(); free-form for any future caller that wants
+  /// to record a related-events cross-reference.
+  relatedEventIds String[] @default([]) @map("related_event_ids")
+
+  /// When the underlying material was originally captured/observed
+  /// (may predate stored_at by an arbitrary amount for late ingests).
+  capturedAt DateTime @map("captured_at") @db.Timestamptz(3)
+
+  /// Server-assigned insertion time.
+  storedAt DateTime @default(now()) @map("stored_at") @db.Timestamptz(3)
+
+  custodyEvents EvidenceCustodyEvent[]
+
+  @@index([organisationId, storedAt])
+  @@index([organisationId, incidentId])
+  @@index([derivedFromEvidenceId])
+  @@map("evidence")
+}
+
+/// Append-only chain-of-custody log (§26.3, §48). Every row is a pure
+/// insert via EvidenceRepository.recordCustodyEvent(); no code path
+/// anywhere in this module calls `.evidenceCustodyEvent.update(` or
+/// `.evidenceCustodyEvent.delete(` — enforced by evidence.append-only.spec.ts.
+model EvidenceCustodyEvent {
+  id String @id @default(uuid()) @db.Uuid
+
+  evidenceId String   @map("evidence_id") @db.Uuid
+  evidence   Evidence @relation(fields: [evidenceId], references: [id])
+
+  at DateTime @default(now()) @map("at") @db.Timestamptz(3)
+
+  actorKind EvidenceCustodyActorKind @map("actor_kind")
+
+  /// System actor: a stable component identifier (e.g.
+  /// "system:evidence-ingest"). User actor: the identity module's User.id.
+  /// Plain string, no FK (see file header).
+  actorId String @map("actor_id")
+
+  action EvidenceCustodyAction
+
+  /// Action-specific structured detail (e.g. { purpose } for VIEWED via
+  /// download, { transform_label } for DERIVED, { expected_hash,
+  /// actual_hash } for VERIFIED/VERIFY_FAILED).
+  detail Json @default("{}")
+
+  @@index([evidenceId, at])
+  @@map("evidence_custody_events")
+}

@@ -17,11 +17,14 @@
     "schema": "prisma/schema"
   },
   "dependencies": {
-    "@sentinel/contracts": "workspace:*",
+    "@aws-sdk/client-s3": "^3",
     "@nestjs/common": "^11",
     "@nestjs/core": "^11",
     "@nestjs/platform-express": "^11",
+    "@nestjs/platform-socket.io": "^11",
+    "@nestjs/websockets": "^11",
     "@prisma/client": "^6.19.3",
+    "@sentinel/contracts": "workspace:*",
     "ioredis": "^6",
     "nats": "^2",
     "nestjs-pino": "^4",
@@ -29,12 +32,14 @@
     "pino-http": "^11",
     "reflect-metadata": "^0.2",
     "rxjs": "^7",
+    "socket.io": "^4",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "@nestjs/testing": "^11",
     "@types/node": "^22",
     "prisma": "^6.19.3",
+    "socket.io-client": "^4.8.3",
     "typescript": "^5",
     "vitest": "^2"
   }

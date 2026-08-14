@@ -1,0 +1,103 @@
+// Decision Ledger domain (WP-08). Owned exclusively by the ledger module — see
+// services/core-api/src/modules/ledger. Do not add unrelated models to this file; the shared
+// `generator`/`datasource` blocks live in base.prisma and are merged automatically (Prisma
+// multi-file schema folder).
+
+/// Append-only Decision Ledger (architecture §5.2 ledger contents, §61 append-only / no
+/// rewriting of security history, §62.1 entry contents).
+///
+/// Mirrors `DecisionLedgerEntrySchema` from `@sentinel/contracts` field-for-field, plus the
+/// hash-chain bookkeeping WP-08 adds: `contentHash`, `previousHash` and `supersedesEntryId`.
+///
+/// APPEND-ONLY INVARIANT
+/// ----------------------
+/// LedgerService exposes append/query/verifyChain ONLY. No `.update(`/`.delete(` against this
+/// model exists anywhere in the module — see ledger.append-only.spec.ts, which enforces this as
+/// an automated source scan (mirrors events.append-only.spec.ts). An outcome becoming known, or
+/// any other correction, is recorded as a brand-new entry with `supersedesEntryId` pointing at
+/// the entry it corrects; the original row is never rewritten.
+model DecisionLedgerEntry {
+  /// Stamped by LedgerService.append() via crypto.randomUUID() when the caller does not supply
+  /// one (directive #2) — but the contracts schema only requires a non-empty string, not UUID
+  /// shape (a caller MAY supply its own entry_id), so this is `@db.Text`, not `@db.Uuid`. The
+  /// natural key: identifies exactly one ledger entry for its lifetime.
+  entryId String @id @map("entry_id") @db.Text
+
+  organisationId String @map("organisation_id")
+
+  /// Stamped by LedgerService.append() via new Date().toISOString() when the caller does not
+  /// supply one.
+  decidedAt DateTime @map("decided_at") @db.Timestamptz(3)
+
+  decisionType String @map("decision_type")
+
+  /// Full snapshot of the inputs available at decision time (actor, target, approvals,
+  /// approver roles, policy hash) — enough to reconstruct the outcome without re-running
+  /// anything (§62.1).
+  inputsSnapshot Json @map("inputs_snapshot")
+
+  ruleOrModelVersions String[] @default([]) @map("rule_or_model_versions")
+
+  policyVersion String @map("policy_version")
+
+  evidenceFor     String[] @default([]) @map("evidence_for")
+  evidenceAgainst String[] @default([]) @map("evidence_against")
+
+  /// Null for deterministic rule evaluations (§61 — a confidence score would be a false signal
+  /// for a deterministic decision); reserved for future probabilistic decision types.
+  confidence Float?
+
+  /// Array of `{ user_id, role, at }` — stored as Json because Prisma has no native
+  /// array-of-object column type. Validated against the contracts `ApprovalSchema` (as part of
+  /// `DecisionLedgerEntrySchema`) on the way in.
+  approvals Json @default("[]")
+
+  actionTaken String @map("action_taken")
+
+  /// Null until the real-world outcome is known. NEVER updated in place — see the model doc's
+  /// append-only invariant above. An outcome becoming known is a new row with
+  /// `supersedesEntryId` set, not a write to this column on the original row.
+  outcome String?
+
+  traceId String @map("trace_id")
+
+  schemaVersion Int @default(1) @map("schema_version")
+
+  // --- WP-08 hash-chain bookkeeping (not part of the @sentinel/contracts schema) ---
+
+  /// SHA-256 (hex) over the canonicalised (recursively sorted-keys) JSON of this entry's
+  /// contract fields plus `supersedesEntryId` — everything that describes what this entry
+  /// claims, but not the chain-linkage fields below. Computed once at append time and never
+  /// changed afterwards. See ledger.hash.ts.
+  contentHash String @map("content_hash") @db.Text
+
+  /// `content_hash` of the organisation's previous latest entry at the moment this one was
+  /// appended; null for an organisation's first entry. This is the hash-chain link:
+  /// LedgerService.verifyChain walks the chain oldest -> newest recomputing content_hash and
+  /// checking each entry's previous_hash against the prior entry's content_hash, so mutating
+  /// (or unlinking) any single stored row is detectable.
+  previousHash String? @map("previous_hash") @db.Text
+
+  /// Set when this entry supersedes (corrects/extends) an earlier one — e.g. recording a
+  /// real-world outcome once known. Deliberately NOT a foreign key: the row it references may
+  /// itself be the subject of a tamper investigation, and a DB-level FK would make inserting
+  /// the entry that reports a corruption fail alongside the corruption itself. Referential
+  /// integrity here is a query-time concern, not a storage-engine one. `@db.Text`, matching
+  /// `entryId` (the column it references by value): entry ids are not required to be UUIDs.
+  supersedesEntryId String? @map("supersedes_entry_id") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  /// Strictly increasing per-row insertion counter (DB-assigned, not part of the contract or
+  /// the content hash). `decidedAt` alone is not a safe "chain order" key: two entries can share
+  /// a millisecond-resolution timestamp. Appends are serialised per organisation (see
+  /// LedgerRepository.append's advisory lock), so `seq` is also true global insertion order —
+  /// the unambiguous ordering LedgerService.verifyChain and "the organisation's latest entry"
+  /// rely on.
+  seq Int @unique @default(autoincrement())
+
+  @@index([organisationId, seq])
+  @@index([organisationId, decisionType, decidedAt])
+  @@index([organisationId, decidedAt])
+  @@map("decision_ledger_entries")
+}

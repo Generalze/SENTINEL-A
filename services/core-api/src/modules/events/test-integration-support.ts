@@ -23,6 +23,9 @@ export function makeAppConfig(overrides: Partial<AppConfig> = {}): AppConfigServ
     S3_SECRET_KEY: 'sentinel123',
     S3_BUCKET: 'sentinel-dev',
     S3_REGION: 'us-east-1',
+    // WP-09 addition to AppConfig (services/core-api/src/config/env.schema.ts);
+    // listed here only to satisfy the AppConfig type, this module has no use for it.
+    S3_EVIDENCE_BUCKET: 'sentinel-evidence',
     PORT: 3000,
     LOG_LEVEL: 'info',
     DEV_AUTH_ENABLED: false,

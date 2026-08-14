@@ -45,6 +45,15 @@ export const envSchema = z.object({
     .string({ required_error: 'S3_BUCKET is required' })
     .min(1, 'S3_BUCKET is required'),
   S3_REGION: z.string().min(1, 'S3_REGION must not be empty').default('us-east-1'),
+  /**
+   * WP-09 (evidence module) addition. Dedicated bucket for immutable
+   * evidence objects, kept separate from `S3_BUCKET` (general-purpose,
+   * used elsewhere) so the evidence vault has its own storage namespace
+   * per architecture §72.1/§74.1. Optional with a dev default so this is
+   * purely additive — boot behaviour for every other module is unchanged
+   * whether or not this variable is set.
+   */
+  S3_EVIDENCE_BUCKET: z.string().min(1, 'S3_EVIDENCE_BUCKET must not be empty').default('sentinel-evidence'),
   PORT: z.coerce
     .number({ invalid_type_error: 'PORT must be a number' })
     .int('PORT must be an integer')

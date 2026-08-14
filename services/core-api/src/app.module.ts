@@ -6,10 +6,14 @@ import type { RequestWithTraceId } from './common/http-types';
 import { AppConfigService } from './config/config.service';
 import { ConfigModule } from './config/config.module';
 import { EventsModule } from './modules/events/events.module';
+import { FusionModule } from './modules/fusion/fusion.module';
 import { HealthModule } from './health/health.module';
 import { IdentityModule } from './modules/identity/identity.module';
 import { InfraModule } from './infra/infra.module';
 import { ConstitutionModule } from './modules/constitution/constitution.module';
+import { EvidenceModule } from './modules/evidence/evidence.module';
+import { LedgerModule } from './modules/ledger/ledger.module';
+import { RealtimeModule } from './modules/realtime/realtime.module';
 import { PrismaModule } from './prisma/prisma.module';
 
 @Module({
@@ -35,6 +39,10 @@ import { PrismaModule } from './prisma/prisma.module';
     EventsModule,
     IdentityModule,
     ConstitutionModule,
+    EvidenceModule,
+    LedgerModule,
+    RealtimeModule,
+    FusionModule,
   ],
 })
 export class AppModule {}

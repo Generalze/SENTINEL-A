@@ -1,0 +1,263 @@
+// SENTINEL Fusion v1 domain (WP-05, architecture §11, §65).
+//
+// Owned exclusively by the fusion module — see
+// services/core-api/src/modules/fusion. Do not add unrelated models here;
+// the shared `generator`/`datasource` blocks live in base.prisma and are
+// merged automatically (Prisma multi-file schema folder).
+//
+// WHY PLAIN `String` COLUMNS INSTEAD OF PRISMA ENUMS
+// -------------------------------------------------
+// The constitution domain uses a Prisma enum, but enums are database-global
+// type names. Several work packages are being built concurrently against
+// this one database, so introducing new global type names here risks a DDL
+// collision with a sibling module. Every "enum-ish" column below therefore
+// stores a plain string whose permitted value set is documented on the
+// field and enforced in TypeScript by the contracts package
+// (@sentinel/contracts: ThreatState, PotentialImpact, OperationalSeverity)
+// and by fusion.constants.ts.
+
+/// A Fusion hypothesis (architecture §65.3) — the accumulated, explainable
+/// assessment of one correlation window.
+///
+/// CORRELATION KEY (directive WP-05 deliverable #1)
+/// -----------------------------------------------
+/// Exactly one hypothesis exists per
+///   (organisation_id, site_id, zone_id ?? 'site-wide', 15-minute tumbling
+///    window over occurred_at)
+/// tuple. `correlationKey` is the serialised form of that tuple and carries
+/// a UNIQUE constraint, which is what makes "load-or-create" safe under
+/// concurrent delivery: two workers racing to create the same window both
+/// attempt the insert, one wins, the loser catches P2002 and re-reads.
+///
+/// STATE RECONSTRUCTION
+/// --------------------
+/// `signals` / `ignoredSignals` hold the full, never-pruned signal history
+/// exactly as the certified CERT-S core (core/threatState.ts) accumulates
+/// it. The core recomputes threat probability, detection confidence and
+/// source diversity from that whole history on every application, so the
+/// history — not the derived scalars — is the authoritative state. The
+/// derived columns are materialised for querying and for the API, and are
+/// always rewritten together with the history in one transaction.
+model Hypothesis {
+  /// §65.3 `hypothesis_id`.
+  id String @id @default(uuid()) @db.Uuid
+
+  /// §65.3 `incident_candidate_id`. Allocated at hypothesis creation and
+  /// stable for the hypothesis's whole life — a de-escalation followed by a
+  /// re-escalation re-emits the SAME candidate id with `re_escalation: true`
+  /// rather than minting a new one (WP-07 consumes these).
+  incidentCandidateId String @unique @default(uuid()) @map("incident_candidate_id") @db.Uuid
+
+  /// §65.3 `type`. Fusion v1 forms one general hypothesis per correlation
+  /// window rather than competing typed hypotheses, so this is the constant
+  /// documented in fusion.constants.ts (HYPOTHESIS_TYPE). Typed/competing
+  /// hypotheses are a later milestone.
+  type String @db.Text
+
+  // --- Correlation dimensions (§65.2) ---
+  organisationId String  @map("organisation_id") @db.Text
+  siteId         String  @map("site_id") @db.Text
+  /// The event's raw zone id, preserved as delivered (may be absent).
+  zoneId         String? @map("zone_id") @db.Text
+  /// `zoneId ?? 'site-wide'` — the value actually used in the correlation
+  /// key, materialised so queries never have to re-derive it.
+  zoneKey        String  @map("zone_key") @db.Text
+
+  /// Serialised correlation tuple; see the model doc. UNIQUE.
+  correlationKey String @unique @map("correlation_key") @db.Text
+
+  /// Inclusive start / exclusive end of the 15-minute tumbling window over
+  /// `occurred_at` that this hypothesis covers.
+  windowStart DateTime @map("window_start") @db.Timestamptz(3)
+  windowEnd   DateTime @map("window_end") @db.Timestamptz(3)
+
+  // --- Assessment (§11.2, §11.3, §65.3) ---
+
+  /// Threat state 0..5 (NORMAL, OBSERVE, SUSPICIOUS, PROBABLE_THREAT,
+  /// VERIFIED_THREAT, CRITICAL_LIFE_SAFETY).
+  state Int
+
+  /// §11.3 separated value 1 of 4 — evidentiary strength that genuine
+  /// detections are occurring at all. Lead ruling (WP-01): §65.3's field
+  /// list abbreviates §11.3, it does not exempt the Hypothesis from
+  /// carrying detection confidence.
+  detectionConfidence Float @map("detection_confidence")
+
+  /// §11.3 separated value 2 of 4.
+  threatProbability Float @map("threat_probability")
+
+  /// §11.3 separated value 3 of 4. One of LOW | MODERATE | HIGH | EXTREME.
+  potentialImpact String @map("potential_impact") @db.Text
+
+  /// §11.3 separated value 4 of 4. One of SEV1..SEV5 (SEV1 most severe).
+  operationalSeverity String @map("operational_severity") @db.Text
+
+  /// §65.3 `source_diversity` — distinct supporting source ids whose
+  /// trust-weighted confidence reached the core's 0.5 threshold.
+  sourceDiversity Int @map("source_diversity")
+
+  /// §65.3 / §11.4. Both arrays are always written together; the API layer
+  /// has no code path that can return one without the other.
+  supportingEventIds    String[] @default([]) @map("supporting_event_ids")
+  contradictingEventIds String[] @default([]) @map("contradicting_event_ids")
+
+  /// §65.3 `confidence_explanation` — regenerated deterministically from the
+  /// signal history on every update (core/explanation.ts). Never a free-text
+  /// operator field.
+  confidenceExplanation String @map("confidence_explanation") @db.Text
+
+  /// §65.3 `rule_or_model_versions` — every rule table / core version that
+  /// contributed to the current assessment. Fusion v1 is rules-only (§65.1);
+  /// no model versions appear here.
+  ruleVersions String[] @default([]) @map("rule_versions")
+
+  /// Full accumulated ProcessedSignal[] (see model doc). Append-only in
+  /// practice: the core never prunes, so contradictions are retained
+  /// forever (§11.4).
+  signals Json @default("[]")
+
+  /// Signals from quarantined sources: recorded, never used in computation.
+  ignoredSignals Json @default("[]") @map("ignored_signals")
+
+  /// Accumulated set of potential-impact families contributed by SUPPORTING
+  /// signals, used by the versioned M1 placeholder impact rule
+  /// (core/eventRules.ts `derivePotentialImpact`). Stored rather than
+  /// recomputed so the impact decision is auditable from the row alone.
+  supportingImpactFamilies String[] @default([]) @map("supporting_impact_families")
+
+  // --- Incident-candidate latch (directive deliverable #5) ---
+
+  /// True once an incident-candidate has been emitted for the current
+  /// escalation and the hypothesis has not since dropped below state 2.
+  /// The latch is what makes emission "exactly once per escalation".
+  incidentCandidateLatched Boolean @default(false) @map("incident_candidate_latched")
+
+  /// Set when a latched hypothesis falls back below state 2. The next
+  /// crossing of state >= 2 therefore re-emits with `re_escalation: true`.
+  /// This is the second column the directive calls for — the latch alone
+  /// cannot distinguish a first emission from a re-emission.
+  incidentCandidateDeEscalated Boolean @default(false) @map("incident_candidate_de_escalated")
+
+  /// How many incident-candidate messages have been emitted for this
+  /// hypothesis (1 = first escalation, >1 = re-escalations).
+  incidentCandidateEmissions Int @default(0) @map("incident_candidate_emissions")
+
+  /// Number of rows in `fusion_hypothesis_transitions` for this hypothesis.
+  /// Materialised so the next transition's `sequence` can be allocated
+  /// without a COUNT, and so the append-only transition log's length is
+  /// covered by the same optimistic-concurrency guard as everything else.
+  transitionCount Int @default(0) @map("transition_count")
+
+  /// Optimistic-concurrency guard. Every state application reads `version`
+  /// and writes `version + 1` with a `WHERE version = <read value>`; a zero
+  /// row count means another delivery updated the row first and the whole
+  /// application is retried against fresh state. This is what prevents a
+  /// lost update from silently dropping a signal.
+  version Int @default(0)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  transitions   HypothesisTransition[]
+  appliedEvents FusionAppliedEvent[]
+
+  @@index([organisationId, updatedAt])
+  @@index([organisationId, siteId, windowStart])
+  @@index([organisationId, state])
+  @@map("fusion_hypotheses")
+}
+
+/// Append-only log of every threat-state change (directive deliverable #3).
+/// Rows are only ever inserted — nothing in the fusion module updates or
+/// deletes a transition.
+model HypothesisTransition {
+  id String @id @default(uuid()) @db.Uuid
+
+  hypothesisId String     @map("hypothesis_id") @db.Uuid
+  hypothesis   Hypothesis @relation(fields: [hypothesisId], references: [id], onDelete: Cascade)
+
+  /// Denormalised for tenant-scoped reads without a join.
+  organisationId String @map("organisation_id") @db.Text
+
+  fromState Int @map("from_state")
+  toState   Int @map("to_state")
+
+  /// The `event_id` of the event whose signal caused the change. Fusion
+  /// uses the event id as the signal id, one-for-one.
+  eventId String @map("event_id") @db.Text
+
+  /// Human-readable justification produced by the certified core
+  /// (`buildReason` in core/threatState.ts).
+  reason String @db.Text
+
+  /// §65.3 `rule_or_model_versions` as of this transition, so a replayed
+  /// history shows which rule table produced each step.
+  ruleVersions String[] @default([]) @map("rule_versions")
+
+  /// 0-based position within this hypothesis's transition log. UNIQUE per
+  /// hypothesis: makes ordering total and makes a double-apply of the same
+  /// signal impossible to record twice.
+  sequence Int
+
+  /// `occurred_at` of the causing event (not wall-clock insert time).
+  occurredAt DateTime @map("occurred_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([hypothesisId, sequence])
+  @@index([organisationId, createdAt])
+  @@map("fusion_hypothesis_transitions")
+}
+
+/// Idempotency + audit join table (directive deliverable #4).
+///
+/// Exactly one row per event the fusion consumer has seen. The
+/// `(organisation_id, event_id)` UNIQUE constraint IS the idempotency
+/// mechanism: a redelivered event's insert fails with P2002 inside the same
+/// transaction that would have applied its signal, so the application rolls
+/// back and the redelivery becomes a no-op.
+///
+/// Events whose type has no rule in EVENT_TYPE_RULES (or whose rule
+/// condition was not met) are still recorded here — "ignored, but
+/// recorded" — with `signalKind` NULL and `ignoreReason` set, and with
+/// `hypothesisId` NULL so unmapped traffic never manufactures empty
+/// hypotheses.
+model FusionAppliedEvent {
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+
+  /// The Normalised Event Contract `event_id` (§40), not the events table's
+  /// surrogate row id — fusion consumes the published event JSON and never
+  /// reads the events module's tables.
+  eventId String @map("event_id") @db.Text
+
+  /// NULL for ignored events (see model doc).
+  hypothesisId String?     @map("hypothesis_id") @db.Uuid
+  hypothesis   Hypothesis? @relation(fields: [hypothesisId], references: [id], onDelete: Cascade)
+
+  /// Correlation key the event resolved to, recorded even when the event
+  /// produced no signal.
+  correlationKey String @map("correlation_key") @db.Text
+
+  eventType String @map("event_type") @db.Text
+
+  /// 'SUPPORTING' | 'CONTRADICTING', or NULL when no signal was produced.
+  signalKind String? @map("signal_kind") @db.Text
+
+  /// Why no signal was produced: 'no_rule' (unknown event type) or
+  /// 'condition_not_met' (a rule matched but its guard failed, e.g. a valid
+  /// access grant without `metadata.schedule_match === true`). NULL when a
+  /// signal WAS produced.
+  ignoreReason String? @map("ignore_reason") @db.Text
+
+  /// Version of the rule table that made the mapping decision above.
+  ruleVersion String @map("rule_version") @db.Text
+
+  appliedAt DateTime @default(now()) @map("applied_at") @db.Timestamptz(3)
+
+  @@unique([organisationId, eventId])
+  @@index([hypothesisId])
+  @@index([organisationId, appliedAt])
+  @@map("fusion_applied_events")
+}
