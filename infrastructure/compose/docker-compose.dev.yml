@@ -7,7 +7,8 @@ services:
       POSTGRES_USER: sentinel
       POSTGRES_PASSWORD: sentinel
     ports:
-      - '127.0.0.1:5432:5432'
+      # Host 5433: a native PostgreSQL already occupies 5432 on the dev machine.
+      - '127.0.0.1:5433:5432'
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
