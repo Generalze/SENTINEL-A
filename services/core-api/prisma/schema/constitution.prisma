@@ -1,0 +1,52 @@
+// SENTINEL — Constitution policy storage (WP-06, architecture §5.1).
+//
+// The Constitution is a versioned, audited policy layer: every version of the policy is kept,
+// exactly one is active, and the active one is what the evaluator loads at boot.
+//
+// SINGLE-ACTIVE INVARIANT
+// -----------------------
+// "Exactly one active version" is a partial uniqueness constraint:
+//     CREATE UNIQUE INDEX constitution_policies_single_active
+//       ON constitution_policies (status) WHERE status = 'active';
+// The Prisma schema DSL cannot express a partial (filtered) unique index, so it is NOT
+// declared here. Until the lead adds the raw-SQL index in the consolidated migration, the
+// invariant is enforced transactionally by ConstitutionPolicyRepository.activate(), which
+// runs at Serializable isolation, retires the incumbent, activates the successor, and
+// re-counts inside the same transaction — aborting if the count is not exactly 1.
+// See services/core-api/src/modules/constitution/constitution.repository.ts.
+
+enum ConstitutionPolicyStatus {
+  draft
+  active
+  retired
+
+  @@map("constitution_policy_status")
+}
+
+model ConstitutionPolicy {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// Policy version string, e.g. "sentinel-constitution-1.1.0". Unique: a version identifies
+  /// exactly one policy body for the lifetime of the system.
+  version String @unique @db.Text
+
+  /// The full policy document (categories, actions, role grants, prohibitions).
+  body Json
+
+  /// SHA-256 over the canonical (key-sorted) serialisation of `body`. Tamper evidence and the
+  /// audit anchor recorded on every Decision Ledger entry. Cryptographic signing is Milestone 2.
+  contentSha256 String @map("content_sha256") @db.Text
+
+  status ConstitutionPolicyStatus @default(draft)
+
+  /// User id of the author, or a bootstrap marker for the seeded baseline.
+  createdBy String @map("created_by") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  /// Set when the version became active; null for draft versions that never activated.
+  activatedAt DateTime? @map("activated_at")
+
+  @@index([status])
+  @@map("constitution_policies")
+}

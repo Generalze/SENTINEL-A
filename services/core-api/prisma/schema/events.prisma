@@ -1,0 +1,80 @@
+// Event ingestion domain (WP-04). Owned exclusively by the events module —
+// see services/core-api/src/modules/events. Do not add unrelated models to
+// this file; the shared `generator`/`datasource` blocks live in base.prisma
+// and are merged automatically (Prisma multi-file schema folder).
+
+/// Append-only event log (architecture §7.1, §40, §64, §64.1).
+///
+/// Ingested rows are immutable. Exactly two write paths anywhere in the
+/// service layer touch an existing row (see events.repository.ts):
+///   1. markPublished(id)            — sets `publishedAt` after a
+///      successful JetStream publish (or a later retry-sweep publish).
+///   2. incrementReceivedCount(id)   — bumps `receivedCount` on the
+///      canonical row when a redelivery of the same event arrives; this
+///      happens inside the same transaction that inserts the linked
+///      duplicate row (recordDuplicateDelivery).
+/// This is the exhaustive list. No other `.update(`/`.delete(` against
+/// this model exists anywhere in the codebase. Corrections are new events
+/// referencing the original via `metadata.corrects_event_id` (a
+/// contract-level convention — not enforced at the DB layer).
+model Event {
+  id String @id @default(uuid()) @db.Uuid
+
+  // --- §40 Normalised Event Contract fields (snake_case columns) ---
+  eventId        String   @map("event_id")
+  schemaVersion  Int      @map("schema_version")
+  organisationId String   @map("organisation_id")
+  siteId         String   @map("site_id")
+  zoneId         String?  @map("zone_id")
+  sourceType     String   @map("source_type")
+  sourceId       String   @map("source_id")
+  sourceTrust    String   @map("source_trust")
+  eventType      String   @map("event_type")
+  confidence     Float
+  occurredAt     DateTime @map("occurred_at") @db.Timestamptz(3)
+  ingestedAt     DateTime @map("ingested_at") @db.Timestamptz(3)
+  location       Json     @default("{}")
+  trackIds       String[] @default([]) @map("track_ids")
+  evidenceRefs   String[] @default([]) @map("evidence_refs")
+  metadata       Json     @default("{}")
+  traceId        String   @map("trace_id")
+
+  // --- Ingestion / delivery bookkeeping (§64.1 idempotency, §76 delivery states) ---
+
+  /// Derived by deriveIdempotencyKey(source_id, event_id, occurred_at, 5000ms).
+  /// Nullable + unique: only the canonical row for a given delivery
+  /// signature carries a value here. Duplicate rows (see `duplicateOf`)
+  /// store NULL, which Postgres treats as distinct from every other NULL
+  /// under a unique index — so redeliveries can each get their own row
+  /// (preserving the fact that multiple deliveries occurred, §64.1)
+  /// without ever colliding with the canonical row's unique key.
+  idempotencyKey String? @unique @map("idempotency_key")
+
+  /// Set only on duplicate rows; points at the canonical row's `id`.
+  duplicateOfEventId String? @map("duplicate_of_event_id") @db.Uuid
+  duplicateOf        Event?  @relation("EventDuplicates", fields: [duplicateOfEventId], references: [id])
+  duplicates         Event[] @relation("EventDuplicates")
+
+  /// Count of deliveries of the canonical event (starts at 1, incremented
+  /// once per linked duplicate). Meaningless on a duplicate row itself.
+  receivedCount Int @default(1) @map("received_count")
+
+  /// Set once the event JSON has been successfully published to
+  /// JetStream. NULL means "not yet published" — either the publish
+  /// attempt right after the DB commit failed, or this is a duplicate row
+  /// that is never independently published. The retry sweep
+  /// (events-publish-sweep.service.ts) republishes rows where this is
+  /// still NULL after 15s.
+  publishedAt DateTime? @map("published_at") @db.Timestamptz(3)
+
+  /// Server-assigned insertion time (not source-controlled, unlike
+  /// `occurredAt`/`ingestedAt`). Used by the retry sweep to find overdue
+  /// publishes and as a stable secondary sort key.
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([organisationId, siteId, occurredAt])
+  @@index([organisationId, sourceType, occurredAt])
+  @@index([publishedAt])
+  @@index([duplicateOfEventId])
+  @@map("events")
+}

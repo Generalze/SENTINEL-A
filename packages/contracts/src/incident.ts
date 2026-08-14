@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { OperationalSeveritySchema, ThreatStateSchema } from './threat';
+import { OperationalSeveritySchema, ThreatStateSchema } from './threat.js';
 
 /**
  * Incident severity (architecture §12.2).

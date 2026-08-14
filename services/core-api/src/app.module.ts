@@ -5,8 +5,11 @@ import { LoggerModule } from 'nestjs-pino';
 import type { RequestWithTraceId } from './common/http-types';
 import { AppConfigService } from './config/config.service';
 import { ConfigModule } from './config/config.module';
+import { EventsModule } from './modules/events/events.module';
 import { HealthModule } from './health/health.module';
+import { IdentityModule } from './modules/identity/identity.module';
 import { InfraModule } from './infra/infra.module';
+import { ConstitutionModule } from './modules/constitution/constitution.module';
 import { PrismaModule } from './prisma/prisma.module';
 
 @Module({
@@ -29,6 +32,9 @@ import { PrismaModule } from './prisma/prisma.module';
     PrismaModule,
     InfraModule,
     HealthModule,
+    EventsModule,
+    IdentityModule,
+    ConstitutionModule,
   ],
 })
 export class AppModule {}

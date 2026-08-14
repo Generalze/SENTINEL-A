@@ -69,6 +69,10 @@ importers:
         version: 2.1.9(@types/node@22.20.1)
 
   packages/simulator:
+    dependencies:
+      '@sentinel/contracts':
+        specifier: workspace:*
+        version: link:../contracts
     devDependencies:
       typescript:
         specifier: ^5
@@ -91,6 +95,9 @@ importers:
       '@prisma/client':
         specifier: ^6.19.3
         version: 6.19.3(prisma@6.19.3(typescript@5.9.3))(typescript@5.9.3)
+      '@sentinel/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
       ioredis:
         specifier: ^6
         version: 6.0.0

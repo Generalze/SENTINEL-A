@@ -25,10 +25,22 @@ module.exports = [
         document: 'readonly',
         window: 'readonly',
         navigator: 'readonly',
-        // Node.js globals
+        // Node.js / shared runtime globals
         console: 'readonly',
         process: 'readonly',
         Buffer: 'readonly',
+        fetch: 'readonly',
+        URL: 'readonly',
+        URLSearchParams: 'readonly',
+        AbortController: 'readonly',
+        setTimeout: 'readonly',
+        clearTimeout: 'readonly',
+        setInterval: 'readonly',
+        clearInterval: 'readonly',
+        setImmediate: 'readonly',
+        crypto: 'readonly',
+        TextEncoder: 'readonly',
+        TextDecoder: 'readonly',
         // Vitest/Jest globals
         describe: 'readonly',
         it: 'readonly',

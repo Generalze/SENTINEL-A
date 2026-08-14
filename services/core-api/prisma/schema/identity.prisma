@@ -1,0 +1,99 @@
+// Identity & Organisation domain (architecture §38, §39.2, §62, §62.1).
+// Owned exclusively by WP-03 (services/core-api/src/modules/identity).
+// datasource/generator live in base.prisma (multi-file schema) — do not
+// duplicate them here.
+
+/// Top-level tenant boundary (§39.2). Every Site, User and downstream
+/// domain record is scoped to exactly one Organisation; cross-organisation
+/// access is denied by default everywhere in the platform.
+model Organisation {
+  id        String   @id @default(cuid())
+  name      String
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  sites Site[]
+  users User[]
+
+  @@map("organisations")
+}
+
+/// A physical/operational site belonging to exactly one Organisation.
+model Site {
+  id             String   @id @default(cuid())
+  organisationId String   @map("organisation_id")
+  name           String
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @default(now()) @updatedAt @map("updated_at")
+
+  organisation Organisation @relation(fields: [organisationId], references: [id])
+  zones        Zone[]
+  userRoles    UserRole[]
+
+  @@index([organisationId])
+  @@map("sites")
+}
+
+/// A Zone belongs to one Site. The full digital twin (buildings, floors,
+/// routes, devices) is §38's Site & Asset domain; Identity only owns this
+/// minimal shell, enough for role site-scoping and WP-03's seed fixtures.
+model Zone {
+  id        String   @id @default(cuid())
+  siteId    String   @map("site_id")
+  name      String
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  site Site @relation(fields: [siteId], references: [id])
+
+  @@index([siteId])
+  @@map("zones")
+}
+
+/// A User belongs to exactly one Organisation. `clearance` (0-5) is
+/// compared against a resource's classification level (architecture §47)
+/// in the §62.1 access guard: ALLOW requires clearance >= classification.
+/// The 0-5 range is enforced at the application layer (zod on the create
+/// DTO), not by a DB check constraint.
+model User {
+  id             String   @id @default(cuid())
+  organisationId String   @map("organisation_id")
+  email          String
+  displayName    String   @map("display_name")
+  clearance      Int      @default(0)
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @default(now()) @updatedAt @map("updated_at")
+
+  organisation Organisation @relation(fields: [organisationId], references: [id])
+  roles        UserRole[]
+
+  @@unique([organisationId, email])
+  @@index([organisationId])
+  @@map("users")
+}
+
+/// A User's assignment to one §62 role string, optionally scoped to a
+/// single Site. `siteId = null` means the assignment is organisation-wide
+/// (see §62.1's "site scope matches ... when the role assignment is
+/// site-scoped" conjunct — a null-scoped assignment always satisfies it).
+/// A user may hold several roles, and the same role at multiple sites.
+///
+/// NOTE: Postgres treats NULL as distinct in unique indexes, so
+/// `[userId, role, siteId]` does not de-duplicate organisation-wide
+/// (siteId null) rows at the DB level. seed.ts therefore upserts by this
+/// model's primary `id` (deterministic per seed user+role) rather than
+/// relying on this constraint for idempotency.
+model UserRole {
+  id     String  @id @default(cuid())
+  userId String  @map("user_id")
+  role   String
+  siteId String? @map("site_id")
+
+  user User  @relation(fields: [userId], references: [id])
+  site Site? @relation(fields: [siteId], references: [id])
+
+  @@unique([userId, role, siteId])
+  @@index([userId])
+  @@index([role])
+  @@map("user_roles")
+}
