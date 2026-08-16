@@ -182,6 +182,8 @@ describe('FieldOfflineOperationSchema', () => {
     const next = { ...operation, device_sequence: 1 };
     const duplicate = { ...operation };
     expect(offlineOperationReplayKey(operation)).toBe(offlineOperationReplayKey(duplicate));
+    expect(offlineOperationReplayKey(operation)).not.toBe(offlineOperationReplayKey({ ...duplicate, organisation_id: 'org-2' }));
+    expect(offlineOperationReplayKey(operation)).not.toBe(offlineOperationReplayKey({ ...duplicate, site_id: 'site-2' }));
     expect(isNewerOfflineOperation(operation, duplicate)).toBe(false);
     expect(isNewerOfflineOperation(next, operation)).toBe(false);
     expect(isNewerOfflineOperation(operation, next)).toBe(true);

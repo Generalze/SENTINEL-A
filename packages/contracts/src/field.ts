@@ -128,6 +128,10 @@ export const FieldOperativeStateUpdateSchema = z.object({
   state: FieldStateSchema,
   location: boundedObject(16 * 1024, 'location').nullable(),
   source_at: timestamp,
+  /**
+   * Client-observed telemetry only. Server modules must calculate
+   * authoritative freshness from source_at and receipt time.
+   */
   freshness_ms: z.number().int().nonnegative(),
   trace_id: traceId,
 }).strict();
@@ -235,8 +239,8 @@ export const FieldOfflineOperationSchema = z.object({
 export type FieldOfflineOperation = z.infer<typeof FieldOfflineOperationSchema>;
 
 /** Stable key for durable duplicate-replay detection. */
-export function offlineOperationReplayKey(operation: Pick<FieldOfflineOperation, 'device_id' | 'device_sequence'>): string {
-  return `${operation.device_id}:${operation.device_sequence}`;
+export function offlineOperationReplayKey(operation: Pick<FieldOfflineOperation, 'organisation_id' | 'site_id' | 'device_id' | 'device_sequence'>): string {
+  return `${operation.organisation_id}:${operation.site_id}:${operation.device_id}:${operation.device_sequence}`;
 }
 
 /** True only when candidate advances the same device's monotonic queue. */

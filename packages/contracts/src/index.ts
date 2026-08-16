@@ -9,3 +9,4 @@ export * from './delivery.js';
 export * from './ledger.js';
 export * from './field.js';
 export * from './whisper.js';
+export * from './device.js';

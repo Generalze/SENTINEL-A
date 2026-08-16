@@ -49,6 +49,10 @@ redefining local shapes.
   - `DeviceActionWhisperResult`: signed recognition-result shape for the first
     Milestone 2 modality, including confidence, device trust, context, freshness,
     and anti-replay nonce.
+- `src/device.ts`
+  - Canonical `DeviceTrustSchema` using the architecture device-trust
+    vocabulary: `TRUSTED`, `DEGRADED`, `SUSPICIOUS`, `QUARANTINED`,
+    `COMPROMISED`, `OFFLINE`.
 - `src/index.ts` exports the new schemas and inferred types.
 - Vitest coverage for valid examples, invalid tenant/site scope, invalid state
   transitions where represented in contracts, duplicate/old offline sequence
@@ -65,6 +69,10 @@ redefining local shapes.
   a realtime/session signal, while Field state is an audited domain event.
 - Whisper contracts must not encode universal secret phrases or any voice,
   gesture, camera, or AI-recognition modality.
+- Replay helper identities must include organisation and site scope unless a
+  stronger global-uniqueness invariant is introduced and tested.
+- `freshness_ms` is client-observed telemetry only. Server modules must compute
+  authoritative freshness from source timestamps and receipt time.
 
 ## Acceptance Criteria
 
@@ -72,8 +80,8 @@ redefining local shapes.
 2. Every new schema has named tests for valid, invalid, and boundary cases.
 3. Field assignment and incident message contracts reuse existing delivery
    semantics instead of introducing a second delivery state machine.
-4. Offline operation contracts make duplicate replay detectable by device id and
-   monotonic sequence number.
+4. Offline operation contracts make duplicate replay detectable by organisation,
+   site, device id and monotonic sequence number.
 5. Device-action Whisper result is versioned, tenant-scoped, anti-replay capable,
    and separate from the response protocol it may invoke.
 

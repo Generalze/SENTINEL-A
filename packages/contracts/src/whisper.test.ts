@@ -67,13 +67,20 @@ describe('DeviceActionWhisperResultSchema', () => {
     expect(DeviceActionWhisperResultSchema.parse(result).freshness_ms).toBe(0);
   });
 
+  it('accepts canonical device trust states and rejects local competing labels', () => {
+    expect(DeviceActionWhisperResultSchema.parse({ ...result, device_trust: 'OFFLINE' }).device_trust).toBe('OFFLINE');
+    expect(() => DeviceActionWhisperResultSchema.parse({ ...result, device_trust: 'UNTRUSTED' })).toThrow();
+  });
+
   it('rejects invalid site scope and a nonce too short for anti-replay', () => {
     expect(() => DeviceActionWhisperResultSchema.parse({ ...result, site_id: '' })).toThrow();
     expect(() => DeviceActionWhisperResultSchema.parse({ ...result, anti_replay_nonce: 'short' })).toThrow();
   });
 
-  it('derives a stable replay key from device, signal version, and nonce', () => {
+  it('derives a tenant-scoped replay key from device, signal version, and nonce', () => {
     expect(deviceActionWhisperReplayKey(result)).toBe(deviceActionWhisperReplayKey({ ...result }));
+    expect(deviceActionWhisperReplayKey(result)).not.toBe(deviceActionWhisperReplayKey({ ...result, organisation_id: 'org-2' }));
+    expect(deviceActionWhisperReplayKey(result)).not.toBe(deviceActionWhisperReplayKey({ ...result, site_id: 'site-2' }));
     expect(deviceActionWhisperReplayKey(result)).not.toBe(deviceActionWhisperReplayKey({ ...result, anti_replay_nonce: 'fedcba9876543210' }));
   });
 });

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { DeviceTrustSchema } from './device.js';
 
 const MAX_CONTEXT_BYTES = 16 * 1024;
 const scopedId = z.string().min(1).max(256);
@@ -83,9 +84,6 @@ export const WhisperSignalSchema = z.object({
 });
 export type WhisperSignal = z.infer<typeof WhisperSignalSchema>;
 
-export const DeviceTrustSchema = z.enum(['TRUSTED', 'DEGRADED', 'UNTRUSTED', 'COMPROMISED']);
-export type DeviceTrust = z.infer<typeof DeviceTrustSchema>;
-
 /** Signed device-action recognition outcome, intentionally not a response protocol. */
 export const DeviceActionWhisperResultSchema = z.object({
   schema_version: z.literal(1),
@@ -100,6 +98,11 @@ export const DeviceActionWhisperResultSchema = z.object({
   confidence: z.number().min(0).max(1),
   device_trust: DeviceTrustSchema,
   context: contextSchema,
+  /**
+   * Client-observed telemetry only. Server modules must calculate
+   * authoritative freshness from recognised_at and receipt time, then verify
+   * the signed nonce/device context.
+   */
   freshness_ms: z.number().int().nonnegative(),
   anti_replay_nonce: z.string().min(16).max(512),
   signature_algorithm: z.string().min(1).max(128),
@@ -110,7 +113,17 @@ export type DeviceActionWhisperResult = z.infer<typeof DeviceActionWhisperResult
 
 /** Key a verifier can retain to reject a replay from a device/signal version. */
 export function deviceActionWhisperReplayKey(
-  result: Pick<DeviceActionWhisperResult, 'device_id' | 'whisper_signal_id' | 'whisper_signal_version' | 'anti_replay_nonce'>,
+  result: Pick<
+    DeviceActionWhisperResult,
+    'organisation_id' | 'site_id' | 'device_id' | 'whisper_signal_id' | 'whisper_signal_version' | 'anti_replay_nonce'
+  >,
 ): string {
-  return `${result.device_id}:${result.whisper_signal_id}:${result.whisper_signal_version}:${result.anti_replay_nonce}`;
+  return [
+    result.organisation_id,
+    result.site_id,
+    result.device_id,
+    result.whisper_signal_id,
+    result.whisper_signal_version,
+    result.anti_replay_nonce,
+  ].join(':');
 }
