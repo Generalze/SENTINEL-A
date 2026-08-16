@@ -58,4 +58,6 @@ export interface CreateIncidentInput {
   relatedEventIds: string[];
   supportingEventIds: string[];
   contradictingEventIds: string[];
+  hypothesisUpdatedAt: Date;
+  hypothesisVersion: number;
 }

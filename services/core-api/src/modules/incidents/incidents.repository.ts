@@ -34,6 +34,8 @@ export class IncidentsRepository {
             relatedEventIds: input.relatedEventIds,
             supportingEventIds: input.supportingEventIds,
             contradictingEventIds: input.contradictingEventIds,
+            hypothesisUpdatedAt: input.hypothesisUpdatedAt,
+            hypothesisVersion: input.hypothesisVersion,
             playbookVersion: ['SEV1', 'SEV2'].includes(input.severity) ? PLAYBOOK_PROOF_A_V1 : null,
           },
         });
@@ -66,6 +68,64 @@ export class IncidentsRepository {
       skipDuplicates: true,
     });
     return this.prisma.responseTask.findMany({ where: { incidentId }, orderBy: { createdAt: 'asc' } });
+  }
+
+  /**
+   * Applies one newer Fusion assessment and, on its first critical-severity
+   * crossing, creates the durable PB-PROOF-A tasks in the same transaction.
+   * Older/equal source timestamps are intentional at-least-once no-ops.
+   */
+  async advanceFromHypothesis(input: {
+    hypothesisId: string; organisationId: string; sourceAt: Date; triggeringEventId: string; hypothesisVersion: number; state: number; severity: string; confidence: number;
+    supportingEventIds: string[]; contradictingEventIds: string[];
+  }): Promise<{ incident: Incident; startedProofA: boolean } | null> {
+    return this.prisma.$transaction(async (tx) => {
+      const found = await tx.incident.findFirst({ where: { hypothesisId: input.hypothesisId, organisationId: input.organisationId }, select: { id: true } });
+      if (!found) return null;
+      // Serialise assessments for this incident. The post-lock reread is
+      // essential under READ COMMITTED: a concurrent newer transaction may
+      // have committed while this transaction was waiting for the row lock.
+      await tx.$queryRaw(Prisma.sql`SELECT id FROM incidents WHERE id = ${found.id}::uuid FOR UPDATE`);
+      const current = await tx.incident.findUniqueOrThrow({ where: { id: found.id } });
+      const isOlder = current.hypothesisVersion !== null && current.hypothesisVersion > input.hypothesisVersion;
+      const isDuplicate = current.hypothesisVersion !== null && current.hypothesisVersion === input.hypothesisVersion;
+      if (isOlder || isDuplicate) return null;
+      const critical = ['SEV1', 'SEV2'].includes(input.severity);
+      const startedProofA = critical && current.proofAStartedAt === null;
+      const updated = await tx.incident.update({
+        where: { id: current.id },
+        data: {
+          threatState: input.state, severity: input.severity, confidence: input.confidence,
+          supportingEventIds: input.supportingEventIds,
+          contradictingEventIds: input.contradictingEventIds,
+          relatedEventIds: [...new Set([...input.supportingEventIds, ...input.contradictingEventIds])],
+          hypothesisUpdatedAt: input.sourceAt,
+          hypothesisTriggeringEventId: input.triggeringEventId,
+          hypothesisVersion: input.hypothesisVersion,
+          ...(startedProofA ? { playbookVersion: PLAYBOOK_PROOF_A_V1, proofAStartedAt: input.sourceAt } : {}),
+        },
+      });
+      if (startedProofA) {
+        await tx.responseTask.createMany({
+          data: [TASK_PRESERVE_EVIDENCE, TASK_NOTIFY_COMMANDER, TASK_DISPATCH_FIELD].map((taskType) => ({ incidentId: current.id, taskType, playbookVersion: PLAYBOOK_PROOF_A_V1 })),
+          skipDuplicates: true,
+        });
+      }
+      await tx.incidentTimelineEntry.create({ data: { incidentId: current.id, kind: 'HYPOTHESIS_UPDATED', payload: {
+        hypothesis_id: input.hypothesisId, source_at: input.sourceAt.toISOString(), threat_state: input.state, severity: input.severity,
+        ...(startedProofA ? { playbook_started: PLAYBOOK_PROOF_A_V1 } : {}),
+      } } });
+      await tx.incidentUpdateOutbox.create({ data: { incidentId: current.id, organisationId: current.organisationId, payload: { id: current.id, organisation_id: current.organisationId, kind: 'HYPOTHESIS_UPDATED' } } });
+      return { incident: updated, startedProofA };
+    });
+  }
+
+  async findForHypothesis(hypothesisId: string, organisationId: string): Promise<Incident | null> {
+    return this.prisma.incident.findFirst({ where: { hypothesisId, organisationId } });
+  }
+
+  async latestHypothesis(hypothesisId: string, organisationId: string) {
+    return this.prisma.hypothesis.findFirst({ where: { id: hypothesisId, organisationId } });
   }
 
   async findTask(incidentId: string, taskId: string, organisationId: string, siteScope: SiteScope): Promise<(ResponseTask & { incident: Incident }) | null> {

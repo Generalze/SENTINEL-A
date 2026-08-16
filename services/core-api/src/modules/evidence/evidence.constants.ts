@@ -2,8 +2,8 @@
 export const OBJECT_KEY_SEPARATOR = '/';
 
 /**
- * Actions this module's routes require on the caller's principal
- * (TODO-WIRED-IN-WAVE-4, same convention as events.constants.ts — the
+ * Actions enforced by the global AccessGuard on this module's routes
+ * (same convention as events.constants.ts — the
  * identity module's real AccessGuard already lists 'evidence.read' as a
  * known §62 action; this module cannot import that constant directly per
  * WP-09's coordination rules, so the string is duplicated here).

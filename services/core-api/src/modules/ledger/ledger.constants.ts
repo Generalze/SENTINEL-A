@@ -2,7 +2,7 @@ export const DEFAULT_LIST_LIMIT = 50;
 export const MAX_LIST_LIMIT = 200;
 
 /**
- * Actions this module's routes require on the caller's principal (TODO-WIRED-IN-WAVE-4 — see
+ * Actions this module's routes require on the caller's principal; the global AccessGuard reads these
  * ledger-principal-action.guard.ts). `ledger.read` matches the action name the identity
  * module's §62 role table (src/modules/identity/roles.ts) already reserves for this purpose
  * (granted to the `investigator` role); this module does not import identity, so the name is

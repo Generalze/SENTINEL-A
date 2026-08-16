@@ -266,6 +266,7 @@ export class FusionService {
           emission_number: latch.emissions,
           triggering_event_id: event.event_id,
           emitted_at: emittedAt,
+          hypothesis_version: outcome.row.version,
         }
       : null;
 
@@ -276,6 +277,7 @@ export class FusionService {
       previous_state: previousState,
       state_changed: next.state !== previousState,
       emitted_at: emittedAt,
+      hypothesis_version: outcome.row.version,
     };
 
     await this.publisher.publishHypothesisUpdate(updateMessage);

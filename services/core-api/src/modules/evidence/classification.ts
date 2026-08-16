@@ -12,7 +12,7 @@
  * semantics (this module does not evaluate clearance at all in WP-09 —
  * see principal-action.guard.ts's doc comment).
  *
- * TODO-CONSOLIDATE: once identity/classification.ts is safe for other
+ * Milestone-1 boundary: once identity/classification.ts is safe for other
  * modules to import (e.g. hoisted to a shared package, or the lead wires
  * cross-module imports after both lanes land), delete this file and
  * import the canonical one instead.

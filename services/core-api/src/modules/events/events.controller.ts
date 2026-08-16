@@ -17,7 +17,7 @@ const ListQuerySchema = z.object({
   occurred_to: z.string().datetime().optional(),
   limit: z.coerce.number().int().positive().max(MAX_LIST_LIMIT).optional(),
   cursor: z.string().min(1).optional(),
-  // Dev-bypass only (TODO-WIRED-IN-WAVE-4): required when no principal is
+  // Development bypass only: required when no principal is
   // present, since there is otherwise no tenant to scope the list to.
   organisation_id: z.string().min(1).optional(),
 });
@@ -75,7 +75,7 @@ export class EventsController {
         return;
       }
     } else {
-      // TODO-WIRED-IN-WAVE-4: only reachable through the guard's
+      // Development bypass path: only reachable through the guard's
       // DEV_AUTH_ENABLED bypass (principal-action.guard.ts) — there is no
       // principal org to compare the body against, so org-match cannot be
       // enforced here. Logged loudly so this is never silently relied on.
@@ -105,7 +105,7 @@ export class EventsController {
     if (principal) {
       organisationId = principal.organisation_id;
     } else {
-      // TODO-WIRED-IN-WAVE-4 dev bypass: no principal means no inferred
+      // Development bypass: no principal means no inferred
       // tenant. Listing across every organisation is never acceptable,
       // even in dev, so require the caller to say which org explicitly.
       if (!query.organisation_id) {

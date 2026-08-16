@@ -3,6 +3,8 @@ export const INCIDENT_CANDIDATE_SUBJECT = 'sentinel.fusion.incident-candidate.>'
 export const INCIDENT_CONSUMER_DURABLE = 'incidents-v1';
 export const INCIDENT_CONSUMER_ACK_WAIT_MS = 30_000;
 export const INCIDENT_CONSUMER_MAX_DELIVER = 5;
+export const HYPOTHESIS_UPDATE_CONSUMER_DURABLE = 'incidents-hypothesis-v1';
+export const HYPOTHESIS_UPDATE_SUBJECT = 'sentinel.fusion.hypothesis.>';
 
 export const PLAYBOOK_PROOF_A_V1 = 'PB-PROOF-A@1';
 export const TASK_PRESERVE_EVIDENCE = 'preserve-evidence';

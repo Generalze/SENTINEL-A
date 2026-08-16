@@ -28,6 +28,14 @@ model Incident {
   closureReason String? @map("closure_reason") @db.Text
   openedAt DateTime @default(now()) @map("opened_at") @db.Timestamptz(3)
   closedAt DateTime? @map("closed_at") @db.Timestamptz(3)
+  /// Latest trusted Fusion hypothesis update accepted for this incident.
+  /// Used as a monotonic source boundary so at-least-once NATS delivery
+  /// cannot roll an incident back to an older assessment.
+  hypothesisUpdatedAt DateTime? @map("hypothesis_updated_at") @db.Timestamptz(3)
+  hypothesisTriggeringEventId String? @map("hypothesis_triggering_event_id") @db.Text
+  hypothesisVersion Int? @map("hypothesis_version")
+  /// Set atomically with task creation when PB-PROOF-A first becomes eligible.
+  proofAStartedAt DateTime? @map("proof_a_started_at") @db.Timestamptz(3)
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 

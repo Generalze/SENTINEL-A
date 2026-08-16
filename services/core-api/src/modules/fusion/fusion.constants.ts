@@ -119,5 +119,5 @@ export const UNIQUE_CONSTRAINT_VIOLATION = 'P2002';
 export const DEFAULT_LIST_LIMIT = 50;
 export const MAX_LIST_LIMIT = 200;
 
-/** Action this module's read routes require on the caller's principal (TODO-WIRED). */
+/** Action this module's read routes require on the caller's principal; the global AccessGuard enforces it. */
 export const ACTION_HYPOTHESIS_READ = 'hypothesis.read';

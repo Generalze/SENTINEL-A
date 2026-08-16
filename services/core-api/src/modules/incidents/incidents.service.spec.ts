@@ -24,6 +24,7 @@ function candidate(ruleVersions: string[] = ['fusion-rules-1.0.0']): IncidentCan
     emission_number: 1,
     triggering_event_id: 'event-a',
     emitted_at: '2026-08-16T09:00:00.000Z',
+    hypothesis_version: 1,
   };
 }
 
@@ -179,5 +180,16 @@ describe('IncidentsService', () => {
     expect(repository.recordSilentApproval).toHaveBeenCalledWith(task.id, 'commander-a');
     expect(repository.listSilentApprovals).not.toHaveBeenCalled();
     expect(constitution.evaluate).not.toHaveBeenCalled();
+  });
+
+  it('treats a stale or duplicate hypothesis update as a no-op', async () => {
+    const existing = { id: 'incident-a', organisationId: 'org-a', siteId: 'site-a', severity: 'SEV2', proofAStartedAt: null };
+    const repository = { advanceFromHypothesis: vi.fn().mockResolvedValue(null), findForHypothesis: vi.fn().mockResolvedValue(existing) };
+    const service = new IncidentsService(repository as never, {} as never, {} as never, {} as never);
+    await service.handleHypothesisUpdate({
+      emitted_at: '2026-08-16T10:00:00.000Z', triggering_event_id: 'event-1', hypothesis_version: 2,
+      hypothesis: { hypothesis_id: 'incident-hypothesis', organisation_id: 'org-a', site_id: 'site-a', state: 4, operational_severity: 'SEV2', threat_probability: 0.9, supporting_event_ids: ['support'], contradicting_event_ids: [] },
+    });
+    expect(repository.advanceFromHypothesis).toHaveBeenCalledOnce();
   });
 });

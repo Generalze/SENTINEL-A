@@ -5,7 +5,7 @@ import { AppConfigService } from '../../config/config.service';
 const CONNECT_TIMEOUT_MS = 1500;
 
 /**
- * TODO-WIRED(lead): `src/infra/redis.provider.ts` only exposes
+ * Milestone-1 note: `src/infra/redis.provider.ts` only exposes
  * `isConfigured()`/`checkHealth()` today — no consumer needed raw Redis
  * commands before this module. Per WP-12 coordination rules this module's
  * lane is `src/modules/realtime/**` only (infra/** is out of lane while

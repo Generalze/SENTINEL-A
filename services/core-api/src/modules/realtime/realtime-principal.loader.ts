@@ -2,7 +2,8 @@ import type { PrismaService } from '../../prisma/prisma.service';
 import type { RealtimePrincipal } from './realtime.types';
 
 /**
- * TODO-WIRED-IN-WAVE-4
+ * Development-only loader used by the Socket.IO handshake until production
+ * identity-provider integration is enabled.
  * ---------------------
  * Defensive local principal loader for the realtime gateway's WS handshake
  * auth (WP-12 deliverable #2). Deliberately duplicates — rather than

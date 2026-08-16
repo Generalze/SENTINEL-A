@@ -17,8 +17,8 @@
  * TENANT SCOPING
  * --------------
  * The organisation is taken from the authenticated principal. Under the
- * TODO-WIRED-IN-WAVE-4 dev bypass there is no principal to infer a tenant
- * from, so an explicit `organisation_id` is REQUIRED rather than defaulting
+ * Development bypass note: without a principal, an explicit `organisation_id`
+ * is REQUIRED rather than defaulting
  * to "all organisations" — an unscoped read is never an acceptable fallback.
  * The detail route treats "belongs to another organisation" and "does not
  * exist" as the same 404, so the API cannot be used to probe for another
@@ -53,7 +53,7 @@ const ListQuerySchema = z.object({
   updated_to: z.string().datetime().optional(),
   limit: z.coerce.number().int().positive().max(MAX_LIST_LIMIT).optional(),
   cursor: z.string().min(1).optional(),
-  // Dev-bypass only (TODO-WIRED-IN-WAVE-4): required when no principal is
+  // Development bypass only: required when no principal is
   // present, since there is otherwise no tenant to scope the list to.
   organisation_id: z.string().min(1).optional(),
 });

@@ -18,30 +18,32 @@
 import { PrismaClient } from '@prisma/client';
 import type { Role } from './roles';
 
-const prisma = new PrismaClient();
+export interface IdentitySeedFixture {
+  readonly organisation: { readonly id: string; readonly name: string };
+  readonly site: { readonly id: string; readonly name: string };
+  readonly zones: ReadonlyArray<{ readonly id: string; readonly name: string }>;
+  readonly users: ReadonlyArray<SeedUser>;
+}
 
-const ORG_ID = 'org_alpha';
-const ORG_NAME = 'Alpha Site Security';
-const SITE_ID = 'site_hq';
-const SITE_NAME = 'HQ';
+export interface SeedUser {
+  readonly id: string;
+  readonly email: string;
+  readonly displayName: string;
+  readonly clearance: number;
+  readonly role: Role;
+  /** Operational roles are scoped to the fixture site; oversight roles are organisation-wide. */
+  readonly siteScoped: boolean;
+}
 
-const ZONES: ReadonlyArray<{ id: string; name: string }> = [
+export const DEFAULT_IDENTITY_SEED: IdentitySeedFixture = {
+  organisation: { id: 'org_alpha', name: 'Alpha Site Security' },
+  site: { id: 'site_hq', name: 'HQ' },
+  zones: [
   { id: 'zone_lobby', name: 'Lobby' },
   { id: 'zone_vault_corridor', name: 'Vault Corridor' },
   { id: 'zone_perimeter', name: 'Perimeter' },
-];
-
-interface SeedUser {
-  id: string;
-  email: string;
-  displayName: string;
-  clearance: number;
-  role: Role;
-  /** Operational roles are scoped to SITE_HQ; oversight roles are organisation-wide (site_id null). */
-  siteScoped: boolean;
-}
-
-const SEED_USERS: ReadonlyArray<SeedUser> = [
+  ],
+  users: [
   { id: 'user_site_commander', email: 'site.commander@alpha.test', displayName: 'Site Commander', clearance: 4, role: 'site.commander', siteScoped: true },
   { id: 'user_operator', email: 'operator@alpha.test', displayName: 'Control-Room Operator', clearance: 3, role: 'operator', siteScoped: true },
   { id: 'user_dispatcher', email: 'dispatcher@alpha.test', displayName: 'Dispatcher', clearance: 3, role: 'dispatcher', siteScoped: true },
@@ -49,41 +51,43 @@ const SEED_USERS: ReadonlyArray<SeedUser> = [
   { id: 'user_investigator', email: 'investigator@alpha.test', displayName: 'Investigator', clearance: 3, role: 'investigator', siteScoped: false },
   { id: 'user_evidence_custodian', email: 'evidence.custodian@alpha.test', displayName: 'Evidence Custodian', clearance: 4, role: 'evidence.custodian', siteScoped: false },
   { id: 'user_admin', email: 'admin@alpha.test', displayName: 'Administrator', clearance: 5, role: 'admin', siteScoped: false },
-];
+  ],
+};
 
-async function main(): Promise<void> {
-  await prisma.organisation.upsert({
-    where: { id: ORG_ID },
-    create: { id: ORG_ID, name: ORG_NAME },
-    update: { name: ORG_NAME },
+/** Seed one deterministic identity fixture. Safe for both the standalone seed and live tests. */
+export async function seedIdentity(prismaClient: PrismaClient, fixture: IdentitySeedFixture = DEFAULT_IDENTITY_SEED): Promise<void> {
+  await prismaClient.organisation.upsert({
+    where: { id: fixture.organisation.id },
+    create: { id: fixture.organisation.id, name: fixture.organisation.name },
+    update: { name: fixture.organisation.name },
   });
 
-  await prisma.site.upsert({
-    where: { id: SITE_ID },
-    create: { id: SITE_ID, organisationId: ORG_ID, name: SITE_NAME },
-    update: { organisationId: ORG_ID, name: SITE_NAME },
+  await prismaClient.site.upsert({
+    where: { id: fixture.site.id },
+    create: { id: fixture.site.id, organisationId: fixture.organisation.id, name: fixture.site.name },
+    update: { organisationId: fixture.organisation.id, name: fixture.site.name },
   });
 
-  for (const zone of ZONES) {
-    await prisma.zone.upsert({
+  for (const zone of fixture.zones) {
+    await prismaClient.zone.upsert({
       where: { id: zone.id },
-      create: { id: zone.id, siteId: SITE_ID, name: zone.name },
-      update: { siteId: SITE_ID, name: zone.name },
+      create: { id: zone.id, siteId: fixture.site.id, name: zone.name },
+      update: { siteId: fixture.site.id, name: zone.name },
     });
   }
 
-  for (const seedUser of SEED_USERS) {
-    await prisma.user.upsert({
+  for (const seedUser of fixture.users) {
+    await prismaClient.user.upsert({
       where: { id: seedUser.id },
       create: {
         id: seedUser.id,
-        organisationId: ORG_ID,
+        organisationId: fixture.organisation.id,
         email: seedUser.email,
         displayName: seedUser.displayName,
         clearance: seedUser.clearance,
       },
       update: {
-        organisationId: ORG_ID,
+        organisationId: fixture.organisation.id,
         email: seedUser.email,
         displayName: seedUser.displayName,
         clearance: seedUser.clearance,
@@ -91,22 +95,32 @@ async function main(): Promise<void> {
     });
 
     const roleAssignmentId = `${seedUser.id}__${seedUser.role}`;
-    const siteId = seedUser.siteScoped ? SITE_ID : null;
-    await prisma.userRole.upsert({
+    const siteId = seedUser.siteScoped ? fixture.site.id : null;
+    await prismaClient.userRole.upsert({
       where: { id: roleAssignmentId },
       create: { id: roleAssignmentId, userId: seedUser.id, role: seedUser.role, siteId },
       update: { role: seedUser.role, siteId },
     });
   }
-
-  console.log(`Seed complete: 1 org, 1 site, ${ZONES.length} zones, ${SEED_USERS.length} users.`);
 }
 
-main()
-  .catch((error: unknown) => {
+async function main(): Promise<void> {
+  const prisma = new PrismaClient();
+  try {
+    await seedIdentity(prisma);
+    console.log(`Seed complete: 1 org, 1 site, ${DEFAULT_IDENTITY_SEED.zones.length} zones, ${DEFAULT_IDENTITY_SEED.users.length} users.`);
+  } finally {
+    await prisma.$disconnect();
+  }
+}
+
+// Keep imports side-effect free so live integration tests can reuse the
+// fixture function without opening a second Prisma connection or seeding the
+// default tenant. The compiled standalone path remains deterministic.
+const invokedFile = process.argv[1] ?? '';
+if (invokedFile.endsWith('/seed.js') || invokedFile.endsWith('\\seed.js')) {
+  void main().catch((error: unknown) => {
     console.error('Seed failed:', error);
     process.exitCode = 1;
-  })
-  .finally(() => {
-    void prisma.$disconnect();
   });
+}

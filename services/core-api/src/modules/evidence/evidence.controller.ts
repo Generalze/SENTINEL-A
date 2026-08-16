@@ -30,7 +30,7 @@ const DeriveBodySchema = z.object({
 const ListQuerySchema = z.object({
   incident_id: z.string().min(1).optional(),
   limit: z.coerce.number().int().positive().max(MAX_LIST_LIMIT).optional(),
-  // Dev-bypass only (TODO-WIRED-IN-WAVE-4): required when no principal is present.
+  // Development bypass only: required when no principal is present.
   organisation_id: z.string().min(1).optional(),
 });
 

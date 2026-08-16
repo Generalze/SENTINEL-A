@@ -12,8 +12,8 @@
 /// §47 data-classification levels, restricted to the handful this module's
 /// rows can ever carry. Canonical source of the full table is
 /// src/modules/identity/classification.ts (see the module's local
-/// classification.ts for the TODO-CONSOLIDATE note on why this is a
-/// separate, small, duplicated enum rather than an import).
+/// classification.ts for the Milestone-1 module-boundary note explaining
+/// why this remains a separate, small, duplicated enum rather than an import).
 enum EvidenceClassification {
   PUBLIC
   INTERNAL

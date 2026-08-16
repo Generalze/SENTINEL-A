@@ -25,6 +25,6 @@ export const IDEMPOTENCY_WINDOW_MS = 5000;
 export const DEFAULT_LIST_LIMIT = 50;
 export const MAX_LIST_LIMIT = 200;
 
-/** Actions this module's routes require on the caller's principal (TODO-WIRED-IN-WAVE-4). */
+/** Actions enforced by the global AccessGuard on this module's routes. */
 export const ACTION_EVENT_INGEST = 'event.ingest';
 export const ACTION_EVENT_READ = 'event.read';

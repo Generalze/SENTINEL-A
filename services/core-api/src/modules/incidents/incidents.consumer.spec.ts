@@ -21,6 +21,7 @@ const candidate = {
   emission_number: 1,
   triggering_event_id: 'event-a',
   emitted_at: '2026-08-16T09:00:00.000Z',
+  hypothesis_version: 1,
 };
 
 describe('IncidentsConsumer', () => {

@@ -31,6 +31,7 @@ const CandidateSchema = z.object({
   emission_number: z.number().int().positive(),
   triggering_event_id: z.string(),
   emitted_at: z.string().datetime(),
+  hypothesis_version: z.number().int().nonnegative(),
 });
 
 /** Durable, sequential consumer: ack only after incident orchestration commits. */

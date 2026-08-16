@@ -129,7 +129,7 @@ export function principalRequest(organisationId: string, traceId = 'wp05-trace')
   } as unknown as RequestWithPrincipal;
 }
 
-/** A request with no principal, exercising the TODO-WIRED dev-bypass path. */
+/** A request with no principal, exercising the explicit development-bypass path. */
 export function anonymousRequest(traceId = 'wp05-trace'): RequestWithPrincipal {
   return { traceId } as unknown as RequestWithPrincipal;
 }

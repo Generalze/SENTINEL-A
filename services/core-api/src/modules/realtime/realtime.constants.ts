@@ -45,7 +45,7 @@ export const WS_EVENT_PRESENCE_CHANGED = 'presence.changed';
 /** Deliverable #4: `sentinel:presence:{organisation_id}` hash, field = user_id. */
 export const PRESENCE_KEY_PREFIX = 'sentinel:presence:';
 
-/** Action this module's HTTP route requires on the caller's principal (TODO-WIRED-IN-WAVE-4). */
+/** Action enforced by the global AccessGuard on this module's HTTP route. */
 export const ACTION_PRESENCE_VIEW = 'presence.view';
 
 /** The one and only room a socket may ever join — always derived server-side. */

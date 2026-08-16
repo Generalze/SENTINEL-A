@@ -120,6 +120,7 @@ export interface IncidentCandidateMessage {
   /** The event whose signal caused the crossing. */
   triggering_event_id: string;
   emitted_at: string;
+  hypothesis_version: number;
 }
 
 /** Message body published to `sentinel.fusion.hypothesis.{organisation_id}` on every update. */
@@ -130,6 +131,7 @@ export interface HypothesisUpdateMessage {
   previous_state: ThreatState;
   state_changed: boolean;
   emitted_at: string;
+  hypothesis_version: number;
 }
 
 /** Outcome of applying one event, returned by FusionService.applyEvent. */

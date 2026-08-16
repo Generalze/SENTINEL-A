@@ -11,6 +11,17 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgresql://sentinel:sentinel@localhost:5433/sentinel
+      NATS_URL: nats://localhost:4222
+      REDIS_URL: redis://localhost:6379
+      S3_ENDPOINT: http://localhost:9000
+      S3_ACCESS_KEY: sentinel
+      S3_SECRET_KEY: sentinel123
+      S3_BUCKET: sentinel-dev
+      S3_EVIDENCE_BUCKET: sentinel-evidence
+      S3_REGION: us-east-1
+      DEV_AUTH_ENABLED: 'true'
 
     steps:
       - uses: actions/checkout@v4
@@ -45,8 +56,42 @@ jobs:
       - name: Typecheck
         run: pnpm -r typecheck
 
+      - name: Start Proof-A live stack
+        run: docker compose -f infrastructure/compose/docker-compose.dev.yml up -d --wait
+
+      - name: Deploy database migrations
+        run: pnpm --filter @sentinel/core-api exec prisma migrate deploy --schema prisma/schema
+
       - name: Lint
         run: pnpm -r lint
 
+      - name: Security source grep gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_files=(services apps packages tests)
+          if rg -n --glob '*.ts' --glob '*.tsx' --glob '*.prisma' 'TODO|@ts-ignore' "${source_files[@]}"; then
+            echo 'Security source gate failed: TODO marker or @ts-ignore found.'
+            exit 1
+          fi
+          # Match TypeScript any annotations/casts/generic arguments, while
+          # intentionally ignoring prose and Vitest's expect.any(...).
+          typed_any_matches="$(rg -n --glob '*.ts' --glob '*.tsx' '(:[[:space:]]*any\b|\bas[[:space:]]+any\b|<[[:space:]]*any[[:space:]]*>|,[[:space:]]*any\b|\bany\[\])' "${source_files[@]}" || true)"
+          typed_any_code="$(printf '%s\n' "$typed_any_matches" | rg -v ':[0-9]+:[[:space:]]*(//|\*|/\*)' || true)"
+          if [[ -n "$typed_any_code" ]]; then
+            printf '%s\n' "$typed_any_code"
+            echo 'Security source gate failed: untyped any detected.'
+            exit 1
+          fi
+
       - name: Test
         run: pnpm -r test
+
+      - name: Proof-A regression
+        env:
+          PROOF_A_LIVE: '1'
+        run: pnpm --filter @sentinel/core-api exec vitest run --config ../../vitest.proof-a.config.ts
+
+      - name: Stop Proof-A live stack
+        if: always()
+        run: docker compose -f infrastructure/compose/docker-compose.dev.yml down -v

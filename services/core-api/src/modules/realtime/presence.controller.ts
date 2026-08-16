@@ -25,8 +25,7 @@ export class PresenceController {
     if (principal) {
       organisationId = principal.organisation_id;
     } else {
-      // TODO-WIRED-IN-WAVE-4 dev bypass (see presence-action.guard.ts):
-      // no principal means no inferred tenant. Listing across every
+      // Development bypass: no principal means no inferred tenant. Listing across every
       // organisation is never acceptable, even in dev, so require the
       // caller to say which org explicitly.
       const queryOrgId = rawQuery.organisation_id;

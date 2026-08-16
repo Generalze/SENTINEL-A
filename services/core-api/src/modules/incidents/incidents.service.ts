@@ -22,6 +22,9 @@ import type { SiteScope } from '../identity/list-pagination';
 const CRITICAL_PLAYBOOK_SEVERITIES = new Set(['SEV1', 'SEV2']);
 const SYSTEM_SITE_SCOPE: SiteScope = { orgWide: true, siteIds: [] };
 
+/** Retryable: Fusion update arrived before its independently-consumed candidate. */
+export class IncidentNotReadyError extends Error {}
+
 /**
  * WP-05 currently exposes no dedicated response-mode field on an incident
  * candidate. Its versioned rule-pack markers are therefore the only durable
@@ -60,6 +63,8 @@ export class IncidentsService {
       relatedEventIds: [...new Set([...candidate.supporting_event_ids, ...candidate.contradicting_event_ids])],
       supportingEventIds: [...new Set(candidate.supporting_event_ids)],
       contradictingEventIds: [...new Set(candidate.contradicting_event_ids)],
+      hypothesisUpdatedAt: new Date(candidate.emitted_at),
+      hypothesisVersion: candidate.hypothesis_version,
     });
 
     if (CRITICAL_PLAYBOOK_SEVERITIES.has(incident.severity)) {
@@ -71,6 +76,23 @@ export class IncidentsService {
         incident.supportingEventIds,
         incident.contradictingEventIds,
       );
+    } else {
+      // The candidate and hypothesis-update consumers are independent durable
+      // streams. A fast replay may deliver every later update before this
+      // candidate creates its incident, so read the authoritative Fusion row
+      // once and advance through the same monotonic path.
+      const latest = await this.repository.latestHypothesis(candidate.hypothesis_id, incident.organisationId);
+      const differsFromCandidate = latest && (latest.state !== candidate.threat_state || latest.operationalSeverity !== candidate.operational_severity ||
+        latest.threatProbability !== candidate.threat_probability || latest.supportingEventIds.join('\u0000') !== candidate.supporting_event_ids.join('\u0000') ||
+        latest.contradictingEventIds.join('\u0000') !== candidate.contradicting_event_ids.join('\u0000'));
+      if (latest && (latest.version > candidate.hypothesis_version || (latest.version === candidate.hypothesis_version && differsFromCandidate))) {
+        await this.handleHypothesisUpdate({
+          triggering_event_id: `candidate-catchup:${latest.updatedAt.toISOString()}`,
+          emitted_at: latest.updatedAt.toISOString(),
+          hypothesis_version: latest.version,
+          hypothesis: { hypothesis_id: latest.id, organisation_id: latest.organisationId, site_id: latest.siteId, state: latest.state, operational_severity: latest.operationalSeverity, threat_probability: latest.threatProbability, supporting_event_ids: latest.supportingEventIds, contradicting_event_ids: latest.contradictingEventIds },
+        });
+      }
     }
 
     const detail = await this.getDetail(incident.organisationId, incident.id, SYSTEM_SITE_SCOPE);
@@ -157,6 +179,30 @@ export class IncidentsService {
 
   async list(filter: IncidentListFilter): Promise<IncidentDetailView[]> {
     return (await this.repository.list(filter)).map(toIncidentView);
+  }
+
+  /** Applies a newer Fusion assessment to an already-created incident. */
+  async handleHypothesisUpdate(message: { triggering_event_id: string; hypothesis_version: number; hypothesis: { hypothesis_id: string; organisation_id: string; site_id: string; state: number; operational_severity: string; threat_probability: number; supporting_event_ids: string[]; contradicting_event_ids: string[] }; emitted_at: string }): Promise<void> {
+    const sourceAt = new Date(message.emitted_at);
+    const existingBeforeAdvance = await this.repository.findForHypothesis(message.hypothesis.hypothesis_id, message.hypothesis.organisation_id);
+    if (!existingBeforeAdvance) throw new IncidentNotReadyError(`Incident for hypothesis ${message.hypothesis.hypothesis_id} is not ready`);
+    const advanced = await this.repository.advanceFromHypothesis({
+      hypothesisId: message.hypothesis.hypothesis_id, organisationId: message.hypothesis.organisation_id, sourceAt, triggeringEventId: message.triggering_event_id, hypothesisVersion: message.hypothesis_version,
+      state: message.hypothesis.state, severity: message.hypothesis.operational_severity, confidence: message.hypothesis.threat_probability,
+      supportingEventIds: [...new Set(message.hypothesis.supporting_event_ids)], contradictingEventIds: [...new Set(message.hypothesis.contradicting_event_ids)],
+    });
+    if (!advanced) {
+      const existing = await this.repository.findForHypothesis(message.hypothesis.hypothesis_id, message.hypothesis.organisation_id);
+      if (existing?.proofAStartedAt && ['SEV1', 'SEV2'].includes(existing.severity)) {
+        await this.runProofA(existing.id, existing.organisationId, existing.siteId, existing.responseMode as ResponseMode, existing.supportingEventIds, existing.contradictingEventIds);
+      }
+      return;
+    }
+    if (advanced.startedProofA) {
+      await this.runProofA(advanced.incident.id, advanced.incident.organisationId, advanced.incident.siteId, advanced.incident.responseMode as ResponseMode, advanced.incident.supportingEventIds, advanced.incident.contradictingEventIds);
+    }
+    const detail = await this.getDetail(advanced.incident.organisationId, advanced.incident.id, SYSTEM_SITE_SCOPE);
+    await this.publisher.publishUpdated(detail);
   }
 
   async getDetail(organisationId: string, incidentId: string, siteScope: SiteScope = SYSTEM_SITE_SCOPE): Promise<IncidentDetailView> {

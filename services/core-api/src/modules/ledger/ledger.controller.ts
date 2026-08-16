@@ -26,7 +26,7 @@ const ListQuerySchema = z.object({
   decided_to: z.string().datetime().optional(),
   limit: z.coerce.number().int().positive().max(MAX_LIST_LIMIT).optional(),
   cursor: z.string().min(1).optional(),
-  // Dev-bypass only (TODO-WIRED-IN-WAVE-4): required when no principal is present, since there
+  // Development bypass only: required when no principal is present, since there
   // is otherwise no tenant to scope the read to.
   organisation_id: z.string().min(1).optional(),
 });
