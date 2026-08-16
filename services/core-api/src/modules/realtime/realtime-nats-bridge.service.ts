@@ -4,7 +4,15 @@ import { NatsProvider } from '../../infra/nats.provider';
 import { type BackoffOptions, withRetryBackoff } from './backoff.util';
 import { pickWhitelistedFields } from './payload-whitelist.util';
 import { RealtimeGateway } from './realtime.gateway';
-import { NATS_SUBJECT_HYPOTHESIS, NATS_SUBJECT_INCIDENT, SUBJECT_ORG_ID_SEGMENT_INDEX, WS_EVENT_HYPOTHESIS_UPDATED, WS_EVENT_INCIDENT_UPDATED } from './realtime.constants';
+import {
+  NATS_SUBJECT_FIELD,
+  NATS_SUBJECT_HYPOTHESIS,
+  NATS_SUBJECT_INCIDENT,
+  SUBJECT_ORG_ID_SEGMENT_INDEX,
+  WS_EVENT_FIELD_UPDATED,
+  WS_EVENT_HYPOTHESIS_UPDATED,
+  WS_EVENT_INCIDENT_UPDATED,
+} from './realtime.constants';
 
 interface SubjectRoute {
   readonly subject: string;
@@ -14,6 +22,7 @@ interface SubjectRoute {
 const ROUTES: readonly SubjectRoute[] = [
   { subject: NATS_SUBJECT_HYPOTHESIS, event: WS_EVENT_HYPOTHESIS_UPDATED },
   { subject: NATS_SUBJECT_INCIDENT, event: WS_EVENT_INCIDENT_UPDATED },
+  { subject: NATS_SUBJECT_FIELD, event: WS_EVENT_FIELD_UPDATED },
 ];
 
 function orgIdFromSubject(subject: string): string | undefined {
@@ -58,7 +67,7 @@ export class RealtimeNatsBridgeService implements OnModuleInit, OnModuleDestroy 
 
   onModuleInit(): void {
     if (!this.nats.isConfigured()) {
-      this.logger.warn('NATS not configured; realtime bridge will not receive fusion/incident updates');
+      this.logger.warn('NATS not configured; realtime bridge will not receive fusion/incident/field updates');
       return;
     }
     for (const route of ROUTES) {

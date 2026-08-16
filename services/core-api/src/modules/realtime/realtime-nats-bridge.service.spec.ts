@@ -1,7 +1,14 @@
 import type { Msg } from 'nats';
 import { describe, expect, it, vi } from 'vitest';
 import type { NatsProvider } from '../../infra/nats.provider';
-import { NATS_SUBJECT_HYPOTHESIS, NATS_SUBJECT_INCIDENT, WS_EVENT_HYPOTHESIS_UPDATED, WS_EVENT_INCIDENT_UPDATED } from './realtime.constants';
+import {
+  NATS_SUBJECT_FIELD,
+  NATS_SUBJECT_HYPOTHESIS,
+  NATS_SUBJECT_INCIDENT,
+  WS_EVENT_FIELD_UPDATED,
+  WS_EVENT_HYPOTHESIS_UPDATED,
+  WS_EVENT_INCIDENT_UPDATED,
+} from './realtime.constants';
 import { RealtimeNatsBridgeService } from './realtime-nats-bridge.service';
 import type { RealtimeGateway } from './realtime.gateway';
 
@@ -73,7 +80,7 @@ describe('RealtimeNatsBridgeService — resubscribe retry/backoff wiring (delive
       supporting_event_ids: ['evt_1', 'evt_2'],
     });
     const nats = fakeNatsProvider(
-      { [NATS_SUBJECT_HYPOTHESIS]: asyncIterableOf([msg]), [NATS_SUBJECT_INCIDENT]: asyncIterableOf([]) },
+      { [NATS_SUBJECT_HYPOTHESIS]: asyncIterableOf([msg]), [NATS_SUBJECT_INCIDENT]: asyncIterableOf([]), [NATS_SUBJECT_FIELD]: asyncIterableOf([]) },
       2, // fails twice before succeeding — proves the retry loop actually retries
     );
     const gateway = fakeGateway();
@@ -108,7 +115,7 @@ describe('RealtimeNatsBridgeService — resubscribe retry/backoff wiring (delive
       status: 'open',
       commander_user_id: 'user_9',
     });
-    const nats = fakeNatsProvider({ [NATS_SUBJECT_HYPOTHESIS]: asyncIterableOf([]), [NATS_SUBJECT_INCIDENT]: asyncIterableOf([msg]) });
+    const nats = fakeNatsProvider({ [NATS_SUBJECT_HYPOTHESIS]: asyncIterableOf([]), [NATS_SUBJECT_INCIDENT]: asyncIterableOf([msg]), [NATS_SUBJECT_FIELD]: asyncIterableOf([]) });
     const gateway = fakeGateway();
     const bridge = new RealtimeNatsBridgeService(nats, gateway);
     bridge.setBackoffOptionsForTesting({ baseMs: 1, maxMs: 2, factor: 1 });
@@ -124,6 +131,36 @@ describe('RealtimeNatsBridgeService — resubscribe retry/backoff wiring (delive
       organisation_id: orgId,
       severity: 'SEV1',
       status: 'open',
+    });
+
+    bridge.onModuleDestroy();
+  });
+
+  it('forwards a field.updated message on the Field subject, whitelisted', async () => {
+    const orgId = 'org_bridge_3';
+    const msg = fakeMsg(`sentinel.field.updated.${orgId}`, {
+      kind: 'FIELD_ASSIGNMENT_ACCEPTED',
+      assignment_id: 'assignment-1',
+      organisation_id: orgId,
+      site_id: 'site-1',
+      need_to_know_summary: 'must never reach the client',
+    });
+    const nats = fakeNatsProvider({ [NATS_SUBJECT_HYPOTHESIS]: asyncIterableOf([]), [NATS_SUBJECT_INCIDENT]: asyncIterableOf([]), [NATS_SUBJECT_FIELD]: asyncIterableOf([msg]) });
+    const gateway = fakeGateway();
+    const bridge = new RealtimeNatsBridgeService(nats, gateway);
+    bridge.setBackoffOptionsForTesting({ baseMs: 1, maxMs: 2, factor: 1 });
+
+    bridge.onModuleInit();
+
+    await vi.waitFor(() => {
+      expect(gateway.broadcastToOrg).toHaveBeenCalled();
+    });
+
+    expect(gateway.broadcastToOrg).toHaveBeenCalledWith(orgId, WS_EVENT_FIELD_UPDATED, {
+      kind: 'FIELD_ASSIGNMENT_ACCEPTED',
+      assignment_id: 'assignment-1',
+      organisation_id: orgId,
+      site_id: 'site-1',
     });
 
     bridge.onModuleDestroy();
@@ -158,7 +195,7 @@ describe('RealtimeNatsBridgeService — resubscribe retry/backoff wiring (delive
 
   it('drops a message whose subject carries no parseable organisation_id, without throwing', async () => {
     const badMsg = fakeMsg('sentinel.fusion.hypothesis', { hypothesis_id: 'x' }); // too few dot-segments
-    const nats = fakeNatsProvider({ [NATS_SUBJECT_HYPOTHESIS]: asyncIterableOf([badMsg]), [NATS_SUBJECT_INCIDENT]: asyncIterableOf([]) });
+    const nats = fakeNatsProvider({ [NATS_SUBJECT_HYPOTHESIS]: asyncIterableOf([badMsg]), [NATS_SUBJECT_INCIDENT]: asyncIterableOf([]), [NATS_SUBJECT_FIELD]: asyncIterableOf([]) });
     const gateway = fakeGateway();
     const bridge = new RealtimeNatsBridgeService(nats, gateway);
 
@@ -177,7 +214,7 @@ describe('RealtimeNatsBridgeService — resubscribe retry/backoff wiring (delive
         throw new Error('not valid JSON');
       },
     } as unknown as Msg;
-    const nats = fakeNatsProvider({ [NATS_SUBJECT_HYPOTHESIS]: asyncIterableOf([]), [NATS_SUBJECT_INCIDENT]: asyncIterableOf([badMsg]) });
+    const nats = fakeNatsProvider({ [NATS_SUBJECT_HYPOTHESIS]: asyncIterableOf([]), [NATS_SUBJECT_INCIDENT]: asyncIterableOf([badMsg]), [NATS_SUBJECT_FIELD]: asyncIterableOf([]) });
     const gateway = fakeGateway();
     const bridge = new RealtimeNatsBridgeService(nats, gateway);
 

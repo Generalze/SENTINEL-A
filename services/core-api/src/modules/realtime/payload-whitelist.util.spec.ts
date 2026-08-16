@@ -66,4 +66,23 @@ describe('pickWhitelistedFields', () => {
     const result = pickWhitelistedFields({ status: 'closed' });
     expect(result).not.toHaveProperty('id');
   });
+
+  it('allows Field invalidation keys without forwarding full assignment records', () => {
+    const result = pickWhitelistedFields({
+      kind: 'FIELD_ASSIGNMENT_ACCEPTED',
+      assignment_id: 'assignment-1',
+      user_id: 'user-field',
+      organisation_id: 'org-1',
+      site_id: 'site-1',
+      need_to_know_summary: 'must not ride websocket',
+      location: { lat: 1 },
+    });
+    expect(result).toEqual({
+      kind: 'FIELD_ASSIGNMENT_ACCEPTED',
+      assignment_id: 'assignment-1',
+      user_id: 'user-field',
+      organisation_id: 'org-1',
+      site_id: 'site-1',
+    });
+  });
 });

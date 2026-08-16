@@ -11,6 +11,10 @@
  * | incident.view      | Read an incident's state/timeline                |
  * | incident.close     | Close/resolve an incident                         |
  * | field.acknowledge  | Acknowledge a field task/dispatch                 |
+ * | field.assignment.manage | Create/cancel Field assignments              |
+ * | field.assignment.act | Accept/start/complete own Field assignments       |
+ * | field.state.write  | Submit audited Field operative state              |
+ * | field.state.read   | Read audited Field operative state                |
  * | event.ingest       | Submit normalised events                          |
  * | evidence.read      | Read preserved evidence                           |
  * | ledger.read        | Read Decision Ledger entries                      |
@@ -38,6 +42,10 @@ export const ACTIONS = [
   'incident.close',
   'incident.silent.approve',
   'field.acknowledge',
+  'field.assignment.manage',
+  'field.assignment.act',
+  'field.state.write',
+  'field.state.read',
   'event.ingest',
   'event.read',
   'evidence.ingest',
@@ -68,10 +76,10 @@ export const ROLES = [
 export type Role = (typeof ROLES)[number];
 
 export const ROLE_ACTIONS: Readonly<Record<Role, readonly Action[]>> = {
-  'site.commander': ['incident.view', 'incident.close', 'incident.silent.approve', 'field.acknowledge', 'evidence.read', 'event.read', 'hypothesis.read'],
-  operator: ['incident.view', 'presence.view', 'event.ingest', 'event.read', 'hypothesis.read'],
-  dispatcher: ['incident.view', 'presence.view', 'event.read', 'hypothesis.read'],
-  'field.operative': ['field.acknowledge', 'incident.view'],
+  'site.commander': ['incident.view', 'incident.close', 'incident.silent.approve', 'field.acknowledge', 'field.assignment.manage', 'field.state.read', 'evidence.read', 'event.read', 'hypothesis.read'],
+  operator: ['incident.view', 'presence.view', 'field.state.read', 'event.ingest', 'event.read', 'hypothesis.read'],
+  dispatcher: ['incident.view', 'presence.view', 'field.assignment.manage', 'field.state.read', 'event.read', 'hypothesis.read'],
+  'field.operative': ['field.acknowledge', 'field.assignment.act', 'field.state.write', 'incident.view'],
   investigator: ['evidence.read', 'evidence.verify', 'ledger.read', 'ledger.verify', 'incident.view', 'event.read', 'hypothesis.read'],
   'evidence.custodian': ['evidence.read', 'evidence.ingest', 'evidence.verify'],
   admin: ['org.admin', 'site.admin', 'user.admin', 'incident.view', 'constitution.policy.read', 'ledger.verify'],

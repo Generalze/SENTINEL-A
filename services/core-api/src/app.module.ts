@@ -17,6 +17,7 @@ import { LedgerModule } from './modules/ledger/ledger.module';
 import { RealtimeModule } from './modules/realtime/realtime.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { IncidentsModule } from './modules/incidents/incidents.module';
+import { FieldModule } from './modules/field/field.module';
 
 @Module({
   imports: [
@@ -50,6 +51,7 @@ import { IncidentsModule } from './modules/incidents/incidents.module';
     RealtimeModule,
     FusionModule,
     IncidentsModule,
+    FieldModule,
   ],
 })
 export class AppModule {}

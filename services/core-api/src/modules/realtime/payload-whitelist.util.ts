@@ -9,7 +9,7 @@
  * evidence refs, model internals, ...) is dropped.
  */
 const ID_ALIASES = ['id', 'hypothesis_id', 'incident_id', 'incident_candidate_id'] as const;
-const PASSTHROUGH_KEYS = ['organisation_id', 'site_id', 'state', 'severity', 'status', 'updated_at'] as const;
+const PASSTHROUGH_KEYS = ['organisation_id', 'site_id', 'state', 'severity', 'status', 'updated_at', 'kind', 'assignment_id', 'user_id'] as const;
 
 export type WhitelistedRealtimePayload = Readonly<Record<string, unknown>>;
 

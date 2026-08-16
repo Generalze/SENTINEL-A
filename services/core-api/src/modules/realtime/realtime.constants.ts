@@ -34,12 +34,14 @@ export function resolveWsCorsOrigin(): string | string[] {
  */
 export const NATS_SUBJECT_HYPOTHESIS = 'sentinel.fusion.hypothesis.>';
 export const NATS_SUBJECT_INCIDENT = 'sentinel.incidents.updated.>';
+export const NATS_SUBJECT_FIELD = 'sentinel.field.updated.>';
 
-/** Both subjects above carry `{organisation_id}` as their 4th dot-segment. */
+/** All update subjects above carry `{organisation_id}` as their 4th dot-segment. */
 export const SUBJECT_ORG_ID_SEGMENT_INDEX = 3;
 
 export const WS_EVENT_HYPOTHESIS_UPDATED = 'hypothesis.updated';
 export const WS_EVENT_INCIDENT_UPDATED = 'incident.updated';
+export const WS_EVENT_FIELD_UPDATED = 'field.updated';
 export const WS_EVENT_PRESENCE_CHANGED = 'presence.changed';
 
 /** Deliverable #4: `sentinel:presence:{organisation_id}` hash, field = user_id. */

@@ -1,0 +1,135 @@
+// SENTINEL Field domain (WP-16, architecture sections 13, 67, 76).
+// Owned exclusively by services/core-api/src/modules/field. Cross-domain
+// identifiers are scalar values; service-layer reads enforce tenant/site scope.
+
+model FieldAssignment {
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  siteId String @map("site_id") @db.Text
+  incidentId String? @map("incident_id") @db.Uuid
+  assigneeUserId String @map("assignee_user_id") @db.Text
+  assignmentType String @map("assignment_type") @db.Text
+  priority String @db.Text
+  status String @default("REQUESTED") @db.Text
+  deliveryState String @default("REQUESTED") @map("delivery_state") @db.Text
+  needToKnowSummary String @map("need_to_know_summary") @db.Text
+  idempotencyKey String @map("idempotency_key") @db.Text
+
+  expiresAt DateTime? @map("expires_at") @db.Timestamptz(3)
+  acceptedAt DateTime? @map("accepted_at") @db.Timestamptz(3)
+  startedAt DateTime? @map("started_at") @db.Timestamptz(3)
+  completedAt DateTime? @map("completed_at") @db.Timestamptz(3)
+  cancelledAt DateTime? @map("cancelled_at") @db.Timestamptz(3)
+  declinedAt DateTime? @map("declined_at") @db.Timestamptz(3)
+
+  createdByUserId String @map("created_by_user_id") @db.Text
+  updatedByUserId String @map("updated_by_user_id") @db.Text
+  acceptedByUserId String? @map("accepted_by_user_id") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  actionIdempotency FieldAssignmentActionIdempotency[]
+
+  @@unique([organisationId, siteId, idempotencyKey], map: "field_assignment_create_idem_key")
+  @@index([organisationId, siteId, status], map: "field_assignment_status_idx")
+  @@index([organisationId, siteId, assigneeUserId], map: "field_assignment_assignee_idx")
+  @@index([incidentId])
+  @@map("field_assignments")
+}
+
+model FieldAssignmentActionIdempotency {
+  id String @id @default(uuid()) @db.Uuid
+  assignmentId String @map("assignment_id") @db.Uuid
+  assignment FieldAssignment @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  action String @db.Text
+  idempotencyKey String @map("idempotency_key") @db.Text
+  actorUserId String @map("actor_user_id") @db.Text
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([assignmentId, action, idempotencyKey], map: "field_assignment_action_idem_key")
+  @@index([assignmentId, createdAt], map: "field_assignment_action_created_idx")
+  @@map("field_assignment_action_idempotency")
+}
+
+model FieldOperativeCurrentState {
+  id String @id @default(uuid()) @db.Uuid
+  organisationId String @map("organisation_id") @db.Text
+  siteId String @map("site_id") @db.Text
+  userId String @map("user_id") @db.Text
+  deviceId String @map("device_id") @db.Text
+  state String @db.Text
+  location Json?
+  sourceAt DateTime @map("source_at") @db.Timestamptz(3)
+  receivedAt DateTime @map("received_at") @db.Timestamptz(3)
+  clientFreshnessMs Int @map("client_freshness_ms")
+  authoritativeFreshnessMs Int @map("authoritative_freshness_ms")
+  traceId String @map("trace_id") @db.Text
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([organisationId, siteId, userId], map: "field_current_state_scope_key")
+  @@index([organisationId, siteId, state], map: "field_current_state_state_idx")
+  @@map("field_operative_current_states")
+}
+
+model FieldOperativeStateHistory {
+  id String @id @default(uuid()) @db.Uuid
+  organisationId String @map("organisation_id") @db.Text
+  siteId String @map("site_id") @db.Text
+  userId String @map("user_id") @db.Text
+  deviceId String @map("device_id") @db.Text
+  state String @db.Text
+  location Json?
+  sourceAt DateTime @map("source_at") @db.Timestamptz(3)
+  receivedAt DateTime @map("received_at") @db.Timestamptz(3)
+  clientFreshnessMs Int @map("client_freshness_ms")
+  authoritativeFreshnessMs Int @map("authoritative_freshness_ms")
+  traceId String @map("trace_id") @db.Text
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([organisationId, siteId, userId, createdAt], map: "field_state_history_user_created_idx")
+  @@map("field_operative_state_history")
+}
+
+model FieldStateUpdateIdempotency {
+  id String @id @default(uuid()) @db.Uuid
+  organisationId String @map("organisation_id") @db.Text
+  siteId String @map("site_id") @db.Text
+  userId String @map("user_id") @db.Text
+  deviceId String @map("device_id") @db.Text
+  idempotencyKey String @map("idempotency_key") @db.Text
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([organisationId, siteId, userId, deviceId, idempotencyKey], map: "field_state_update_idem_key")
+  @@index([organisationId, siteId, userId, createdAt], map: "field_state_update_user_created_idx")
+  @@map("field_state_update_idempotency")
+}
+
+model FieldAuditLog {
+  id String @id @default(uuid()) @db.Uuid
+  organisationId String @map("organisation_id") @db.Text
+  siteId String @map("site_id") @db.Text
+  assignmentId String? @map("assignment_id") @db.Uuid
+  actorUserId String? @map("actor_user_id") @db.Text
+  kind String @db.Text
+  payload Json @default("{}")
+  at DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([organisationId, siteId, at], map: "field_audit_scope_at_idx")
+  @@index([assignmentId, at], map: "field_audit_assignment_at_idx")
+  @@map("field_audit_log")
+}
+
+model FieldOutbox {
+  id String @id @default(uuid()) @db.Uuid
+  organisationId String @map("organisation_id") @db.Text
+  siteId String @map("site_id") @db.Text
+  payload Json
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  publishedAt DateTime? @map("published_at") @db.Timestamptz(3)
+
+  @@index([publishedAt, createdAt], map: "field_outbox_publish_idx")
+  @@index([organisationId, siteId, createdAt], map: "field_outbox_scope_created_idx")
+  @@map("field_outbox")
+}
