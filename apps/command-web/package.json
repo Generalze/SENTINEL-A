@@ -11,13 +11,21 @@
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
+    "@tanstack/react-query": "^5.101.4",
     "react": "^18",
-    "react-dom": "^18"
+    "react-dom": "^18",
+    "socket.io-client": "^4.8.3"
   },
   "devDependencies": {
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.2",
     "@types/react": "^18",
     "@types/react-dom": "^18",
     "@vitejs/plugin-react": "^4",
+    "autoprefixer": "^10.5.4",
+    "jsdom": "^30.0.1",
+    "postcss": "^8.5.26",
+    "tailwindcss": "^4.3.3",
     "typescript": "^5",
     "vite": "^6",
     "vitest": "^2"

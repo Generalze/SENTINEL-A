@@ -1,5 +1,5 @@
 import { ForbiddenException, NotFoundException } from '@nestjs/common';
-import type { Event as EventRow, Evidence as EvidenceRow, EvidenceCustodyEvent as CustodyRow } from '@prisma/client';
+import { Prisma, type Event as EventRow, Evidence as EvidenceRow, EvidenceCustodyEvent as CustodyRow } from '@prisma/client';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { sha256Hex } from './evidence.hash';
 import type { EvidenceObjectStoreProvider } from './evidence-object-store.provider';
@@ -19,6 +19,7 @@ function buildEvidenceRow(overrides: Partial<EvidenceRow> = {}): EvidenceRow {
     classification: 'EVIDENCE',
     derivedFromEvidenceId: null,
     incidentId: null,
+    responseTaskId: null,
     relatedEventIds: [],
     capturedAt: new Date('2026-01-01T00:00:00.000Z'),
     storedAt: new Date('2026-01-01T00:00:01.000Z'),
@@ -75,6 +76,7 @@ function makeRepository(): EvidenceRepository {
     findById: vi.fn(),
     list: vi.fn(),
     findEventsByIds: vi.fn(),
+    findSnapshotForResponseTask: vi.fn(),
   } as unknown as EvidenceRepository;
 }
 
@@ -312,6 +314,57 @@ describe('EvidenceService.preserveEventSnapshot', () => {
       service.preserveEventSnapshot({ organisation_id: 'org-1', incident_id: 'inc-1', event_ids: ['missing-evt'], actor: { kind: 'system' } }),
     ).rejects.toBeInstanceOf(NotFoundException);
     expect(repository.createEvidence).not.toHaveBeenCalled();
+  });
+
+  it('accepts Fusion NormalisedEvent.event_id values and stores canonical Event UUID references', async () => {
+    const event = buildEventRow({ id: 'evt-uuid-canonical', eventId: 'external-event-id' });
+    vi.mocked(repository.findEventsByIds).mockResolvedValue([event]);
+    vi.mocked(repository.createEvidence).mockImplementation(async (data) =>
+      buildEvidenceRow({ id: data.id as string, classification: data.classification as EvidenceRow['classification'] }),
+    );
+    vi.mocked(repository.createCustodyEvent).mockResolvedValue(buildCustodyRow());
+
+    await service.preserveEventSnapshot({
+      organisation_id: 'org-1',
+      incident_id: 'inc-1',
+      event_ids: [event.eventId],
+      actor: { kind: 'system' },
+    });
+
+    expect(vi.mocked(repository.findEventsByIds)).toHaveBeenCalledWith('org-1', [event.eventId]);
+    expect(vi.mocked(repository.createEvidence).mock.calls[0][0].relatedEventIds).toEqual([event.id]);
+  });
+
+  it('returns an existing response-task snapshot without writing a duplicate on retry', async () => {
+    vi.mocked(repository.findSnapshotForResponseTask).mockResolvedValue(buildEvidenceRow({ id: 'existing-snapshot' }));
+
+    await expect(
+      service.preserveEventSnapshot({
+        organisation_id: 'org-1',
+        incident_id: 'inc-1',
+        event_ids: ['evt-1'],
+        response_task_id: 'task-1',
+        actor: { kind: 'system' },
+      }),
+    ).resolves.toBe('existing-snapshot');
+    expect(repository.findEventsByIds).not.toHaveBeenCalled();
+    expect(repository.createEvidence).not.toHaveBeenCalled();
+  });
+
+  it('recovers the canonical response-task snapshot when concurrent persistence hits its unique boundary', async () => {
+    const event = buildEventRow();
+    vi.mocked(repository.findEventsByIds).mockResolvedValue([event]);
+    vi.mocked(repository.createEvidence).mockRejectedValue(
+      new Prisma.PrismaClientKnownRequestError('duplicate response task', { code: 'P2002', clientVersion: '6.19.3' }),
+    );
+    vi.mocked(repository.findSnapshotForResponseTask).mockResolvedValue(buildEvidenceRow({ id: 'canonical-snapshot', responseTaskId: 'task-1' }));
+
+    await expect(
+      service.preserveEventSnapshot({
+        organisation_id: 'org-1', incident_id: 'inc-1', event_ids: [event.id], response_task_id: 'task-1', actor: { kind: 'system' },
+      }),
+    ).resolves.toBe('canonical-snapshot');
+    expect(repository.createCustodyEvent).not.toHaveBeenCalled();
   });
 });
 

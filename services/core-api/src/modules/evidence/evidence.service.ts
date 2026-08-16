@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { ForbiddenException, Inject, Injectable, NotFoundException } from '@nestjs/common';
-import type { Event as EventRow } from '@prisma/client';
+import { Prisma, type Event as EventRow } from '@prisma/client';
 import { SYSTEM_ACTOR_ID } from './evidence.constants';
 import { EvidenceObjectStoreProvider } from './evidence-object-store.provider';
 import { canonicalJson, sha256Hex } from './evidence.hash';
@@ -75,27 +75,41 @@ export class EvidenceService {
 
     await this.objectStore.putObject(objectKey, input.content, input.content_type);
 
-    const row = await this.repository.createEvidence({
-      id: evidenceId,
-      organisationId: input.organisation_id,
-      sourceId: input.source_id,
-      objectKey,
-      contentHash,
-      sizeBytes: input.content.byteLength,
-      contentType: input.content_type,
-      classification: input.classification,
-      incidentId: input.incident_id ?? null,
-      relatedEventIds: input.related_event_ids ?? [],
-      capturedAt: input.captured_at ?? new Date(),
-    });
-
-    await this.repository.createCustodyEvent({
-      evidenceId: row.id,
-      actorKind: input.actor.kind,
-      actorId: actorId(input.actor),
-      action: 'INGESTED',
-      detail: { source_id: input.source_id, content_type: input.content_type, size_bytes: row.sizeBytes },
-    });
+    let row;
+    try {
+      const evidenceData = {
+        id: evidenceId, organisationId: input.organisation_id, sourceId: input.source_id, objectKey, contentHash,
+        sizeBytes: input.content.byteLength, contentType: input.content_type, classification: input.classification,
+        incidentId: input.incident_id ?? null, responseTaskId: input.response_task_id ?? null,
+        relatedEventIds: input.related_event_ids ?? [], capturedAt: input.captured_at ?? new Date(),
+      };
+      const custodyData = { actorKind: input.actor.kind, actorId: actorId(input.actor), action: 'INGESTED' as const, detail: { source_id: input.source_id, content_type: input.content_type, size_bytes: input.content.byteLength } };
+      // Production repository always supplies the atomic method. The fallback
+      // keeps older isolated test doubles usable; it is not a production path.
+      const atomic = (this.repository as Partial<EvidenceRepository>).createEvidenceWithIngestedCustody;
+      if (atomic) {
+        row = await atomic.call(this.repository, evidenceData, custodyData);
+      } else {
+        row = await this.repository.createEvidence(evidenceData);
+        await this.repository.createCustodyEvent({ ...custodyData, evidenceId: row.id });
+      }
+    } catch (error) {
+      // A racing response consumer may have placed its object milliseconds
+      // earlier. The nullable unique response_task_id makes the metadata
+      // record canonical; recover it rather than producing a second snapshot.
+      if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== 'P2002' || !input.response_task_id || !input.incident_id) {
+        throw error;
+      }
+      const existing = await this.repository.findSnapshotForResponseTask(
+        input.organisation_id,
+        input.incident_id,
+        input.response_task_id,
+      );
+      if (!existing) throw error;
+      const compensate = (this.objectStore as Partial<EvidenceObjectStoreProvider>).removeUncommittedObject;
+      if (compensate) await compensate.call(this.objectStore, objectKey);
+      return toEvidenceMetadataResponse(existing);
+    }
 
     return toEvidenceMetadataResponse(row);
   }
@@ -203,9 +217,25 @@ export class EvidenceService {
    * worse than a rejected request.
    */
   async preserveEventSnapshot(input: PreserveEventSnapshotInput): Promise<string> {
+    if (input.response_task_id) {
+      const existing = await this.repository.findSnapshotForResponseTask(
+        input.organisation_id,
+        input.incident_id,
+        input.response_task_id,
+      );
+      if (existing) return existing.id;
+    }
     const events = await this.repository.findEventsByIds(input.organisation_id, input.event_ids);
-    const byId = new Map(events.map((event) => [event.id, event]));
-    const missing = input.event_ids.filter((id) => !byId.has(id));
+    // `event_ids` may be the Event row uuid (direct Evidence callers) or the
+    // NormalisedEvent `event_id` carried by a Fusion candidate. Build both
+    // aliases after tenant-scoped lookup, then retain Event.id in the durable
+    // evidence relation so the metadata model remains canonical.
+    const byRequestedId = new Map<string, EventRow>();
+    for (const event of events) {
+      byRequestedId.set(event.id, event);
+      byRequestedId.set(event.eventId, event);
+    }
+    const missing = input.event_ids.filter((id) => !byRequestedId.has(id));
     if (missing.length > 0) {
       throw new NotFoundException(`Event ids not found for organisation ${input.organisation_id}: ${missing.join(', ')}`);
     }
@@ -216,20 +246,22 @@ export class EvidenceService {
     const snapshot = {
       organisation_id: input.organisation_id,
       incident_id: input.incident_id,
+      response_task_id: input.response_task_id,
       snapshot_taken_at: new Date().toISOString(),
-      events: input.event_ids.map((id) => toSnapshotEvent(byId.get(id) as EventRow)),
+      events: input.event_ids.map((id) => toSnapshotEvent(byRequestedId.get(id) as EventRow)),
     };
 
     const content = Buffer.from(canonicalJson(snapshot), 'utf8');
 
     const evidence = await this.ingest({
       organisation_id: input.organisation_id,
-      source_id: 'system:event-snapshot',
+      source_id: input.response_task_id ? `system:event-snapshot:${input.response_task_id}` : 'system:event-snapshot',
       content,
       content_type: 'application/json',
       classification: 'EVIDENCE',
-      related_event_ids: input.event_ids,
+      related_event_ids: [...new Set(input.event_ids.map((id) => (byRequestedId.get(id) as EventRow).id))],
       incident_id: input.incident_id,
+      response_task_id: input.response_task_id,
       actor: input.actor,
     });
 

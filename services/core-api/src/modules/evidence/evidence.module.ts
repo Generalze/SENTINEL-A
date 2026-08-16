@@ -9,5 +9,6 @@ import { EvidenceService } from './evidence.service';
   imports: [PrismaModule],
   controllers: [EvidenceController],
   providers: [EvidenceRepository, EvidenceObjectStoreProvider, EvidenceService],
+  exports: [EvidenceService],
 })
 export class EvidenceModule {}

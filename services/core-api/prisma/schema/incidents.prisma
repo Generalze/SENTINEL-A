@@ -1,0 +1,126 @@
+// SENTINEL Incident & Response domain (WP-07, architecture §§12, 63, 76).
+// Owned exclusively by services/core-api/src/modules/incidents.  Cross-domain
+// identifiers are deliberately scalar values: this keeps Incident independent
+// from Fusion, Identity, and Evidence migration ordering while all reads stay
+// tenant-scoped in the service layer.
+
+model Incident {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// Exactly one incident may be created for a Fusion hypothesis.  This is the
+  /// durable idempotency boundary for JetStream redelivery.
+  hypothesisId String @unique @map("hypothesis_id") @db.Uuid
+  incidentCandidateId String @map("incident_candidate_id") @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  siteId String @map("site_id") @db.Text
+  incidentType String @map("incident_type") @db.Text
+  severity String @db.Text
+  threatState Int @map("threat_state")
+  confidence Float
+  responseMode String @map("response_mode") @db.Text
+  commanderUserId String? @map("commander_user_id") @db.Text
+  relatedEventIds String[] @default([]) @map("related_event_ids")
+  supportingEventIds String[] @default([]) @map("supporting_event_ids")
+  contradictingEventIds String[] @default([]) @map("contradicting_event_ids")
+  playbookVersion String? @map("playbook_version") @db.Text
+  status String @default("open") @db.Text
+  closureReason String? @map("closure_reason") @db.Text
+  openedAt DateTime @default(now()) @map("opened_at") @db.Timestamptz(3)
+  closedAt DateTime? @map("closed_at") @db.Timestamptz(3)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  timeline IncidentTimelineEntry[]
+  responseTasks ResponseTask[]
+
+  @@index([organisationId, status])
+  @@index([organisationId, severity])
+  @@index([organisationId, openedAt])
+  @@map("incidents")
+}
+
+/// Append-only operational record.  No write path updates or deletes these
+/// rows; corrections are expressed as subsequent entries.
+model IncidentTimelineEntry {
+  id String @id @default(uuid()) @db.Uuid
+  incidentId String @map("incident_id") @db.Uuid
+  incident Incident @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+  at DateTime @default(now()) @db.Timestamptz(3)
+  kind String @db.Text
+  actorUserId String? @map("actor_user_id") @db.Text
+  payload Json @default("{}")
+
+  @@index([incidentId, at])
+  @@map("incident_timeline_entries")
+}
+
+/// A versioned playbook task.  `deliveryState` uses @sentinel/contracts §76
+/// values and is only moved by the incident service after canTransition().
+model ResponseTask {
+  id String @id @default(uuid()) @db.Uuid
+  incidentId String @map("incident_id") @db.Uuid
+  incident Incident @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+  taskType String @map("task_type") @db.Text
+  playbookVersion String @map("playbook_version") @db.Text
+  deliveryState String @default("REQUESTED") @map("delivery_state") @db.Text
+  /// Completion is deliberately independent from §76 delivery state: an
+  /// automatic evidence action can complete without pretending a transport
+  /// delivered or a human acknowledged it.
+  completedAt DateTime? @map("completed_at") @db.Timestamptz(3)
+  completionDetail Json? @map("completion_detail")
+  evidenceSnapshotId String? @unique @map("evidence_snapshot_id") @db.Uuid
+  evidenceSnapshotStartedAt DateTime? @map("evidence_snapshot_started_at") @db.Timestamptz(3)
+  acknowledgedAt DateTime? @map("acknowledged_at") @db.Timestamptz(3)
+  acknowledgedByUserId String? @map("acknowledged_by_user_id") @db.Text
+  payload Json @default("{}")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  dispatchHandoff ResponseDispatchHandoff?
+  silentApprovals ResponseTaskSilentApproval[]
+
+  @@unique([incidentId, taskType])
+  @@index([incidentId, deliveryState])
+  @@map("response_tasks")
+}
+
+/// Append-only task-scoped approvals for a pending SILENT dispatch. The unique
+/// task/user pair makes retrying an approver submission idempotent.
+model ResponseTaskSilentApproval {
+  id String @id @default(uuid()) @db.Uuid
+  taskId String @map("task_id") @db.Uuid
+  task ResponseTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  userId String @map("user_id") @db.Text
+  claimedRole String @map("claimed_role") @db.Text
+  approvedAt DateTime @default(now()) @map("approved_at") @db.Timestamptz(3)
+
+  @@unique([taskId, userId])
+  @@index([taskId, approvedAt])
+  @@map("response_task_silent_approvals")
+}
+
+/// Transactional incident-update outbox. Consumers may see duplicates, but a
+/// committed state mutation can never lose its repairable notification record.
+model IncidentUpdateOutbox {
+  id String @id @default(uuid()) @db.Uuid
+  incidentId String @map("incident_id") @db.Uuid
+  organisationId String @map("organisation_id") @db.Text
+  payload Json
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  publishedAt DateTime? @map("published_at") @db.Timestamptz(3)
+
+  @@index([publishedAt, createdAt])
+  @@index([organisationId, createdAt])
+  @@map("incident_update_outbox")
+}
+
+model ResponseDispatchHandoff {
+  id String @id @default(uuid()) @db.Uuid
+  taskId String @unique @map("task_id") @db.Uuid
+  task ResponseTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  acceptedAt DateTime @default(now()) @map("accepted_at") @db.Timestamptz(3)
+  destination String @db.Text
+  receipt Json @default("{}")
+
+  @@map("response_dispatch_handoffs")
+}

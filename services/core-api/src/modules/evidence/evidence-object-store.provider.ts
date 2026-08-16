@@ -1,6 +1,6 @@
 import type { Readable } from 'node:stream';
 import { Inject, Injectable, Logger, type OnModuleInit } from '@nestjs/common';
-import { CreateBucketCommand, GetObjectCommand, HeadBucketCommand, PutObjectCommand, S3Client, S3ServiceException } from '@aws-sdk/client-s3';
+import { CreateBucketCommand, DeleteObjectCommand, GetObjectCommand, HeadBucketCommand, PutObjectCommand, S3Client, S3ServiceException } from '@aws-sdk/client-s3';
 import { AppConfigService } from '../../config/config.service';
 import { OBJECT_KEY_SEPARATOR } from './evidence.constants';
 
@@ -110,6 +110,12 @@ export class EvidenceObjectStoreProvider implements OnModuleInit {
     await this.ensureBucket();
     const result = await this.client.send(new GetObjectCommand({ Bucket: this.bucket, Key: objectKey }));
     return streamToBuffer(result.Body as Readable);
+  }
+
+  /** Compensation ONLY for this caller's just-uploaded object after its DB
+   * insert lost a unique race. Never accepts a committed Evidence id/key. */
+  async removeUncommittedObject(objectKey: string): Promise<void> {
+    await this.client.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: objectKey }));
   }
 }
 

@@ -36,6 +36,7 @@
 export const ACTIONS = [
   'incident.view',
   'incident.close',
+  'incident.silent.approve',
   'field.acknowledge',
   'event.ingest',
   'event.read',
@@ -67,7 +68,7 @@ export const ROLES = [
 export type Role = (typeof ROLES)[number];
 
 export const ROLE_ACTIONS: Readonly<Record<Role, readonly Action[]>> = {
-  'site.commander': ['incident.view', 'incident.close', 'field.acknowledge', 'evidence.read', 'event.read', 'hypothesis.read'],
+  'site.commander': ['incident.view', 'incident.close', 'incident.silent.approve', 'field.acknowledge', 'evidence.read', 'event.read', 'hypothesis.read'],
   operator: ['incident.view', 'presence.view', 'event.ingest', 'event.read', 'hypothesis.read'],
   dispatcher: ['incident.view', 'presence.view', 'event.read', 'hypothesis.read'],
   'field.operative': ['field.acknowledge', 'incident.view'],

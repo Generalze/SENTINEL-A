@@ -266,6 +266,39 @@ describe('boot: seeding and loading the active policy', () => {
   });
 });
 
+describe('certified baseline upgrade from 1.1 to 1.2', () => {
+  it('stages and activates 1.2 through the two-person gate without overwriting 1.1', async () => {
+    const legacy = baselineCopy('sentinel-constitution-1.1.0');
+    const categories = { ...legacy.categories };
+    const actions = { ...legacy.actions };
+    const roles = { ...legacy.roles };
+    delete categories['response_dispatch_standard'];
+    delete categories['response_dispatch_silent'];
+    delete actions['response.dispatch.standard'];
+    delete actions['response.dispatch.silent'];
+    delete roles['system.response'];
+    const legacyPolicy: Policy = { ...legacy, categories, actions, roles };
+    repository.rows.push(storedFrom(legacyPolicy, 'active', 'legacy-bootstrap'));
+
+    await service.onModuleInit();
+    expect(service.activePolicy.version).toBe('sentinel-constitution-1.1.0');
+    await service.createDraft(SENTINEL_BASELINE_POLICY, 'u-steward');
+
+    const result = await service.activatePolicy({
+      version: SENTINEL_BASELINE_POLICY.version,
+      actor: steward(),
+      ...TWO_AUTHORISED_APPROVERS,
+      traceId: 'constitution-upgrade-1.1-to-1.2',
+    });
+
+    expect(result.activated).toBe(true);
+    expect(result.active.version).toBe('sentinel-constitution-1.2.0');
+    expect(repository.rows.find((row) => row.version === 'sentinel-constitution-1.1.0')?.status).toBe('retired');
+    expect(sink.entries).toHaveLength(1);
+    expect(sink.entries[0]?.trace_id).toBe('constitution-upgrade-1.1-to-1.2');
+  });
+});
+
 describe('ledger: every evaluation emits exactly one record', () => {
   beforeEach(async () => {
     await service.onModuleInit();
@@ -350,7 +383,7 @@ describe('ledger: every evaluation emits exactly one record', () => {
 });
 
 describe('activation is gated by the constitution itself (§58.2)', () => {
-  const NEXT_VERSION = 'sentinel-constitution-1.2.0';
+  const NEXT_VERSION = 'sentinel-constitution-1.3.0';
 
   beforeEach(async () => {
     await service.onModuleInit();

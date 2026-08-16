@@ -107,7 +107,7 @@ export function policyBody(policy: Policy): Record<string, unknown> {
  * by two members of the same function colluding.
  */
 export const SENTINEL_BASELINE_POLICY: Policy = freezePolicy({
-  version: 'sentinel-constitution-1.1.0',
+  version: 'sentinel-constitution-1.2.0',
 
   categories: {
     routine_read: {
@@ -119,6 +119,16 @@ export const SENTINEL_BASELINE_POLICY: Policy = freezePolicy({
       approval: 'NONE',
       description: 'Annotation of operational records.',
       approval_roles: [],
+    },
+    response_dispatch_standard: {
+      approval: 'NONE',
+      description: 'Dispatch through an ordinary, policy-authorised response channel.',
+      approval_roles: [],
+    },
+    response_dispatch_silent: {
+      approval: 'TWO_PERSON',
+      description: 'Silent field dispatch that must not reveal protective coordination.',
+      approval_roles: ['site.commander'],
     },
 
     sensitive_data_export: {
@@ -184,6 +194,8 @@ export const SENTINEL_BASELINE_POLICY: Policy = freezePolicy({
   actions: {
     'incident.view': 'routine_read',
     'incident.annotate': 'routine_write',
+    'response.dispatch.standard': 'response_dispatch_standard',
+    'response.dispatch.silent': 'response_dispatch_silent',
     'report.export.summary': 'sensitive_data_export',
     'user.role.grant': 'account_privilege_change',
 
@@ -203,6 +215,7 @@ export const SENTINEL_BASELINE_POLICY: Policy = freezePolicy({
 
   roles: {
     viewer: ['incident.view'],
+    'system.response': ['response.dispatch.standard', 'response.dispatch.silent'],
     analyst: ['incident.view', 'incident.annotate', 'report.export.summary'],
     'evidence.custodian': [
       'incident.view',

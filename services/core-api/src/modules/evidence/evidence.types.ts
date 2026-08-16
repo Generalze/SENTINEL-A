@@ -11,6 +11,7 @@ export interface IngestInput {
   classification: EvidenceClassificationLevel;
   related_event_ids?: string[];
   incident_id?: string;
+  response_task_id?: string;
   /** When the underlying material was captured; defaults to now() if omitted. */
   captured_at?: Date;
   actor: CustodyActor;
@@ -32,6 +33,8 @@ export interface PreserveEventSnapshotInput {
   incident_id: string;
   event_ids: string[];
   actor: CustodyActor;
+  /** Stable response-task identity used to make orchestration retries idempotent. */
+  response_task_id?: string;
 }
 
 export interface EvidenceMetadataResponse {

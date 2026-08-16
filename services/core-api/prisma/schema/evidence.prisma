@@ -103,6 +103,10 @@ model Evidence {
   /// against a known incident). Plain string, no FK — see file header.
   incidentId String? @map("incident_id")
 
+  /// Nullable for ordinary evidence. A response task may preserve exactly one
+  /// snapshot, enforced structurally across concurrent consumer deliveries.
+  responseTaskId String? @unique @map("response_task_id") @db.Uuid
+
   /// Event ids (events.id, the Event model's uuid) this evidence item is
   /// derived from or otherwise references. Populated by
   /// preserveEventSnapshot(); free-form for any future caller that wants

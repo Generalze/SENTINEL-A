@@ -26,6 +26,19 @@ export class EvidenceRepository {
     return this.prisma.evidenceCustodyEvent.create({ data });
   }
 
+  /** Atomic post-upload commit: an Evidence row is never visible without its
+   * mandatory INGESTED custody line. */
+  async createEvidenceWithIngestedCustody(
+    evidence: Prisma.EvidenceUncheckedCreateInput,
+    custody: Omit<Prisma.EvidenceCustodyEventUncheckedCreateInput, 'evidenceId'>,
+  ): Promise<EvidenceRow> {
+    return this.prisma.$transaction(async (tx) => {
+      const row = await tx.evidence.create({ data: evidence });
+      await tx.evidenceCustodyEvent.create({ data: { ...custody, evidenceId: row.id } });
+      return row;
+    });
+  }
+
   /** Tenant-scoped lookup — `organisationId` is part of the WHERE, not checked after the fact. */
   async findById(id: string, organisationId: string): Promise<EvidenceRow | null> {
     return this.prisma.evidence.findFirst({ where: { id, organisationId } });
@@ -53,6 +66,25 @@ export class EvidenceRepository {
    */
   async findEventsByIds(organisationId: string, eventIds: string[]): Promise<EventRow[]> {
     if (eventIds.length === 0) return [];
-    return this.prisma.event.findMany({ where: { id: { in: eventIds }, organisationId } });
+    // Fusion's IncidentCandidate carries NormalisedEvent.event_id values,
+    // while direct Evidence callers historically supplied Event.id values.
+    // Resolve either identity strictly inside the same tenant; the resulting
+    // Evidence row records canonical Event.id values (see service).
+    // Event.id is UUID-typed while NormalisedEvent.event_id is arbitrary
+    // text. Never hand an external id to Prisma's UUID filter: PostgreSQL
+    // rejects it before it can evaluate the OR condition.
+    const rowIds = eventIds.filter((id) => UUID_PATTERN.test(id));
+    const identityPredicates: Prisma.EventWhereInput[] = [{ eventId: { in: eventIds } }];
+    if (rowIds.length > 0) identityPredicates.push({ id: { in: rowIds } });
+    return this.prisma.event.findMany({ where: { organisationId, OR: identityPredicates } });
+  }
+
+  async findSnapshotForResponseTask(organisationId: string, incidentId: string, responseTaskId: string): Promise<EvidenceRow | null> {
+    return this.prisma.evidence.findFirst({
+      where: { organisationId, incidentId, responseTaskId },
+      orderBy: { storedAt: 'asc' },
+    });
   }
 }
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;

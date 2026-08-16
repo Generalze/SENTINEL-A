@@ -1,6 +1,5 @@
 {
   "$schema": "https://turbo.build/schema.json",
-  "version": "2",
   "tasks": {
     "build": {
       "outputs": ["dist/**"],

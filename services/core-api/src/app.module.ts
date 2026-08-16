@@ -16,6 +16,7 @@ import { EvidenceModule } from './modules/evidence/evidence.module';
 import { LedgerModule } from './modules/ledger/ledger.module';
 import { RealtimeModule } from './modules/realtime/realtime.module';
 import { PrismaModule } from './prisma/prisma.module';
+import { IncidentsModule } from './modules/incidents/incidents.module';
 
 @Module({
   imports: [
@@ -48,6 +49,7 @@ import { PrismaModule } from './prisma/prisma.module';
     LedgerModule,
     RealtimeModule,
     FusionModule,
+    IncidentsModule,
   ],
 })
 export class AppModule {}
