@@ -7,3 +7,5 @@ export * from './threat.js';
 export * from './incident.js';
 export * from './delivery.js';
 export * from './ledger.js';
+export * from './field.js';
+export * from './whisper.js';
