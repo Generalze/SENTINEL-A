@@ -183,4 +183,7 @@ Recertification triggers: two failed reviews in a lane, or assignment to a new d
 
 ---
 
-*This plan is the standing order for Milestone 1. Changes to sections 2, 3, or 7 are lead-only decisions and must be committed with a rationale.*
+*This plan was the standing order for Milestone 1. Milestone 1 is closed by
+`docs/execution/MILESTONE-1-SIGNOFF.md`; the next execution slice is
+`docs/execution/MILESTONE-2-ROADMAP.md`. Changes to sections 2, 3, or 7 remain
+lead-only decisions and must be committed with a rationale.*

@@ -54,7 +54,11 @@ High-consequence actions require explicit policy authority. Sentinel may analyse
 
 ## Status
 
-Concept architecture baseline for lawful high-security protective operations — product planning and phased implementation (v1.1).
+Milestone 1 / Proof A is implemented and signed off in
+[`docs/execution/MILESTONE-1-SIGNOFF.md`](docs/execution/MILESTONE-1-SIGNOFF.md).
+The next execution slice is
+[`docs/execution/MILESTONE-2-ROADMAP.md`](docs/execution/MILESTONE-2-ROADMAP.md):
+Field Operations Foundation.
 
 ## License
 
