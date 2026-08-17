@@ -325,6 +325,83 @@ describe('Field REST surface (live stack, WP-16 AC7 / WP-17 AC6-AC8)', () => {
     expect(await prisma.fieldOperativeCurrentState.count({ where: { userId: fx.operativeA1, siteId: { not: fx.siteA1 } } })).toBe(0);
   });
 
+  it('WP-17A/C7-07: a Field write naming a nonexistent site and one naming another tenant real site are refused identically', async () => {
+    // The dispatcher is org-wide-capable at the API level here only because
+    // `site_id` is in the body; what must not happen is either request being
+    // told which of the two failure modes it hit.
+    const nonexistent = await post('/api/v1/field/assignments', fx.dispatcherA1, newAssignmentBody({ site_id: `${fx.siteA1}_ghost` }));
+    const otherTenant = await post('/api/v1/field/assignments', fx.dispatcherA1, newAssignmentBody({ site_id: fx.siteB1 }));
+
+    expect([403, 404]).toContain(nonexistent.status);
+    expect(otherTenant.status).toBe(nonexistent.status);
+    expect(await otherTenant.text()).toBe(await nonexistent.text());
+
+    expect(await prisma.fieldAssignment.count({ where: { siteId: { in: [`${fx.siteA1}_ghost`, fx.siteB1] } } })).toBe(0);
+  });
+
+  it('WP-17A/C7-07: an operative state write for a nonexistent site is refused and persists nothing', async () => {
+    const res = await post('/api/v1/field/state', fx.operativeA1, {
+      site_id: `${fx.siteA1}_ghost`,
+      device_id: 'device-wp17a',
+      state: 'AVAILABLE',
+      location: null,
+      source_at: new Date().toISOString(),
+      freshness_ms: 0,
+      idempotency_key: `state-${randomUUID()}`,
+      trace_id: `trace-${randomUUID()}`,
+    });
+
+    expect([403, 404]).toContain(res.status);
+    expect(await prisma.fieldOperativeCurrentState.count({ where: { siteId: `${fx.siteA1}_ghost` } })).toBe(0);
+    // The whole transactional bundle is absent, not just the live row.
+    expect(await prisma.fieldOperativeStateHistory.count({ where: { siteId: `${fx.siteA1}_ghost` } })).toBe(0);
+    expect(await prisma.fieldAuditLog.count({ where: { siteId: `${fx.siteA1}_ghost` } })).toBe(0);
+    expect(await prisma.fieldOutbox.count({ where: { siteId: `${fx.siteA1}_ghost` } })).toBe(0);
+  });
+
+  it('WP-17A: the database itself rejects a live Field row pairing one organisation with another tenant site', async () => {
+    // Defence in depth below the service layer: even a direct write that
+    // bypasses FieldService cannot create the cross-tenant pair, because the
+    // foreign key references (id, organisation_id) together rather than id.
+    await expect(
+      prisma.fieldAssignment.create({
+        data: {
+          organisationId: fx.orgA,
+          siteId: fx.siteB1, // a real Site — but org B's
+          assigneeUserId: fx.operativeA1,
+          assignmentType: 'INCIDENT_RESPONSE',
+          priority: 'SEV2',
+          needToKnowSummary: 'should never persist',
+          idempotencyKey: `fk-probe-${randomUUID()}`,
+          createdByUserId: fx.dispatcherA1,
+          updatedByUserId: fx.dispatcherA1,
+        },
+      }),
+    ).rejects.toThrow();
+
+    expect(await prisma.fieldAssignment.count({ where: { organisationId: fx.orgA, siteId: fx.siteB1 } })).toBe(0);
+  });
+
+  it('WP-17A: historical Field rows keep no Site foreign key, so audit history is never cascade-deletable', async () => {
+    // The ruling in field.prisma: live state is constrained, recorded history
+    // is not. This pins that the four historical/reliability tables have no
+    // FK to sites — a future Site lifecycle must not be able to erase them.
+    const constrained = await prisma.$queryRawUnsafe<Array<{ table_name: string }>>(
+      `SELECT DISTINCT tc.table_name::text AS table_name
+       FROM information_schema.table_constraints tc
+       JOIN information_schema.constraint_column_usage ccu ON ccu.constraint_name = tc.constraint_name
+       WHERE tc.constraint_type = 'FOREIGN KEY'
+         AND ccu.table_name = 'sites'
+         AND tc.table_name LIKE 'field_%'`,
+    );
+    const names = constrained.map((row) => row.table_name).sort();
+
+    expect(names).toEqual(['field_assignments', 'field_operative_current_states']);
+    for (const historical of ['field_operative_state_history', 'field_state_update_idempotency', 'field_audit_log', 'field_outbox']) {
+      expect(names).not.toContain(historical);
+    }
+  });
+
   it('WP-16 AC7: a dispatcher cannot act on an assignment, and an operative cannot cancel one', async () => {
     const created = await createAssignment();
     const dispatcherAccept = await post(`/api/v1/field/assignments/${created.id}/accept`, fx.dispatcherA1, {

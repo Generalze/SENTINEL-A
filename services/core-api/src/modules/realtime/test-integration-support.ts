@@ -134,15 +134,32 @@ export async function makeUserWithRoles(prisma: PrismaService, organisationId: s
 
 /**
  * Deletes everything the fixture helpers created for the given orgs, in FK
- * order: role assignments, then users, then sites, then organisations.
- * (`UserRole` references both `User` and `Site` without a cascade, so both
- * must go first — see prisma/schema/identity.prisma.)
+ * order: Field live state, then role assignments, then users, then zones, then
+ * sites, then organisations. (`UserRole` references both `User` and `Site`
+ * without a cascade — see prisma/schema/identity.prisma.)
+ *
+ * WP-17A: the two Field live-state tables now hold an `ON DELETE RESTRICT`
+ * composite foreign key to `sites`, so a site cannot be deleted while a Field
+ * assignment or current-state row still names it. No spec using this helper
+ * writes Field rows today, but this is a *shared* helper that deletes sites,
+ * and leaving the gap would turn the first spec that does into a confusing
+ * foreign-key error inside `afterAll` rather than an obvious test failure.
+ * Deleting them here is cheap and keeps the helper honest about its promise to
+ * remove everything for the given organisations.
+ *
+ * Deliberately NOT deleted here: Field history, idempotency, audit, and outbox
+ * rows. They carry no site foreign key by design (they are the record of what
+ * was known at the time), so they never block a site delete — and a shared test
+ * helper is not the place to establish habits about erasing audit history.
  */
 export async function cleanupOrgsAndUsers(prisma: PrismaService, organisationIds: readonly string[]): Promise<void> {
   if (organisationIds.length === 0) {
     return;
   }
   const ids = [...organisationIds];
+  await prisma.fieldAssignmentActionIdempotency.deleteMany({ where: { assignment: { organisationId: { in: ids } } } });
+  await prisma.fieldAssignment.deleteMany({ where: { organisationId: { in: ids } } });
+  await prisma.fieldOperativeCurrentState.deleteMany({ where: { organisationId: { in: ids } } });
   await prisma.userRole.deleteMany({ where: { user: { organisationId: { in: ids } } } });
   await prisma.user.deleteMany({ where: { organisationId: { in: ids } } });
   await prisma.zone.deleteMany({ where: { site: { organisationId: { in: ids } } } });

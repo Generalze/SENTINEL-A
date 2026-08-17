@@ -1,6 +1,34 @@
 // SENTINEL Field domain (WP-16, architecture sections 13, 67, 76).
-// Owned exclusively by services/core-api/src/modules/field. Cross-domain
-// identifiers are scalar values; service-layer reads enforce tenant/site scope.
+// Owned exclusively by services/core-api/src/modules/field. Service-layer reads
+// enforce tenant/site scope on every path.
+//
+// WP-17A site referential integrity — the split in this file is deliberate:
+//
+//   LIVE DOMAIN STATE (FieldAssignment, FieldOperativeCurrentState)
+//     carries a composite (site_id, organisation_id) relation to Site with
+//     onDelete: Restrict. These rows assert something true *right now*, so the
+//     site they name must exist and must belong to the same organisation. The
+//     reference is composite rather than a plain Site.id FK so the database
+//     itself rejects a row that pairs one tenant's organisation with another
+//     tenant's site (§62.1 defence in depth).
+//
+//   HISTORICAL / RELIABILITY ARTEFACTS (FieldOperativeStateHistory,
+//   FieldStateUpdateIdempotency, FieldAuditLog, FieldOutbox)
+//     deliberately carry NO Site foreign key. Their `site_id` is the site
+//     identifier as recorded at the time of the event, and it must stay that
+//     way. `Cascade` would let a site's lifecycle erase security history
+//     (forbidden by §61); `Restrict` on every one of them would mean a site
+//     could never be removed once it had produced a single audit row, which
+//     silently invents a Site retirement policy this work package has no
+//     mandate to decide. Their integrity comes from the write-time check
+//     instead: the service proves the site exists in the organisation BEFORE
+//     the transaction that writes the live row, the history row, the audit row
+//     and the outbox row together.
+//
+// See docs/execution/directives/WP-17A-field-site-integrity.md for the locked
+// ruling, including the rule that a future Site lifecycle feature must define
+// RETIRED/tombstone semantics before any hard delete, and must never cascade
+// or rewrite retained Field history to make a deletion possible.
 
 model FieldAssignment {
   id String @id @default(uuid()) @db.Uuid
@@ -31,6 +59,9 @@ model FieldAssignment {
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   actionIdempotency FieldAssignmentActionIdempotency[]
+
+  /// WP-17A: composite so the pair must match, not just the site id.
+  site Site @relation(fields: [siteId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
 
   @@unique([organisationId, siteId, idempotencyKey], map: "field_assignment_create_idem_key")
   @@index([organisationId, siteId, status], map: "field_assignment_status_idx")
@@ -67,6 +98,9 @@ model FieldOperativeCurrentState {
   authoritativeFreshnessMs Int @map("authoritative_freshness_ms")
   traceId String @map("trace_id") @db.Text
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  /// WP-17A: composite so the pair must match, not just the site id.
+  site Site @relation(fields: [siteId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
 
   @@unique([organisationId, siteId, userId], map: "field_current_state_scope_key")
   @@index([organisationId, siteId, state], map: "field_current_state_state_idx")

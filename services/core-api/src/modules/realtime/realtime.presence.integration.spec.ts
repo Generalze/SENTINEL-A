@@ -14,9 +14,15 @@ import {
   type TestOrgUser,
 } from './test-integration-support';
 
+interface PresenceEntry {
+  user_id: string;
+  connected_at: string;
+  sockets: number;
+}
+
 interface PresenceListResponse {
   organisation_id: string;
-  presence: Array<{ user_id: string; connected_at: string; sockets: number }>;
+  presence: PresenceEntry[];
 }
 
 /** Acceptance criterion #4 (WP-12): presence add/remove reflected in Redis, the HTTP endpoint, and the presence.changed broadcast. */
@@ -98,10 +104,11 @@ describe('Realtime gateway — presence add/remove (live stack, AC4)', () => {
 
     // 3. GET /api/v1/presence. The observer itself is also connected (same
     // org), so the list has both entries — assert the subject's specifically.
-    const afterConnect = await fetchPresence(org.organisationId);
-    expect(afterConnect.organisation_id).toBe(org.organisationId);
-    expect(afterConnect.presence).toHaveLength(2);
-    expect(afterConnect.presence).toEqual(expect.arrayContaining([expect.objectContaining({ user_id: org.userId, sockets: 1 })]));
+    // Same connect-vs-record race as the two-socket test below: poll rather
+    // than assume the endpoint sees the subject the instant it is connected.
+    const afterConnect = await presenceEventually(org.organisationId, (entries) => entries.length === 2);
+    expect(afterConnect).toHaveLength(2);
+    expect(afterConnect).toEqual(expect.arrayContaining([expect.objectContaining({ user_id: org.userId, sockets: 1 })]));
 
     // Now disconnect and verify all three reverse.
     const offlineBroadcast = waitForEvent<{ user_id: string; online: boolean }>(observer, WS_EVENT_PRESENCE_CHANGED);
@@ -116,6 +123,28 @@ describe('Realtime gateway — presence add/remove (live stack, AC4)', () => {
     expect(afterDisconnect.presence).toEqual([expect.objectContaining({ user_id: observerUser.userId })]);
   }, 10_000);
 
+  /**
+   * A client's `connect` event fires when the handshake completes, which is
+   * strictly BEFORE the server's `handleConnection` has finished recording
+   * presence in Redis. Asserting the presence endpoint immediately after
+   * `connect` therefore races the server, and did intermittently fail. Polls
+   * until the server-side state converges (or the deadline passes, so a real
+   * regression still fails rather than hanging) instead of assuming the two
+   * are synchronous, and replaces the fixed sleep the disconnect half used.
+   */
+  async function presenceEventually(organisationId: string, predicate: (entries: PresenceEntry[]) => boolean, timeoutMs = 4000): Promise<PresenceEntry[]> {
+    const deadline = Date.now() + timeoutMs;
+    let latest: PresenceEntry[] = [];
+    for (;;) {
+      latest = (await fetchPresence(organisationId)).presence;
+      if (predicate(latest)) return latest;
+      if (Date.now() >= deadline) return latest;
+      await new Promise((resolve) => {
+        setTimeout(resolve, 50);
+      });
+    }
+  }
+
   it('a second socket for the same user increments the Redis/endpoint socket count and does not double-broadcast online', async () => {
     const first = connectAs(org.userId);
     await waitForEvent(first, 'connect');
@@ -123,20 +152,16 @@ describe('Realtime gateway — presence add/remove (live stack, AC4)', () => {
     const second = connectAs(org.userId);
     await waitForEvent(second, 'connect');
 
-    const list = await fetchPresence(org.organisationId);
-    expect(list.presence).toEqual([expect.objectContaining({ user_id: org.userId, sockets: 2 })]);
+    const list = await presenceEventually(org.organisationId, (entries) => entries.some((entry) => entry.sockets === 2));
+    expect(list).toEqual([expect.objectContaining({ user_id: org.userId, sockets: 2 })]);
 
     first.close();
-    // Give the server a moment to process the disconnect before asserting.
-    await new Promise((resolve) => {
-      setTimeout(resolve, 300);
-    });
 
-    const listAfterOneClose = await fetchPresence(org.organisationId);
-    expect(listAfterOneClose.presence).toEqual([expect.objectContaining({ user_id: org.userId, sockets: 1 })]);
+    const listAfterOneClose = await presenceEventually(org.organisationId, (entries) => entries.some((entry) => entry.sockets === 1));
+    expect(listAfterOneClose).toEqual([expect.objectContaining({ user_id: org.userId, sockets: 1 })]);
 
     second.close();
-  }, 10_000);
+  }, 15_000);
 
   it('GET /api/v1/presence requires organisation_id when no principal is present (dev bypass)', async () => {
     const response = await fetch(`${baseUrl}/api/v1/presence`);

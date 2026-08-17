@@ -89,14 +89,18 @@ export class RealtimeGateway implements OnGatewayInit<RealtimeServer>, OnGateway
       return;
     }
 
-    await client.join(orgRoom(principal.organisation_id));
     // WP-17/D1: Field rooms are additional to the org room and are derived
     // from the principal's own role assignments — a principal with no Field
     // visibility action joins none, and so receives no Field traffic.
+    //
+    // Joined in ONE call rather than two awaits: presence is recorded after
+    // this, and every await here delays the point at which a just-connected
+    // socket becomes visible to `GET /api/v1/presence`. Adding a second await
+    // measurably widened that window (it surfaced as a flake in
+    // realtime.presence.integration.spec.ts). socket.io accepts an array, so
+    // there is no reason to pay for two round trips.
     const fieldRooms = fieldRoomsFor(principal);
-    if (fieldRooms.length > 0) {
-      await client.join(fieldRooms);
-    }
+    await client.join([orgRoom(principal.organisation_id), ...fieldRooms]);
     this.logger.log(`socket ${client.id} connected: user=${principal.user_id} org=${principal.organisation_id} field_rooms=${fieldRooms.length}`);
 
     const wentOnline = await this.presence.recordConnect(principal.organisation_id, principal.user_id);

@@ -71,6 +71,22 @@ export type TransitionResult =
 export class FieldRepository {
   constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
 
+  /**
+   * WP-17A: the site must exist AND belong to the caller's organisation.
+   *
+   * Deliberately one query answering one question, so "no such site" and
+   * "a real site in another tenant" are indistinguishable to the caller — the
+   * service turns both into the same 404. The composite foreign key added in
+   * `20260817210000_wp17a_field_site_integrity` enforces the same invariant at
+   * the database, but this runs first: a Field mutation must be refused before
+   * the transaction that would write the live row, the history row, the audit
+   * row and the outbox row, not by catching a constraint error afterwards.
+   */
+  async siteExistsInOrganisation(organisationId: string, siteId: string): Promise<boolean> {
+    const site = await this.prisma.site.findFirst({ where: { id: siteId, organisationId }, select: { id: true } });
+    return site !== null;
+  }
+
   async assigneeCanReceive(organisationId: string, siteId: string, userId: string): Promise<boolean> {
     const user = await this.prisma.user.findFirst({
       where: { id: userId, organisationId, roles: { some: { role: 'field.operative', siteId } } },

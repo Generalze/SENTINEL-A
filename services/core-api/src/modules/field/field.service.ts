@@ -80,8 +80,21 @@ export class FieldService {
     return parseOrBadRequest(StateUpdateInputSchema, raw);
   }
 
+  /**
+   * WP-17A/C7-07: the site a Field write names must exist in the caller's own
+   * organisation. A nonexistent site and another tenant's real site produce the
+   * identical 404 — the caller must not be able to use this endpoint to learn
+   * that some id is a real site somewhere else in the platform.
+   */
+  private async assertSiteInOrganisation(organisationId: string, siteId: string): Promise<void> {
+    if (!(await this.repository.siteExistsInOrganisation(organisationId, siteId))) {
+      throw new NotFoundException('Site not found');
+    }
+  }
+
   async createAssignment(principal: Principal, siteScope: SiteScope, input: CreateAssignmentInput): Promise<FieldAssignmentView> {
     if (!siteAllowed(siteScope, input.site_id)) throw new ForbiddenException('Principal is not scoped to this site');
+    await this.assertSiteInOrganisation(principal.organisation_id, input.site_id);
     if (!(await this.repository.assigneeCanReceive(principal.organisation_id, input.site_id, input.assignee_user_id))) {
       throw new BadRequestException('Assignee is not a field operative at this site');
     }
@@ -160,6 +173,7 @@ export class FieldService {
 
   async recordState(principal: Principal, siteScope: SiteScope, input: StateUpdateInput): Promise<FieldOperativeStateView> {
     if (!siteAllowed(siteScope, input.site_id)) throw new ForbiddenException('Principal is not scoped to this site');
+    await this.assertSiteInOrganisation(principal.organisation_id, input.site_id);
     const sourceAt = new Date(input.source_at);
     const receivedAt = new Date();
     const authoritativeFreshnessMs = Math.max(0, receivedAt.getTime() - sourceAt.getTime());

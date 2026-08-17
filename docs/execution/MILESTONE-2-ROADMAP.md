@@ -94,12 +94,19 @@ the whole log.
 | WP-15 / WP-15A | Done | `631fa8a`, `ff083cc` |
 | WP-16 | Done, with Wave-7 review findings closed by WP-17 | `bd6076e` |
 | WP-17 | Done — site-scoped Field delivery, need-to-know payloads, subject-token safety across every NATS builder, operative REST refetch, WP-16 AC7 API tests | this wave |
-| WP-17A | **Scheduled, not started** — Field `site_id` referential integrity (C7-07) | — |
+| WP-17A | Implemented, awaiting WP-17 merge — Field `site_id` referential integrity (C7-07) | branch `wp-17a-field-site-integrity` |
 | WP-18 .. WP-22 | Not started | — |
 
-**Next:** Wave 8 — WP-18 incident field messaging, then WP-19 patrol
-foundation. WP-17A can run before or alongside Wave 8; it is independent of
-both.
+**Branch state.** WP-17 is open as PR #1 (`wp-17-field-realtime` → `main`) and
+frozen for its merge gate. WP-17A is stacked on the WP-17 head and must not be
+opened against `main` until WP-17 merges; after that it is rebased onto the
+resulting `main` for its own review.
+
+**Next:** WP-17A merges before Wave 8. Site referential integrity is
+foundational to both of the next domains — incident messaging and patrol
+persistence must not inherit the ability to write authoritative Field history
+against fictional sites. Then Wave 8: WP-18 incident field messaging, then
+WP-19 patrol foundation.
 
 Wave-7 review findings, the delivery-semantics ruling, and the remaining
 accepted limitations are in

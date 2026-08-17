@@ -19,6 +19,18 @@ model Organisation {
 }
 
 /// A physical/operational site belonging to exactly one Organisation.
+///
+/// WP-17A: `@@unique([id, organisationId])` is a candidate key that exists so
+/// Field live-state tables can reference (site, organisation) as a PAIR rather
+/// than referencing `id` alone. A plain FK to `Site.id` would still permit a
+/// row claiming `organisation_id = org-A, site_id = site-B` where site-B
+/// belongs to org-B; the composite reference makes the database reject that,
+/// giving §62.1's tenant boundary a defence below the service layer. `id`
+/// remains the primary key and nothing about site identity changes.
+///
+/// NOTE: this model is WP-03's, and the two back-relations below are required
+/// by Prisma for the relations declared in field.prisma. They add no column and
+/// no behaviour to Identity.
 model Site {
   id             String   @id @default(cuid())
   organisationId String   @map("organisation_id")
@@ -30,6 +42,10 @@ model Site {
   zones        Zone[]
   userRoles    UserRole[]
 
+  fieldAssignments   FieldAssignment[]
+  fieldCurrentStates FieldOperativeCurrentState[]
+
+  @@unique([id, organisationId], map: "sites_id_organisation_key")
   @@index([organisationId])
   @@map("sites")
 }
