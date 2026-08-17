@@ -105,13 +105,49 @@ export async function makeOrgAndUser(prisma: PrismaService, label: string): Prom
   return { organisationId: organisation.id, userId: user.id };
 }
 
-/** Deletes everything `makeOrgAndUser` created for the given orgs (users first, then organisations, respecting FKs). */
+/** WP-17: one §62 role assignment for a fixture user. `siteId: null` is organisation-wide. */
+export interface TestRoleSpec {
+  readonly role: string;
+  readonly siteId: string | null;
+}
+
+/** WP-17: a site inside an existing fixture organisation, for site-scoped room tests. */
+export async function makeSite(prisma: PrismaService, organisationId: string, label: string): Promise<string> {
+  const site = await prisma.site.create({ data: { organisationId, name: `wp17-${label}-${randomUUID()}` } });
+  return site.id;
+}
+
+/** WP-17: a fixture user carrying real §62 role assignments, so Field room derivation is exercised against real rows. */
+export async function makeUserWithRoles(prisma: PrismaService, organisationId: string, label: string, roles: readonly TestRoleSpec[]): Promise<TestOrgUser> {
+  const suffix = `${label}-${randomUUID()}`;
+  const user = await prisma.user.create({
+    data: {
+      organisationId,
+      email: `${suffix}@example.invalid`,
+      displayName: `WP-17 ${label}`,
+      clearance: 5,
+      roles: { create: roles.map((spec) => ({ role: spec.role, siteId: spec.siteId })) },
+    },
+  });
+  return { organisationId, userId: user.id };
+}
+
+/**
+ * Deletes everything the fixture helpers created for the given orgs, in FK
+ * order: role assignments, then users, then sites, then organisations.
+ * (`UserRole` references both `User` and `Site` without a cascade, so both
+ * must go first — see prisma/schema/identity.prisma.)
+ */
 export async function cleanupOrgsAndUsers(prisma: PrismaService, organisationIds: readonly string[]): Promise<void> {
   if (organisationIds.length === 0) {
     return;
   }
-  await prisma.user.deleteMany({ where: { organisationId: { in: [...organisationIds] } } });
-  await prisma.organisation.deleteMany({ where: { id: { in: [...organisationIds] } } });
+  const ids = [...organisationIds];
+  await prisma.userRole.deleteMany({ where: { user: { organisationId: { in: ids } } } });
+  await prisma.user.deleteMany({ where: { organisationId: { in: ids } } });
+  await prisma.zone.deleteMany({ where: { site: { organisationId: { in: ids } } } });
+  await prisma.site.deleteMany({ where: { organisationId: { in: ids } } });
+  await prisma.organisation.deleteMany({ where: { id: { in: ids } } });
 }
 
 /** Resolves with the next `event` emitted on `emitter`, or rejects if none arrives within `timeoutMs`. */

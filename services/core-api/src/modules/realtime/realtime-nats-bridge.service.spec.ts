@@ -2,6 +2,8 @@ import type { Msg } from 'nats';
 import { describe, expect, it, vi } from 'vitest';
 import type { NatsProvider } from '../../infra/nats.provider';
 import {
+  fieldOrgWideRoom,
+  fieldSiteRoom,
   NATS_SUBJECT_FIELD,
   NATS_SUBJECT_HYPOTHESIS,
   NATS_SUBJECT_INCIDENT,
@@ -59,8 +61,10 @@ function fakeNatsProvider(subscribeBySubject: Readonly<Record<string, AsyncItera
   return { isConfigured: () => true, getConnection } as unknown as NatsProvider & { getConnection: ReturnType<typeof vi.fn> };
 }
 
-function fakeGateway(): RealtimeGateway & { broadcastToOrg: ReturnType<typeof vi.fn> } {
-  return { broadcastToOrg: vi.fn() } as unknown as RealtimeGateway & { broadcastToOrg: ReturnType<typeof vi.fn> };
+type FakeGateway = RealtimeGateway & { broadcastToOrg: ReturnType<typeof vi.fn>; broadcastToRooms: ReturnType<typeof vi.fn> };
+
+function fakeGateway(): FakeGateway {
+  return { broadcastToOrg: vi.fn(), broadcastToRooms: vi.fn() } as unknown as FakeGateway;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -136,13 +140,14 @@ describe('RealtimeNatsBridgeService — resubscribe retry/backoff wiring (delive
     bridge.onModuleDestroy();
   });
 
-  it('forwards a field.updated message on the Field subject, whitelisted', async () => {
+  it('routes a field.updated message to the site room and the org-wide Field room only (WP-17/D2)', async () => {
     const orgId = 'org_bridge_3';
-    const msg = fakeMsg(`sentinel.field.updated.${orgId}`, {
+    const msg = fakeMsg(`sentinel.field.updated.${orgId}.site-1`, {
       kind: 'FIELD_ASSIGNMENT_ACCEPTED',
       assignment_id: 'assignment-1',
       organisation_id: orgId,
       site_id: 'site-1',
+      state: 'COMPROMISED',
       need_to_know_summary: 'must never reach the client',
     });
     const nats = fakeNatsProvider({ [NATS_SUBJECT_HYPOTHESIS]: asyncIterableOf([]), [NATS_SUBJECT_INCIDENT]: asyncIterableOf([]), [NATS_SUBJECT_FIELD]: asyncIterableOf([msg]) });
@@ -153,15 +158,34 @@ describe('RealtimeNatsBridgeService — resubscribe retry/backoff wiring (delive
     bridge.onModuleInit();
 
     await vi.waitFor(() => {
-      expect(gateway.broadcastToOrg).toHaveBeenCalled();
+      expect(gateway.broadcastToRooms).toHaveBeenCalled();
     });
 
-    expect(gateway.broadcastToOrg).toHaveBeenCalledWith(orgId, WS_EVENT_FIELD_UPDATED, {
+    expect(gateway.broadcastToRooms).toHaveBeenCalledWith([fieldSiteRoom(orgId, 'site-1'), fieldOrgWideRoom(orgId)], WS_EVENT_FIELD_UPDATED, {
       kind: 'FIELD_ASSIGNMENT_ACCEPTED',
       assignment_id: 'assignment-1',
       organisation_id: orgId,
       site_id: 'site-1',
     });
+    // The organisation room never carries Field traffic any more (WP-17/F1).
+    expect(gateway.broadcastToOrg).not.toHaveBeenCalled();
+
+    bridge.onModuleDestroy();
+  });
+
+  it('drops a Field message whose subject carries no site token rather than falling back to an org-wide fanout (WP-17/D2)', async () => {
+    const orgId = 'org_bridge_4';
+    const msg = fakeMsg(`sentinel.field.updated.${orgId}`, { kind: 'FIELD_ASSIGNMENT_CREATED', assignment_id: 'assignment-9' });
+    const nats = fakeNatsProvider({ [NATS_SUBJECT_HYPOTHESIS]: asyncIterableOf([]), [NATS_SUBJECT_INCIDENT]: asyncIterableOf([]), [NATS_SUBJECT_FIELD]: asyncIterableOf([msg]) });
+    const gateway = fakeGateway();
+    const bridge = new RealtimeNatsBridgeService(nats, gateway);
+    bridge.setBackoffOptionsForTesting({ baseMs: 1, maxMs: 2, factor: 1 });
+
+    bridge.onModuleInit();
+    await sleep(50);
+
+    expect(gateway.broadcastToRooms).not.toHaveBeenCalled();
+    expect(gateway.broadcastToOrg).not.toHaveBeenCalled();
 
     bridge.onModuleDestroy();
   });

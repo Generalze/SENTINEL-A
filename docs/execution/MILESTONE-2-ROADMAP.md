@@ -84,6 +84,24 @@ realtime, and test foundation that a mobile app can safely depend on.
 5. **Wave 10:** WP-21 Whisper foundation gate.
 6. **Wave 11:** WP-22 live regression, sign-off, and tag.
 
+## Execution Progress
+
+Kept current so a resumed session can see where work stopped without reading
+the whole log.
+
+| WP | State | Landed in |
+|---|---|---|
+| WP-15 / WP-15A | Done | `631fa8a`, `ff083cc` |
+| WP-16 | Done, with Wave-7 review findings closed by WP-17 | `bd6076e` |
+| WP-17 | Done — site-scoped Field delivery, need-to-know payloads, subject-token safety, operative REST refetch, WP-16 AC7 API tests | this wave |
+| WP-18 .. WP-22 | Not started | — |
+
+**Next:** Wave 8 — WP-18 incident field messaging, then WP-19 patrol
+foundation. Wave-7 review findings and accepted limitations are recorded in
+[`security/WAVE-7-FINDINGS.md`](security/WAVE-7-FINDINGS.md); two of those
+limitations are explicitly deferred into WP-18 and WP-19 and should be picked
+up there.
+
 ## Risk Register
 
 | Risk | Control |

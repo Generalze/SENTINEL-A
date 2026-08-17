@@ -39,6 +39,14 @@ export const NATS_SUBJECT_FIELD = 'sentinel.field.updated.>';
 /** All update subjects above carry `{organisation_id}` as their 4th dot-segment. */
 export const SUBJECT_ORG_ID_SEGMENT_INDEX = 3;
 
+/**
+ * WP-17/D2: the Field subject alone is site-scoped —
+ * `sentinel.field.updated.{organisation_id}.{site_id}` — so its 5th segment is
+ * the site. A Field message without that segment is dropped rather than
+ * broadcast organisation-wide (fail closed).
+ */
+export const SUBJECT_SITE_ID_SEGMENT_INDEX = 4;
+
 export const WS_EVENT_HYPOTHESIS_UPDATED = 'hypothesis.updated';
 export const WS_EVENT_INCIDENT_UPDATED = 'incident.updated';
 export const WS_EVENT_FIELD_UPDATED = 'field.updated';
@@ -50,7 +58,24 @@ export const PRESENCE_KEY_PREFIX = 'sentinel:presence:';
 /** Action enforced by the global AccessGuard on this module's HTTP route. */
 export const ACTION_PRESENCE_VIEW = 'presence.view';
 
-/** The one and only room a socket may ever join — always derived server-side. */
+/** Organisation-wide room: incident, hypothesis, and presence traffic. Always derived server-side. */
 export function orgRoom(organisationId: string): string {
   return `org:${organisationId}`;
+}
+
+/**
+ * WP-17/D1: Field rooms, also derived server-side only.
+ *
+ * A socket joins EITHER `fieldOrgWideRoom` (when some Field-granting role
+ * assignment is organisation-wide) OR one `fieldSiteRoom` per site-scoped
+ * grant — never both. The bridge emits each Field event to the org-wide room
+ * and to the one site room, so that split is what makes delivery exactly-once
+ * per socket while still reaching organisation-wide authorities for every site.
+ */
+export function fieldSiteRoom(organisationId: string, siteId: string): string {
+  return `org:${organisationId}:field:site:${siteId}`;
+}
+
+export function fieldOrgWideRoom(organisationId: string): string {
+  return `org:${organisationId}:field:all`;
 }

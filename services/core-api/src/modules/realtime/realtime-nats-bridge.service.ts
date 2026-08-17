@@ -2,33 +2,48 @@ import { Inject, Injectable, Logger, type OnModuleDestroy, type OnModuleInit } f
 import type { Msg } from 'nats';
 import { NatsProvider } from '../../infra/nats.provider';
 import { type BackoffOptions, withRetryBackoff } from './backoff.util';
-import { pickWhitelistedFields } from './payload-whitelist.util';
+import { pickFieldRealtimeFields, pickWhitelistedFields } from './payload-whitelist.util';
 import { RealtimeGateway } from './realtime.gateway';
 import {
+  fieldOrgWideRoom,
+  fieldSiteRoom,
   NATS_SUBJECT_FIELD,
   NATS_SUBJECT_HYPOTHESIS,
   NATS_SUBJECT_INCIDENT,
   SUBJECT_ORG_ID_SEGMENT_INDEX,
+  SUBJECT_SITE_ID_SEGMENT_INDEX,
   WS_EVENT_FIELD_UPDATED,
   WS_EVENT_HYPOTHESIS_UPDATED,
   WS_EVENT_INCIDENT_UPDATED,
 } from './realtime.constants';
 
+/** `org` fans out to the whole organisation room; `field` fans out to site-scoped Field rooms (WP-17/D2). */
+type RouteScope = 'org' | 'field';
+
 interface SubjectRoute {
   readonly subject: string;
   readonly event: string;
+  readonly scope: RouteScope;
 }
 
 const ROUTES: readonly SubjectRoute[] = [
-  { subject: NATS_SUBJECT_HYPOTHESIS, event: WS_EVENT_HYPOTHESIS_UPDATED },
-  { subject: NATS_SUBJECT_INCIDENT, event: WS_EVENT_INCIDENT_UPDATED },
-  { subject: NATS_SUBJECT_FIELD, event: WS_EVENT_FIELD_UPDATED },
+  { subject: NATS_SUBJECT_HYPOTHESIS, event: WS_EVENT_HYPOTHESIS_UPDATED, scope: 'org' },
+  { subject: NATS_SUBJECT_INCIDENT, event: WS_EVENT_INCIDENT_UPDATED, scope: 'org' },
+  { subject: NATS_SUBJECT_FIELD, event: WS_EVENT_FIELD_UPDATED, scope: 'field' },
 ];
 
-function orgIdFromSubject(subject: string): string | undefined {
+function segmentFromSubject(subject: string, index: number): string | undefined {
   const parts = subject.split('.');
-  const orgId = parts[SUBJECT_ORG_ID_SEGMENT_INDEX];
-  return parts.length > SUBJECT_ORG_ID_SEGMENT_INDEX && orgId && orgId.length > 0 ? orgId : undefined;
+  const segment = parts[index];
+  return parts.length > index && segment && segment.length > 0 ? segment : undefined;
+}
+
+function orgIdFromSubject(subject: string): string | undefined {
+  return segmentFromSubject(subject, SUBJECT_ORG_ID_SEGMENT_INDEX);
+}
+
+function siteIdFromSubject(subject: string): string | undefined {
+  return segmentFromSubject(subject, SUBJECT_SITE_ID_SEGMENT_INDEX);
 }
 
 function errorMessage(error: unknown): string {
@@ -125,6 +140,16 @@ export class RealtimeNatsBridgeService implements OnModuleInit, OnModuleDestroy 
       return;
     }
 
+    // WP-17/D2: a Field message is site-scoped or it is not delivered. There
+    // is deliberately no organisation-wide fallback — falling back would turn
+    // a malformed subject into the exact cross-site fanout this route exists
+    // to remove.
+    const siteId = route.scope === 'field' ? siteIdFromSubject(msg.subject) : undefined;
+    if (route.scope === 'field' && !siteId) {
+      this.logger.warn(`dropping field message on ${msg.subject}: could not determine site_id from subject`);
+      return;
+    }
+
     let raw: unknown;
     try {
       raw = msg.json();
@@ -133,7 +158,15 @@ export class RealtimeNatsBridgeService implements OnModuleInit, OnModuleDestroy 
       return;
     }
 
-    const payload = pickWhitelistedFields(raw, organisationId);
-    this.gateway.broadcastToOrg(organisationId, route.event, payload);
+    if (route.scope === 'field' && siteId) {
+      this.gateway.broadcastToRooms(
+        [fieldSiteRoom(organisationId, siteId), fieldOrgWideRoom(organisationId)],
+        route.event,
+        pickFieldRealtimeFields(raw, organisationId, siteId),
+      );
+      return;
+    }
+
+    this.gateway.broadcastToOrg(organisationId, route.event, pickWhitelistedFields(raw, organisationId));
   }
 }
