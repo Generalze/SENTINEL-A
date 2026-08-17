@@ -9,7 +9,7 @@ import type { AppConfigService } from '../../config/config.service';
 export function makeAppConfig(overrides: Partial<AppConfig> = {}): AppConfigService {
   const values: AppConfig = {
     DATABASE_URL: 'postgresql://sentinel:sentinel@localhost:5433/sentinel',
-    NATS_URL: 'nats://localhost:4222',
+    NATS_URL: 'nats://127.0.0.1:4222',
     REDIS_URL: 'redis://localhost:6379',
     S3_ENDPOINT: 'http://localhost:9000',
     S3_ACCESS_KEY: 'sentinel',
