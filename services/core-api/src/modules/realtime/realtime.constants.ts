@@ -69,8 +69,16 @@ export function orgRoom(organisationId: string): string {
  * A socket joins EITHER `fieldOrgWideRoom` (when some Field-granting role
  * assignment is organisation-wide) OR one `fieldSiteRoom` per site-scoped
  * grant — never both. The bridge emits each Field event to the org-wide room
- * and to the one site room, so that split is what makes delivery exactly-once
- * per socket while still reaching organisation-wide authorities for every site.
+ * and to the one site room, so that split gives each socket a SINGLE eligible
+ * fanout path while still reaching organisation-wide authorities for every
+ * site.
+ *
+ * Note the scope of that claim: it rules out the same event being fanned out
+ * to one socket twice by room membership. It is NOT a transport-level
+ * exactly-once guarantee — a socket that disconnects and reconnects may miss
+ * an event or observe a re-emitted one, and the outbox publisher's own
+ * at-least-once retry can republish. That is by design: the socket is a
+ * signal, and REST remains authoritative.
  */
 export function fieldSiteRoom(organisationId: string, siteId: string): string {
   return `org:${organisationId}:field:site:${siteId}`;

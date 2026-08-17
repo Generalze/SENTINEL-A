@@ -1,3 +1,5 @@
+import { assertSafeSubjectToken } from '../../common/messaging/subject-token';
+
 export const INCIDENTS_STREAM_NAME = 'SENTINEL_FUSION';
 export const INCIDENT_CANDIDATE_SUBJECT = 'sentinel.fusion.incident-candidate.>';
 export const INCIDENT_CONSUMER_DURABLE = 'incidents-v1';
@@ -17,6 +19,13 @@ export const SILENT_DISPATCH_ACTION = 'response.dispatch.silent';
 export const STANDARD_DISPATCH_ACTION = 'response.dispatch.standard';
 export const RESPONSE_SYSTEM_ACTOR = 'system:incident-response';
 
+/**
+ * WP-17/C7-06: the realtime bridge reads the organisation out of this subject
+ * to pick the room it broadcasts into, so the token must not be able to shift
+ * the subject's arity. Both publish sites treat a throw here as a failed
+ * publish — the database stays authoritative either way.
+ */
 export function incidentUpdatedSubject(organisationId: string): string {
+  assertSafeSubjectToken(organisationId, 'organisation_id');
   return `sentinel.incidents.updated.${organisationId}`;
 }

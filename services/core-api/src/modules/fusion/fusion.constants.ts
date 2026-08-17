@@ -4,6 +4,8 @@
  * externally-visible surface of the module in one file.
  */
 
+import { assertSafeSubjectToken } from '../../common/messaging/subject-token';
+
 /**
  * Version of the declarative event -> signal rule table (core/eventRules.ts).
  * Recorded in §65.3 `rule_or_model_versions` on every hypothesis and every
@@ -78,11 +80,22 @@ export const CONSUMER_ACK_WAIT_MS = 30_000;
 /** Max redelivery attempts before a message is left to the stream's limits. */
 export const CONSUMER_MAX_DELIVER = 5;
 
+/**
+ * WP-17/C7-06: both consumers of these subjects parse the organisation out of
+ * the concrete subject and refuse a payload that disagrees with it
+ * (incidents.consumer.ts / incidents-hypothesis.consumer.ts, per C4-01). That
+ * parse requires an exact 4-segment subject, so an organisation id containing a
+ * `.` would not misroute — it would make every message for that tenant
+ * permanently undeliverable instead. Asserting here fails loudly at the publish
+ * site rather than silently downstream.
+ */
 export function hypothesisSubject(organisationId: string): string {
+  assertSafeSubjectToken(organisationId, 'organisation_id');
   return `sentinel.fusion.hypothesis.${organisationId}`;
 }
 
 export function incidentCandidateSubject(organisationId: string): string {
+  assertSafeSubjectToken(organisationId, 'organisation_id');
   return `sentinel.fusion.incident-candidate.${organisationId}`;
 }
 

@@ -93,14 +93,29 @@ the whole log.
 |---|---|---|
 | WP-15 / WP-15A | Done | `631fa8a`, `ff083cc` |
 | WP-16 | Done, with Wave-7 review findings closed by WP-17 | `bd6076e` |
-| WP-17 | Done — site-scoped Field delivery, need-to-know payloads, subject-token safety, operative REST refetch, WP-16 AC7 API tests | this wave |
+| WP-17 | Done — site-scoped Field delivery, need-to-know payloads, subject-token safety across every NATS builder, operative REST refetch, WP-16 AC7 API tests | this wave |
+| WP-17A | **Scheduled, not started** — Field `site_id` referential integrity (C7-07) | — |
 | WP-18 .. WP-22 | Not started | — |
 
 **Next:** Wave 8 — WP-18 incident field messaging, then WP-19 patrol
-foundation. Wave-7 review findings and accepted limitations are recorded in
-[`security/WAVE-7-FINDINGS.md`](security/WAVE-7-FINDINGS.md); two of those
-limitations are explicitly deferred into WP-18 and WP-19 and should be picked
-up there.
+foundation. WP-17A can run before or alongside Wave 8; it is independent of
+both.
+
+Wave-7 review findings, the delivery-semantics ruling, and the remaining
+accepted limitations are in
+[`security/WAVE-7-FINDINGS.md`](security/WAVE-7-FINDINGS.md). Two items there
+are binding on later work:
+
+- **WP-18 must not inherit WP-17's site-room need-to-know boundary.** Incident
+  messages have named recipients and an incident purpose, so visibility must be
+  narrower than site membership, and message content must not ride the socket.
+  The required scope chain is written out in the findings register.
+- **WP-19 checkpoint verification follows the Field-state precedent.** The
+  client supplies checkpoint, source time, method, and device evidence; the
+  server determines tenant/site validity, route membership, checkpoint
+  ordering, device/actor authority, authoritative receipt time, replay and
+  idempotency, missed/late state, and the audit and timeline effects. Client
+  time and client freshness stay telemetry.
 
 ## Risk Register
 

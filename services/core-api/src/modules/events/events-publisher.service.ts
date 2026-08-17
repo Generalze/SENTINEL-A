@@ -1,10 +1,19 @@
 import { Inject, Injectable, Logger, type OnModuleInit } from '@nestjs/common';
 import { JSONCodec, RetentionPolicy, StorageType, nanos } from 'nats';
 import type { NormalisedEvent } from '@sentinel/contracts';
+import { assertSafeSubjectToken, isSafeSubjectToken } from '../../common/messaging/subject-token';
 import { NatsProvider } from '../../infra/nats.provider';
 import { PUBLISH_TIMEOUT_MS, STREAM_MAX_AGE_MS, STREAM_NAME, SUBJECT_WILDCARD } from './events.constants';
 
+/**
+ * WP-17/C7-06: both tokens are asserted safe. Ingest rejects an unsafe
+ * `organisation_id`/`site_id` at the boundary, so this is the backstop for
+ * rows that predate that check — it turns a subject that would silently
+ * misroute or be rejected by NATS into a loud, diagnosable failure.
+ */
 export function buildSubject(organisationId: string, siteId: string): string {
+  assertSafeSubjectToken(organisationId, 'organisation_id');
+  assertSafeSubjectToken(siteId, 'site_id');
   return `sentinel.events.${organisationId}.${siteId}`;
 }
 
@@ -61,6 +70,13 @@ export class EventsPublisherService implements OnModuleInit {
    */
   async tryPublish(id: string, event: NormalisedEvent): Promise<boolean> {
     if (!this.nats.isConfigured()) {
+      return false;
+    }
+    // Distinguish "this row can never be published" from a transient NATS
+    // failure: the retry sweep would otherwise re-attempt it every tick
+    // forever and log it as if NATS were merely unavailable.
+    if (!isSafeSubjectToken(event.organisation_id) || !isSafeSubjectToken(event.site_id)) {
+      this.logger.error(`Event ${id} has an unsafe subject scope (org=${event.organisation_id} site=${event.site_id}); it cannot be published and will not reach Fusion`);
       return false;
     }
     try {

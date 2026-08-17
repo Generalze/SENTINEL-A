@@ -14,11 +14,35 @@ Milestone 2 acceptance remains a separate lead decision.
 
 | ID | Priority | Finding | Resolution / current state | Verification evidence |
 |---|---|---|---|---|
-| C7-01 | P0 | **Cross-site Field fanout.** WP-16 published Field events to `sentinel.field.updated.{organisation_id}` and the bridge forwarded them to `org:{organisation_id}`. Every socket in a tenant therefore received every site's Field traffic — assignment ids, operative ids, and site ids for sites the caller has no scope over. Site scope existed in the domain layer and was discarded at the delivery layer, defeating the §62.1 site conjunct for anything that rides the socket. | **Fixed.** Field events publish on `sentinel.field.updated.{organisation_id}.{site_id}`; the bridge routes on the site token to `org:{org}:field:site:{site}` plus `org:{org}:field:all`. Room membership is derived server-side from the principal's own §62 role assignments — an organisation-wide grant joins the org-wide Field room, a site-scoped grant joins only its own site rooms, and the two branches are mutually exclusive so no socket is served twice. A Field message with no site token is dropped, never fanned out organisation-wide. | `realtime.field-isolation.integration.spec.ts` (live stack) proves the site-A1 event reaches the A1 operative and reaches neither the A2 operative nor the other tenant, and that an organisation-wide dispatcher receives every site exactly once; `field-rooms.util.spec.ts` covers room derivation; `realtime-nats-bridge.service.spec.ts` covers routing and the fail-closed drop. |
+| C7-01 | P0 | **Cross-site Field fanout.** WP-16 published Field events to `sentinel.field.updated.{organisation_id}` and the bridge forwarded them to `org:{organisation_id}`. Every socket in a tenant therefore received every site's Field traffic — assignment ids, operative ids, and site ids for sites the caller has no scope over. Site scope existed in the domain layer and was discarded at the delivery layer, defeating the §62.1 site conjunct for anything that rides the socket. | **Fixed.** Field events publish on `sentinel.field.updated.{organisation_id}.{site_id}`; the bridge routes on the site token to `org:{org}:field:site:{site}` plus `org:{org}:field:all`. Room membership is derived server-side from the principal's own §62 role assignments — an organisation-wide grant joins the org-wide Field room, a site-scoped grant joins only its own site rooms, and the two branches are mutually exclusive, so each socket has a single eligible fanout path (see *Delivery semantics* below). A Field message with no site token is dropped, never fanned out organisation-wide. | `realtime.field-isolation.integration.spec.ts` (live stack) proves the site-A1 event reaches the A1 operative and reaches neither the A2 operative nor the other tenant, and that an organisation-wide dispatcher receives every site over a single fanout path; `field-rooms.util.spec.ts` covers room derivation; `realtime-nats-bridge.service.spec.ts` covers routing and the fail-closed drop. |
 | C7-02 | P0 | **Need-to-know leak of operative state.** The `FIELD_STATE_UPDATED` outbox payload carried the operative's `state`, and the shared realtime whitelist passed `state` through. `COMPROMISED` and `NEED_SUPPORT` therefore reached every connected socket in the organisation, including principals whose roles grant no Field action at all. | **Fixed.** The wire carries a signal, not the record: Field outbox payloads are reduced to `kind`, `organisation_id`, `site_id`, and the relevant subject id, and a Field-specific projection (`pickFieldRealtimeFields`) enforces that at the bridge regardless of what a future payload contains. Operative state is read over REST behind `field.state.read`. Sockets are additionally only joined for principals holding a Field visibility action. | `payload-whitelist.util.spec.ts` asserts `state` is dropped even when present; the live AC5 test publishes `state`, `location`, and `need_to_know_summary` and asserts none arrive; `realtime.gateway.spec.ts` asserts a no-Field-action principal joins no Field room. |
 | C7-03 | P1 | **Subject-token injection via `site_id`.** `organisation_id` and `site_id` are free-text columns and were interpolated straight into a NATS subject. NATS treats `.` as the token separator and `*`/`>` as wildcards, so a caller able to name a site (`x.y`, `x.>`) could change the subject's arity or widen it — steering Field events into another site's room or across a wildcard. | **Fixed.** One shared validator (`common/messaging/subject-token.ts`) defines what may be a subject token. Every Field mutation validates `site_id` at the API boundary and rejects an unsafe value before persistence; the outbox publisher revalidates and refuses to publish a row whose scope ids are unsafe, skipping it (unpublished, logged at error) rather than stalling the queue. | `subject-token.spec.ts` covers separator, wildcard, whitespace, length, and non-string inputs; `field.api.integration.spec.ts` asserts unsafe site ids are refused over HTTP and never persist; `field-outbox.publisher.spec.ts` covers the publisher's refusal and its continue-past-poisoned-row behaviour. |
 | C7-04 | P1 | **No authoritative refetch path for the operative.** The delivery doctrine is that a socket signals and the client refetches over REST. `GET /field/assignments` requires `field.assignment.manage`, which `field.operative` does not hold, and `GET /field/state/:userId` requires `field.state.read`, which it also does not hold. An operative receiving a Field signal had no endpoint to refetch from, so the doctrine was unimplementable and the service's "own state needs no extra authority" branch was unreachable. | **Fixed.** Added `GET /field/assignments/mine`, `GET /field/assignments/mine/:id`, `GET /field/assignments/:id`, and `GET /field/state/mine`. Each route carries exactly one `@RequiresAction` — the assignee's read and the dispatcher's read are separate routes rather than one widened guard. A non-assignee reading another operative's assignment gets 404, not 403, so the assignee set is not itself disclosed. | `field.api.integration.spec.ts` proves `mine` returns only the caller's assignments, that another operative's assignment is 404, that the operative holds no manage authority, and that `state/mine` returns the caller's own state. |
+| C7-06 | P2 | **The subject-token rule was applied to one builder, not all of them.** Lead review of the C7-03 fix asked whether *every* dynamic NATS token was covered. It was not: the service has five subject builders, and WP-17 hardened only the Field one. The material gap is `sentinel.events.{organisation_id}.{site_id}`, where `site_id` is free client text on the ingest API. Because ingest persists first and publishes as a follow-up step (§76), an event whose `site_id` contains `.`, `*`, `>` or whitespace is accepted with 201 and then **never reaches Fusion** — a silently undeliverable detection, which on a protective platform is worse than a rejected request. The incidents/hypothesis consumers were checked and already fail closed (they require an exact 4-segment subject), so this was an availability and integrity gap rather than a misrouting one. | **Fixed.** Ingest validates both tokens at the boundary and returns 400 before persistence. All five builders (`events`, `fusion` hypothesis and incident-candidate, `incidents` updated, `field` updated) now assert the shared rule. The events publisher distinguishes "can never be published" from a transient NATS failure so the retry sweep does not mask it, and the incidents outbox publisher — which `break`s on error — now skips a poisoned row instead of stalling every tenant's updates behind it. | `subject-builders.spec.ts` is a cross-module guard asserting all seven builder/token combinations reject unsafe input and keep a fixed segment count, so a sixth builder added without validation fails there; `events.controller.spec.ts` covers the 400-before-persistence path for both fields. |
 | C7-05 | P2 | **WP-16 acceptance criterion 7 was not delivered.** WP-16 shipped service and repository unit tests against doubles. A double cannot prove that the global guard chain is bound to the Field routes, that a cross-site create is refused, that a cross-organisation read hides existence, or that a duplicate action over HTTP writes no second audit or outbox row. | **Fixed.** A live-stack Field API regression drives the whole surface through the real `DevAuthGuard → AccessGuard` chain. | `field.api.integration.spec.ts` — 13 tests covering lifecycle, cross-site create, cross-organisation read, non-assignee action, dispatcher/operative authority separation, illegal transition, duplicate-action idempotency with audit/outbox counts, and server-computed freshness with a replayed state update. |
+
+## Delivery semantics — what is and is not claimed
+
+Lead ruling, recorded so the room design is not over-read:
+
+> **Single-scope delivery path; REST remains authoritative.**
+
+The org-wide/site room split guarantees that a Field event has one eligible
+fanout path to any given socket — room membership cannot deliver the same event
+to the same socket twice. That is a fanout property.
+
+It is **not** a transport-level exactly-once guarantee, and must not be
+described as one. WebSocket delivery is not exactly-once under disconnect,
+reconnect, or gateway restart, and the Field outbox publisher is deliberately
+at-least-once (a publish that succeeds but fails to mark the row is republished
+on the next sweep). Both are acceptable precisely because the socket carries a
+signal rather than state: a client that missed a signal, or saw one twice,
+converges on the same answer by refetching over REST, where the full
+authorization chain runs.
+
+Any future consumer that needs ordered or once-only Field semantics must build
+them on the REST read model or on a durable JetStream consumer, not on the WS
+channel.
 
 ## Accepted limitations
 
@@ -32,16 +56,36 @@ Recorded so they are not mistaken for oversights:
 
 2. **A Field signal still discloses that *something* changed at a site.** The
    payload is deliberately minimal, but membership of a site room is itself the
-   need-to-know boundary at this layer. Per-assignment recipient filtering
-   belongs with WP-18's incident-scoped messaging, where the recipient set is
-   part of the contract.
+   need-to-know boundary at this layer. That is acceptable for WP-17, where the
+   subject of an event is an assignment or a state belonging to the site.
 
-3. **`site_id` existence is not verified on a state write.** An organisation-wide
-   `field.state.write` holder could record state against a site id that exists
-   only as a string. It is subject-token safe and therefore cannot steer
-   delivery, and assignment creation is already constrained by the assignee's
-   site-scoped `field.operative` role. This is data hygiene rather than a
-   delivery boundary, and is left to the patrol/site work in WP-19.
+   **Lead direction — WP-18 must not inherit this.** An incident field message
+   has named recipients and an incident purpose, so its visibility has to be
+   strictly narrower than "everyone assigned to this site". The required chain
+   is:
+
+   ```text
+   authenticated principal
+        -> organisation scope
+        -> site scope
+        -> incident scope
+        -> assignment / purpose
+        -> named recipient membership
+        -> REST-authoritative message
+        -> minimal realtime notification
+   ```
+
+   The realtime event should say no more than *"a message in incident X changed
+   state; refetch it"*. Message content must not ride the socket, and the room
+   a message notification lands in cannot be the site room — recipient
+   membership is finer-grained than site membership, so WP-18 needs its own
+   room or per-socket delivery derived from the recipient set.
+
+## Scheduled remediation
+
+| ID | Priority | Finding | Disposition |
+|---|---|---|---|
+| C7-07 | P2 | **`site_id` existence is not verified on a Field write.** An organisation-wide `field.state.write` holder can record state against a site id that exists only as a string. It is subject-token safe, so it cannot steer delivery or cross a tenant boundary — but it writes authoritative, permanent audit history naming a place that was never in the tenant, and emits a realtime event into a room no socket can be in. | **Scheduled, not accepted.** An earlier draft of this register listed this as an accepted limitation; that framing was too generous and is withdrawn. Tracked as [`WP-17A-field-site-integrity.md`](../directives/WP-17A-field-site-integrity.md): service-level existence-and-tenant check on every Field write, a database relation where the model allows it via an additive migration, and an explicit ruling on whether `Event`/`Incident` site ids take the same constraint. |
 
 ## Verification boundary
 

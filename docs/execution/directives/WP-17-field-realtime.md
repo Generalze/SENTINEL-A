@@ -142,7 +142,15 @@ doubles exist. WP-17 closes it.
 3. A connected principal whose roles grant no Field action receives no Field
    event.
 4. An organisation-wide Field authority receives Field events for every site in
-   its organisation, exactly once per event.
+   its organisation, over a single eligible fanout path — the org-wide/site
+   room split cannot deliver one event to the same socket twice.
+
+   This is a statement about room fanout, not about transport. WebSocket
+   delivery is not exactly-once under disconnect, reconnect, or publisher
+   retry, and the Field outbox is deliberately at-least-once. The guarantee
+   the system actually offers is **single-scope delivery path; REST remains
+   authoritative** — a client that missed or double-received a signal reaches
+   the same state by refetching.
 5. Operative `state` never appears in a socket payload; the payload carries only
    `kind`, `organisation_id`, `site_id`, and the relevant subject id.
 6. A `site_id` that is not a safe subject token is rejected at the API boundary

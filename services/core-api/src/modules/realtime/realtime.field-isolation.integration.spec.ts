@@ -25,8 +25,12 @@ import {
  * a tenant saw every site's Field traffic and the operative's `state` rode the
  * wire (WP-17/F1, F2). These are the regressions that prove both are closed:
  * delivery is site-scoped, organisation-wide Field authorities still see every
- * site exactly once, a principal with no Field action sees nothing, and the
- * payload is a routing signal rather than a domain record.
+ * site over a single fanout path, a principal with no Field action sees
+ * nothing, and the payload is a routing signal rather than a domain record.
+ *
+ * These assert room-fanout behaviour on a stable connection. They are not — and
+ * cannot be — a transport exactly-once claim: the socket is a signal and REST
+ * remains authoritative.
  */
 describe('Realtime Field delivery — site scoping and need-to-know (live stack, WP-17 AC1-AC5)', () => {
   let restoreEnv: () => void;
@@ -144,7 +148,7 @@ describe('Realtime Field delivery — site scoping and need-to-know (live stack,
     await Promise.all([receivedByA1, noneForCustodian]);
   }, 15_000);
 
-  it('AC4: an organisation-wide Field authority receives events for every site, exactly once each', async () => {
+  it('AC4: an organisation-wide Field authority receives every site over a single fanout path (no duplicate room delivery)', async () => {
     const clientDispatcher = connectAs(dispatcherOrgWide);
     await waitForEvent(clientDispatcher, 'connect');
 
@@ -156,8 +160,10 @@ describe('Realtime Field delivery — site scoping and need-to-know (live stack,
     publishFieldEvent(orgA, siteA1, { kind: 'FIELD_ASSIGNMENT_CREATED', assignment_id: 'assignment-site-a1' });
     publishFieldEvent(orgA, siteA2, { kind: 'FIELD_ASSIGNMENT_CREATED', assignment_id: 'assignment-site-a2' });
 
-    // Wait past the point where a duplicate would have arrived, then assert on
-    // the whole set — a "received twice" bug is invisible to a first-event wait.
+    // Wait past the point where a room-fanout duplicate would have arrived,
+    // then assert on the whole set — a "delivered twice by room membership"
+    // bug is invisible to a first-event wait. (Scope: one stable connection,
+    // one publish each; this says nothing about reconnect or publisher retry.)
     await sleep(1500);
 
     expect(received).toHaveLength(2);

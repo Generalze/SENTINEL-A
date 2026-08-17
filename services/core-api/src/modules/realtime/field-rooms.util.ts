@@ -20,8 +20,11 @@ export const FIELD_VISIBILITY_ACTIONS: readonly string[] = ['field.assignment.ma
  * assignment (`site_id === null`) means the whole tenant is in scope, so the
  * socket joins the single org-wide Field room and no site rooms. Otherwise it
  * joins one room per granted site. The two branches are mutually exclusive, so
- * a Field event emitted to both the org-wide room and one site room reaches
- * each socket exactly once.
+ * a Field event emitted to both the org-wide room and one site room has a
+ * single eligible fanout path to any given socket — it cannot be delivered
+ * twice by room membership. This is a fanout property, not a transport
+ * delivery guarantee (see `realtime.constants.ts`); REST remains
+ * authoritative.
  *
  * This module imports identity's role table directly rather than re-deriving
  * it: WP-12's lane rule that kept `realtime` free of `modules/identity` was a
