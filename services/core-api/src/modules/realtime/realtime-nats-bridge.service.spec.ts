@@ -161,9 +161,9 @@ describe('RealtimeNatsBridgeService — resubscribe retry/backoff wiring (delive
       expect(gateway.broadcastToRooms).toHaveBeenCalled();
     });
 
+    // C7-08: scope + kind only. No assignment_id, no user_id, no state.
     expect(gateway.broadcastToRooms).toHaveBeenCalledWith([fieldSiteRoom(orgId, 'site-1'), fieldOrgWideRoom(orgId)], WS_EVENT_FIELD_UPDATED, {
       kind: 'FIELD_ASSIGNMENT_ACCEPTED',
-      assignment_id: 'assignment-1',
       organisation_id: orgId,
       site_id: 'site-1',
     });
@@ -171,6 +171,53 @@ describe('RealtimeNatsBridgeService — resubscribe retry/backoff wiring (delive
     expect(gateway.broadcastToOrg).not.toHaveBeenCalled();
 
     bridge.onModuleDestroy();
+  });
+
+  it('C7-08: drops a message whose subject carries surplus segments instead of index-reading it', async () => {
+    const orgId = 'org_bridge_5';
+    // A subject the builders can no longer produce. The subscriptions use
+    // single-token wildcards so this should not arrive at all; the bridge must
+    // still refuse it rather than reading `orgId` out of position 3 and
+    // broadcasting into that organisation.
+    const msg = fakeMsg(`sentinel.incidents.updated.${orgId}.extra`, { id: 'inc-1', organisation_id: orgId });
+    const nats = fakeNatsProvider({ [NATS_SUBJECT_HYPOTHESIS]: asyncIterableOf([]), [NATS_SUBJECT_INCIDENT]: asyncIterableOf([msg]), [NATS_SUBJECT_FIELD]: asyncIterableOf([]) });
+    const gateway = fakeGateway();
+    const bridge = new RealtimeNatsBridgeService(nats, gateway);
+    bridge.setBackoffOptionsForTesting({ baseMs: 1, maxMs: 2, factor: 1 });
+
+    bridge.onModuleInit();
+    await sleep(50);
+
+    expect(gateway.broadcastToOrg).not.toHaveBeenCalled();
+    expect(gateway.broadcastToRooms).not.toHaveBeenCalled();
+
+    bridge.onModuleDestroy();
+  });
+
+  it('C7-08: drops a Field message with a surplus segment after the site token', async () => {
+    const orgId = 'org_bridge_6';
+    const msg = fakeMsg(`sentinel.field.updated.${orgId}.site-1.extra`, { kind: 'FIELD_ASSIGNMENT_CREATED' });
+    const nats = fakeNatsProvider({ [NATS_SUBJECT_HYPOTHESIS]: asyncIterableOf([]), [NATS_SUBJECT_INCIDENT]: asyncIterableOf([]), [NATS_SUBJECT_FIELD]: asyncIterableOf([msg]) });
+    const gateway = fakeGateway();
+    const bridge = new RealtimeNatsBridgeService(nats, gateway);
+    bridge.setBackoffOptionsForTesting({ baseMs: 1, maxMs: 2, factor: 1 });
+
+    bridge.onModuleInit();
+    await sleep(50);
+
+    expect(gateway.broadcastToRooms).not.toHaveBeenCalled();
+    expect(gateway.broadcastToOrg).not.toHaveBeenCalled();
+
+    bridge.onModuleDestroy();
+  });
+
+  it('C7-08: subscribes with exact-arity wildcards rather than a trailing `>`', () => {
+    expect(NATS_SUBJECT_HYPOTHESIS).toBe('sentinel.fusion.hypothesis.*');
+    expect(NATS_SUBJECT_INCIDENT).toBe('sentinel.incidents.updated.*');
+    expect(NATS_SUBJECT_FIELD).toBe('sentinel.field.updated.*.*');
+    for (const subject of [NATS_SUBJECT_HYPOTHESIS, NATS_SUBJECT_INCIDENT, NATS_SUBJECT_FIELD]) {
+      expect(subject).not.toContain('>');
+    }
   });
 
   it('drops a Field message whose subject carries no site token rather than falling back to an org-wide fanout (WP-17/D2)', async () => {

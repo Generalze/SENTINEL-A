@@ -52,21 +52,35 @@ export function pickWhitelistedFields(raw: unknown, fallbackOrganisationId?: str
 }
 
 /**
- * WP-17/D4: Field events get their own, narrower projection.
+ * WP-17/D4 + C7-08: Field events get their own, deliberately minimal
+ * projection — a cache-invalidation hint and nothing else.
  *
- * A Field event is a signal that something in the socket's scope changed —
- * the client then refetches the authoritative record over REST, where
+ * A Field event is a signal that something in the socket's scope changed. The
+ * client then refetches the authoritative record over REST, where
  * `field.assignment.*` / `field.state.read` are enforced. So the wire carries
- * routing and identity only. In particular the operative's `state`
- * (`COMPROMISED`, `NEED_SUPPORT`, ...) is deliberately NOT forwarded, even
- * though the shared whitelist above would pass a `state` key through.
+ * scope and the kind of change, and no object identity at all.
+ *
+ * Why no `assignment_id` / `user_id` (C7-08): the Field site room is shared by
+ * every principal holding a Field visibility action at that site, and
+ * `field.assignment.act` is held by every `field.operative` posted there. REST
+ * deliberately answers 404 — not 403 — when one operative asks for another
+ * operative's assignment, because the assignee set is itself need-to-know.
+ * Forwarding the identifier on the shared channel would have the socket
+ * disclose the existence and stable id of an object REST says that same
+ * principal may not know exists. The socket must never be the weaker boundary.
+ *
+ * The cost is a slightly wider refetch: an operative reloads
+ * `assignments/mine` / `state/mine`, and a dispatcher reloads the site-scoped
+ * list, rather than fetching one object by id. That is the correct trade at
+ * this layer. Object-specific notification needs an assignee- or user-scoped
+ * room, not a wider payload on a shared one.
  *
  * `organisation_id` and `site_id` are taken from the NATS subject the message
  * arrived on — the same values that chose the room — rather than from the
  * payload body, so a client can never be told it is looking at a scope other
  * than the one that was authorised to receive it.
  */
-const FIELD_PASSTHROUGH_KEYS = ['kind', 'assignment_id', 'user_id'] as const;
+const FIELD_PASSTHROUGH_KEYS = ['kind'] as const;
 
 export function pickFieldRealtimeFields(raw: unknown, organisationId: string, siteId: string): WhitelistedRealtimePayload {
   const record = isPlainRecord(raw) ? raw : {};

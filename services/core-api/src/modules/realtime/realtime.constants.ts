@@ -27,14 +27,24 @@ export function resolveWsCorsOrigin(): string | string[] {
 
 /**
  * Deliverable #3: plain (non-JetStream) subscriptions — this channel is
- * fire-and-forget, clients refetch history via REST. `>` matches the
- * organisation id token and anything published after it, per the
- * coordination note (fusion/incidents publishers are concurrent work and
- * their exact subject arity beyond `{organisation_id}` isn't fixed yet).
+ * fire-and-forget, clients refetch history via REST.
+ *
+ * C7-08 hardening: these were `>` (match the organisation token and anything
+ * after it), which WP-12 chose because the publishers were concurrent work and
+ * their subject arity was not yet fixed. It is fixed now — every builder in
+ * `common/messaging` produces an exact subject — so the consumers narrow to
+ * the same grammar with single-token `*` wildcards. A message with surplus
+ * segments no longer reaches the bridge at all, and `handleMessage` rejects
+ * one anyway if the server-side subscription is ever loosened. Fail closed on
+ * both sides.
  */
-export const NATS_SUBJECT_HYPOTHESIS = 'sentinel.fusion.hypothesis.>';
-export const NATS_SUBJECT_INCIDENT = 'sentinel.incidents.updated.>';
-export const NATS_SUBJECT_FIELD = 'sentinel.field.updated.>';
+export const NATS_SUBJECT_HYPOTHESIS = 'sentinel.fusion.hypothesis.*';
+export const NATS_SUBJECT_INCIDENT = 'sentinel.incidents.updated.*';
+export const NATS_SUBJECT_FIELD = 'sentinel.field.updated.*.*';
+
+/** Exact segment count each route's subject must have; anything else is dropped. */
+export const ORG_SUBJECT_SEGMENTS = 4;
+export const FIELD_SUBJECT_SEGMENTS = 5;
 
 /** All update subjects above carry `{organisation_id}` as their 4th dot-segment. */
 export const SUBJECT_ORG_ID_SEGMENT_INDEX = 3;

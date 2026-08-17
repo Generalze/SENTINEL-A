@@ -80,8 +80,8 @@ describe('pickWhitelistedFields', () => {
   });
 });
 
-describe('pickFieldRealtimeFields (WP-17/D4)', () => {
-  it('forwards only the Field signal keys, never the domain record', () => {
+describe('pickFieldRealtimeFields (WP-17/D4, C7-08)', () => {
+  it('forwards scope and kind only — never the domain record', () => {
     const result = pickFieldRealtimeFields(
       {
         kind: 'FIELD_ASSIGNMENT_ACCEPTED',
@@ -97,8 +97,6 @@ describe('pickFieldRealtimeFields (WP-17/D4)', () => {
 
     expect(result).toEqual({
       kind: 'FIELD_ASSIGNMENT_ACCEPTED',
-      assignment_id: 'assignment-1',
-      user_id: 'user-field',
       organisation_id: 'org-1',
       site_id: 'site-1',
     });
@@ -107,10 +105,23 @@ describe('pickFieldRealtimeFields (WP-17/D4)', () => {
     expect(result).not.toHaveProperty('priority');
   });
 
+  it('C7-08: never forwards a peer object identifier on the shared site channel', () => {
+    // The Field site room holds every principal with a Field visibility action
+    // at that site, and REST answers 404 (not 403) when one operative asks for
+    // another's assignment. Forwarding the id here would let the socket
+    // disclose the existence of an object REST says the caller may not know
+    // exists.
+    const result = pickFieldRealtimeFields({ kind: 'FIELD_ASSIGNMENT_CREATED', assignment_id: 'peer-assignment', user_id: 'peer-operative' }, 'org-1', 'site-1');
+    expect(result).toEqual({ kind: 'FIELD_ASSIGNMENT_CREATED', organisation_id: 'org-1', site_id: 'site-1' });
+    expect(result).not.toHaveProperty('assignment_id');
+    expect(result).not.toHaveProperty('user_id');
+  });
+
   it('never forwards operative state, even when the payload carries it', () => {
     const result = pickFieldRealtimeFields({ kind: 'FIELD_STATE_UPDATED', user_id: 'user-field', state: 'COMPROMISED' }, 'org-1', 'site-1');
-    expect(result).toEqual({ kind: 'FIELD_STATE_UPDATED', user_id: 'user-field', organisation_id: 'org-1', site_id: 'site-1' });
+    expect(result).toEqual({ kind: 'FIELD_STATE_UPDATED', organisation_id: 'org-1', site_id: 'site-1' });
     expect(result).not.toHaveProperty('state');
+    expect(result).not.toHaveProperty('user_id');
   });
 
   it('takes scope from the subject, never from the payload body', () => {

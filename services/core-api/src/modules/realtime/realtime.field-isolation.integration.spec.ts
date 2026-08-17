@@ -127,12 +127,14 @@ describe('Realtime Field delivery — site scoping and need-to-know (live stack,
 
     const [received] = await Promise.all([receivedByA1, noneForA2, noneForB]);
 
+    // C7-08: scope and kind only — the assignment id stays off the shared
+    // site channel, since REST hides a peer's assignment behind a 404.
     expect(received).toEqual({
       kind: 'FIELD_ASSIGNMENT_CREATED',
-      assignment_id: 'assignment-wp17-1',
       organisation_id: orgA,
       site_id: siteA1,
     });
+    expect(received).not.toHaveProperty('assignment_id');
   }, 15_000);
 
   it('AC3: a connected principal whose roles grant no Field action receives nothing', async () => {
@@ -167,8 +169,11 @@ describe('Realtime Field delivery — site scoping and need-to-know (live stack,
     await sleep(1500);
 
     expect(received).toHaveLength(2);
+    // `site_id` is the only discriminator left on the wire after C7-08, which
+    // is exactly the point: the notification says which scope changed, and the
+    // client refetches to learn what.
     expect(received.map((payload) => payload.site_id).sort()).toEqual([siteA1, siteA2].sort());
-    expect(received.map((payload) => payload.assignment_id).sort()).toEqual(['assignment-site-a1', 'assignment-site-a2']);
+    expect(received.every((payload) => !('assignment_id' in payload))).toBe(true);
   }, 15_000);
 
   it('AC5: operative state never rides the socket, and scope comes from the subject rather than the payload', async () => {
@@ -194,13 +199,14 @@ describe('Realtime Field delivery — site scoping and need-to-know (live stack,
 
     expect(received).toEqual({
       kind: 'FIELD_STATE_UPDATED',
-      user_id: operativeA1.userId,
       organisation_id: orgA,
       site_id: siteA1,
     });
     expect(received).not.toHaveProperty('state');
     expect(received).not.toHaveProperty('location');
     expect(received).not.toHaveProperty('need_to_know_summary');
+    // C7-08: not even whose state changed.
+    expect(received).not.toHaveProperty('user_id');
   }, 15_000);
 
   it('drops a Field message published without a site token instead of falling back to an organisation-wide fanout', async () => {

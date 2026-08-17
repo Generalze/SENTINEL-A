@@ -5,13 +5,18 @@ import { hypothesisSubject, incidentCandidateSubject } from '../../modules/fusio
 import { incidentUpdatedSubject } from '../../modules/incidents/incidents.constants';
 
 /**
- * WP-17/C7-06: a cross-module guard that every NATS subject builder in the
- * service applies the same canonical token rule.
+ * WP-17/C7-06: asserts that each of the five NATS subject builders known to
+ * this service applies the same canonical token rule.
  *
  * WP-17 hardened the Field subject only; the Wave-7 audit found four more
- * builders interpolating dynamic ids. This spec exists so a sixth builder
- * added later without validation is caught here rather than in a review — if
- * you add one, add it to `BUILDERS`.
+ * builders interpolating dynamic ids, and this pins all of them.
+ *
+ * Scope of the guarantee — `BUILDERS` is a hand-maintained list. A sixth
+ * builder added elsewhere and never registered here will NOT fail this suite,
+ * so this is a regression pin for the builders that exist, not an automatic
+ * bar on adding an unvalidated one. Getting that stronger property means
+ * centralising subject construction behind one module so there is no second
+ * place to add a builder; that is not WP-17 work.
  */
 const UNSAFE_TOKENS = ['org.evil', 'org-a.>', 'org *', 'org a', ''];
 
