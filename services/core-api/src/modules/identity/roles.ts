@@ -26,6 +26,12 @@
  * | field.message.read | Read a Field message you sent or were addressed in |
  * | field.message.acknowledge | Acknowledge a Field message addressed to you |
  * | incident.field-message.oversight.read | Read incident Field messages as command oversight |
+ * | patrol.route.read  | Read patrol routes and their versioned checkpoints  |
+ * | patrol.route.manage | Create patrol routes / publish new route versions  |
+ * | patrol.run.read    | Read patrol runs (operatives: own runs only)        |
+ * | patrol.run.manage  | Schedule/cancel patrol runs; command abandonment    |
+ * | patrol.run.act     | Start/abandon own assigned patrol run               |
+ * | patrol.checkpoint.verify | Verify a checkpoint on own assigned run       |
  *
  * §62 role -> action table (source of truth for RBAC; site/clearance/
  * purpose are attribute-based constraints layered on top by AccessGuard,
@@ -58,6 +64,19 @@ export const ACTIONS = [
   // incident.view, so binding message content to it would disclose messages
   // to all six at once. Granted to site.commander only.
   'incident.field-message.oversight.read',
+  // WP-19/C9-09: patrol capability is its own explicit vocabulary. None of it
+  // is implied by incident.view or the Field assignment actions. The C9-05
+  // matrix: site.commander reads and manages routes and runs; dispatcher may
+  // schedule runs but NOT redefine patrol standards (that is the point of
+  // ruling timing policy onto the route version); field.operative may only
+  // act on and read their own run. COMPLETE is system-owned — no role holds
+  // an action for it because no endpoint exists.
+  'patrol.route.read',
+  'patrol.route.manage',
+  'patrol.run.read',
+  'patrol.run.manage',
+  'patrol.run.act',
+  'patrol.checkpoint.verify',
   'event.ingest',
   'event.read',
   'evidence.ingest',
@@ -88,10 +107,10 @@ export const ROLES = [
 export type Role = (typeof ROLES)[number];
 
 export const ROLE_ACTIONS: Readonly<Record<Role, readonly Action[]>> = {
-  'site.commander': ['incident.view', 'incident.close', 'incident.silent.approve', 'field.acknowledge', 'field.assignment.manage', 'field.state.read', 'evidence.read', 'event.read', 'hypothesis.read', 'field.message.send', 'field.message.read', 'field.message.acknowledge', 'incident.field-message.oversight.read'],
+  'site.commander': ['incident.view', 'incident.close', 'incident.silent.approve', 'field.acknowledge', 'field.assignment.manage', 'field.state.read', 'evidence.read', 'event.read', 'hypothesis.read', 'field.message.send', 'field.message.read', 'field.message.acknowledge', 'incident.field-message.oversight.read', 'patrol.route.read', 'patrol.route.manage', 'patrol.run.read', 'patrol.run.manage'],
   operator: ['incident.view', 'presence.view', 'field.state.read', 'event.ingest', 'event.read', 'hypothesis.read'],
-  dispatcher: ['incident.view', 'presence.view', 'field.assignment.manage', 'field.state.read', 'event.read', 'hypothesis.read', 'field.message.send', 'field.message.read', 'field.message.acknowledge'],
-  'field.operative': ['field.acknowledge', 'field.assignment.act', 'field.state.write', 'incident.view', 'field.message.send', 'field.message.read', 'field.message.acknowledge'],
+  dispatcher: ['incident.view', 'presence.view', 'field.assignment.manage', 'field.state.read', 'event.read', 'hypothesis.read', 'field.message.send', 'field.message.read', 'field.message.acknowledge', 'patrol.route.read', 'patrol.run.read', 'patrol.run.manage'],
+  'field.operative': ['field.acknowledge', 'field.assignment.act', 'field.state.write', 'incident.view', 'field.message.send', 'field.message.read', 'field.message.acknowledge', 'patrol.run.read', 'patrol.run.act', 'patrol.checkpoint.verify'],
   investigator: ['evidence.read', 'evidence.verify', 'ledger.read', 'ledger.verify', 'incident.view', 'event.read', 'hypothesis.read'],
   'evidence.custodian': ['evidence.read', 'evidence.ingest', 'evidence.verify'],
   admin: ['org.admin', 'site.admin', 'user.admin', 'incident.view', 'constitution.policy.read', 'ledger.verify'],

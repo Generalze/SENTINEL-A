@@ -508,7 +508,11 @@ export function resolveAbandonedCheckpointState(
 
 /** C9-03: a run may complete only when nothing is still outstanding. */
 export function canCompletePatrolRun(checkpointStates: readonly PatrolRunCheckpointState[]): boolean {
-  return !checkpointStates.includes('PENDING');
+  // C9-08 fail closed: a run with no checkpoints proves nothing, a PENDING
+  // checkpoint is unfinished business, and a CANCELLED checkpoint only exists
+  // on runs that were themselves cancelled or abandoned — none may COMPLETE.
+  if (checkpointStates.length === 0) return false;
+  return checkpointStates.every((state) => state === 'VERIFIED' || state === 'LATE' || state === 'MISSED');
 }
 
 export const IncidentFieldMessageSchema = z.object({

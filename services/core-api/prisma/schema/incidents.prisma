@@ -42,6 +42,7 @@ model Incident {
   timeline IncidentTimelineEntry[]
   responseTasks ResponseTask[]
   fieldMessages IncidentFieldMessage[]
+  patrolRuns PatrolRun[]
 
   /// WP-18 candidate key. Deliberately redundant with the primary key: it makes
   /// (id, organisation_id, site_id) referenceable, so a Field message can be

@@ -96,7 +96,7 @@ the whole log.
 | WP-17 | Done — site-scoped Field delivery, need-to-know payloads, subject-token safety across every NATS builder, operative REST refetch, WP-16 AC7 API tests | merged `83a5d7d` |
 | WP-17A | Done — Field `site_id` referential integrity, closing Wave-7 finding C7-07 | merged `5f01b15` |
 | WP-18 | Done — incident field messaging: named-recipient entitlement, commander oversight as its own action, immutable recipients, tuple-bound persistence, transport-evidence delivery | merged `5868bf7` |
-| WP-19 | Directive and execution contract written, checkpoint corrections C9-01..C9-06 applied, scheduling authority ruled to the route version; **implementation HOLD** pending the lead's contract lock | branch `docs/wp-19-directive` |
+| WP-19 | Contract PASS (C9-01..C9-06); full implementation pass delivered per the lead's consolidated GO, incorporating C9-07..C9-09 — schema, RBAC, lifecycle, verification, missed sweep, audit/timeline/outbox, 24 patrol tests. **MERGE HOLD** pending whole-system adversarial audit + hosted CI | branch `wp-19-patrol-foundation` |
 | WP-20 .. WP-22 | Not started | — |
 
 **Wave 7 is closed.** WP-17 and WP-17A are both on `main`; C7-07 is closed.
@@ -104,12 +104,13 @@ the whole log.
 **Wave 8 is open.** WP-18 is the first half and has landed. WP-19 patrol
 foundation closes it.
 
-**Next:** WP-19 implementation, once the lead locks the patrol-execution and
-missed/late contract. See
-[`directives/WP-19-patrol-foundation.md`](directives/WP-19-patrol-foundation.md),
-which resolves the execution-anchor gap and carries no open questions: timing
-policy belongs to the versioned route checkpoint, and a run materialises
-absolute expectations from its server-owned start.
+**Next:** the lead's whole-system adversarial audit of WP-19 (schema,
+authorization, tenant isolation, lifecycle, timing, concurrency, idempotency,
+audit, realtime, migrations) against hosted CI, then the merge gate. See
+[`directives/WP-19-patrol-foundation.md`](directives/WP-19-patrol-foundation.md):
+timing policy belongs to the versioned route checkpoint, a run materialises
+absolute expectations from its server-owned start, and completion is
+system-owned.
 
 ### CI contract
 

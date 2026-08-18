@@ -234,10 +234,14 @@ describe('WP-19/C9-03 run lifecycle', () => {
     expect(PatrolRunSchema.parse(run({ status: 'CANCELLED', ended_at: START }))).toMatchObject({ status: 'CANCELLED' });
   });
 
-  it('completes only when nothing is still outstanding', () => {
+  it('C9-08: completion fails closed — only a non-empty fully resolved patrol qualifies', () => {
     expect(canCompletePatrolRun(['VERIFIED', 'LATE', 'MISSED'])).toBe(true);
+    expect(canCompletePatrolRun(['VERIFIED'])).toBe(true);
     expect(canCompletePatrolRun(['VERIFIED', 'PENDING'])).toBe(false);
-    expect(canCompletePatrolRun([])).toBe(true);
+    // A checkpoint-free run proves no patrol happened; it must not COMPLETE.
+    expect(canCompletePatrolRun([])).toBe(false);
+    // CANCELLED checkpoints only exist on cancelled or abandoned runs.
+    expect(canCompletePatrolRun(['VERIFIED', 'CANCELLED'])).toBe(false);
   });
 
   it('abandonment cannot launder an already-overdue checkpoint', () => {

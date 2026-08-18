@@ -3,10 +3,10 @@
 **Issued by:** Lead (/root) - **Lane:** Core with senior review - **Wave:** 8
 **Depends:** WP-15 Field Contracts, WP-16 Field Domain, WP-17 Field Realtime, WP-17A Field Site Integrity, WP-18 Incident Field Messaging
 **Review chain:** Cipher adversarial review -> Lead merge gate
-**Status:** Directive and contract design only. **Implementation is HOLD** until
-the lead locks this contract. Checkpoint corrections C9-01 through C9-06 are
-applied; the scheduling-authority question is ruled (route version owns the
-standard).
+**Status:** Contract **PASS** (C9-01..C9-06 applied; scheduling authority ruled
+to the route version). Implementation pass **delivered** under the lead's
+consolidated GO, incorporating C9-07, C9-08 and C9-09 as requirements.
+**MERGE HOLD** until the whole-system adversarial audit and hosted CI.
 
 ## Objective
 
@@ -216,18 +216,61 @@ database remain authoritative. **A socket acknowledgement is not a checkpoint
 verification** — WP-18/C8-01 established that transport receipt and human action
 are different evidence, and patrol must not blur them.
 
-## Deliverables (implementation stage, not yet authorized)
+## Implementation-pass requirements (ruled with the consolidated GO)
 
-- Prisma models and an additive migration for patrol runs and run checkpoints,
-  with the WP-17A composite site relation and the WP-18 incident tuple relation
-  where an incident is present.
-- Run lifecycle service (schedule, start, complete, abandon) with CAS.
-- Checkpoint verification endpoint deriving everything in section 4 server-side.
-- A missed-checkpoint sweep, idempotent and auditable.
-- Realtime notification of run/checkpoint state changes, content-free.
-- Unit and live-stack tests including cross-tenant, cross-site, wrong-run,
-  out-of-order, replayed verification, deadline boundary, and missed-sweep
-  cases.
+**C9-07 — the tuple is enforced below the service layer.** A run checkpoint
+carries route + version identity, and persistence binds it twice: to its run on
+`(patrol_run_id, organisation_id, site_id, patrol_route_id, route_version)` and
+to its definition checkpoint on
+`(patrol_checkpoint_id, patrol_route_id, route_version)`. A row that disagrees
+with its run about tenant, site, route or pinned version cannot exist, even for
+a writer that bypasses the service. The verification record is bound the same
+way to `(patrol_run_checkpoint_id, patrol_run_id, organisation_id)`.
+
+**C9-08 — completion fails closed.** `canCompletePatrolRun` accepts only a
+non-empty set in which every checkpoint is VERIFIED, LATE or MISSED. An empty
+set proves no patrol happened; a PENDING checkpoint is unfinished business; a
+CANCELLED checkpoint only exists on runs that were themselves cancelled or
+abandoned. None may COMPLETE.
+
+**C9-09 — explicit action vocabulary.**
+
+```text
+patrol.route.read    patrol.route.manage
+patrol.run.read      patrol.run.manage
+patrol.run.act       patrol.checkpoint.verify
+
+START            assigned operative              (patrol.run.act)
+SCHEDULE/CANCEL  commander or dispatcher         (patrol.run.manage)
+ABANDON          operative on own run, or command intervention
+                 with a mandatory audited reason
+COMPLETE         system-owned: no action, no endpoint — it happens
+                 inside the transaction resolving the final checkpoint
+VERIFY           assigned operative only         (patrol.checkpoint.verify)
+```
+
+Verification idempotency stays namespaced as ruled:
+`organisation_id + patrol_run_id + patrol_run_checkpoint_id +
+operative_user_id + idempotency_key`.
+
+## Delivered implementation
+
+- `packages/contracts/src/field.ts` — patrol contracts with C9-01..C9-04 and
+  the C9-08 fail-closed completion rule, plus the pure timing/ordering
+  functions used by the service.
+- `services/core-api/prisma/schema/patrol.prisma` and additive migration
+  `20260819090000_wp19_patrol_foundation` — seven tables with the C9-07
+  composite bindings, the WP-17A site relation and the WP-18 incident tuple.
+- `services/core-api/src/modules/patrol/` — repository (run-lock
+  serialization, database-clock receipt via `clock_timestamp()` after the
+  lock, materialisation at start, missed sweep, system-owned completion),
+  service (C9-05 authorization and 404 non-probing), controller (one action
+  per route), and the sweeper.
+- Audit to `FieldAuditLog`, incident timeline entries for incident-linked
+  runs, and content-free realtime signals over the existing WP-17 Field
+  outbox path.
+- 24 patrol tests (4 eligibility unit, 20 live-stack API) plus the contract
+  suites.
 
 ## Acceptance criteria (implementation stage)
 
@@ -259,5 +302,6 @@ per-run cadence supplied at scheduling time — is rejected for WP-19 because it
 would let a scheduler weaken an approved patrol standard for one shift without
 changing the definition anyone reviewed.
 
-No open questions remain. Implementation is HOLD only pending the lead's lock of
-this contract.
+No open questions remain. The contract is locked, the implementation pass is
+delivered, and the package is on MERGE HOLD pending the lead's whole-system
+adversarial audit and hosted CI.
