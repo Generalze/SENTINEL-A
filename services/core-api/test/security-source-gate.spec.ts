@@ -97,12 +97,22 @@ function pathWithoutScanner(): string {
 
 const fixtures: string[] = [];
 
-/** Builds a throwaway tree with one source file under `services/`. */
-function fixture(fileName: string, contents: string): string {
+/** Every canonical root the gate requires. */
+const REQUIRED_ROOTS = ['services', 'apps', 'packages', 'tests'] as const;
+
+/**
+ * Builds a throwaway tree containing ALL required roots, with one source file
+ * under `services/`. The gate refuses a partially-present tree, so a fixture
+ * that created only `services/` would now be indistinguishable from a broken
+ * checkout.
+ */
+function fixture(fileName: string, contents: string, omit: readonly string[] = []): string {
   const root = mkdtempSync(join(tmpdir(), 'sentinel-gate-'));
   fixtures.push(root);
-  mkdirSync(join(root, 'services'), { recursive: true });
-  writeFileSync(join(root, 'services', fileName), contents, 'utf8');
+  for (const dir of REQUIRED_ROOTS) {
+    if (!omit.includes(dir)) mkdirSync(join(root, dir), { recursive: true });
+  }
+  if (!omit.includes('services')) writeFileSync(join(root, 'services', fileName), contents, 'utf8');
   return root;
 }
 
@@ -115,7 +125,8 @@ describe('security source gate', () => {
     const root = fixture('clean.ts', 'export const value: string = "ok";\n');
     const result = runGate(root);
     expect(result.status).toBe(0);
-    expect(result.output).toContain('Security source gate passed');
+    // The log line is itself the evidence of scope, so pin it in full.
+    expect(result.output).toContain('Security source gate passed: scanned services apps packages tests');
   });
 
   it('rejects a deferred-work marker', () => {
@@ -155,6 +166,18 @@ describe('security source gate', () => {
     expect(result.status).toBe(2);
     expect(result.output).toContain('CANNOT RUN');
     expect(result.output).not.toContain('passed');
+  });
+
+  it('FAILS CLOSED when ANY single required root is missing, not only when all are', () => {
+    // The partial-omission false green: accepting whichever roots existed made
+    // a tree missing one of them report a clean scan of the whole repository.
+    for (const missing of REQUIRED_ROOTS) {
+      const root = fixture('clean.ts', 'export const value: string = "ok";\n', [missing]);
+      const result = runGate(root);
+      expect(result.status, `omitting ${missing} must fail closed`).toBe(2);
+      expect(result.output).toContain(`required source root '${missing}' is missing`);
+      expect(result.output).not.toContain('passed');
+    }
   });
 
   it('FAILS CLOSED when no expected source root exists', () => {

@@ -47,18 +47,22 @@ if ! command -v rg >/dev/null 2>&1; then
   exit "$FAIL_CANNOT_RUN"
 fi
 
+# EVERY canonical root must be present. Accepting whichever roots happened to
+# exist left a false green: a tree missing `services/` would still report
+# "passed: scanned apps packages tests", which reads as a clean scan of the
+# whole repository. A partially-scanned tree is not a passing tree.
+#
+# `-d` rather than `-e`: a FILE named `services` must not satisfy a directory
+# invariant.
 CANDIDATE_ROOTS=(services apps packages tests)
 ROOTS=()
 for candidate in "${CANDIDATE_ROOTS[@]}"; do
-  if [ -e "$candidate" ]; then
-    ROOTS+=("$candidate")
+  if [ ! -d "$candidate" ]; then
+    echo "Security source gate CANNOT RUN: required source root '$candidate' is missing under '$ROOT'." >&2
+    exit "$FAIL_CANNOT_RUN"
   fi
+  ROOTS+=("$candidate")
 done
-
-if [ "${#ROOTS[@]}" -eq 0 ]; then
-  echo "Security source gate CANNOT RUN: none of ${CANDIDATE_ROOTS[*]} exist under '$ROOT'." >&2
-  exit "$FAIL_CANNOT_RUN"
-fi
 
 # Runs ripgrep and returns its output, distinguishing "no matches" from failure.
 # Sets RG_OUTPUT and returns 0 when matches exist, 1 when there are none, and
