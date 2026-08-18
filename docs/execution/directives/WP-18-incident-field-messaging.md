@@ -3,7 +3,9 @@
 **Issued by:** Lead (/root) - **Lane:** Core with senior review - **Wave:** 8
 **Depends:** WP-15 Field Contracts, WP-16 Field Domain, WP-17 Field Realtime, WP-17A Field Site Integrity
 **Review chain:** Cipher adversarial review -> Lead merge gate
-**Status:** Directive only. **No implementation branch until WP-17A is merged.**
+**Status:** Authorized for implementation. WP-17 and WP-17A are present on
+`main`; Wave-7 closure prerequisites are satisfied. Implementation must follow
+this directive from the current accepted `main`.
 
 ## Objective
 
