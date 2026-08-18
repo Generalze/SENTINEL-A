@@ -3,8 +3,8 @@
 **Issued by:** Lead (/root) - **Lane:** Core with senior review - **Wave:** 7 (hardening)
 **Depends:** WP-16 Field Domain, WP-17 Field Realtime
 **Review chain:** Cipher adversarial review -> Lead merge gate
-**Status:** Implemented on `wp-17a-field-site-integrity` (stacked on the WP-17
-branch). Awaiting WP-17 merge, then its own review and merge gate.
+**Status:** Implemented and in final merge gate. Presence of this work package
+on `main` closes C7-07 and completes Wave 7.
 
 ## Objective
 
