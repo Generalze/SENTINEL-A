@@ -1,5 +1,6 @@
 import { BadRequestException, ConflictException, ForbiddenException, Inject, Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
+import type { FieldAssignmentStatus } from '@sentinel/contracts';
 import { z } from 'zod';
 import { isSafeSubjectToken, SUBJECT_TOKEN_RULE } from '../../common/messaging/subject-token';
 import type { Principal } from '../../common/security/principal';
@@ -148,6 +149,34 @@ export class FieldService {
     const row = await this.repository.getAssignment(principal.organisation_id, assignmentId, siteScope);
     if (!row) throw new NotFoundException('Assignment not found');
     return mapFieldAssignment(row);
+  }
+
+  /**
+   * WP-20/B10-02 idempotency recovery probe — pure evidence lookup, no mutable
+   * eligibility re-evaluation, actor-scoped per the C8-05 lesson.
+   *
+   * The offline replay executor asks THIS domain — the owner of the assignment
+   * status machine — whether a downstream idempotency identity it already
+   * derived has committed. It deliberately does not call `transitionAssignment`
+   * to find out: that path re-evaluates CURRENT mutable eligibility (assignee,
+   * expected-status CAS, the transition table) before it ever reaches the
+   * idempotency check, so drift since the first attempt could report an effect
+   * that DID commit as a rejection — false history.
+   *
+   * `status` is the ORIGINAL intended post-transition status, taken from this
+   * service's own ACTION_TARGETS, NOT the assignment's current status. The
+   * evidence proves that this action, by this actor, under this key, landed;
+   * what it landed was ACTION_TARGETS[action]. Reading live status instead
+   * would put a value the first attempt never produced into a receipt.
+   */
+  async probeTransitionEvidence(
+    principal: Principal,
+    assignmentId: string,
+    action: FieldAssignmentAction,
+    idempotencyKey: string,
+  ): Promise<{ committed: false } | { committed: true; status: FieldAssignmentStatus }> {
+    const committed = await this.repository.findTransitionEvidence(principal.organisation_id, assignmentId, action, principal.user.id, idempotencyKey);
+    return committed ? { committed: true, status: ACTION_TARGETS[action] } : { committed: false };
   }
 
   async transitionAssignment(

@@ -3,12 +3,14 @@ import { BadRequestException, type INestApplication } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import {
   deriveOfflineDownstreamIdempotencyKey,
+  MAX_OFFLINE_DEVICE_SEQUENCE,
   type AuthenticatedFieldDeviceContext,
   type FieldOfflineOperationKind,
   type OfflineOperationResult,
   type OfflineReplayConflict,
+  type OfflineReplayNamespace,
 } from '@sentinel/contracts';
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { AppModule } from '../../app.module';
 import { buildPrincipal, type Principal } from '../../common/security/principal';
 import { PrismaService } from '../../prisma/prisma.service';
@@ -16,7 +18,12 @@ import { TIMELINE_MESSAGE_ACKNOWLEDGED } from '../field-messaging/field-messagin
 import { FieldMessagingService } from '../field-messaging/field-messaging.service';
 import { FieldService } from '../field/field.service';
 import { intersectSiteScope } from '../identity/list-pagination';
-import { ACTION_MESSAGE_SEND, AUDIT_OFFLINE_OPERATION_FINALIZED, AUDIT_OFFLINE_OPERATION_RECEIVED } from './field-offline.constants';
+import {
+  ACTION_MESSAGE_SEND,
+  AUDIT_OFFLINE_OPERATION_FINALIZED,
+  AUDIT_OFFLINE_OPERATION_RECEIVED,
+  OFFLINE_PROCESSING_LEASE_MS,
+} from './field-offline.constants';
 import { FieldOfflineRepository } from './field-offline.repository';
 import { FieldOfflineReplayService } from './field-offline.service';
 import type { OfflineSubmissionOutcome } from './field-offline.types';
@@ -77,6 +84,13 @@ const fx = {
   siteA2: `${tag}_siteA2`,
   opAlpha: `${tag}_opAlpha`,
   opBravo: `${tag}_opBravo`,
+  /**
+   * B10-02: an operative with NO standing eligibility fixture. Every other
+   * operative here is depended on by the locked 17, so the drift regression
+   * needs a recipient whose incident eligibility it can break and restore
+   * without touching a fixture another test reads.
+   */
+  opCharlie: `${tag}_opCharlie`,
   dispatcherA1: `${tag}_dispatcherA1`,
   incidentA1: randomUUID(),
 };
@@ -93,6 +107,7 @@ async function seed(prisma: PrismaService): Promise<void> {
   const users: Array<{ id: string; role: string; site: string }> = [
     { id: fx.opAlpha, role: 'field.operative', site: fx.siteA1 },
     { id: fx.opBravo, role: 'field.operative', site: fx.siteA1 },
+    { id: fx.opCharlie, role: 'field.operative', site: fx.siteA1 },
     { id: fx.dispatcherA1, role: 'dispatcher', site: fx.siteA1 },
     ...bulkRecipients.map((id) => ({ id, role: 'dispatcher', site: fx.siteA1 })),
   ];
@@ -211,6 +226,12 @@ function expectConflict(outcome: OfflineSubmissionOutcome): OfflineReplayConflic
   return outcome.conflict;
 }
 
+function expectInvalid(outcome: OfflineSubmissionOutcome): string[] {
+  expect(outcome.kind, JSON.stringify(outcome)).toBe('invalid');
+  if (outcome.kind !== 'invalid') throw new Error('unreachable: outcome is not invalid');
+  return outcome.issues;
+}
+
 /** `device_sequence` is BIGINT, so a plain JSON.stringify of a receipt row throws. */
 function jsonWithBigInt(value: unknown): string {
   return JSON.stringify(value, (_key, entry: unknown) => (typeof entry === 'bigint' ? entry.toString() : entry));
@@ -230,11 +251,11 @@ describe('WP-20 offline replay acceptance (live stack)', () => {
   let fixtureSeq = 0;
 
   /** A fresh REQUESTED assignment, so each transition test starts from a clean CAS. */
-  async function newAssignment(assignee: string): Promise<string> {
+  async function newAssignment(assignee: string, status: string = 'REQUESTED'): Promise<string> {
     const row = await prisma.fieldAssignment.create({
       data: {
         organisationId: fx.orgA, siteId: fx.siteA1, incidentId: fx.incidentA1, assigneeUserId: assignee,
-        assignmentType: 'INCIDENT_RESPONSE', priority: 'SEV3', status: 'REQUESTED', deliveryState: 'REQUESTED',
+        assignmentType: 'INCIDENT_RESPONSE', priority: 'SEV3', status, deliveryState: 'REQUESTED',
         needToKnowSummary: 'wp20 fixture', idempotencyKey: `${tag}-assignment-${fixtureSeq++}`,
         createdByUserId: fx.dispatcherA1, updatedByUserId: fx.dispatcherA1,
       },
@@ -313,6 +334,93 @@ describe('WP-20 offline replay acceptance (live stack)', () => {
       await app.close();
     }
   }, 60_000);
+
+  /**
+   * Every spy in this file is a deliberately injected fault. Leaving one
+   * installed would silently corrupt the next test, and the B10 regressions
+   * below install faults from inside mock implementations where an explicit
+   * `mockRestore` is easy to miss — so restoration is unconditional.
+   */
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // ---------------------------------------------------------------------------
+  // B10 shared recipe helpers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * The recipe every B10-01/B10-02 test starts from: a REAL submit whose
+   * downstream effect commits and whose FINALIZATION then faults. It leaves the
+   * receipt in UNKNOWN with claim generation 1 consumed, the cursor held, and
+   * the domain effect durably committed — the exact "we do not know what
+   * happened" state both rules exist to recover from.
+   */
+  async function submitWithFaultedFinalize(
+    principal: Principal,
+    context: AuthenticatedFieldDeviceContext,
+    operation: OperationDraft,
+  ): Promise<OfflineSubmissionOutcome> {
+    const fault = vi.spyOn(repository, 'finalizeAndAdvance').mockRejectedValueOnce(new Error('simulated finalization fault'));
+    try {
+      return await service.submit(principal, context, operation);
+    } finally {
+      fault.mockRestore();
+    }
+  }
+
+  /** Claims the receipt and asserts which generation the claim established. */
+  async function claimAt(receiptId: string, expectedGeneration: number): Promise<number> {
+    const generation = await repository.claimForProcessing(receiptId);
+    expect(generation, 'the claim was refused').toBe(expectedGeneration);
+    if (generation === null) throw new Error('unreachable: claim was lost');
+    return generation;
+  }
+
+  /**
+   * Ages a claim past the C10-08 recovery lease, so the next claim is a LEGAL
+   * steal rather than a race. Deterministic by construction: the stall is
+   * expressed as a timestamp, never as elapsed wall-clock time.
+   */
+  async function ageLeasePastExpiry(receiptId: string): Promise<void> {
+    await prisma.fieldOfflineOperationReceipt.update({
+      where: { id: receiptId },
+      data: { processingClaimedAt: new Date(Date.now() - 2 * OFFLINE_PROCESSING_LEASE_MS) },
+    });
+  }
+
+  const namespaceFor = (userId: string, deviceId: string, siteId: string = fx.siteA1): OfflineReplayNamespace => ({
+    organisation_id: fx.orgA, site_id: siteId, user_id: userId, device_id: deviceId,
+  });
+
+  /** The identity half of a fenced repository write, read back off the stored receipt. */
+  function fenceIdentity(
+    row: { id: string; offlineOperationId: string; deviceSequence: bigint; operationKind: string; requestFingerprint: string },
+    namespace: OfflineReplayNamespace,
+    traceId: string,
+    claimGeneration: number,
+  ) {
+    return {
+      namespace,
+      receiptId: row.id,
+      offlineOperationId: row.offlineOperationId,
+      deviceSequence: Number(row.deviceSequence),
+      operationKind: row.operationKind,
+      requestFingerprint: row.requestFingerprint,
+      traceId,
+      claimGeneration,
+    };
+  }
+
+  /** EVERY finalization audit row for one operation, whatever disposition it carries. */
+  const finalizedAuditCount = (offlineOperationId: string) =>
+    prisma.fieldAuditLog.count({
+      where: {
+        organisationId: fx.orgA,
+        kind: AUDIT_OFFLINE_OPERATION_FINALIZED,
+        payload: { path: ['offline_operation_id'], equals: offlineOperationId },
+      },
+    });
 
   // --- 1. concurrency ------------------------------------------------------
 
@@ -880,5 +988,458 @@ describe('WP-20 offline replay acceptance (live stack)', () => {
     expect(receipts).toHaveLength(1);
     expect(Number(receipts[0].deviceSequence)).toBe(0);
     expect(Number((await cursorFor(fx.opAlpha, device))?.lastFinalizedSequence)).toBe(0);
+  });
+
+  // ===========================================================================
+  // B10-01 — the claim fence
+  //
+  // Worker A claims a receipt and stalls (a GC pause, a hung socket, a paused
+  // container) until its 60s lease expires. Worker B legally reclaims,
+  // finalizes, and moves on. Then A wakes up holding a verdict computed from a
+  // world that no longer exists. Every test below is that story, made
+  // deterministic: the stall is a TIMESTAMP, never elapsed wall-clock time.
+  // ===========================================================================
+
+  // --- 19. B10-01/1 + B10-01/3 ---------------------------------------------
+
+  it('B10-01/1,3: a STALE claimant markUnknown cannot downgrade the APPLIED outcome a newer claim recorded, and emits no audit row', async () => {
+    const device = `${tag}_dev_b10_fence_downgrade`;
+    const assignmentId = await newAssignment(fx.opAlpha);
+    const context = makeContext(fx.opAlpha, device);
+    const namespace = namespaceFor(fx.opAlpha, device);
+    const operation = acceptOp(assignmentId, { device_id: device, device_sequence: 0 });
+
+    // Generation 1 is consumed by a real attempt: the domain effect COMMITS,
+    // finalization faults, the receipt records UNKNOWN and the cursor holds.
+    expect(expectConflict(await submitWithFaultedFinalize(alpha(), context, operation)).conflict_code).toBe('UNKNOWN_OUTCOME');
+    const receipt = (await receiptsFor(fx.opAlpha, device))[0];
+    expect(receipt.status).toBe('UNKNOWN');
+    expect(receipt.attemptCount).toBe(1);
+    expect(await assignmentStatus(assignmentId)).toBe('ACCEPTED');
+
+    // Worker A claims generation 2, then stalls past its lease.
+    const generationA = await claimAt(receipt.id, 2);
+    await ageLeasePastExpiry(receipt.id);
+
+    // Worker B legally reclaims the abandoned lease and records the truth.
+    const generationB = await claimAt(receipt.id, 3);
+    const byWorkerB = await repository.finalizeAndAdvance({
+      ...fenceIdentity(receipt, namespace, operation.trace_id, generationB),
+      outcome: 'APPLIED',
+      conflictCode: null,
+      resultRef: assignmentId,
+      resultSnapshot: { assignment_id: assignmentId, status: 'ACCEPTED' },
+    });
+    expect(byWorkerB.kind).toBe('finalized');
+
+    const auditsBefore = await finalizedAuditCount(operation.offline_operation_id);
+    const unknownAuditsBefore = await offlineAuditCount(operation.offline_operation_id, 'UNKNOWN');
+    const cursorBefore = await cursorFor(fx.opAlpha, device);
+    expect(Number(cursorBefore?.lastFinalizedSequence)).toBe(0);
+
+    // Worker A wakes up and reports the infrastructure fault it saw. Unfenced,
+    // this would downgrade a FINALIZED APPLIED back to UNKNOWN — re-opening a
+    // queue position whose effect has already committed, and inviting a third
+    // attempt to fire it a second time.
+    const lost = await repository.markUnknown(fenceIdentity(receipt, namespace, operation.trace_id, generationA));
+    expect(lost.kind).toBe('lost');
+
+    const after = await prisma.fieldOfflineOperationReceipt.findUniqueOrThrow({ where: { id: receipt.id } });
+    expect(after.status).toBe('APPLIED');
+    expect(after.outcome).toBe('APPLIED');
+    expect(after.finalizedAt).not.toBeNull();
+    expect(after.resultRef).toBe(assignmentId);
+
+    // B10-01/3: the lost call mutated NOTHING — no false audit row, no cursor
+    // movement, not even a cursor row touch.
+    expect(await finalizedAuditCount(operation.offline_operation_id)).toBe(auditsBefore);
+    expect(await offlineAuditCount(operation.offline_operation_id, 'UNKNOWN')).toBe(unknownAuditsBefore);
+    const cursorAfter = await cursorFor(fx.opAlpha, device);
+    expect(Number(cursorAfter?.lastFinalizedSequence)).toBe(0);
+    expect(cursorAfter?.updatedAt.toISOString()).toBe(cursorBefore?.updatedAt.toISOString());
+
+    // Still exactly one domain effect across the whole story.
+    expect(await assignmentIdempotencyCount(assignmentId)).toBe(1);
+    expect(await assignmentAuditCount(assignmentId)).toBe(1);
+  });
+
+  // --- 20. B10-01/2 + B10-01/3 ---------------------------------------------
+
+  it('B10-01/2,3: a STALE claimant finalize cannot rewrite the newer REJECTED outcome, advance the cursor again, or emit a false APPLIED audit row', async () => {
+    const device = `${tag}_dev_b10_fence_rewrite`;
+    const assignmentId = await newAssignment(fx.opAlpha);
+    const context = makeContext(fx.opAlpha, device);
+    const namespace = namespaceFor(fx.opAlpha, device);
+    const operation = acceptOp(assignmentId, { device_id: device, device_sequence: 0 });
+
+    expect(expectConflict(await submitWithFaultedFinalize(alpha(), context, operation)).conflict_code).toBe('UNKNOWN_OUTCOME');
+    const receipt = (await receiptsFor(fx.opAlpha, device))[0];
+    expect(receipt.status).toBe('UNKNOWN');
+
+    const generationA = await claimAt(receipt.id, 2);
+    await ageLeasePastExpiry(receipt.id);
+    const generationB = await claimAt(receipt.id, 3);
+
+    // This time the attempt that legally owns the receipt records a
+    // DETERMINISTIC rejection, which consumes the queue position (C10-07).
+    const byWorkerB = await repository.finalizeAndAdvance({
+      ...fenceIdentity(receipt, namespace, operation.trace_id, generationB),
+      outcome: 'REJECTED',
+      conflictCode: 'DOMAIN_REJECTED',
+      resultRef: null,
+      resultSnapshot: { http_status: 409 },
+    });
+    expect(byWorkerB.kind).toBe('finalized');
+
+    const auditsBefore = await finalizedAuditCount(operation.offline_operation_id);
+    const cursorBefore = await cursorFor(fx.opAlpha, device);
+    // C10-07: exactly one advance, performed by the attempt that owned the receipt.
+    expect(Number(cursorBefore?.lastFinalizedSequence)).toBe(0);
+
+    // Worker A wakes up believing it applied. Unfenced, an `update by id` here
+    // would put a stale APPLIED on top of a real REJECTED.
+    const lost = await repository.finalizeAndAdvance({
+      ...fenceIdentity(receipt, namespace, operation.trace_id, generationA),
+      outcome: 'APPLIED',
+      conflictCode: null,
+      resultRef: assignmentId,
+      resultSnapshot: { assignment_id: assignmentId, status: 'ACCEPTED' },
+    });
+    expect(lost.kind).toBe('lost');
+
+    const after = await prisma.fieldOfflineOperationReceipt.findUniqueOrThrow({ where: { id: receipt.id } });
+    expect(after.status).toBe('REJECTED');
+    expect(after.outcome).toBe('REJECTED');
+    expect(after.resultRef).toBeNull();
+    expect(after.resultSnapshot).toEqual({ http_status: 409 });
+
+    // B10-01/3: no false APPLIED audit row, and the cursor did not move again.
+    expect(await finalizedAuditCount(operation.offline_operation_id)).toBe(auditsBefore);
+    expect(await offlineAuditCount(operation.offline_operation_id, 'APPLIED')).toBe(0);
+    const cursorAfter = await cursorFor(fx.opAlpha, device);
+    expect(Number(cursorAfter?.lastFinalizedSequence)).toBe(0);
+    expect(cursorAfter?.updatedAt.toISOString()).toBe(cursorBefore?.updatedAt.toISOString());
+  });
+
+  // --- 21. B10-01/4 ---------------------------------------------------------
+
+  it('B10-01/4: a submission that LOSES its claim fence reports the winning attempt stored outcome, never its own stale verdict', async () => {
+    const device = `${tag}_dev_b10_fence_reread`;
+    const assignmentId = await newAssignment(fx.opAlpha);
+    const context = makeContext(fx.opAlpha, device);
+    const operation = acceptOp(assignmentId, { device_id: device, device_sequence: 0 });
+
+    expect(expectConflict(await submitWithFaultedFinalize(alpha(), context, operation)).conflict_code).toBe('UNKNOWN_OUTCOME');
+    const receipt = (await receiptsFor(fx.opAlpha, device))[0];
+    expect(receipt.status).toBe('UNKNOWN');
+
+    // The retry claims generation 2 and reaches finalization — and at exactly
+    // that instant a rival worker steals the (now aged) lease and finalizes
+    // first. Injecting the steal INSIDE the finalize call is what makes the
+    // interleaving deterministic instead of a sleep-and-hope race.
+    const realFinalize = repository.finalizeAndAdvance.bind(repository);
+    vi.spyOn(repository, 'finalizeAndAdvance').mockImplementationOnce(async (input) => {
+      await ageLeasePastExpiry(input.receiptId);
+      const rivalGeneration = await claimAt(input.receiptId, 3);
+      const byRival = await realFinalize({ ...input, claimGeneration: rivalGeneration });
+      expect(byRival.kind).toBe('finalized');
+      // Now the caller's own write lands, carrying the superseded generation 2.
+      return realFinalize(input);
+    });
+
+    const answered = expectResult(await service.submit(alpha(), context, operation));
+
+    // The loser reports the WINNER's truth, down the ordinary replay path.
+    expect(answered.outcome).toBe('APPLIED');
+    expect(answered.replayed).toBe(true);
+    expect(answered.result_ref).toBe(assignmentId);
+    expect(answered.result_snapshot).toEqual({ assignment_id: assignmentId, status: 'ACCEPTED' });
+    expect(answered.next_expected_sequence).toBe(1);
+
+    const stored = await prisma.fieldOfflineOperationReceipt.findUniqueOrThrow({ where: { id: receipt.id } });
+    expect(stored.status).toBe('APPLIED');
+    expect(stored.attemptCount).toBe(3);
+    expect(answered.finalized_at).toBe(stored.finalizedAt?.toISOString());
+
+    // Exactly one finalization was recorded, by the attempt that owned the
+    // receipt, and exactly one domain effect exists across all three attempts.
+    expect(await offlineAuditCount(operation.offline_operation_id, 'APPLIED')).toBe(1);
+    expect(await assignmentIdempotencyCount(assignmentId)).toBe(1);
+    expect(await assignmentAuditCount(assignmentId)).toBe(1);
+    expect(await assignmentOutboxCount(assignmentId)).toBe(1);
+    expect(Number((await cursorFor(fx.opAlpha, device))?.lastFinalizedSequence)).toBe(0);
+
+    // And an ordinary reconnect afterwards converges on the same stored answer.
+    const replay = expectResult(await service.submit(alpha(), context, operation));
+    expect(replay.replayed).toBe(true);
+    expect(replay.outcome).toBe('APPLIED');
+    expect(replay.finalized_at).toBe(answered.finalized_at);
+    expect(await receiptsFor(fx.opAlpha, device)).toHaveLength(1);
+  });
+
+  // ===========================================================================
+  // B10-02 — truthful recovery when the world has drifted
+  //
+  // The effect committed, the offline finalization faulted, and by the time the
+  // device reconnects the CURRENT eligibility the domain re-checks no longer
+  // holds. Re-running the domain call cannot answer "did it happen?" honestly;
+  // the evidence row written in the effect's own transaction can.
+  // ===========================================================================
+
+  // --- 22. B10-02/5 ---------------------------------------------------------
+
+  it('B10-02/5: a message send recovers APPLIED from the committed message even after the recipient has stopped being eligible', async () => {
+    const device = `${tag}_dev_b10_drift_send`;
+    const context = makeContext(fx.opAlpha, device);
+    const recipientAssignment = await newAssignment(fx.opCharlie, 'ACCEPTED');
+    const body = `wp20-drift-${randomUUID()}`;
+    const operation = makeOperation({
+      device_id: device,
+      device_sequence: 0,
+      operation_kind: 'INCIDENT_FIELD_MESSAGE_SEND',
+      payload: { incident_id: fx.incidentA1, recipient_user_ids: [fx.opCharlie], body, retention_class: 'standard' },
+    });
+
+    try {
+      expect(expectConflict(await submitWithFaultedFinalize(alpha(), context, operation)).conflict_code).toBe('UNKNOWN_OUTCOME');
+
+      const receipt = (await receiptsFor(fx.opAlpha, device))[0];
+      expect(receipt.status).toBe('UNKNOWN');
+      // The message DID commit — that is exactly why the outcome is unknown.
+      const committed = await prisma.incidentFieldMessage.findFirstOrThrow({
+        where: { organisationId: fx.orgA, senderUserId: fx.opAlpha, idempotencyKey: receipt.downstreamIdempotencyKey },
+        select: { id: true },
+      });
+      expect(await prisma.incidentFieldMessageRecipient.count({ where: { messageId: committed.id } })).toBe(1);
+      expect((await cursorFor(fx.opAlpha, device))?.lastFinalizedSequence).toBeNull();
+
+      // THE WORLD CHANGES. The recipient's involvement in the incident ends, so
+      // WP-18/C8-03 eligibility no longer holds for them.
+      await prisma.fieldAssignment.update({ where: { id: recipientAssignment }, data: { status: 'COMPLETED', completedAt: new Date() } });
+
+      // Proof the drift is real: an identical FRESH send is now a 400. A retry
+      // that re-ran the domain would finalize REJECTED for a message that
+      // already exists — false history, written into a receipt the device
+      // replays as final.
+      const principal = alpha();
+      const freshInput = messaging.parseSend({
+        recipient_user_ids: [fx.opCharlie],
+        body,
+        media_refs: [],
+        retention_class: 'standard',
+        idempotency_key: `drift-probe-${randomUUID()}`,
+        trace_id: `trace-${randomUUID()}`,
+      });
+      await expect(messaging.send(principal, intersectSiteScope(principal, ACTION_MESSAGE_SEND), fx.incidentA1, freshInput)).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
+
+      // The retry asks the OWNING domain for evidence instead, and recovers.
+      const recovered = expectResult(await service.submit(alpha(), context, operation));
+      expect(recovered.outcome).toBe('APPLIED');
+      expect(recovered.result_ref).toBe(committed.id);
+      // R6 allowlist, rebuilt from the EVIDENCE row: identifiers and a count.
+      expect(recovered.result_snapshot).toEqual({ incident_field_message_id: committed.id, incident_id: fx.incidentA1, recipient_count: 1 });
+      expect(recovered.next_expected_sequence).toBe(1);
+
+      // The recovery READ evidence; it created nothing.
+      expect(await prisma.incidentFieldMessage.count({ where: { organisationId: fx.orgA, senderUserId: fx.opAlpha, traceId: operation.trace_id } })).toBe(1);
+      expect(await prisma.incidentFieldMessageRecipient.count({ where: { messageId: committed.id } })).toBe(1);
+      expect(Number((await cursorFor(fx.opAlpha, device))?.lastFinalizedSequence)).toBe(0);
+
+      const finalizedReceipt = (await receiptsFor(fx.opAlpha, device))[0];
+      expect(finalizedReceipt.status).toBe('APPLIED');
+      expect(finalizedReceipt.attemptCount).toBe(2);
+      const snapshotJson = jsonWithBigInt(finalizedReceipt.resultSnapshot);
+      expect(snapshotJson).toContain('recipient_count');
+      expect(snapshotJson).not.toContain(body);
+      expect(snapshotJson).not.toContain(fx.opCharlie);
+    } finally {
+      await prisma.fieldAssignment.update({ where: { id: recipientAssignment }, data: { status: 'ACCEPTED', completedAt: null } });
+    }
+  });
+
+  // --- 23. B10-02/6 ---------------------------------------------------------
+
+  it('B10-02/6: an assignment accept recovers the ORIGINAL intended status from evidence, not the status the assignment has since drifted to', async () => {
+    const device = `${tag}_dev_b10_drift_assignment`;
+    const assignmentId = await newAssignment(fx.opAlpha);
+    const context = makeContext(fx.opAlpha, device);
+    const operation = acceptOp(assignmentId, { device_id: device, device_sequence: 0 });
+
+    expect(expectConflict(await submitWithFaultedFinalize(alpha(), context, operation)).conflict_code).toBe('UNKNOWN_OUTCOME');
+    expect(await assignmentStatus(assignmentId)).toBe('ACCEPTED');
+    expect((await cursorFor(fx.opAlpha, device))?.lastFinalizedSequence).toBeNull();
+
+    // THE WORLD CHANGES: the operative gets on with the job before the
+    // reconnect lands, so the assignment has moved past the queued transition.
+    await prisma.fieldAssignment.update({ where: { id: assignmentId }, data: { status: 'IN_PROGRESS', startedAt: new Date() } });
+
+    const recovered = expectResult(await service.submit(alpha(), context, operation));
+    expect(recovered.outcome).toBe('APPLIED');
+    expect(recovered.result_ref).toBe(assignmentId);
+    // WP-16's own ACTION_TARGETS for the recovered action — NOT the live
+    // status. The evidence proves this action by this actor under this key
+    // landed; what it landed was ACCEPTED. Reading live state instead would
+    // write a value the recovered attempt never produced into a receipt the
+    // device replays as final.
+    expect(recovered.result_snapshot).toEqual({ assignment_id: assignmentId, status: 'ACCEPTED' });
+    expect(recovered.next_expected_sequence).toBe(1);
+
+    // The recovery did not touch the domain object it recovered.
+    expect(await assignmentStatus(assignmentId)).toBe('IN_PROGRESS');
+    expect(await prisma.fieldAuditLog.count({ where: { assignmentId, kind: 'FIELD_ASSIGNMENT_ACCEPTED' } })).toBe(1);
+    expect(await assignmentIdempotencyCount(assignmentId)).toBe(1);
+    expect(await assignmentOutboxCount(assignmentId)).toBe(1);
+    expect(Number((await cursorFor(fx.opAlpha, device))?.lastFinalizedSequence)).toBe(0);
+  });
+
+  // --- 24. B10-02/7 ---------------------------------------------------------
+
+  it('B10-02/7: an acknowledgement recovers APPLIED without restamping acknowledged_at or appending a second timeline entry', async () => {
+    const device = `${tag}_dev_b10_drift_ack`;
+    const context = makeContext(fx.opAlpha, device);
+    const messageId = await newDeliveredMessage(fx.opAlpha);
+    const operation = makeOperation({
+      device_id: device,
+      device_sequence: 0,
+      operation_kind: 'INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE',
+      payload: { message_id: messageId },
+    });
+
+    const timelineWhere = {
+      incidentId: fx.incidentA1,
+      kind: TIMELINE_MESSAGE_ACKNOWLEDGED,
+      payload: { path: ['incident_field_message_id'], equals: messageId },
+    };
+
+    expect(expectConflict(await submitWithFaultedFinalize(alpha(), context, operation)).conflict_code).toBe('UNKNOWN_OUTCOME');
+
+    // The acknowledgement COMMITTED. Its own effect is the drift: the C8-01
+    // precondition the domain re-checks is DELIVERED, and the row is no longer
+    // in that state.
+    const before = await prisma.incidentFieldMessageRecipient.findFirstOrThrow({ where: { messageId, recipientUserId: fx.opAlpha } });
+    expect(before.deliveryState).toBe('ACKNOWLEDGED');
+    expect(before.acknowledgedAt).not.toBeNull();
+    expect(await prisma.incidentTimelineEntry.count({ where: timelineWhere })).toBe(1);
+    expect((await cursorFor(fx.opAlpha, device))?.lastFinalizedSequence).toBeNull();
+
+    const recovered = expectResult(await service.submit(alpha(), context, operation));
+    expect(recovered.outcome).toBe('APPLIED');
+    expect(recovered.result_ref).toBe(messageId);
+    expect(recovered.result_snapshot).toEqual({ incident_field_message_id: messageId });
+    expect(recovered.next_expected_sequence).toBe(1);
+
+    // C10-06: the recovery cannot manufacture a second, later acknowledgement.
+    const after = await prisma.incidentFieldMessageRecipient.findFirstOrThrow({ where: { messageId, recipientUserId: fx.opAlpha } });
+    expect(after.acknowledgedAt?.toISOString()).toBe(before.acknowledgedAt?.toISOString());
+    expect(after.deliveryState).toBe('ACKNOWLEDGED');
+    expect(await prisma.incidentTimelineEntry.count({ where: timelineWhere })).toBe(1);
+    expect(await prisma.incidentFieldMessageActionIdempotency.count({ where: { messageId, action: 'acknowledge' } })).toBe(1);
+    expect(Number((await cursorFor(fx.opAlpha, device))?.lastFinalizedSequence)).toBe(0);
+  });
+
+  // --- 25. B10-02/8 ---------------------------------------------------------
+
+  it('B10-02/8: with NO committed evidence, a retry the domain deterministically refuses finalizes REJECTED and consumes its queue position', async () => {
+    const device = `${tag}_dev_b10_no_evidence`;
+    const assignmentId = await newAssignment(fx.opAlpha);
+    const context = makeContext(fx.opAlpha, device);
+    const operation = acceptOp(assignmentId, { device_id: device, device_sequence: 0 });
+
+    // The FIRST attempt dies INSIDE the domain call, before any effect: an
+    // infrastructure fault, so the outcome is unknown and nothing committed.
+    const infrastructure = vi.spyOn(field, 'transitionAssignment').mockRejectedValueOnce(new Error('simulated infrastructure fault'));
+    expect(expectConflict(await service.submit(alpha(), context, operation)).conflict_code).toBe('UNKNOWN_OUTCOME');
+    infrastructure.mockRestore();
+
+    expect((await receiptsFor(fx.opAlpha, device))[0].status).toBe('UNKNOWN');
+    expect(await assignmentStatus(assignmentId)).toBe('REQUESTED');
+    expect(await assignmentIdempotencyCount(assignmentId)).toBe(0);
+    expect((await cursorFor(fx.opAlpha, device))?.lastFinalizedSequence).toBeNull();
+
+    // The world moves while the device is away: the assignment is cancelled, so
+    // the queued accept can never apply.
+    await prisma.fieldAssignment.update({ where: { id: assignmentId }, data: { status: 'CANCELLED', cancelledAt: new Date() } });
+
+    // Generation 2 probes for evidence, finds NONE — and absence is proof,
+    // because every evidence row is written in the same transaction as the
+    // effect it records. So the deterministic 4xx is the real, first-and-only
+    // answer rather than a re-evaluation contradicting a forgotten commit.
+    const rejected = expectResult(await service.submit(alpha(), context, operation));
+    expect(rejected.outcome).toBe('REJECTED');
+    expect(rejected.replayed).toBe(false);
+    expect(rejected.result_snapshot).toEqual({ http_status: 409 });
+    expect(rejected.result_ref).toBeNull();
+    expect(rejected.next_expected_sequence).toBe(1);
+    // C10-07: a rejection consumes its position rather than wedging the queue.
+    expect(Number((await cursorFor(fx.opAlpha, device))?.lastFinalizedSequence)).toBe(0);
+
+    // NO domain effect ever existed — which is exactly what makes REJECTED truthful.
+    expect(await assignmentIdempotencyCount(assignmentId)).toBe(0);
+    expect(await assignmentAuditCount(assignmentId)).toBe(0);
+    expect(await assignmentOutboxCount(assignmentId)).toBe(0);
+    expect(await assignmentStatus(assignmentId)).toBe('CANCELLED');
+    expect(await offlineAuditCount(operation.offline_operation_id, 'REJECTED')).toBe(1);
+  });
+
+  // ===========================================================================
+  // B10-03 — an exhausted sequence namespace
+  // ===========================================================================
+
+  // --- 26. B10-03/9 ---------------------------------------------------------
+
+  it('B10-03/9: a namespace finalized at MAX reports NO next sequence, still replays its stored outcome, and admits nothing new', async () => {
+    const device = `${tag}_dev_b10_exhaustion`;
+    const context = makeContext(fx.opAlpha, device);
+    const assignmentId = await newAssignment(fx.opAlpha);
+    const untouched = await newAssignment(fx.opAlpha);
+
+    // One position short of the end of the namespace.
+    await prisma.fieldOfflineDeviceCursor.create({
+      data: {
+        organisationId: fx.orgA,
+        siteId: fx.siteA1,
+        userId: fx.opAlpha,
+        deviceId: device,
+        lastFinalizedSequence: BigInt(MAX_OFFLINE_DEVICE_SEQUENCE) - 1n,
+      },
+    });
+
+    const operation = acceptOp(assignmentId, { device_id: device, device_sequence: MAX_OFFLINE_DEVICE_SEQUENCE });
+    const applied = expectResult(await service.submit(alpha(), context, operation));
+    expect(applied.outcome).toBe('APPLIED');
+    expect(applied.replayed).toBe(false);
+    // `last + 1` would leave the safe-integer range, so the honest answer is
+    // "there is no next sequence" — never a silently wrapped or rounded one.
+    expect(applied.next_expected_sequence).toBeNull();
+    expect(await assignmentStatus(assignmentId)).toBe('ACCEPTED');
+    expect(Number((await cursorFor(fx.opAlpha, device))?.lastFinalizedSequence)).toBe(MAX_OFFLINE_DEVICE_SEQUENCE);
+
+    // An exhausted device can still read back what it already did.
+    const replay = expectResult(await service.submit(alpha(), context, operation));
+    expect(replay.replayed).toBe(true);
+    expect(replay.outcome).toBe('APPLIED');
+    expect(replay.next_expected_sequence).toBeNull();
+    expect(replay.finalized_at).toBe(applied.finalized_at);
+    expect(replay.result_snapshot).toEqual({ assignment_id: assignmentId, status: 'ACCEPTED' });
+
+    // A CHANGED request at the consumed MAX position is still reuse: exhaustion
+    // does not soften C10-04, and there is deliberately no cursor reset.
+    const changed: OperationDraft = { ...operation, payload: { assignment_id: untouched, expected_status: 'REQUESTED' } };
+    const conflict = expectConflict(await service.submit(alpha(), context, changed));
+    expect(conflict.conflict_code).toBe('SEQUENCE_REUSED');
+    expect(conflict.expected_sequence).toBeNull();
+    expect(await assignmentStatus(untouched)).toBe('REQUESTED');
+    expect(await assignmentIdempotencyCount(untouched)).toBe(0);
+
+    // And nothing can follow MAX: the contract itself refuses the position, so
+    // an exhausted namespace cannot be extended by a client that ignores the
+    // null. Refused at parse time — no receipt, no cursor movement.
+    const beyond = acceptOp(untouched, { device_id: device, device_sequence: MAX_OFFLINE_DEVICE_SEQUENCE + 1 });
+    expect(expectInvalid(await service.submit(alpha(), context, beyond)).length).toBeGreaterThan(0);
+
+    expect(await receiptsFor(fx.opAlpha, device)).toHaveLength(1);
+    expect(Number((await cursorFor(fx.opAlpha, device))?.lastFinalizedSequence)).toBe(MAX_OFFLINE_DEVICE_SEQUENCE);
   });
 });

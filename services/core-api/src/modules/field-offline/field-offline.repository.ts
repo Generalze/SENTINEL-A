@@ -130,6 +130,12 @@ export interface FinalizeInput {
   resultRef: string | null;
   resultSnapshot: Record<string, unknown> | null;
   traceId: string;
+  /**
+   * B10-01: the `attemptCount` this worker's claim established. Every write
+   * this attempt makes to the receipt is fenced on it, so a worker whose lease
+   * was legally stolen cannot land a write behind the newer attempt's back.
+   */
+  claimGeneration: number;
 }
 
 export interface MarkUnknownInput {
@@ -140,14 +146,28 @@ export interface MarkUnknownInput {
   operationKind: string;
   requestFingerprint: string;
   traceId: string;
+  /** B10-01: see FinalizeInput.claimGeneration. */
+  claimGeneration: number;
 }
 
-export interface FinalizeResult {
-  /** Server clock, taken inside the finalizing transaction. */
-  finalizedAt: Date;
-  /** The cursor value AFTER the forward-only advance. */
-  lastFinalizedSequence: number | null;
-}
+/**
+ * B10-01. `lost` means the CAS fence did not match: this attempt no longer
+ * owns the receipt, so it mutated NOTHING — not the receipt, not the cursor,
+ * not the audit trail — and its caller must report what the owning attempt
+ * recorded rather than its own stale verdict.
+ */
+export type FinalizeOutcome =
+  | {
+      kind: 'finalized';
+      /** Server clock, taken inside the finalizing transaction. */
+      finalizedAt: Date;
+      /** The cursor value AFTER the forward-only advance. */
+      lastFinalizedSequence: number | null;
+    }
+  | { kind: 'lost' };
+
+/** B10-01: same fence, same two answers, for the infrastructure-fault path. */
+export type MarkUnknownOutcome = { kind: 'marked' } | { kind: 'lost' };
 
 @Injectable()
 export class FieldOfflineRepository {
@@ -327,8 +347,20 @@ export class FieldOfflineRepository {
    * finalized receipt can never be re-claimed. The whole predicate lives in
    * the WHERE clause, so the winner is decided by the database's row lock
    * rather than by a read-then-write the loser could interleave with.
+   *
+   * B10-01: returns the CLAIM GENERATION — `attemptCount` as it stands after
+   * this claim's increment — or null when the claim was lost. The generation
+   * is the fencing token every subsequent write by this attempt carries, so a
+   * worker that stalls past its lease cannot later overwrite the outcome of
+   * the attempt that legally reclaimed the receipt.
+   *
+   * The read happens INSIDE the claiming transaction, after the CAS: the row
+   * this updateMany touched is write-locked until commit, so no competing
+   * claim can increment between the update and the read. A read outside the
+   * transaction could observe a LATER attempt's count and hand this worker a
+   * fencing token belonging to someone else — which would defeat the fence.
    */
-  async claimForProcessing(receiptId: string): Promise<boolean> {
+  async claimForProcessing(receiptId: string): Promise<number | null> {
     return this.prisma.$transaction(async (tx) => {
       const now = await this.dbNow(tx);
       const leaseExpiry = new Date(now.getTime() - OFFLINE_PROCESSING_LEASE_MS);
@@ -342,7 +374,13 @@ export class FieldOfflineRepository {
         },
         data: { status: RECEIPT_STATUS_APPLYING, processingClaimedAt: now, attemptCount: { increment: 1 } },
       });
-      return claim.count === 1;
+      if (claim.count !== 1) return null;
+      const claimed = await tx.fieldOfflineOperationReceipt.findUnique({ where: { id: receiptId }, select: { attemptCount: true } });
+      // The row was just updated inside this very transaction, so its absence
+      // is an integrity fault, not a race. Fail loudly rather than invent a
+      // fencing token no write could ever match.
+      if (claimed === null) throw new Error('offline receipt vanished inside its own claim transaction');
+      return claimed.attemptCount;
     });
   }
 
@@ -357,16 +395,27 @@ export class FieldOfflineRepository {
    *
    * The advance is forward-only. A stale finalizer that somehow arrives after
    * the cursor has moved on updates nothing rather than rewinding the queue.
+   *
+   * B10-01 CLAIM FENCE. The receipt write is a compare-and-set on
+   * `(id, status = APPLYING, attemptCount = claimGeneration)`, and it runs
+   * FIRST — before the cursor advance and before the audit row — so a lost
+   * fence leaves the transaction having mutated nothing at all. The cursor
+   * lock is still taken ahead of it to keep tx1's lock order and avoid a
+   * deadlock; acquiring a lock is not a mutation, so ordering it first costs
+   * the fence nothing.
    */
-  async finalizeAndAdvance(input: FinalizeInput): Promise<FinalizeResult> {
+  async finalizeAndAdvance(input: FinalizeInput): Promise<FinalizeOutcome> {
     return this.prisma.$transaction(async (tx) => {
       // Same lock order as tx1 — cursor first — so the two paths cannot deadlock.
       await this.lockCursor(tx, input.namespace);
       const finalizedAt = await this.dbNow(tx);
       const sequence = sequenceToDb(input.deviceSequence);
 
-      await tx.fieldOfflineOperationReceipt.update({
-        where: { id: input.receiptId },
+      const fenced = await tx.fieldOfflineOperationReceipt.updateMany({
+        // B10-01: `id` alone is NOT enough. A worker whose lease expired and
+        // was legally reclaimed would otherwise overwrite the newer attempt's
+        // finalized outcome — stale REJECTED landing on top of a real APPLIED.
+        where: { id: input.receiptId, status: RECEIPT_STATUS_APPLYING, attemptCount: input.claimGeneration },
         data: {
           status: input.outcome,
           outcome: input.outcome,
@@ -378,6 +427,10 @@ export class FieldOfflineRepository {
           finalizedAt,
         },
       });
+      // Fence lost. NOTHING has been written yet — no cursor advance, no audit
+      // row — so returning here leaves the newer attempt's record untouched
+      // and its queue position exactly where that attempt put it.
+      if (fenced.count === 0) return { kind: 'lost' };
 
       await tx.fieldOfflineDeviceCursor.updateMany({
         where: {
@@ -404,7 +457,7 @@ export class FieldOfflineRepository {
         trace_id: input.traceId,
       });
 
-      return { finalizedAt, lastFinalizedSequence: nullableSequenceFromDb(cursor?.lastFinalizedSequence ?? null) };
+      return { kind: 'finalized', finalizedAt, lastFinalizedSequence: nullableSequenceFromDb(cursor?.lastFinalizedSequence ?? null) };
     });
   }
 
@@ -415,10 +468,20 @@ export class FieldOfflineRepository {
    * reclaims this receipt under the lease and re-invokes the domain with the
    * SAME stored downstream key, so the domain's own idempotency — not this
    * module — decides whether the first attempt had already landed.
+   *
+   * B10-01: fenced identically to `finalizeAndAdvance`, and for a sharper
+   * reason. Unfenced, a stale worker's markUnknown would DOWNGRADE a newer
+   * attempt's finalized APPLIED back to UNKNOWN — re-opening a queue position
+   * whose effect has already committed, and inviting a third attempt to fire
+   * it again. A lost fence writes no receipt change and no audit row.
    */
-  async markUnknown(input: MarkUnknownInput): Promise<void> {
-    await this.prisma.$transaction(async (tx) => {
-      await tx.fieldOfflineOperationReceipt.update({ where: { id: input.receiptId }, data: { status: RECEIPT_STATUS_UNKNOWN } });
+  async markUnknown(input: MarkUnknownInput): Promise<MarkUnknownOutcome> {
+    return this.prisma.$transaction(async (tx) => {
+      const fenced = await tx.fieldOfflineOperationReceipt.updateMany({
+        where: { id: input.receiptId, status: RECEIPT_STATUS_APPLYING, attemptCount: input.claimGeneration },
+        data: { status: RECEIPT_STATUS_UNKNOWN },
+      });
+      if (fenced.count === 0) return { kind: 'lost' };
       await this.audit(tx, input.namespace, AUDIT_OFFLINE_OPERATION_FINALIZED, {
         offline_operation_id: input.offlineOperationId,
         device_id: input.namespace.device_id,
@@ -430,6 +493,33 @@ export class FieldOfflineRepository {
         request_fingerprint: input.requestFingerprint,
         trace_id: input.traceId,
       });
+      return { kind: 'marked' };
     });
+  }
+
+  /**
+   * B10-01 lost-fence recovery read. A fresh, NON-transactional read of the
+   * receipt as it stands right now, so an attempt that lost its fence can
+   * report what the owning attempt actually recorded instead of its own stale
+   * verdict. Deliberately outside any transaction: the point is to observe the
+   * OTHER attempt's committed work.
+   */
+  async getReceiptById(receiptId: string): Promise<OfflineStoredReceipt | null> {
+    const row = await this.prisma.fieldOfflineOperationReceipt.findUnique({ where: { id: receiptId }, select: receiptProjection });
+    return row === null ? null : mapReceipt(row);
+  }
+
+  /**
+   * B10-01: the namespace's current cursor value, read without a lock. Used
+   * only to rebuild `next_expected_sequence` for a reply whose outcome was
+   * decided by ANOTHER attempt — the cursor is not being decided here, merely
+   * reported, so the serialization boundary is not needed.
+   */
+  async readCursor(namespace: OfflineReplayNamespace): Promise<number | null> {
+    const cursor = await this.prisma.fieldOfflineDeviceCursor.findUnique({
+      where: { organisationId_siteId_userId_deviceId: namespaceWhere(namespace) },
+      select: { lastFinalizedSequence: true },
+    });
+    return nullableSequenceFromDb(cursor?.lastFinalizedSequence ?? null);
   }
 }

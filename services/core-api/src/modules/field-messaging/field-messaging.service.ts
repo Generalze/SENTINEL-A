@@ -233,6 +233,42 @@ export class FieldMessagingService {
     return mapMessage(result.message);
   }
 
+  /**
+   * WP-20/B10-02 idempotency recovery probe — pure evidence lookup, no mutable
+   * eligibility re-evaluation, actor-scoped per the C8-05 lesson.
+   *
+   * The offline replay executor asks THIS domain whether the send identity it
+   * derived has already committed. It cannot learn that by calling `send`
+   * again: `send` re-runs sender eligibility, incident scope resolution and
+   * the aggregate bound BEFORE the repository's idempotency layer, so an
+   * eligibility that drifted since the first attempt would turn an effect that
+   * already committed into a REJECTED receipt — false history the device would
+   * then treat as final.
+   *
+   * The sender is `principal.user.id` and the tenant `principal.organisation_id`,
+   * matching the send-idempotency identity exactly (C8-05).
+   */
+  async probeSendEvidence(
+    principal: Principal,
+    incidentId: string,
+    idempotencyKey: string,
+  ): Promise<{ id: string; incidentId: string; recipientCount: number } | null> {
+    return this.repository.findSendEvidence(principal.organisation_id, incidentId, principal.user.id, idempotencyKey);
+  }
+
+  /**
+   * WP-20/B10-02 idempotency recovery probe — pure evidence lookup, no mutable
+   * eligibility re-evaluation, actor-scoped per the C8-05 lesson.
+   *
+   * Same argument as `probeSendEvidence`: `acknowledge` re-checks recipiency
+   * and the C8-01 DELIVERED precondition before reaching its idempotency row,
+   * so a re-run cannot distinguish "never happened" from "already happened and
+   * the state moved on". The evidence row can.
+   */
+  async probeAcknowledgeEvidence(principal: Principal, messageId: string, idempotencyKey: string): Promise<boolean> {
+    return this.repository.findAcknowledgeEvidence(principal.organisation_id, messageId, principal.user.id, idempotencyKey);
+  }
+
   private isEntitled(message: MessageWithRecipients, userId: string): boolean {
     return message.senderUserId === userId || message.recipients.some((row) => row.recipientUserId === userId);
   }

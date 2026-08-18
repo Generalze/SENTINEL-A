@@ -302,6 +302,34 @@ server-authenticated device identity can populate
    serializing a domain object. No message body, recipient list or
    need-to-know content enters the generic receipt, result, audit or logs.
 
+### Whole-system audit correction batch (B10, applied)
+
+1. **B10-01 — claim fencing (P1).** Every receipt write after the claim is a
+   compare-and-set on `(id, status = APPLYING, attempt_count =
+   claim_generation)`; the claim returns the generation read inside its own
+   transaction. A worker whose lease was legally stolen loses the fence and
+   mutates nothing — not the receipt, not the cursor, not the audit trail —
+   and reports the owning attempt's stored outcome instead of its stale
+   verdict. Deterministic lease-steal regressions pin both corruption
+   directions.
+2. **B10-02 — truthful UNKNOWN recovery (P1).** Before re-executing any
+   attempt after the first (claim generation > 1), the executor asks the
+   OWNING domain for idempotency evidence under the server-derived key
+   (sender-scoped message row; actor-scoped action-idempotency rows).
+   Evidence recovers APPLIED with the snapshot built from the evidence —
+   the assignment snapshot carries the ORIGINAL intended target status,
+   never drifted current state — and skips the domain call. Absence proves
+   no prior effect (evidence rows commit atomically with their effects), so
+   a deterministic 4xx may truthfully finalize REJECTED. C10-02 binding is
+   unchanged and still precedes any disclosure. Drift regressions cover all
+   three operation families.
+3. **B10-03 — sequence exhaustion (P2).** `nextExpectedOfflineSequence`
+   returns null at `MAX_OFFLINE_DEVICE_SEQUENCE`; an exhausted namespace is
+   judged purely by its receipts (replay of the MAX position works, a
+   changed request is SEQUENCE_REUSED, nothing can follow); the result
+   contract's `next_expected_sequence` is nullable. No reset — a spent
+   namespace requires a new authenticated device identity, per C10-03.
+
 ## Checkpoint B acceptance tests (locked now)
 
 Same device + concurrent same sequence -> exactly one domain effect. Same

@@ -152,6 +152,35 @@ export class FieldRepository {
     }
   }
 
+  /**
+   * WP-20/B10-02 idempotency recovery probe — pure evidence lookup, no mutable
+   * eligibility re-evaluation, actor-scoped per the C8-05 lesson.
+   *
+   * `FieldAssignmentActionIdempotency` is written inside the SAME transaction
+   * as the status change, the audit row and the outbox row, so its presence
+   * proves the transition committed and its absence proves it did not. Nothing
+   * about the assignment's CURRENT status is consulted — that is the whole
+   * point: current status is mutable and may have moved on, while this row is
+   * immutable evidence of what happened.
+   *
+   * `actorUserId` binds the actor and the assignment's `organisationId` binds
+   * the tenant. The idempotency row carries no organisation column of its own,
+   * so without that join a key could be answered across tenants.
+   */
+  async findTransitionEvidence(
+    organisationId: string,
+    assignmentId: string,
+    action: string,
+    actorUserId: string,
+    idempotencyKey: string,
+  ): Promise<boolean> {
+    const evidence = await this.prisma.fieldAssignmentActionIdempotency.findFirst({
+      where: { assignmentId, action, idempotencyKey, actorUserId, assignment: { organisationId } },
+      select: { id: true },
+    });
+    return evidence !== null;
+  }
+
   async transitionAssignment(input: TransitionInput): Promise<TransitionResult> {
     return this.prisma.$transaction(async (tx) => {
       const found = await tx.fieldAssignment.findFirst({

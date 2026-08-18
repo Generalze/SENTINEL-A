@@ -9,6 +9,7 @@ import {
   fingerprintOfflineSemanticRequest,
   isNewerOfflineOperation,
   MAX_INCIDENT_FIELD_MESSAGE_BODY_BYTES,
+  MAX_OFFLINE_DEVICE_SEQUENCE,
   nextExpectedOfflineSequence,
   OFFLINE_SEQUENCE_START,
   offlineReceiptAdvancesCursor,
@@ -94,6 +95,44 @@ describe('WP-20/C10-03 sequence classification is contiguous', () => {
     expect(classifyOfflineSequence({ last_finalized_sequence: 4, incoming_sequence: 2, receipt: { exists: true, same_semantic_request: true } })).toBe('REPLAY');
     expect(classifyOfflineSequence({ last_finalized_sequence: 4, incoming_sequence: 2, receipt: { exists: true, same_semantic_request: false } })).toBe('SEQUENCE_REUSED');
     expect(classifyOfflineSequence({ last_finalized_sequence: 4, incoming_sequence: 2, receipt: { exists: false } })).toBe('SEQUENCE_STALE');
+  });
+
+  /**
+   * B10-03. The namespace is finite, so the contract must say so out loud
+   * rather than compute MAX + 1 and hand back a position that is no longer a
+   * safe integer. There is no reset: a device that has consumed every position
+   * needs a new authenticated identity, not a rewound cursor.
+   */
+  it('B10-03: a finalized MAX exhausts the namespace and there is no next sequence', () => {
+    expect(nextExpectedOfflineSequence(MAX_OFFLINE_DEVICE_SEQUENCE)).toBeNull();
+    expect(nextExpectedOfflineSequence(MAX_OFFLINE_DEVICE_SEQUENCE - 1)).toBe(MAX_OFFLINE_DEVICE_SEQUENCE);
+  });
+
+  it('B10-03: an exhausted namespace is judged purely by its receipt — never FRESH, never a GAP', () => {
+    const exhausted = { last_finalized_sequence: MAX_OFFLINE_DEVICE_SEQUENCE, incoming_sequence: MAX_OFFLINE_DEVICE_SEQUENCE };
+    // The finalized MAX position can still be read back.
+    expect(classifyOfflineSequence({ ...exhausted, receipt: { exists: true, same_semantic_request: true } })).toBe('REPLAY');
+    // A CHANGED request may never hide behind the identity MAX established.
+    expect(classifyOfflineSequence({ ...exhausted, receipt: { exists: true, same_semantic_request: false } })).toBe('SEQUENCE_REUSED');
+    // A consumed position with no receipt is stale, exactly as anywhere else.
+    expect(classifyOfflineSequence({ ...exhausted, receipt: { exists: false } })).toBe('SEQUENCE_STALE');
+  });
+
+  it('B10-03: a result may report a null next_expected_sequence when the namespace is exhausted', () => {
+    const result = OfflineOperationResultSchema.parse({
+      schema_version: 2,
+      offline_operation_id: OP_ID,
+      device_sequence: MAX_OFFLINE_DEVICE_SEQUENCE,
+      operation_kind: 'FIELD_ASSIGNMENT_ACCEPT',
+      outcome: 'APPLIED',
+      replayed: false,
+      finalized_at: '2026-08-18T10:06:00.000Z',
+      next_expected_sequence: null,
+      result_ref: OP_ID,
+      result_snapshot: { assignment_id: OP_ID, status: 'ACCEPTED' },
+      trace_id: 'trace-max',
+    });
+    expect(result.next_expected_sequence).toBeNull();
   });
 });
 

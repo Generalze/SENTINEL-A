@@ -185,6 +185,51 @@ export class FieldMessagingRepository {
   }
 
   /**
+   * WP-20/B10-02 idempotency recovery probe — pure evidence lookup, no mutable
+   * eligibility re-evaluation, actor-scoped per the C8-05 lesson.
+   *
+   * The where-clause is EXACTLY the sender-scoped one the P2002 replay lookup
+   * in `send` uses, and for the same reason: the send-idempotency identity
+   * includes the sender, so a probe must never surface a message this
+   * authenticated sender did not create. The projection is narrower than the
+   * replay's on purpose — an id, its incident, and a COUNT. No body, no media,
+   * no recipient ids: this feeds a receipt snapshot that is read back on
+   * reconnect (C10-11/R6).
+   */
+  async findSendEvidence(
+    organisationId: string,
+    incidentId: string,
+    senderUserId: string,
+    idempotencyKey: string,
+  ): Promise<{ id: string; incidentId: string; recipientCount: number } | null> {
+    const existing = await this.prisma.incidentFieldMessage.findFirst({
+      where: { organisationId, incidentId, senderUserId, idempotencyKey },
+      select: { id: true, incidentId: true, _count: { select: { recipients: true } } },
+    });
+    if (!existing) return null;
+    return { id: existing.id, incidentId: existing.incidentId, recipientCount: existing._count.recipients };
+  }
+
+  /**
+   * WP-20/B10-02 idempotency recovery probe — pure evidence lookup, no mutable
+   * eligibility re-evaluation, actor-scoped per the C8-05 lesson.
+   *
+   * The idempotency row is written in the SAME transaction as the delivery
+   * state change, so its presence proves the acknowledgement committed and its
+   * absence proves it did not. `recipientUserId` binds the actor and the
+   * parent message's `organisationId` binds the tenant — the row itself
+   * carries no organisation column, so without that join a key from another
+   * tenant's message could answer this probe.
+   */
+  async findAcknowledgeEvidence(organisationId: string, messageId: string, recipientUserId: string, idempotencyKey: string): Promise<boolean> {
+    const evidence = await this.prisma.incidentFieldMessageActionIdempotency.findFirst({
+      where: { messageId, recipientUserId, action: 'acknowledge', idempotencyKey, message: { organisationId } },
+      select: { id: true },
+    });
+    return evidence !== null;
+  }
+
+  /**
    * WP-18/C8-01: the system-owned transport-evidence step.
    *
    * Called ONLY when a recipient's own authenticated socket has positively

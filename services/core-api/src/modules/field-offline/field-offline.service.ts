@@ -23,8 +23,8 @@ import { FieldMessagingService } from '../field-messaging/field-messaging.servic
 import { FieldService } from '../field/field.service';
 import type { FieldAssignmentAction } from '../field/field.types';
 import { intersectSiteScope, type SiteScope } from '../identity/list-pagination';
-import { REQUIRED_ACTION_FOR_KIND } from './field-offline.constants';
-import { FieldOfflineRepository, type FinalizeInput, type FinalizeResult, type Tx } from './field-offline.repository';
+import { RECEIPT_STATUS_APPLYING, REQUIRED_ACTION_FOR_KIND } from './field-offline.constants';
+import { FieldOfflineRepository, type FinalizeInput, type Tx } from './field-offline.repository';
 import type { OfflineAdmission, OfflineExecutionEffect, OfflineStoredReceipt, OfflineSubmissionOutcome } from './field-offline.types';
 
 /**
@@ -75,6 +75,20 @@ interface ResultInput {
   resultSnapshot: Record<string, unknown> | null;
   traceId: string;
 }
+
+/**
+ * B10-01: what one attempt's finalization actually achieved.
+ *
+ *  - `finalized` this attempt owned the receipt and recorded the outcome;
+ *  - `lost`      the claim fence did not match, so a NEWER attempt owns the
+ *                receipt and this one mutated nothing;
+ *  - `unknown`   the finalizing write itself faulted, so the outcome is
+ *                genuinely unknown and the receipt now says so.
+ */
+type FinalizeAttempt =
+  | { kind: 'finalized'; finalizedAt: Date; lastFinalizedSequence: number | null }
+  | { kind: 'lost' }
+  | { kind: 'unknown' };
 
 /**
  * C10-08: which failures consume a queue position.
@@ -178,11 +192,14 @@ export class FieldOfflineReplayService {
     // A live attempt already holds it, so this submission must not fire a
     // second effect. The holder will finalize; this device retries and gets
     // the stored outcome as a REPLAY.
-    if (!(await this.repository.claimForProcessing(admission.receipt.id))) {
+    // B10-01: the claim yields a GENERATION (`attemptCount` after the
+    // increment), and every receipt write this attempt makes is fenced on it.
+    const claimGeneration = await this.repository.claimForProcessing(admission.receipt.id);
+    if (claimGeneration === null) {
       return this.conflict('OPERATION_IN_PROGRESS', operation, expectedSequence);
     }
 
-    return this.executeAndFinalize(principal, namespace, operation, admission.receipt, requiredAction, expectedSequence);
+    return this.executeAndFinalize(principal, namespace, operation, admission.receipt, requiredAction, expectedSequence, claimGeneration);
   }
 
   // ---------------------------------------------------------------------------
@@ -328,7 +345,8 @@ export class FieldOfflineReplayService {
     operation: FieldOfflineOperationV2,
     receipt: OfflineStoredReceipt,
     requiredAction: string,
-    expectedSequence: number,
+    expectedSequence: number | null,
+    claimGeneration: number,
   ): Promise<OfflineSubmissionOutcome> {
     const finalizeIdentity = {
       namespace,
@@ -338,55 +356,94 @@ export class FieldOfflineReplayService {
       operationKind: receipt.operationKind,
       requestFingerprint: receipt.requestFingerprint,
       traceId: operation.trace_id,
+      claimGeneration,
     };
 
+    /**
+     * B10-02: TRUTHFUL RECOVERY BEFORE RE-EXECUTION.
+     *
+     * Generation 1 is the first attempt — nothing can have committed under
+     * this receipt yet, so it goes straight to the domain. Generation > 1
+     * means an earlier attempt reached the domain and we do not know what
+     * happened to it. Re-running the domain call cannot answer that honestly:
+     * every one of these services re-evaluates CURRENT mutable eligibility
+     * (the assignment's status and assignee, the sender's incident
+     * eligibility, the recipient's DELIVERED precondition) BEFORE control ever
+     * reaches its idempotency table. If that eligibility has drifted since the
+     * first attempt, the re-run returns a deterministic 4xx and we would
+     * finalize REJECTED for an effect that HAS ALREADY COMMITTED — false
+     * history, written into a receipt the device replays as final.
+     *
+     * So we ask the OWNING domain for evidence first. On evidence we recover
+     * APPLIED, build the snapshot from the EVIDENCE (never from current
+     * mutable state, which may have moved on), and skip the domain call
+     * entirely — there is nothing left to do and re-running it could only
+     * misreport. C10-02 binding is untouched and still ran before the claim:
+     * a caller who lost authorization never reaches this line, so the probe
+     * discloses nothing to anyone not already entitled to the receipt.
+     */
+    const recovered = claimGeneration > 1 ? await this.probeCommittedEffect(principal, operation, receipt) : null;
+
     let effect: OfflineExecutionEffect;
-    try {
-      // NO transaction of ours wraps this call (C10-10). The domain service
-      // owns its own transaction and its own idempotency table; nesting it
-      // inside a replay transaction would put this module in charge of a
-      // commit boundary it has no business deciding. The key it receives is
-      // the STORED downstream key, so a retry after a crash converges on the
-      // same domain identity instead of double-firing.
-      effect = await this.execute({
-        principal,
-        siteScope: intersectSiteScope(principal, requiredAction),
-        operation,
-        downstreamIdempotencyKey: receipt.downstreamIdempotencyKey,
-      });
-    } catch (error) {
-      const httpStatus = deterministicRejectionStatus(error);
-      if (httpStatus === null) {
-        // Infrastructure. The outcome is genuinely unknown, so the cursor
-        // holds and the operation is retried into convergence (C10-08).
-        await this.repository.markUnknown(finalizeIdentity);
-        return this.conflict('UNKNOWN_OUTCOME', operation, expectedSequence);
+    if (recovered !== null) {
+      effect = recovered;
+    } else {
+      try {
+        // NO transaction of ours wraps this call (C10-10). The domain service
+        // owns its own transaction and its own idempotency table; nesting it
+        // inside a replay transaction would put this module in charge of a
+        // commit boundary it has no business deciding. The key it receives is
+        // the STORED downstream key, so a retry after a crash converges on the
+        // same domain identity instead of double-firing.
+        effect = await this.execute({
+          principal,
+          siteScope: intersectSiteScope(principal, requiredAction),
+          operation,
+          downstreamIdempotencyKey: receipt.downstreamIdempotencyKey,
+        });
+      } catch (error) {
+        const httpStatus = deterministicRejectionStatus(error);
+        if (httpStatus === null) {
+          // Infrastructure. The outcome is genuinely unknown, so the cursor
+          // holds and the operation is retried into convergence (C10-08).
+          const marked = await this.repository.markUnknown(finalizeIdentity);
+          if (marked.kind === 'lost') return this.reportLostFence(operation, namespace, receipt.id);
+          return this.conflict('UNKNOWN_OUTCOME', operation, expectedSequence);
+        }
+        // R6: the snapshot for a rejection is the status code and NOTHING else.
+        // Domain error text may name an incident, a site or a recipient the
+        // caller is not entitled to know exists, so none of it is stored, logged
+        // or returned — a 404 must never become "exists but belongs to someone
+        // else" (C10-11).
+        //
+        // B10-02: this REJECTED is now provably truthful. At generation > 1 the
+        // probe above found NO evidence, and every evidence row is written in
+        // the same transaction as the effect it records — so absence proves no
+        // prior effect committed, and a deterministic 4xx here is the real,
+        // first-and-only answer rather than a re-evaluation that might be
+        // contradicting a commit we forgot about.
+        const rejected = await this.finalize({
+          ...finalizeIdentity,
+          outcome: 'REJECTED',
+          conflictCode: 'DOMAIN_REJECTED',
+          resultRef: null,
+          resultSnapshot: { http_status: httpStatus },
+        });
+        if (rejected.kind === 'lost') return this.reportLostFence(operation, namespace, receipt.id);
+        if (rejected.kind === 'unknown') return this.conflict('UNKNOWN_OUTCOME', operation, expectedSequence);
+        return this.result({
+          offlineOperationId: receipt.offlineOperationId,
+          deviceSequence: receipt.deviceSequence,
+          operationKind: receipt.operationKind,
+          outcome: 'REJECTED',
+          replayed: false,
+          finalizedAt: rejected.finalizedAt,
+          lastFinalizedSequence: rejected.lastFinalizedSequence,
+          resultRef: null,
+          resultSnapshot: { http_status: httpStatus },
+          traceId: operation.trace_id,
+        });
       }
-      // R6: the snapshot for a rejection is the status code and NOTHING else.
-      // Domain error text may name an incident, a site or a recipient the
-      // caller is not entitled to know exists, so none of it is stored, logged
-      // or returned — a 404 must never become "exists but belongs to someone
-      // else" (C10-11).
-      const rejected = await this.finalize({
-        ...finalizeIdentity,
-        outcome: 'REJECTED',
-        conflictCode: 'DOMAIN_REJECTED',
-        resultRef: null,
-        resultSnapshot: { http_status: httpStatus },
-      });
-      if (rejected === null) return this.conflict('UNKNOWN_OUTCOME', operation, expectedSequence);
-      return this.result({
-        offlineOperationId: receipt.offlineOperationId,
-        deviceSequence: receipt.deviceSequence,
-        operationKind: receipt.operationKind,
-        outcome: 'REJECTED',
-        replayed: false,
-        finalizedAt: rejected.finalizedAt,
-        lastFinalizedSequence: rejected.lastFinalizedSequence,
-        resultRef: null,
-        resultSnapshot: { http_status: httpStatus },
-        traceId: operation.trace_id,
-      });
     }
 
     const applied = await this.finalize({
@@ -396,7 +453,8 @@ export class FieldOfflineReplayService {
       resultRef: effect.resultRef,
       resultSnapshot: effect.resultSnapshot,
     });
-    if (applied === null) return this.conflict('UNKNOWN_OUTCOME', operation, expectedSequence);
+    if (applied.kind === 'lost') return this.reportLostFence(operation, namespace, receipt.id);
+    if (applied.kind === 'unknown') return this.conflict('UNKNOWN_OUTCOME', operation, expectedSequence);
     return this.result({
       offlineOperationId: receipt.offlineOperationId,
       deviceSequence: receipt.deviceSequence,
@@ -424,16 +482,136 @@ export class FieldOfflineReplayService {
    * only reclaimable after the 60s lease, so a reconnecting device would be
    * told OPERATION_IN_PROGRESS about an attempt no process is running. Marking
    * UNKNOWN leaves it immediately reclaimable, exactly as a domain-call fault
-   * already does. `null` means "not finalized"; the caller must not fabricate
-   * a result for it.
+   * already does. Anything other than `finalized` means "no outcome was
+   * recorded by THIS attempt"; the caller must not fabricate a result for it.
+   *
+   * B10-01: both writes carry the claim fence, so a third answer is possible —
+   * `lost`, meaning a newer attempt owns the receipt and this one changed
+   * nothing.
    */
-  private async finalize(input: FinalizeInput): Promise<FinalizeResult | null> {
+  private async finalize(input: FinalizeInput): Promise<FinalizeAttempt> {
     try {
-      return await this.repository.finalizeAndAdvance(input);
+      const outcome = await this.repository.finalizeAndAdvance(input);
+      return outcome.kind === 'lost' ? { kind: 'lost' } : outcome;
     } catch {
-      await this.repository.markUnknown(input);
-      return null;
+      const marked = await this.repository.markUnknown(input);
+      return marked.kind === 'lost' ? { kind: 'lost' } : { kind: 'unknown' };
     }
+  }
+
+  /**
+   * B10-01: this attempt's claim fence did not match, so a NEWER attempt owns
+   * the receipt and this attempt wrote nothing.
+   *
+   * THE CORRUPTION THIS FENCES. Worker A claims the receipt at generation 1
+   * and stalls — a GC pause, a hung socket, a paused container — until its
+   * 60s lease expires. Worker B legally reclaims at generation 2, calls the
+   * domain, and finalizes APPLIED. A then wakes up holding a verdict computed
+   * from a world that no longer exists. Unfenced, A's `update by id` would
+   * land on top of B's: a stale REJECTED overwriting a real APPLIED, or A's
+   * `markUnknown` downgrading B's finalized receipt back to UNKNOWN and
+   * re-opening a queue position whose effect has already committed — inviting
+   * a third attempt to fire it a second time. The fence turns A's write into a
+   * no-op, and this method makes A report B's truth instead of A's.
+   *
+   * So: re-read the receipt. If the newer attempt already finalized it, answer
+   * with THAT stored outcome down the ordinary replay path (C10-11/R7 — built
+   * purely from receipt columns, never refetched from domain state). If it has
+   * not finalized yet, the newer attempt is still live and this caller is told
+   * to come back: OPERATION_IN_PROGRESS while the receipt sits in APPLYING,
+   * UNKNOWN_OUTCOME for anything else — a receipt that vanished, or one in a
+   * state no outcome can honestly be read from.
+   */
+  private async reportLostFence(
+    operation: FieldOfflineOperationV2,
+    namespace: OfflineReplayNamespace,
+    receiptId: string,
+  ): Promise<OfflineSubmissionOutcome> {
+    const current = await this.repository.getReceiptById(receiptId);
+    // The cursor may have been advanced by the attempt that won, so the reply's
+    // next_expected_sequence must come from the cursor as it stands NOW.
+    const lastFinalizedSequence = await this.repository.readCursor(namespace);
+    if (current !== null && this.isFinalized(current)) {
+      return this.replayStoredResult(operation, current, lastFinalizedSequence);
+    }
+    const inProgress = current !== null && current.status === RECEIPT_STATUS_APPLYING;
+    return this.conflict(inProgress ? 'OPERATION_IN_PROGRESS' : 'UNKNOWN_OUTCOME', operation, nextExpectedOfflineSequence(lastFinalizedSequence));
+  }
+
+  // ---------------------------------------------------------------------------
+  // B10-02 domain-owned evidence probes
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Asks the OWNING domain whether this receipt's server-derived downstream
+   * idempotency identity has already committed, and if so rebuilds the effect
+   * from the EVIDENCE.
+   *
+   * Each probe is a pure lookup of the row the domain writes in the SAME
+   * transaction as its effect. That atomicity is the whole argument: presence
+   * proves the effect committed, absence proves it did not. Neither branch
+   * consults mutable state — not the assignment's current status, not the
+   * recipient's current delivery state, not current eligibility — because all
+   * of those may have drifted since the attempt we are recovering.
+   *
+   * The switch mirrors `execute` exactly, kind for kind, so the allowlist
+   * stays checked by the type system: a seventh operation kind fails to
+   * compile here until someone decides what evidence proves IT committed.
+   */
+  private async probeCommittedEffect(
+    principal: Principal,
+    operation: FieldOfflineOperationV2,
+    receipt: OfflineStoredReceipt,
+  ): Promise<OfflineExecutionEffect | null> {
+    const key = receipt.downstreamIdempotencyKey;
+    switch (operation.operation_kind) {
+      case 'FIELD_ASSIGNMENT_ACCEPT':
+        return this.probeAssignmentTransition(principal, operation.payload, 'accept', key);
+      case 'FIELD_ASSIGNMENT_DECLINE':
+        return this.probeAssignmentTransition(principal, operation.payload, 'decline', key);
+      case 'FIELD_ASSIGNMENT_START':
+        return this.probeAssignmentTransition(principal, operation.payload, 'start', key);
+      case 'FIELD_ASSIGNMENT_COMPLETE':
+        return this.probeAssignmentTransition(principal, operation.payload, 'complete', key);
+      case 'INCIDENT_FIELD_MESSAGE_SEND': {
+        const evidence = await this.messaging.probeSendEvidence(principal, operation.payload.incident_id, key);
+        if (evidence === null) return null;
+        // R6 allowlist, rebuilt from the evidence row: identifiers and a
+        // COUNT. Never the body, never the recipient list.
+        return {
+          resultRef: evidence.id,
+          resultSnapshot: { incident_field_message_id: evidence.id, incident_id: evidence.incidentId, recipient_count: evidence.recipientCount },
+        };
+      }
+      case 'INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE': {
+        const committed = await this.messaging.probeAcknowledgeEvidence(principal, operation.payload.message_id, key);
+        if (!committed) return null;
+        return { resultRef: operation.payload.message_id, resultSnapshot: { incident_field_message_id: operation.payload.message_id } };
+      }
+      default: {
+        const exhaustive: never = operation;
+        return exhaustive;
+      }
+    }
+  }
+
+  /**
+   * The status in the snapshot is the ORIGINAL intended post-transition status
+   * — WP-16's own ACTION_TARGETS mapping, returned by the domain — and NOT the
+   * assignment's current status. The evidence proves this action by this actor
+   * under this key landed; what it landed was that target. Reading live status
+   * instead would write a value the recovered attempt never produced into a
+   * receipt the device replays as final.
+   */
+  private async probeAssignmentTransition(
+    principal: Principal,
+    payload: OfflineAssignmentTransitionPayload,
+    action: FieldAssignmentAction,
+    downstreamIdempotencyKey: string,
+  ): Promise<OfflineExecutionEffect | null> {
+    const evidence = await this.field.probeTransitionEvidence(principal, payload.assignment_id, action, downstreamIdempotencyKey);
+    if (!evidence.committed) return null;
+    return { resultRef: payload.assignment_id, resultSnapshot: { assignment_id: payload.assignment_id, status: evidence.status } };
   }
 
   // ---------------------------------------------------------------------------
