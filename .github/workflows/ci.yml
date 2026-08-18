@@ -71,24 +71,17 @@ jobs:
       - name: Lint
         run: pnpm -r lint
 
-      - name: Security source grep gate
-        shell: bash
+      # The scanner is installed EXPLICITLY. It is absent from the runner
+      # image, and the previous inline gate treated that as "no matches found"
+      # — reporting success while scanning nothing.
+      - name: Install security scanner
         run: |
-          set -euo pipefail
-          source_files=(services apps packages tests)
-          if rg -n --glob '*.ts' --glob '*.tsx' --glob '*.prisma' 'TODO|@ts-ignore' "${source_files[@]}"; then
-            echo 'Security source gate failed: TODO marker or @ts-ignore found.'
-            exit 1
-          fi
-          # Match TypeScript any annotations/casts/generic arguments, while
-          # intentionally ignoring prose and Vitest's expect.any(...).
-          typed_any_matches="$(rg -n --glob '*.ts' --glob '*.tsx' '(:[[:space:]]*any\b|\bas[[:space:]]+any\b|<[[:space:]]*any[[:space:]]*>|,[[:space:]]*any\b|\bany\[\])' "${source_files[@]}" || true)"
-          typed_any_code="$(printf '%s\n' "$typed_any_matches" | rg -v ':[0-9]+:[[:space:]]*(//|\*|/\*)' || true)"
-          if [[ -n "$typed_any_code" ]]; then
-            printf '%s\n' "$typed_any_code"
-            echo 'Security source gate failed: untyped any detected.'
-            exit 1
-          fi
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+          rg --version
+
+      - name: Security source gate
+        run: bash scripts/security-source-gate.sh .
 
       - name: Test
         run: pnpm -r test
