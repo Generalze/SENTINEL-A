@@ -3,6 +3,7 @@ import { ThrottlerGuard, Throttle } from '@nestjs/throttler';
 import type { ServerResponse } from 'node:http';
 import { NormalisedEventSchema } from '@sentinel/contracts';
 import { z } from 'zod';
+import { isSafeSubjectToken, SUBJECT_TOKEN_RULE } from '../../common/messaging/subject-token';
 import { RequiresAction } from '../../common/security/requires-action.decorator';
 import type { RequestWithPrincipal } from '../../common/security/principal';
 import { ACTION_EVENT_INGEST, ACTION_EVENT_READ, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT } from './events.constants';
@@ -63,6 +64,26 @@ export class EventsController {
       return;
     }
     const event = parsed.data;
+
+    // WP-17/C7-06: `organisation_id` and `site_id` are interpolated into this
+    // event's JetStream subject (`sentinel.events.{org}.{site}`), and `site_id`
+    // is free client text. A value carrying `.`, `*`, `>` or whitespace either
+    // re-shapes the subject or makes NATS reject the publish outright — and
+    // because ingest persists first and publishes as a follow-up step (§76),
+    // the caller would get a 201 for an event that can never reach Fusion. On a
+    // protective platform a silently undeliverable detection is a worse outcome
+    // than a rejected request, so this fails at the boundary instead.
+    for (const [field, value] of [['organisation_id', event.organisation_id], ['site_id', event.site_id]] as const) {
+      if (!isSafeSubjectToken(value)) {
+        writeJson(res, HttpStatus.BAD_REQUEST, {
+          error: 'Invalid event payload',
+          trace_id: traceIdOf(req),
+          field_errors: [`${field} ${SUBJECT_TOKEN_RULE}`],
+        });
+        return;
+      }
+    }
+
     const principal = req.principal;
 
     if (principal) {

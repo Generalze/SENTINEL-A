@@ -32,6 +32,8 @@ export async function loadRealtimePrincipal(prisma: PrismaService, userId: strin
   return {
     user_id: user.id,
     organisation_id: user.organisationId,
-    roles: user.roles.map((assignment) => assignment.role),
+    // WP-17/D1: `site_id` is carried through, not discarded — Field room
+    // membership is derived from it.
+    roles: user.roles.map((assignment) => ({ role: assignment.role, site_id: assignment.siteId ?? null })),
   };
 }

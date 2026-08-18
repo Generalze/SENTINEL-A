@@ -1,4 +1,4 @@
-import { BadRequestException, ConflictException, ForbiddenException } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { buildPrincipal, type Principal } from '../../common/security/principal';
 import type { FieldRepository } from './field.repository';
@@ -147,6 +147,57 @@ describe('FieldService', () => {
         idempotency_key: 'start-1',
       }),
     ).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it('rejects a site_id that is not a safe NATS subject token before any repository call (WP-17/D3)', () => {
+    const repository = repositoryDouble();
+    const service = new FieldService(repository);
+
+    for (const unsafe of ['site.a1', 'site-a1.>', 'site *', '']) {
+      expect(() => service.parseCreateAssignment(assignment({ site_id: unsafe }))).toThrow(BadRequestException);
+      expect(() =>
+        service.parseStateUpdate({
+          site_id: unsafe,
+          device_id: 'device-1',
+          state: 'RESPONDING',
+          location: null,
+          source_at: '2026-08-16T09:59:30.000Z',
+          freshness_ms: 0,
+          idempotency_key: 'state-1',
+          trace_id: 'trace-state',
+        }),
+      ).toThrow(BadRequestException);
+    }
+
+    expect(repository.createAssignment).not.toHaveBeenCalled();
+    expect(repository.recordState).not.toHaveBeenCalled();
+  });
+
+  it('lists only the caller own assignments for the operative refetch route (WP-17/D5)', async () => {
+    const repository = repositoryDouble();
+    const service = new FieldService(repository);
+
+    await service.listOwnAssignments(principal('user-field', 'field.operative'), siteScope);
+
+    expect(repository.listAssignments).toHaveBeenCalledWith('org-1', siteScope, 'user-field');
+  });
+
+  it('hides another operative assignment behind 404 rather than 403 (WP-17/D5)', async () => {
+    const repository = repositoryDouble({
+      getAssignment: vi.fn().mockResolvedValue(assignmentRow({ assigneeUserId: 'someone-else' })),
+    } as Partial<FieldRepository>);
+    const service = new FieldService(repository);
+
+    await expect(service.getOwnAssignment(principal('user-field', 'field.operative'), siteScope, assignmentRow().id)).rejects.toBeInstanceOf(NotFoundException);
+  });
+
+  it('returns the caller own assignment when they are the assignee', async () => {
+    const repository = repositoryDouble({ getAssignment: vi.fn().mockResolvedValue(assignmentRow()) } as Partial<FieldRepository>);
+    const service = new FieldService(repository);
+
+    const result = await service.getOwnAssignment(principal('user-field', 'field.operative'), siteScope, assignmentRow().id);
+
+    expect(result.assignee_user_id).toBe('user-field');
   });
 
   it('computes authoritative freshness server-side and preserves client freshness as telemetry', async () => {

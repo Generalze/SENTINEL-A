@@ -48,6 +48,37 @@ describe('EventsController#ingest (POST /api/v1/events)', () => {
     expect(service.ingest).not.toHaveBeenCalled();
   });
 
+  it('WP-17/C7-06: returns 400 for a site_id that cannot form a NATS subject token, and never persists it', async () => {
+    // `site_id` is free client text and is interpolated into this event's
+    // JetStream subject. Persisting first and publishing after (§76) would
+    // otherwise return 201 for an event that can never reach Fusion.
+    for (const unsafe of ['site.a', 'site-a.>', 'site *', 'site a']) {
+      const service = makeService();
+      const controller = new EventsController(service);
+      const event = makeNormalisedEvent({ organisation_id: 'org-1', site_id: unsafe });
+      const res = makeRes();
+
+      await controller.ingest(makeReq({ principal: principalFor('org-1') }), event, res);
+
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body ?? '{}').field_errors[0]).toMatch(/site_id/);
+      expect(service.ingest).not.toHaveBeenCalled();
+    }
+  });
+
+  it('WP-17/C7-06: returns 400 for an organisation_id that cannot form a NATS subject token', async () => {
+    const service = makeService();
+    const controller = new EventsController(service);
+    const event = makeNormalisedEvent({ organisation_id: 'org.1', site_id: 'site-a' });
+    const res = makeRes();
+
+    await controller.ingest(makeReq({ principal: principalFor('org.1') }), event, res);
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body ?? '{}').field_errors[0]).toMatch(/organisation_id/);
+    expect(service.ingest).not.toHaveBeenCalled();
+  });
+
   it('returns 404 and never calls the service when the body organisation does not match the principal', async () => {
     const service = makeService();
     const controller = new EventsController(service);

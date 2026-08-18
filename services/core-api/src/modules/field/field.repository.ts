@@ -271,20 +271,25 @@ export class FieldRepository {
           payload: { user_id: input.actorUserId, state: input.state, source_at: input.sourceAt.toISOString(), received_at: input.receivedAt.toISOString() },
         },
       });
+      // WP-17/D4: the wire carries a signal, not the domain record. The
+      // operative's `state` (COMPROMISED, NEED_SUPPORT, ...) stays out of the
+      // outbox payload and is read over REST behind `field.state.read`; the
+      // audit row above keeps the full detail.
       await tx.fieldOutbox.create({
         data: {
           organisationId: input.organisationId,
           siteId: input.siteId,
-          payload: { kind: 'FIELD_STATE_UPDATED', user_id: input.actorUserId, state: input.state, organisation_id: input.organisationId, site_id: input.siteId },
+          payload: { kind: 'FIELD_STATE_UPDATED', user_id: input.actorUserId, organisation_id: input.organisationId, site_id: input.siteId },
         },
       });
       return { state: current, created: true };
     });
   }
 
-  async listAssignments(organisationId: string, siteScope: SiteScope): Promise<FieldAssignment[]> {
+  /** `assigneeUserId` narrows the read to one operative's own assignments (WP-17/D5). */
+  async listAssignments(organisationId: string, siteScope: SiteScope, assigneeUserId?: string): Promise<FieldAssignment[]> {
     return this.prisma.fieldAssignment.findMany({
-      where: { organisationId, ...siteScopeWhere(siteScope) },
+      where: { organisationId, ...siteScopeWhere(siteScope), ...(assigneeUserId === undefined ? {} : { assigneeUserId }) },
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: 200,
     });
