@@ -96,21 +96,26 @@ the whole log.
 | WP-17 | Done — site-scoped Field delivery, need-to-know payloads, subject-token safety across every NATS builder, operative REST refetch, WP-16 AC7 API tests | merged `83a5d7d` |
 | WP-17A | Done — Field `site_id` referential integrity, closing Wave-7 finding C7-07 | merged `5f01b15` |
 | WP-18 | Done — incident field messaging: named-recipient entitlement, commander oversight as its own action, immutable recipients, tuple-bound persistence, transport-evidence delivery | merged `5868bf7` |
-| WP-19 | Contract PASS (C9-01..C9-06); implementation pass delivered (C9-07..C9-09); whole-system audit correction batch applied — evidence tuple completed, request-bound idempotency, locked mutable dependencies, fail-closed START, boundary-bounded JSON — with 34 patrol tests. **MERGE HOLD** pending final effective-diff audit + hosted CI at the corrected head | branch `wp-19-patrol-foundation` |
-| WP-20 .. WP-22 | Not started | — |
+| WP-19 | Done — versioned patrol standards, materialised run expectations, server-owned timing (C9-01..C9-09), whole-system audit correction batch (complete evidence tuple, request-bound idempotency, locked mutable dependencies, fail-closed START, boundary-bounded JSON), 34 patrol tests | merged `e4092e2` |
+| WP-20 | Directive issued — offline operation contracts & replay foundation (C10-01..C10-11). **Checkpoint A (contracts) GO after directive acceptance; persistence/executor/HTTP HOLD** | branch `docs/wp-20-directive` |
+| WP-21 .. WP-22 | Not started | — |
 
 **Wave 7 is closed.** WP-17 and WP-17A are both on `main`; C7-07 is closed.
 
-**Wave 8 is open.** WP-18 is the first half and has landed. WP-19 patrol
-foundation closes it.
+**Wave 8 is complete.** WP-18 (`5868bf7`) and WP-19 (`e4092e2`) are both on
+accepted mirror `main`; C9-01..C9-09 are closed and the whole-system audit
+passed.
 
-**Next:** the lead's whole-system adversarial audit of WP-19 (schema,
-authorization, tenant isolation, lifecycle, timing, concurrency, idempotency,
-audit, realtime, migrations) against hosted CI, then the merge gate. See
-[`directives/WP-19-patrol-foundation.md`](directives/WP-19-patrol-foundation.md):
-timing policy belongs to the versioned route checkpoint, a run materialises
-absolute expectations from its server-owned start, and completion is
-system-owned.
+**Wave 9 is open. WP-20 is the current gate.** See
+[`directives/WP-20-offline-operation-contracts.md`](directives/WP-20-offline-operation-contracts.md):
+a V2 discriminated offline-operation contract, contiguous per-device
+sequencing, request-bound fingerprints, an authenticated device-context seam,
+and a deliberately narrow replay allowlist — reconnection may delay an
+authorised operation but never duplicate, reorder, de-authorize or backdate
+it. Checkpoint A (contracts only) is authorised once the directive is
+accepted; persistence, the replay executor and any HTTP surface stay HOLD.
+WP-20 proves the ordering/idempotency/recovery foundation; it does not by
+itself complete architecture Proof D.
 
 ### CI contract
 
