@@ -1,0 +1,287 @@
+// SENTINEL Patrol domain (WP-19, architecture sections 13, 61, 62.1).
+// Owned exclusively by services/core-api/src/modules/patrol.
+//
+// The load-bearing split (directive WP-19, sections 1-3):
+//
+//   PatrolRoute            mutable header: name + current_version pointer.
+//   PatrolRouteVersion     one immutable published version of the standard.
+//   PatrolCheckpoint       the versioned definition rows. Timing policy
+//                          (window/late/missed offsets) lives HERE, on the
+//                          version — never on the run and never per schedule.
+//   PatrolRun              one operative executing one exact pinned version.
+//   PatrolRunCheckpoint    the run's materialised absolute expectations.
+//   PatrolCheckpointVerification  the authoritative evidence record.
+//
+// C9-07 — the route/run/checkpoint tuple is enforced BELOW the service layer:
+//
+//   PatrolRunCheckpoint -> PatrolRun on
+//     (patrol_run_id, organisation_id, site_id, patrol_route_id, route_version)
+//   PatrolRunCheckpoint -> PatrolCheckpoint on
+//     (patrol_checkpoint_id, patrol_route_id, route_version)
+//
+// so a run checkpoint cannot name a checkpoint from a different route or a
+// different version than the one its run pinned, and cannot drift from its
+// run's tenant/site, even for a writer that bypasses the service. The WP-17A
+// composite Site relation and the WP-18 Incident tuple relation carry the same
+// discipline onto patrol's outer edges. Every EVIDENCE relation is Restrict —
+// patrol truth is history and must never be cascade-erased by a parent's
+// lifecycle (§61). The one deliberate exception is the replay guard
+// (PatrolRunActionIdempotency -> PatrolRun, Cascade): an idempotency row is
+// not history, it exists only to dedupe requests against a live run, matching
+// the WP-16/WP-18 replay-guard precedent.
+//
+// Timing instants are materialised absolutes (directive section 3): computed
+// once from the pinned version's offsets and the run's server-owned started_at,
+// then never recomputed. `resolved_at`/`recorded_at` are written from the
+// DATABASE clock inside the mutating transaction (C9-06); no client timestamp
+// is ever authoritative.
+
+model PatrolRoute {
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  siteId String @map("site_id") @db.Text
+  name String @db.Text
+  /// Pointer to the latest published version. Runs pin their own copy; moving
+  /// this pointer never changes any existing run.
+  currentVersion Int @map("current_version")
+
+  createdByUserId String @map("created_by_user_id") @db.Text
+  idempotencyKey String @map("idempotency_key") @db.Text
+  traceId String @map("trace_id") @db.Text
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  /// WP-17A: composite so the pair must match, not just the site id.
+  site Site @relation(fields: [siteId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
+  versions PatrolRouteVersion[]
+  runs PatrolRun[]
+  checkpoints PatrolCheckpoint[]
+
+  /// Candidate key so children can bind route + tenant + site in one reference.
+  @@unique([id, organisationId, siteId], map: "patrol_route_id_org_site_key")
+  /// C8-05 lesson carried forward: creation idempotency includes the creator.
+  @@unique([organisationId, siteId, createdByUserId, idempotencyKey], map: "patrol_route_create_idem_key")
+  @@index([organisationId, siteId], map: "patrol_route_scope_idx")
+  @@map("patrol_routes")
+}
+
+/// One immutable published version of a route's patrol standard (C9-04).
+/// Changing the standard means publishing a NEW version; there is no API that
+/// edits the checkpoint rows of an existing one.
+model PatrolRouteVersion {
+  id String @id @default(uuid()) @db.Uuid
+
+  patrolRouteId String @map("patrol_route_id") @db.Uuid
+  version Int
+  organisationId String @map("organisation_id") @db.Text
+  siteId String @map("site_id") @db.Text
+
+  publishedByUserId String @map("published_by_user_id") @db.Text
+  publishedAt DateTime @default(now()) @map("published_at") @db.Timestamptz(3)
+  idempotencyKey String @map("idempotency_key") @db.Text
+  traceId String @map("trace_id") @db.Text
+
+  route PatrolRoute @relation(fields: [patrolRouteId, organisationId, siteId], references: [id, organisationId, siteId], onDelete: Restrict, onUpdate: Cascade)
+
+  checkpoints PatrolCheckpoint[]
+  runs PatrolRun[]
+
+  /// (patrol_route_id, version) is the real version key (C9-04).
+  @@unique([patrolRouteId, version], map: "patrol_route_version_key")
+  @@unique([patrolRouteId, publishedByUserId, idempotencyKey], map: "patrol_route_version_publish_idem_key")
+  @@map("patrol_route_versions")
+}
+
+/// A checkpoint of one exact route version, carrying that version's timing
+/// standard. Immutable once published (C9-04): later route edits become new
+/// versions with new rows, so historical patrol truth cannot be rewritten.
+model PatrolCheckpoint {
+  id String @id @default(uuid()) @db.Uuid
+
+  patrolRouteId String @map("patrol_route_id") @db.Uuid
+  routeVersion Int @map("route_version")
+  organisationId String @map("organisation_id") @db.Text
+  siteId String @map("site_id") @db.Text
+
+  sequenceNumber Int @map("sequence_number")
+  name String @db.Text
+  /// Scalar by design: Zone is validated at write time (a route may outlive a
+  /// zone's lifecycle; §61 forbids cascade-rewriting a published standard).
+  zoneId String? @map("zone_id") @db.Text
+  location Json?
+
+  /// C9-02/C9-04 relative standard, materialised per run from its started_at.
+  windowOpenOffsetMs Int @map("window_open_offset_ms")
+  lateAfterOffsetMs Int @map("late_after_offset_ms")
+  missedAfterOffsetMs Int @map("missed_after_offset_ms")
+
+  traceId String @map("trace_id") @db.Text
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  routeVersionRef PatrolRouteVersion @relation(fields: [patrolRouteId, routeVersion], references: [patrolRouteId, version], onDelete: Restrict, onUpdate: Cascade)
+  route PatrolRoute @relation(fields: [patrolRouteId, organisationId, siteId], references: [id, organisationId, siteId], onDelete: Restrict, onUpdate: Cascade)
+
+  runCheckpoints PatrolRunCheckpoint[]
+
+  @@unique([patrolRouteId, routeVersion, sequenceNumber], map: "patrol_checkpoint_sequence_key")
+  /// Candidate key for the run-checkpoint tuple binding (C9-07).
+  @@unique([id, patrolRouteId, routeVersion], map: "patrol_checkpoint_id_route_version_key")
+  @@map("patrol_checkpoints")
+}
+
+/// One operative walking one exact route version (directive section 1).
+model PatrolRun {
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  siteId String @map("site_id") @db.Text
+  patrolRouteId String @map("patrol_route_id") @db.Uuid
+  /// Pinned at schedule time. Every run checkpoint must originate from this
+  /// exact version — enforced by the composite FK on PatrolRunCheckpoint.
+  routeVersion Int @map("route_version")
+
+  assignedOperativeUserId String @map("assigned_operative_user_id") @db.Text
+  /// Set only when the patrol executes as part of an incident response.
+  incidentId String? @map("incident_id") @db.Uuid
+
+  status String @default("SCHEDULED") @db.Text
+  scheduledStartAt DateTime @map("scheduled_start_at") @db.Timestamptz(3)
+  /// Server-owned actual start (database clock); basis for materialisation.
+  startedAt DateTime? @map("started_at") @db.Timestamptz(3)
+  endedAt DateTime? @map("ended_at") @db.Timestamptz(3)
+  /// C9-09: command abandonment must carry its reason.
+  abandonReason String? @map("abandon_reason") @db.Text
+
+  createdByUserId String @map("created_by_user_id") @db.Text
+  idempotencyKey String @map("idempotency_key") @db.Text
+  traceId String @map("trace_id") @db.Text
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  /// WP-17A: composite so the pair must match, not just the site id.
+  site Site @relation(fields: [siteId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  route PatrolRoute @relation(fields: [patrolRouteId, organisationId, siteId], references: [id, organisationId, siteId], onDelete: Restrict, onUpdate: Cascade)
+  /// The pinned version must actually exist for this route (C9-04).
+  routeVersionRef PatrolRouteVersion @relation(fields: [patrolRouteId, routeVersion], references: [patrolRouteId, version], onDelete: Restrict, onUpdate: Cascade)
+  /// WP-18 tuple: THIS incident under THIS tenant and site, or nothing.
+  incident Incident? @relation(fields: [incidentId, organisationId, siteId], references: [id, organisationId, siteId], onDelete: Restrict, onUpdate: Cascade)
+
+  checkpoints PatrolRunCheckpoint[]
+  verifications PatrolCheckpointVerification[]
+  actionIdempotency PatrolRunActionIdempotency[]
+
+  /// Candidate key binding every dimension a run checkpoint must agree on (C9-07).
+  @@unique([id, organisationId, siteId, patrolRouteId, routeVersion], map: "patrol_run_binding_key")
+  /// Narrower candidate key for the verification record's run binding.
+  @@unique([id, organisationId], map: "patrol_run_id_org_key")
+  /// Schedule idempotency includes the creator (C8-05 lesson).
+  @@unique([organisationId, siteId, createdByUserId, idempotencyKey], map: "patrol_run_schedule_idem_key")
+  @@index([organisationId, siteId, status], map: "patrol_run_status_idx")
+  @@index([organisationId, assignedOperativeUserId, createdAt], map: "patrol_run_operative_idx")
+  @@index([incidentId])
+  @@map("patrol_runs")
+}
+
+/// One materialised checkpoint expectation of one run (directive section 3).
+/// The three instants are computed once at start and never recomputed.
+model PatrolRunCheckpoint {
+  id String @id @default(uuid()) @db.Uuid
+
+  patrolRunId String @map("patrol_run_id") @db.Uuid
+  patrolCheckpointId String @map("patrol_checkpoint_id") @db.Uuid
+  organisationId String @map("organisation_id") @db.Text
+  siteId String @map("site_id") @db.Text
+  patrolRouteId String @map("patrol_route_id") @db.Uuid
+  routeVersion Int @map("route_version")
+
+  sequenceNumber Int @map("sequence_number")
+  windowOpensAt DateTime @map("window_opens_at") @db.Timestamptz(3)
+  lateAfter DateTime @map("late_after") @db.Timestamptz(3)
+  missedAfter DateTime @map("missed_after") @db.Timestamptz(3)
+
+  state String @default("PENDING") @db.Text
+  /// Database receipt time of the resolving verification (C9-06).
+  resolvedAt DateTime? @map("resolved_at") @db.Timestamptz(3)
+  verificationId String? @unique(map: "patrol_run_checkpoint_verification_key") @map("verification_id") @db.Uuid
+
+  traceId String @map("trace_id") @db.Text
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  /// C9-07: one reference binds run, tenant, site, route AND pinned version.
+  run PatrolRun @relation(fields: [patrolRunId, organisationId, siteId, patrolRouteId, routeVersion], references: [id, organisationId, siteId, patrolRouteId, routeVersion], onDelete: Restrict, onUpdate: Cascade)
+  /// C9-07: the definition checkpoint must belong to that exact version.
+  checkpoint PatrolCheckpoint @relation(fields: [patrolCheckpointId, patrolRouteId, routeVersion], references: [id, patrolRouteId, routeVersion], onDelete: Restrict, onUpdate: Cascade)
+  verification PatrolCheckpointVerification? @relation("ResolvingVerification", fields: [verificationId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  verifications PatrolCheckpointVerification[] @relation("VerificationRunCheckpoint")
+
+  @@unique([patrolRunId, patrolCheckpointId], map: "patrol_run_checkpoint_pair_key")
+  @@unique([patrolRunId, sequenceNumber], map: "patrol_run_checkpoint_sequence_key")
+  /// Candidate key for the verification's tuple binding: the row's complete
+  /// authoritative identity (audit batch correction 1).
+  @@unique([id, patrolRunId, organisationId, siteId, patrolRouteId, routeVersion, patrolCheckpointId], map: "patrol_run_checkpoint_identity_key")
+  @@index([state, missedAfter], map: "patrol_run_checkpoint_sweep_idx")
+  @@map("patrol_run_checkpoints")
+}
+
+/// The authoritative verification record (C9-01). Append-only: no write path
+/// updates or deletes these rows. `source_at` is device telemetry;
+/// `recorded_at` is the database clock read inside the resolving transaction
+/// and is the only value any timing decision used.
+model PatrolCheckpointVerification {
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  siteId String @map("site_id") @db.Text
+  patrolRunId String @map("patrol_run_id") @db.Uuid
+  patrolRunCheckpointId String @map("patrol_run_checkpoint_id") @db.Uuid
+  patrolRouteId String @map("patrol_route_id") @db.Uuid
+  routeVersion Int @map("route_version")
+  patrolCheckpointId String @map("patrol_checkpoint_id") @db.Uuid
+
+  operativeUserId String @map("operative_user_id") @db.Text
+  deviceId String @map("device_id") @db.Text
+  verificationMethod String @map("verification_method") @db.Text
+  verificationContext Json @default("{}") @map("verification_context")
+
+  sourceAt DateTime @map("source_at") @db.Timestamptz(3)
+  recordedAt DateTime @map("recorded_at") @db.Timestamptz(3)
+
+  idempotencyKey String @map("idempotency_key") @db.Text
+  traceId String @map("trace_id") @db.Text
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  run PatrolRun @relation(fields: [patrolRunId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  /// Audit batch correction 1: the evidence row binds the run checkpoint's
+  /// COMPLETE authoritative identity — run, tenant, site, route, pinned
+  /// version AND definition checkpoint — so a service-bypassing writer cannot
+  /// attach a verification to the right run checkpoint while making the
+  /// immutable evidence claim a different site, route, version or checkpoint.
+  runCheckpoint PatrolRunCheckpoint @relation("VerificationRunCheckpoint", fields: [patrolRunCheckpointId, patrolRunId, organisationId, siteId, patrolRouteId, routeVersion, patrolCheckpointId], references: [id, patrolRunId, organisationId, siteId, patrolRouteId, routeVersion, patrolCheckpointId], onDelete: Restrict, onUpdate: Cascade)
+
+  resolvedRunCheckpoint PatrolRunCheckpoint? @relation("ResolvingVerification")
+
+  /// C9-06: the idempotency namespace includes the authoritative actor and run
+  /// scope, so another actor's key collision can never return this record.
+  @@unique([organisationId, patrolRunId, patrolRunCheckpointId, operativeUserId, idempotencyKey], map: "patrol_verification_idem_key")
+  @@index([organisationId, patrolRunId, recordedAt], map: "patrol_verification_run_idx")
+  @@map("patrol_checkpoint_verifications")
+}
+
+/// Replay guard for run lifecycle actions (start/cancel/abandon), keyed by the
+/// acting user per the C9-06/C8-05 rule. Verification has its own table.
+model PatrolRunActionIdempotency {
+  id String @id @default(uuid()) @db.Uuid
+  patrolRunId String @map("patrol_run_id") @db.Uuid
+  run PatrolRun @relation(fields: [patrolRunId], references: [id], onDelete: Cascade)
+  actorUserId String @map("actor_user_id") @db.Text
+  action String @db.Text
+  idempotencyKey String @map("idempotency_key") @db.Text
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([patrolRunId, actorUserId, action, idempotencyKey], map: "patrol_run_action_idem_key")
+  @@map("patrol_run_action_idempotency")
+}
