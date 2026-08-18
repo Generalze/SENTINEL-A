@@ -41,10 +41,23 @@ export function resolveWsCorsOrigin(): string | string[] {
 export const NATS_SUBJECT_HYPOTHESIS = 'sentinel.fusion.hypothesis.*';
 export const NATS_SUBJECT_INCIDENT = 'sentinel.incidents.updated.*';
 export const NATS_SUBJECT_FIELD = 'sentinel.field.updated.*.*';
+/** WP-18: per-recipient message notifications. `{organisation_id}.{recipient_user_id}`. */
+export const NATS_SUBJECT_FIELD_MESSAGE = 'sentinel.field.message.updated.*.*';
 
 /** Exact segment count each route's subject must have; anything else is dropped. */
 export const ORG_SUBJECT_SEGMENTS = 4;
 export const FIELD_SUBJECT_SEGMENTS = 5;
+export const FIELD_MESSAGE_SUBJECT_SEGMENTS = 6;
+/**
+ * `sentinel.field.message.updated.{organisation_id}.{recipient_user_id}` is SIX
+ * segments, so its organisation sits at index 4 — NOT at
+ * SUBJECT_ORG_ID_SEGMENT_INDEX (3), which belongs to the four-segment
+ * `sentinel.X.Y.{organisation_id}` subjects. Reusing the four-segment constant
+ * here parsed "updated" as the organisation and routed notifications into a
+ * room nobody occupies.
+ */
+export const SUBJECT_MESSAGE_ORG_ID_SEGMENT_INDEX = 4;
+export const SUBJECT_RECIPIENT_SEGMENT_INDEX = 5;
 
 /** All update subjects above carry `{organisation_id}` as their 4th dot-segment. */
 export const SUBJECT_ORG_ID_SEGMENT_INDEX = 3;
@@ -60,6 +73,7 @@ export const SUBJECT_SITE_ID_SEGMENT_INDEX = 4;
 export const WS_EVENT_HYPOTHESIS_UPDATED = 'hypothesis.updated';
 export const WS_EVENT_INCIDENT_UPDATED = 'incident.updated';
 export const WS_EVENT_FIELD_UPDATED = 'field.updated';
+export const WS_EVENT_FIELD_MESSAGE_UPDATED = 'field.message.updated';
 export const WS_EVENT_PRESENCE_CHANGED = 'presence.changed';
 
 /** Deliverable #4: `sentinel:presence:{organisation_id}` hash, field = user_id. */
@@ -96,4 +110,14 @@ export function fieldSiteRoom(organisationId: string, siteId: string): string {
 
 export function fieldOrgWideRoom(organisationId: string): string {
   return `org:${organisationId}:field:all`;
+}
+
+/**
+ * WP-18: one room per authenticated user, derived server-side from the
+ * principal. This is the only channel whose audience EQUALS the entitled set,
+ * which is why a message identifier may ride it while the shared Field site
+ * room may not (C7-08). Content still never does.
+ */
+export function userRoom(organisationId: string, userId: string): string {
+  return `org:${organisationId}:user:${userId}`;
 }

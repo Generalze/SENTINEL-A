@@ -6,7 +6,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { fieldRoomsFor } from './field-rooms.util';
 import { PresenceService } from './presence.service';
 import { loadRealtimePrincipal } from './realtime-principal.loader';
-import { orgRoom, resolveWsCorsOrigin, WS_EVENT_PRESENCE_CHANGED, WS_PATH } from './realtime.constants';
+import { orgRoom, resolveWsCorsOrigin, userRoom, WS_EVENT_PRESENCE_CHANGED, WS_PATH } from './realtime.constants';
 import type { RealtimePrincipal } from './realtime.types';
 
 const DEV_USER_HEADER = 'x-dev-user-id';
@@ -100,7 +100,8 @@ export class RealtimeGateway implements OnGatewayInit<RealtimeServer>, OnGateway
     // realtime.presence.integration.spec.ts). socket.io accepts an array, so
     // there is no reason to pay for two round trips.
     const fieldRooms = fieldRoomsFor(principal);
-    await client.join([orgRoom(principal.organisation_id), ...fieldRooms]);
+    // WP-18: the per-user room needs no authorisation beyond being this user.
+    await client.join([orgRoom(principal.organisation_id), userRoom(principal.organisation_id, principal.user_id), ...fieldRooms]);
     this.logger.log(`socket ${client.id} connected: user=${principal.user_id} org=${principal.organisation_id} field_rooms=${fieldRooms.length}`);
 
     const wentOnline = await this.presence.recordConnect(principal.organisation_id, principal.user_id);
@@ -155,6 +156,30 @@ export class RealtimeGateway implements OnGatewayInit<RealtimeServer>, OnGateway
       return;
     }
     this.server.to([...rooms]).emit(event, payload);
+  }
+
+  /**
+   * WP-18/C8-01: emits to one user's own room and waits for a socket-level
+   * acknowledgement from at least one of their connections.
+   *
+   * The returned boolean is the ONLY thing that may advance a recipient row to
+   * DELIVERED. A NATS publish proves the internal bus accepted an event; this
+   * proves the recipient's transport did. Returns false when the user has no
+   * live socket, or none acknowledges within the timeout — in which case the
+   * row correctly stays REQUESTED.
+   */
+  async emitToUserAwaitingReceipt(organisationId: string, userId: string, event: string, payload: unknown, timeoutMs = 2000): Promise<boolean> {
+    if (!this.server) {
+      this.logger.warn(`emitToUserAwaitingReceipt(${event}) dropped: socket.io server not yet initialised`);
+      return false;
+    }
+    try {
+      const responses = await this.server.to(userRoom(organisationId, userId)).timeout(timeoutMs).emitWithAck(event, payload);
+      return Array.isArray(responses) && responses.length > 0;
+    } catch {
+      // socket.io rejects the ack promise when no socket answers in time.
+      return false;
+    }
   }
 
   private async authenticate(socket: RealtimeSocket): Promise<RealtimePrincipal> {

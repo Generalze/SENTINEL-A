@@ -2,6 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { Prisma, type IncidentFieldMessage, type IncidentFieldMessageRecipient } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { TIMELINE_MESSAGE_ACKNOWLEDGED, TIMELINE_MESSAGE_SENT } from './field-messaging.constants';
+import { OPERATIONAL_ASSIGNMENT_STATUSES } from './field-messaging.eligibility';
 import type { SiteScope } from './field-messaging.types';
 
 export type MessageWithRecipients = IncidentFieldMessage & { recipients: IncidentFieldMessageRecipient[] };
@@ -60,14 +61,41 @@ export class FieldMessagingRepository {
     return site !== null;
   }
 
-  /** Recipients must be real users in the caller's own tenant. Returns the ids that are not. */
-  async unknownRecipients(organisationId: string, recipientUserIds: readonly string[]): Promise<string[]> {
-    const found = await this.prisma.user.findMany({
-      where: { organisationId, id: { in: [...recipientUserIds] } },
-      select: { id: true },
-    });
-    const known = new Set(found.map((user) => user.id));
-    return recipientUserIds.filter((id) => !known.has(id));
+  /**
+   * WP-18/C8-03: loads exactly what the eligibility rules need for a set of
+   * users — their role assignments, and whether each holds an operational Field
+   * assignment for this precise organisation + site + incident.
+   *
+   * Users absent from the returned map do not exist in this tenant. The caller
+   * must NOT tell the sender which of the two it was: distinguishing them would
+   * turn send into a tenant/user/role/assignment probe.
+   */
+  async loadEligibilityFacts(
+    organisationId: string,
+    siteId: string,
+    incidentId: string,
+    userIds: readonly string[],
+  ): Promise<Map<string, { roles: Array<{ role: string; siteId: string | null }>; hasOperationalAssignment: boolean }>> {
+    const ids = [...new Set(userIds)];
+    const [users, assignments] = await Promise.all([
+      this.prisma.user.findMany({
+        where: { organisationId, id: { in: ids } },
+        select: { id: true, roles: { select: { role: true, siteId: true } } },
+      }),
+      this.prisma.fieldAssignment.findMany({
+        where: {
+          organisationId,
+          siteId,
+          incidentId,
+          assigneeUserId: { in: ids },
+          status: { in: [...OPERATIONAL_ASSIGNMENT_STATUSES] },
+        },
+        select: { assigneeUserId: true },
+      }),
+    ]);
+
+    const assigned = new Set(assignments.map((row) => row.assigneeUserId));
+    return new Map(users.map((user) => [user.id, { roles: user.roles, hasOperationalAssignment: assigned.has(user.id) }]));
   }
 
   /**
@@ -148,6 +176,31 @@ export class FieldMessagingRepository {
     }
   }
 
+  /**
+   * WP-18/C8-01: the system-owned transport-evidence step.
+   *
+   * Called ONLY when a recipient's own authenticated socket has positively
+   * acknowledged receipt of the notification. There is deliberately no public
+   * route onto this path, and publishing to NATS does not reach it.
+   *
+   * Validated against the shared section 76 table (REQUESTED -> DELIVERED) and
+   * a no-op for any row already past REQUESTED, so a reconnect storm cannot
+   * rewrite an established state or an acknowledgement.
+   */
+  async recordTransportDelivery(messageId: string, recipientUserId: string, canAdvance: (from: string) => boolean): Promise<boolean> {
+    const recipient = await this.prisma.incidentFieldMessageRecipient.findFirst({
+      where: { messageId, recipientUserId },
+      select: { id: true, deliveryState: true },
+    });
+    if (!recipient || !canAdvance(recipient.deliveryState)) return false;
+
+    const updated = await this.prisma.incidentFieldMessageRecipient.updateMany({
+      where: { id: recipient.id, deliveryState: recipient.deliveryState },
+      data: { deliveryState: 'DELIVERED', deliveredAt: new Date() },
+    });
+    return updated.count === 1;
+  }
+
   /** Scoped read. Entitlement (sender/recipient/oversight) is decided by the service, never here. */
   async findMessage(organisationId: string, messageId: string, siteScope: SiteScope): Promise<MessageWithRecipients | null> {
     return this.prisma.incidentFieldMessage.findFirst({
@@ -192,7 +245,7 @@ export class FieldMessagingRepository {
     recipientUserId: string,
     idempotencyKey: string,
     siteScope: SiteScope,
-    resolvePath: (from: string) => readonly string[] | null,
+    requiredState: string,
   ): Promise<AcknowledgeResult> {
     return this.prisma.$transaction(async (tx) => {
       const message = await tx.incidentFieldMessage.findFirst({
@@ -217,23 +270,18 @@ export class FieldMessagingRepository {
       if (duplicate) return { kind: 'duplicate', message };
       if (recipient.deliveryState === 'ACKNOWLEDGED') return { kind: 'duplicate', message };
 
-      // Section 76 has no REQUESTED -> ACKNOWLEDGED edge; the path walks
-      // through DELIVERED, and every hop was validated by the caller against
-      // the shared transition table. An unreachable state is refused here
-      // WITHOUT mutating anything.
-      const path = resolvePath(recipient.deliveryState);
-      if (path === null) return { kind: 'conflict', currentState: recipient.deliveryState };
+      // C8-01: acknowledgement may ONLY advance a row that transport evidence
+      // already moved to DELIVERED. Acknowledging a REQUESTED row is refused
+      // here without mutating anything — a human acknowledgement must never
+      // manufacture the transport evidence that should have preceded it.
+      if (recipient.deliveryState !== requiredState) return { kind: 'conflict', currentState: recipient.deliveryState };
 
       const at = new Date();
-      const passedThroughDelivered = path.includes('DELIVERED');
       await tx.incidentFieldMessageRecipient.update({
         where: { id: recipient.id },
-        data: {
-          deliveryState: 'ACKNOWLEDGED',
-          acknowledgedAt: at,
-          // The acknowledgement is the proof of delivery when none was recorded.
-          deliveredAt: recipient.deliveredAt ?? (passedThroughDelivered ? at : recipient.deliveredAt),
-        },
+        // deliveredAt is deliberately NOT written here: it belongs to the
+        // transport-evidence step and must keep its own timestamp.
+        data: { deliveryState: 'ACKNOWLEDGED', acknowledgedAt: at },
       });
       await tx.incidentFieldMessageActionIdempotency.create({
         data: { messageId, recipientUserId, action: 'acknowledge', idempotencyKey },

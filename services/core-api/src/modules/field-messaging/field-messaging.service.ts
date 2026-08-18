@@ -1,8 +1,9 @@
 import { BadRequestException, ConflictException, ForbiddenException, Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
-import { canTransition, IncidentFieldMessageSchema, MAX_INCIDENT_FIELD_MESSAGE_BODY_BYTES, MAX_INCIDENT_FIELD_MESSAGE_MEDIA_REFS } from '@sentinel/contracts';
+import { IncidentFieldMessageSchema, MAX_INCIDENT_FIELD_MESSAGE_BODY_BYTES, MAX_INCIDENT_FIELD_MESSAGE_MEDIA_REFS } from '@sentinel/contracts';
 import { z } from 'zod';
 import type { Principal } from '../../common/security/principal';
-import { acknowledgementPath } from './field-messaging.constants';
+import { ACKNOWLEDGE_REQUIRES_STATE, ACTION_MESSAGE_SEND } from './field-messaging.constants';
+import { isEligibleRecipient, isEligibleSender } from './field-messaging.eligibility';
 import { mapMessage } from './field-messaging.mapper';
 import { FieldMessagingRepository, type MessageWithRecipients } from './field-messaging.repository';
 import type { IncidentFieldMessageView, SiteScope } from './field-messaging.types';
@@ -93,10 +94,32 @@ export class FieldMessagingService {
     const recipientUserIds = [...new Set(input.recipient_user_ids)];
     if (recipientUserIds.length !== input.recipient_user_ids.length) throw new BadRequestException('recipient_user_ids must be unique');
 
-    const unknown = await this.repository.unknownRecipients(principal.organisation_id, recipientUserIds);
-    // Never echo which ids were unknown: that would turn send into a user
-    // directory probe across the tenant boundary.
-    if (unknown.length > 0) throw new BadRequestException('one or more recipients are not users in this organisation');
+    // WP-18/C8-03. Same-tenant membership is not sufficient for either side.
+    // One query loads the facts for the sender and every proposed recipient.
+    const facts = await this.repository.loadEligibilityFacts(principal.organisation_id, siteId, incidentId, [
+      principal.user.id,
+      ...recipientUserIds,
+    ]);
+
+    // The sender must be eligible for THIS incident. A site-scoped operative
+    // must not be able to inject into every incident at their site.
+    const senderFacts = facts.get(principal.user.id);
+    if (
+      !senderFacts ||
+      !isEligibleSender({ roles: senderFacts.roles, siteId, hasOperationalAssignment: senderFacts.hasOperationalAssignment }, ACTION_MESSAGE_SEND)
+    ) {
+      throw new ForbiddenException('Not permitted to send on this incident');
+    }
+
+    // Every named recipient must be eligible. One indistinguishable failure for
+    // all causes — nonexistent, foreign tenant, wrong site, role without
+    // field.message.read, unassigned operative, terminal assignment — so the
+    // endpoint cannot be used to probe users, roles, or assignments.
+    const ineligible = recipientUserIds.filter((id) => {
+      const recipient = facts.get(id);
+      return !recipient || !isEligibleRecipient({ roles: recipient.roles, siteId, hasOperationalAssignment: recipient.hasOperationalAssignment });
+    });
+    if (ineligible.length > 0) throw new BadRequestException('one or more recipients are not eligible for this incident');
 
     const expiresAt = input.expires_at ? new Date(input.expires_at) : null;
     const sentAt = new Date();
@@ -160,7 +183,7 @@ export class FieldMessagingService {
       principal.user.id,
       input.idempotency_key,
       siteScope,
-      (from) => acknowledgementPath(from, (a, b) => canTransition(a as Parameters<typeof canTransition>[0], b as Parameters<typeof canTransition>[1])),
+      ACKNOWLEDGE_REQUIRES_STATE,
     );
 
     if (result.kind === 'not_recipient') throw new NotFoundException('Message not found');
@@ -194,6 +217,3 @@ export class FieldMessagingService {
     });
   }
 }
-
-/** Re-exported so the controller can keep its guard imports in one place. */
-export { ForbiddenException };

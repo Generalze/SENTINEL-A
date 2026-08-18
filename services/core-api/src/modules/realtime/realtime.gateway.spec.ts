@@ -3,7 +3,7 @@ import type { AppConfigService } from '../../config/config.service';
 import type { PrismaService } from '../../prisma/prisma.service';
 import { PresenceService } from './presence.service';
 import { RealtimeGateway } from './realtime.gateway';
-import { fieldOrgWideRoom, fieldSiteRoom, orgRoom, WS_EVENT_PRESENCE_CHANGED } from './realtime.constants';
+import { fieldOrgWideRoom, fieldSiteRoom, orgRoom, userRoom, WS_EVENT_PRESENCE_CHANGED } from './realtime.constants';
 
 function fakeConfig(devAuthEnabled: boolean): AppConfigService {
   return { values: { DEV_AUTH_ENABLED: devAuthEnabled } } as unknown as AppConfigService;
@@ -133,11 +133,12 @@ describe('RealtimeGateway — room selection and presence broadcast (deliverable
 
     await gateway.handleConnection(socket as never);
 
-    // No Field-granting role, so no Field room: the org room is the only entry.
+    // No Field-granting role, so no Field room. The per-user room (WP-18) is
+    // unconditional: it needs no authority beyond being this user.
     // One join call, always — every await before `recordConnect` delays the
     // point at which the socket becomes visible to the presence endpoint.
     expect(socket.join).toHaveBeenCalledTimes(1);
-    expect(socket.join).toHaveBeenCalledWith([orgRoom('org_1')]);
+    expect(socket.join).toHaveBeenCalledWith([orgRoom('org_1'), userRoom('org_1', 'user_1')]);
   });
 
   it('additionally joins the Field site room for a site-scoped operative (WP-17/D1)', async () => {
@@ -150,7 +151,7 @@ describe('RealtimeGateway — room selection and presence broadcast (deliverable
     await gateway.handleConnection(socket as never);
 
     expect(socket.join).toHaveBeenCalledTimes(1);
-    expect(socket.join).toHaveBeenCalledWith([orgRoom('org_1'), fieldSiteRoom('org_1', 'site_a')]);
+    expect(socket.join).toHaveBeenCalledWith([orgRoom('org_1'), userRoom('org_1', 'user_1'), fieldSiteRoom('org_1', 'site_a')]);
   });
 
   it('joins the org-wide Field room for an organisation-wide dispatcher, and no site room (WP-17/D1)', async () => {
@@ -162,7 +163,7 @@ describe('RealtimeGateway — room selection and presence broadcast (deliverable
 
     await gateway.handleConnection(socket as never);
 
-    expect(socket.join).toHaveBeenCalledWith([orgRoom('org_1'), fieldOrgWideRoom('org_1')]);
+    expect(socket.join).toHaveBeenCalledWith([orgRoom('org_1'), userRoom('org_1', 'user_1'), fieldOrgWideRoom('org_1')]);
   });
 
   it('joins no Field room for a principal whose roles grant no Field action (WP-17/AC3)', async () => {
@@ -175,7 +176,7 @@ describe('RealtimeGateway — room selection and presence broadcast (deliverable
     await gateway.handleConnection(socket as never);
 
     expect(socket.join).toHaveBeenCalledTimes(1);
-    expect(socket.join).toHaveBeenCalledWith([orgRoom('org_1')]);
+    expect(socket.join).toHaveBeenCalledWith([orgRoom('org_1'), userRoom('org_1', 'user_1')]);
   });
 
   it('disconnects a socket that somehow reaches handleConnection with no principal (defence in depth)', async () => {

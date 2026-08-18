@@ -33,32 +33,22 @@ export const TIMELINE_MESSAGE_SENT = 'INCIDENT_FIELD_MESSAGE_SENT';
 export const TIMELINE_MESSAGE_ACKNOWLEDGED = 'INCIDENT_FIELD_MESSAGE_ACKNOWLEDGED';
 
 /**
- * WP-18 delivery walk (section 76).
+ * WP-18/C8-01: acknowledgement does NOT infer delivery.
  *
- * A recipient acknowledging a message is itself proof the message reached them,
- * but section 76 has no REQUESTED -> ACKNOWLEDGED edge: the legal route is
- * REQUESTED -> DELIVERED -> ACKNOWLEDGED. Rather than add an edge or stand up a
- * second state machine — both forbidden by the directive — this WALKS the
- * existing graph and validates every hop with the shared `canTransition`.
+ * Section 76 keeps three pieces of evidence distinct: REQUESTED is Sentinel
+ * deciding an action should be attempted, DELIVERED is the destination
+ * TRANSPORT accepting it, and ACKNOWLEDGED is an authorised human or device
+ * confirming receipt. An earlier draft walked REQUESTED -> DELIVERED ->
+ * ACKNOWLEDGED inside the human acknowledgement and stamped delivered_at from
+ * the acknowledgement clock. That collapsed two different pieces of evidence
+ * into one operation and is rejected.
  *
- * Returns the ordered states to apply, or null when acknowledgement is not
- * reachable from `from` (e.g. EXECUTED, or FAILED without a retry first), in
- * which case the caller must refuse without mutating anything.
+ * REQUESTED -> DELIVERED is system-owned and needs positive transport evidence
+ * (an acknowledgement from one of the recipient's own authenticated sockets).
+ * Publishing to NATS does not qualify: that proves the internal bus accepted
+ * an event, not that the recipient's transport did.
+ *
+ * The public acknowledgement route is therefore strict — only DELIVERED may
+ * advance to ACKNOWLEDGED.
  */
-export function acknowledgementPath(from: string, canTransition: (a: string, b: string) => boolean): readonly string[] | null {
-  if (from === 'ACKNOWLEDGED') return [];
-  const candidates: readonly (readonly string[])[] = [['ACKNOWLEDGED'], ['DELIVERED', 'ACKNOWLEDGED']];
-  for (const path of candidates) {
-    let current = from;
-    let legal = true;
-    for (const next of path) {
-      if (!canTransition(current, next)) {
-        legal = false;
-        break;
-      }
-      current = next;
-    }
-    if (legal) return path;
-  }
-  return null;
-}
+export const ACKNOWLEDGE_REQUIRES_STATE = 'DELIVERED';

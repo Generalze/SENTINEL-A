@@ -9,9 +9,8 @@ import { PrismaService } from '../../prisma/prisma.service';
  * WP-18 merge-blocking acceptance set, driven over real HTTP through the global
  * guard chain (DevAuthGuard -> AccessGuard) against the live stack.
  *
- * These are deliberately adversarial rather than happy-path: the whole point of
- * WP-18's model is who may NOT see a message, so most of the cases below assert
- * a denial and its exact shape.
+ * Deliberately adversarial: the point of WP-18's model is who may NOT see or
+ * send a message, so most cases assert a denial and the exact shape of it.
  */
 
 const STACK_ENV: Record<string, string> = {
@@ -35,11 +34,17 @@ const fx = {
   siteB1: `${tag}_siteB1`,
   commanderA1: `${tag}_commanderA1`,
   commanderOrgWide: `${tag}_commanderOrgWide`,
-  senderA1: `${tag}_senderA1`,
-  recipientA1: `${tag}_recipientA1`,
-  peerA1: `${tag}_peerA1`,
-  operativeA2: `${tag}_operativeA2`,
+  dispatcherA1: `${tag}_dispatcherA1`,
+  operatorA1: `${tag}_operatorA1`,
   investigatorA1: `${tag}_investigatorA1`,
+  // field.operative, assigned to incidentA1 — eligible sender and recipient
+  assignedOp: `${tag}_assignedOp`,
+  assignedOp2: `${tag}_assignedOp2`,
+  // field.operative at the same site, NO assignment — ineligible
+  unassignedOp: `${tag}_unassignedOp`,
+  // field.operative whose assignment has reached a terminal status — ineligible
+  terminalOp: `${tag}_terminalOp`,
+  operativeA2: `${tag}_operativeA2`,
   senderB1: `${tag}_senderB1`,
   incidentA1: randomUUID(),
   incidentA2: randomUUID(),
@@ -59,15 +64,15 @@ async function seed(prisma: PrismaService): Promise<void> {
 
   const users: Array<{ id: string; org: string; role: string; site: string | null }> = [
     { id: fx.commanderA1, org: fx.orgA, role: 'site.commander', site: fx.siteA1 },
-    // Organisation-wide: the only principal whose scope reaches an incident
-    // whose site is not an operational Site row.
     { id: fx.commanderOrgWide, org: fx.orgA, role: 'site.commander', site: null },
-    { id: fx.senderA1, org: fx.orgA, role: 'field.operative', site: fx.siteA1 },
-    { id: fx.recipientA1, org: fx.orgA, role: 'field.operative', site: fx.siteA1 },
-    { id: fx.peerA1, org: fx.orgA, role: 'field.operative', site: fx.siteA1 },
-    { id: fx.operativeA2, org: fx.orgA, role: 'field.operative', site: fx.siteA2 },
-    // Holds incident.view but NO field-message action at all.
+    { id: fx.dispatcherA1, org: fx.orgA, role: 'dispatcher', site: fx.siteA1 },
+    { id: fx.operatorA1, org: fx.orgA, role: 'operator', site: fx.siteA1 },
     { id: fx.investigatorA1, org: fx.orgA, role: 'investigator', site: fx.siteA1 },
+    { id: fx.assignedOp, org: fx.orgA, role: 'field.operative', site: fx.siteA1 },
+    { id: fx.assignedOp2, org: fx.orgA, role: 'field.operative', site: fx.siteA1 },
+    { id: fx.unassignedOp, org: fx.orgA, role: 'field.operative', site: fx.siteA1 },
+    { id: fx.terminalOp, org: fx.orgA, role: 'field.operative', site: fx.siteA1 },
+    { id: fx.operativeA2, org: fx.orgA, role: 'field.operative', site: fx.siteA2 },
     { id: fx.senderB1, org: fx.orgB, role: 'field.operative', site: fx.siteB1 },
   ];
   for (const u of users) {
@@ -89,8 +94,24 @@ async function seed(prisma: PrismaService): Promise<void> {
       incident(fx.incidentA1, fx.orgA, fx.siteA1),
       incident(fx.incidentA2, fx.orgA, fx.siteA2),
       incident(fx.incidentB1, fx.orgB, fx.siteB1),
-      // Legacy-shaped incident: real tenant, but its site is not an operational Site row.
+      // Legacy-shaped: real tenant, but its site is not an operational Site row.
       incident(fx.incidentGhostSite, fx.orgA, `${fx.siteA1}_ghost`),
+    ],
+  });
+
+  // Field assignments are what make an operative eligible for an incident.
+  const assignment = (assignee: string, status: string) => ({
+    organisationId: fx.orgA, siteId: fx.siteA1, incidentId: fx.incidentA1, assigneeUserId: assignee,
+    assignmentType: 'INCIDENT_RESPONSE', priority: 'SEV3', status, deliveryState: 'REQUESTED',
+    needToKnowSummary: 'wp18 fixture', idempotencyKey: `wp18-${assignee}-${status}`,
+    createdByUserId: fx.commanderA1, updatedByUserId: fx.commanderA1,
+  });
+  await prisma.fieldAssignment.createMany({
+    data: [
+      assignment(fx.assignedOp, 'ACCEPTED'),
+      assignment(fx.assignedOp2, 'IN_PROGRESS'),
+      // Terminal: must NOT confer eligibility.
+      assignment(fx.terminalOp, 'COMPLETED'),
     ],
   });
 }
@@ -101,6 +122,8 @@ async function cleanup(prisma: PrismaService): Promise<void> {
   await prisma.incidentFieldMessageRecipient.deleteMany({ where: { organisationId: { in: orgs } } });
   await prisma.incidentFieldMessageOutbox.deleteMany({ where: { organisationId: { in: orgs } } });
   await prisma.incidentFieldMessage.deleteMany({ where: { organisationId: { in: orgs } } });
+  await prisma.fieldAssignmentActionIdempotency.deleteMany({ where: { assignment: { organisationId: { in: orgs } } } });
+  await prisma.fieldAssignment.deleteMany({ where: { organisationId: { in: orgs } } });
   await prisma.incidentTimelineEntry.deleteMany({ where: { incident: { organisationId: { in: orgs } } } });
   await prisma.incident.deleteMany({ where: { organisationId: { in: orgs } } });
   await prisma.userRole.deleteMany({ where: { user: { organisationId: { in: orgs } } } });
@@ -120,7 +143,7 @@ describe('WP-18 incident field messaging (live stack)', () => {
 
   function sendBody(overrides: Record<string, unknown> = {}): Record<string, unknown> {
     return {
-      recipient_user_ids: [fx.recipientA1],
+      recipient_user_ids: [fx.assignedOp],
       body: 'Proceed to the north gate.',
       retention_class: 'operational-30d',
       idempotency_key: `send-${randomUUID()}`,
@@ -129,8 +152,9 @@ describe('WP-18 incident field messaging (live stack)', () => {
     };
   }
 
+  /** Sent by the commander, whose scope alone qualifies. */
   async function sendMessage(overrides: Record<string, unknown> = {}): Promise<{ id: string }> {
-    const res = await post(`/api/v1/field-messages/incidents/${fx.incidentA1}`, fx.senderA1, sendBody(overrides));
+    const res = await post(`/api/v1/field-messages/incidents/${fx.incidentA1}`, fx.commanderA1, sendBody(overrides));
     expect(res.status).toBe(201);
     return (await res.json()) as { id: string };
   }
@@ -152,85 +176,190 @@ describe('WP-18 incident field messaging (live stack)', () => {
     }
   }, 30_000);
 
+  // ---------------------------------------------------------------- reads
+
   it('a named recipient may read a message addressed to them', async () => {
     const created = await sendMessage();
-    const res = await get(`/api/v1/field-messages/mine/${created.id}`, fx.recipientA1);
+    const res = await get(`/api/v1/field-messages/mine/${created.id}`, fx.assignedOp);
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { body: string; recipients: Array<{ recipient_user_id: string; delivery_state: string }> };
+    const body = (await res.json()) as { body: string; recipients: unknown[] };
     expect(body.body).toBe('Proceed to the north gate.');
-    expect(body.recipients).toEqual([{ recipient_user_id: fx.recipientA1, delivery_state: 'REQUESTED', delivered_at: null, acknowledged_at: null }]);
+    expect(body.recipients).toEqual([{ recipient_user_id: fx.assignedOp, delivery_state: 'REQUESTED', delivered_at: null, acknowledged_at: null }]);
   });
 
-  it('a same-site peer who is not a recipient gets an indistinguishable 404', async () => {
-    const created = await sendMessage();
-    const peer = await get(`/api/v1/field-messages/mine/${created.id}`, fx.peerA1);
-    const absent = await get(`/api/v1/field-messages/mine/${randomUUID()}`, fx.peerA1);
-
-    expect(peer.status).toBe(404);
-    expect(absent.status).toBe(404);
-    // Not merely the same status — the same response, so existence cannot be inferred.
-    expect(await peer.text()).toBe(await absent.text());
+  it('an ELIGIBLE but unnamed operative still gets 404 — eligibility decides who may be named, membership decides who may read', async () => {
+    const created = await sendMessage({ recipient_user_ids: [fx.assignedOp] });
+    // assignedOp2 is assigned to this very incident, so it could have been
+    // named. It was not, so it must not be able to read this message.
+    const unnamed = await get(`/api/v1/field-messages/mine/${created.id}`, fx.assignedOp2);
+    const absent = await get(`/api/v1/field-messages/mine/${randomUUID()}`, fx.assignedOp2);
+    expect(unnamed.status).toBe(404);
+    expect(await unnamed.text()).toBe(await absent.text());
   });
 
   it('incident.view without an explicit field-message action cannot read content', async () => {
     const created = await sendMessage();
-    // The investigator holds incident.view but no field.message.* action.
-    expect((await get(`/api/v1/field-messages/mine/${created.id}`, fx.investigatorA1)).status).toBe(403);
-    expect((await get(`/api/v1/field-messages/oversight/${created.id}`, fx.investigatorA1)).status).toBe(403);
-    expect((await get(`/api/v1/field-messages/incidents/${fx.incidentA1}/mine`, fx.investigatorA1)).status).toBe(403);
+    for (const denied of [fx.investigatorA1, fx.operatorA1]) {
+      expect((await get(`/api/v1/field-messages/mine/${created.id}`, denied)).status).toBe(403);
+      expect((await get(`/api/v1/field-messages/oversight/${created.id}`, denied)).status).toBe(403);
+    }
   });
 
   it('a field operative cannot use the oversight route even for a message they can read', async () => {
     const created = await sendMessage();
-    expect((await get(`/api/v1/field-messages/mine/${created.id}`, fx.recipientA1)).status).toBe(200);
-    expect((await get(`/api/v1/field-messages/oversight/${created.id}`, fx.recipientA1)).status).toBe(403);
+    expect((await get(`/api/v1/field-messages/mine/${created.id}`, fx.assignedOp)).status).toBe(200);
+    expect((await get(`/api/v1/field-messages/oversight/${created.id}`, fx.assignedOp)).status).toBe(403);
+    // Dispatcher holds the ordinary actions but NOT oversight.
+    expect((await get(`/api/v1/field-messages/oversight/${created.id}`, fx.dispatcherA1)).status).toBe(403);
   });
 
   it('site.commander oversight reads without becoming a recipient or creating delivery state', async () => {
     const created = await sendMessage();
-
     const before = await prisma.incidentFieldMessageRecipient.count({ where: { messageId: created.id } });
-    const res = await get(`/api/v1/field-messages/oversight/${created.id}`, fx.commanderA1);
-    expect(res.status).toBe(200);
-    const list = await get(`/api/v1/field-messages/oversight/incidents/${fx.incidentA1}`, fx.commanderA1);
-    expect(list.status).toBe(200);
 
-    // The core invariant: oversight must not manufacture recipient state.
+    expect((await get(`/api/v1/field-messages/oversight/${created.id}`, fx.commanderA1)).status).toBe(200);
+    expect((await get(`/api/v1/field-messages/oversight/incidents/${fx.incidentA1}`, fx.commanderA1)).status).toBe(200);
+
     expect(await prisma.incidentFieldMessageRecipient.count({ where: { messageId: created.id } })).toBe(before);
     expect(await prisma.incidentFieldMessageRecipient.count({ where: { messageId: created.id, recipientUserId: fx.commanderA1 } })).toBe(0);
 
-    // ...and cannot acknowledge as a recipient.
     const ack = await post(`/api/v1/field-messages/mine/${created.id}/acknowledge`, fx.commanderA1, { idempotency_key: `ack-${randomUUID()}` });
     expect(ack.status).toBe(404);
     expect(await prisma.incidentFieldMessageRecipient.count({ where: { messageId: created.id, deliveryState: 'ACKNOWLEDGED' } })).toBe(0);
   });
 
   it('recipient membership is frozen: a later participant never sees an earlier message', async () => {
-    const earlier = await sendMessage({ recipient_user_ids: [fx.recipientA1] });
-    // peerA1 is subsequently addressed on a NEW message — the older one stays hidden.
-    const later = await sendMessage({ recipient_user_ids: [fx.recipientA1, fx.peerA1] });
+    const earlier = await sendMessage({ recipient_user_ids: [fx.assignedOp] });
+    const later = await sendMessage({ recipient_user_ids: [fx.assignedOp, fx.assignedOp2] });
 
-    expect((await get(`/api/v1/field-messages/mine/${later.id}`, fx.peerA1)).status).toBe(200);
-    expect((await get(`/api/v1/field-messages/mine/${earlier.id}`, fx.peerA1)).status).toBe(404);
+    expect((await get(`/api/v1/field-messages/mine/${later.id}`, fx.assignedOp2)).status).toBe(200);
+    expect((await get(`/api/v1/field-messages/mine/${earlier.id}`, fx.assignedOp2)).status).toBe(404);
 
-    const mine = (await (await get(`/api/v1/field-messages/incidents/${fx.incidentA1}/mine`, fx.peerA1)).json()) as Array<{ id: string }>;
+    const mine = (await (await get(`/api/v1/field-messages/incidents/${fx.incidentA1}/mine`, fx.assignedOp2)).json()) as Array<{ id: string }>;
     expect(mine.some((m) => m.id === later.id)).toBe(true);
     expect(mine.some((m) => m.id === earlier.id)).toBe(false);
   });
 
+  // -------------------------------------------------- C8-03 eligibility
+
+  it('C8-03: same-tenant membership alone does not make somebody nameable', async () => {
+    const cases: Array<[string, string]> = [
+      ['same-org user with no message role', fx.operatorA1],
+      ['same-site operative with no assignment', fx.unassignedOp],
+      ['operative whose assignment reached a terminal status', fx.terminalOp],
+      ['operative scoped to another site', fx.operativeA2],
+      ['foreign-tenant user', fx.senderB1],
+      ['nonexistent user', `${tag}_ghost_user`],
+    ];
+
+    const bodies: string[] = [];
+    for (const [, candidate] of cases) {
+      const res = await post(`/api/v1/field-messages/incidents/${fx.incidentA1}`, fx.commanderA1, sendBody({ recipient_user_ids: [candidate] }));
+      expect(res.status).toBe(400);
+      const text = await res.text();
+      // Never disclose WHICH condition failed, or the id itself.
+      expect(text).toContain('not eligible for this incident');
+      expect(text).not.toContain(candidate);
+      bodies.push(text);
+    }
+    // Every cause produces the identical outward failure.
+    expect(new Set(bodies).size).toBe(1);
+    expect(await prisma.incidentFieldMessage.count({ where: { incidentId: fx.incidentA1, senderUserId: fx.commanderA1, body: null } })).toBe(0);
+  });
+
+  it('C8-03: an operative assigned to this incident may be named, and a dispatcher may be named on scope alone', async () => {
+    const withOperative = await sendMessage({ recipient_user_ids: [fx.assignedOp, fx.assignedOp2] });
+    expect((await get(`/api/v1/field-messages/mine/${withOperative.id}`, fx.assignedOp2)).status).toBe(200);
+
+    const withDispatcher = await sendMessage({ recipient_user_ids: [fx.dispatcherA1] });
+    expect((await get(`/api/v1/field-messages/mine/${withDispatcher.id}`, fx.dispatcherA1)).status).toBe(200);
+  });
+
+  it('C8-03: a site operative not assigned to the incident cannot SEND into it', async () => {
+    const denied = await post(`/api/v1/field-messages/incidents/${fx.incidentA1}`, fx.unassignedOp, sendBody({ recipient_user_ids: [fx.assignedOp] }));
+    expect(denied.status).toBe(403);
+
+    // ...while an assigned operative at the same site can.
+    const allowed = await post(`/api/v1/field-messages/incidents/${fx.incidentA1}`, fx.assignedOp, sendBody({ recipient_user_ids: [fx.assignedOp2] }));
+    expect(allowed.status).toBe(201);
+  });
+
+  it('C8-02: dispatcher may send, read and acknowledge; operator may do none of it', async () => {
+    const sent = await post(`/api/v1/field-messages/incidents/${fx.incidentA1}`, fx.dispatcherA1, sendBody({ recipient_user_ids: [fx.dispatcherA1] }));
+    expect(sent.status).toBe(201);
+    const id = ((await sent.json()) as { id: string }).id;
+
+    expect((await get(`/api/v1/field-messages/mine/${id}`, fx.dispatcherA1)).status).toBe(200);
+    // Acknowledge is reachable for a dispatcher who is a named recipient. It is
+    // refused on delivery state (C8-01), not on authorisation — 409, not 403.
+    const ack = await post(`/api/v1/field-messages/mine/${id}/acknowledge`, fx.dispatcherA1, { idempotency_key: `ack-${randomUUID()}` });
+    expect(ack.status).toBe(409);
+
+    for (const path of [`/api/v1/field-messages/incidents/${fx.incidentA1}`, `/api/v1/field-messages/mine/${id}/acknowledge`]) {
+      expect((await post(path, fx.operatorA1, sendBody())).status).toBe(403);
+    }
+    expect((await get(`/api/v1/field-messages/mine/${id}`, fx.operatorA1)).status).toBe(403);
+  });
+
+  // ------------------------------------------------- C8-01 delivery state
+
+  it('C8-01: acknowledging a REQUESTED row is refused and fabricates no delivery evidence', async () => {
+    const created = await sendMessage();
+    const before = await prisma.incidentFieldMessageRecipient.findFirstOrThrow({ where: { messageId: created.id, recipientUserId: fx.assignedOp } });
+    expect(before.deliveryState).toBe('REQUESTED');
+
+    const res = await post(`/api/v1/field-messages/mine/${created.id}/acknowledge`, fx.assignedOp, { idempotency_key: `ack-${randomUUID()}` });
+    expect(res.status).toBe(409);
+
+    const after = await prisma.incidentFieldMessageRecipient.findFirstOrThrow({ where: { id: before.id } });
+    // Zero mutation: no state change, no fabricated delivered_at, no ack stamp.
+    expect(after.deliveryState).toBe('REQUESTED');
+    expect(after.deliveredAt).toBeNull();
+    expect(after.acknowledgedAt).toBeNull();
+    expect(await prisma.incidentFieldMessageActionIdempotency.count({ where: { messageId: created.id } })).toBe(0);
+    expect(
+      await prisma.incidentTimelineEntry.count({
+        where: { incidentId: fx.incidentA1, kind: 'INCIDENT_FIELD_MESSAGE_ACKNOWLEDGED', payload: { path: ['incident_field_message_id'], equals: created.id } },
+      }),
+    ).toBe(0);
+  });
+
+  it('C8-01: once transport evidence exists, acknowledge advances only that recipient and is idempotent', async () => {
+    const created = await sendMessage({ recipient_user_ids: [fx.assignedOp, fx.assignedOp2] });
+
+    // Simulate the system-owned transport-evidence step for ONE recipient only.
+    await prisma.incidentFieldMessageRecipient.updateMany({
+      where: { messageId: created.id, recipientUserId: fx.assignedOp },
+      data: { deliveryState: 'DELIVERED', deliveredAt: new Date() },
+    });
+
+    const key = `ack-${randomUUID()}`;
+    const first = await post(`/api/v1/field-messages/mine/${created.id}/acknowledge`, fx.assignedOp, { idempotency_key: key });
+    const second = await post(`/api/v1/field-messages/mine/${created.id}/acknowledge`, fx.assignedOp, { idempotency_key: key });
+    expect(first.status).toBe(201);
+    expect(second.status).toBe(201);
+
+    const rows = await prisma.incidentFieldMessageRecipient.findMany({ where: { messageId: created.id } });
+    expect(rows.find((r) => r.recipientUserId === fx.assignedOp)?.deliveryState).toBe('ACKNOWLEDGED');
+    // Per recipient: one acknowledgement must not advance anybody else.
+    expect(rows.find((r) => r.recipientUserId === fx.assignedOp2)?.deliveryState).toBe('REQUESTED');
+
+    expect(
+      await prisma.incidentTimelineEntry.count({
+        where: { incidentId: fx.incidentA1, kind: 'INCIDENT_FIELD_MESSAGE_ACKNOWLEDGED', payload: { path: ['incident_field_message_id'], equals: created.id } },
+      }),
+    ).toBe(1);
+  });
+
+  // ------------------------------------------------------- scope & tuples
+
   it('the send request cannot choose organisation_id or site_id', async () => {
-    // Two independent defences, and both must hold. A body naming ANOTHER
-    // tenant is stopped by the global AccessGuard, which answers 404 rather
-    // than confirming the other tenant exists...
-    const crossTenant = await post(`/api/v1/field-messages/incidents/${fx.incidentA1}`, fx.senderA1, sendBody({ organisation_id: fx.orgB, site_id: fx.siteB1 }));
+    const crossTenant = await post(`/api/v1/field-messages/incidents/${fx.incidentA1}`, fx.commanderA1, sendBody({ organisation_id: fx.orgB, site_id: fx.siteB1 }));
     expect(crossTenant.status).toBe(404);
 
-    // ...and a body naming the caller's OWN scope still never reaches the
-    // service, because the send schema is .strict() and has no such fields.
-    const inScope = await post(`/api/v1/field-messages/incidents/${fx.incidentA1}`, fx.senderA1, sendBody({ organisation_id: fx.orgA, site_id: fx.siteA1 }));
+    const inScope = await post(`/api/v1/field-messages/incidents/${fx.incidentA1}`, fx.commanderA1, sendBody({ organisation_id: fx.orgA, site_id: fx.siteA1 }));
     expect(inScope.status).toBe(400);
 
-    // Scope is taken from the incident, not the caller's wishes.
     const created = await sendMessage();
     const row = await prisma.incidentFieldMessage.findUniqueOrThrow({ where: { id: created.id } });
     expect(row.organisationId).toBe(fx.orgA);
@@ -239,54 +368,36 @@ describe('WP-18 incident field messaging (live stack)', () => {
 
   it('cross-organisation and cross-site sends and reads are refused', async () => {
     const created = await sendMessage();
-
-    // Another tenant cannot read it, and cannot tell it apart from a missing id.
     expect((await get(`/api/v1/field-messages/mine/${created.id}`, fx.senderB1)).status).toBe(404);
-    // ...nor send into this tenant's incident.
     expect((await post(`/api/v1/field-messages/incidents/${fx.incidentA1}`, fx.senderB1, sendBody({ recipient_user_ids: [fx.senderB1] }))).status).toBe(404);
-    // A same-tenant operative scoped to another site cannot send into site A1's incident.
     expect((await post(`/api/v1/field-messages/incidents/${fx.incidentA1}`, fx.operativeA2, sendBody({ recipient_user_ids: [fx.operativeA2] }))).status).toBe(404);
   });
 
-  it('recipients outside the tenant are refused without revealing which id was unknown', async () => {
-    const res = await post(`/api/v1/field-messages/incidents/${fx.incidentA1}`, fx.senderA1, sendBody({ recipient_user_ids: [fx.recipientA1, fx.senderB1] }));
-    expect(res.status).toBe(400);
-    expect(await res.text()).not.toContain(fx.senderB1);
-  });
-
   it('a legacy incident whose site does not resolve returns a generic 409', async () => {
-    // A site-scoped caller never even reaches the eligibility check: the
-    // incident's site is outside their scope, so they get 404 first. That
-    // ordering is deliberate — out-of-scope must not reveal ineligibility.
     expect((await post(`/api/v1/field-messages/incidents/${fx.incidentGhostSite}`, fx.commanderA1, sendBody())).status).toBe(404);
 
-    // The organisation-wide commander IS in scope, and so sees the integrity
-    // refusal itself.
     const res = await post(`/api/v1/field-messages/incidents/${fx.incidentGhostSite}`, fx.commanderOrgWide, sendBody());
     expect(res.status).toBe(409);
     const text = await res.text();
     expect(text).toContain('not eligible for Field messaging');
-    // Must not disclose whether the site is missing or belongs elsewhere.
     expect(text).not.toContain(`${fx.siteA1}_ghost`);
     expect(await prisma.incidentFieldMessage.count({ where: { incidentId: fx.incidentGhostSite } })).toBe(0);
   });
 
   it('the database rejects a message tuple that does not match a real tenant/site/incident', async () => {
-    // Cross-tenant site pairing.
     await expect(
       prisma.incidentFieldMessage.create({
         data: {
-          organisationId: fx.orgA, siteId: fx.siteB1, incidentId: fx.incidentA1, senderUserId: fx.senderA1,
+          organisationId: fx.orgA, siteId: fx.siteB1, incidentId: fx.incidentA1, senderUserId: fx.commanderA1,
           body: 'never', retentionClass: 'x', idempotencyKey: `fk-${randomUUID()}`, traceId: 'fk',
         },
       }),
     ).rejects.toThrow();
 
-    // Incident that exists, but not under this site.
     await expect(
       prisma.incidentFieldMessage.create({
         data: {
-          organisationId: fx.orgA, siteId: fx.siteA1, incidentId: fx.incidentA2, senderUserId: fx.senderA1,
+          organisationId: fx.orgA, siteId: fx.siteA1, incidentId: fx.incidentA2, senderUserId: fx.commanderA1,
           body: 'never', retentionClass: 'x', idempotencyKey: `fk-${randomUUID()}`, traceId: 'fk',
         },
       }),
@@ -295,47 +406,23 @@ describe('WP-18 incident field messaging (live stack)', () => {
     expect(await prisma.incidentFieldMessage.count({ where: { siteId: fx.siteB1, organisationId: fx.orgA } })).toBe(0);
   });
 
-  it('acknowledge advances only the acknowledging recipient and is idempotent', async () => {
-    const created = await sendMessage({ recipient_user_ids: [fx.recipientA1, fx.peerA1] });
-    const key = `ack-${randomUUID()}`;
-
-    const first = await post(`/api/v1/field-messages/mine/${created.id}/acknowledge`, fx.recipientA1, { idempotency_key: key });
-    const second = await post(`/api/v1/field-messages/mine/${created.id}/acknowledge`, fx.recipientA1, { idempotency_key: key });
-    expect(first.status).toBe(201);
-    expect(second.status).toBe(201);
-
-    const rows = await prisma.incidentFieldMessageRecipient.findMany({ where: { messageId: created.id }, orderBy: { recipientUserId: 'asc' } });
-    const acked = rows.find((r) => r.recipientUserId === fx.recipientA1);
-    const other = rows.find((r) => r.recipientUserId === fx.peerA1);
-    expect(acked?.deliveryState).toBe('ACKNOWLEDGED');
-    // Per-recipient: one acknowledgement must not advance anybody else.
-    expect(other?.deliveryState).toBe('REQUESTED');
-
-    // Duplicate wrote no second timeline entry.
-    const acks = await prisma.incidentTimelineEntry.count({
-      where: { incidentId: fx.incidentA1, kind: 'INCIDENT_FIELD_MESSAGE_ACKNOWLEDGED', payload: { path: ['incident_field_message_id'], equals: created.id } },
-    });
-    expect(acks).toBe(1);
-  });
-
   it('a non-recipient cannot acknowledge, and duplicate sends are idempotent', async () => {
     const created = await sendMessage();
-    expect((await post(`/api/v1/field-messages/mine/${created.id}/acknowledge`, fx.peerA1, { idempotency_key: `ack-${randomUUID()}` })).status).toBe(404);
+    expect((await post(`/api/v1/field-messages/mine/${created.id}/acknowledge`, fx.assignedOp2, { idempotency_key: `ack-${randomUUID()}` })).status).toBe(404);
 
     const key = `send-${randomUUID()}`;
-    const one = await post(`/api/v1/field-messages/incidents/${fx.incidentA1}`, fx.senderA1, sendBody({ idempotency_key: key }));
-    const two = await post(`/api/v1/field-messages/incidents/${fx.incidentA1}`, fx.senderA1, sendBody({ idempotency_key: key }));
+    const one = await post(`/api/v1/field-messages/incidents/${fx.incidentA1}`, fx.commanderA1, sendBody({ idempotency_key: key }));
+    const two = await post(`/api/v1/field-messages/incidents/${fx.incidentA1}`, fx.commanderA1, sendBody({ idempotency_key: key }));
     expect(one.status).toBe(201);
     expect(two.status).toBe(201);
     const idOne = ((await one.json()) as { id: string }).id;
-    const idTwo = ((await two.json()) as { id: string }).id;
-    expect(idTwo).toBe(idOne);
+    expect(((await two.json()) as { id: string }).id).toBe(idOne);
     expect(await prisma.incidentFieldMessage.count({ where: { incidentId: fx.incidentA1, idempotencyKey: key } })).toBe(1);
     expect(await prisma.incidentFieldMessageOutbox.count({ where: { payload: { path: ['message_id'], equals: idOne } } })).toBe(1);
   });
 
   it('the transactional bundle is written together, and the outbox signal carries no content', async () => {
-    const created = await sendMessage({ recipient_user_ids: [fx.recipientA1, fx.peerA1], body: 'sensitive operational detail' });
+    const created = await sendMessage({ recipient_user_ids: [fx.assignedOp, fx.assignedOp2], body: 'sensitive operational detail' });
 
     expect(await prisma.incidentFieldMessageRecipient.count({ where: { messageId: created.id } })).toBe(2);
     expect(
@@ -346,14 +433,13 @@ describe('WP-18 incident field messaging (live stack)', () => {
 
     const outbox = await prisma.incidentFieldMessageOutbox.findMany({ where: { payload: { path: ['message_id'], equals: created.id } } });
     expect(outbox).toHaveLength(2);
-    expect(outbox.map((row) => row.recipientUserId).sort()).toEqual([fx.recipientA1, fx.peerA1].sort());
+    expect(outbox.map((row) => row.recipientUserId).sort()).toEqual([fx.assignedOp, fx.assignedOp2].sort());
     for (const row of outbox) {
       const payload = row.payload as Record<string, unknown>;
       expect(Object.keys(payload).sort()).toEqual(['incident_id', 'kind', 'message_id']);
       expect(JSON.stringify(payload)).not.toContain('sensitive operational detail');
       expect(payload).not.toHaveProperty('body');
       expect(payload).not.toHaveProperty('sender_user_id');
-      expect(payload).not.toHaveProperty('media_refs');
     }
   });
 });

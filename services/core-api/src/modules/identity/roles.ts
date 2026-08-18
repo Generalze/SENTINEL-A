@@ -90,7 +90,7 @@ export type Role = (typeof ROLES)[number];
 export const ROLE_ACTIONS: Readonly<Record<Role, readonly Action[]>> = {
   'site.commander': ['incident.view', 'incident.close', 'incident.silent.approve', 'field.acknowledge', 'field.assignment.manage', 'field.state.read', 'evidence.read', 'event.read', 'hypothesis.read', 'field.message.send', 'field.message.read', 'field.message.acknowledge', 'incident.field-message.oversight.read'],
   operator: ['incident.view', 'presence.view', 'field.state.read', 'event.ingest', 'event.read', 'hypothesis.read'],
-  dispatcher: ['incident.view', 'presence.view', 'field.assignment.manage', 'field.state.read', 'event.read', 'hypothesis.read'],
+  dispatcher: ['incident.view', 'presence.view', 'field.assignment.manage', 'field.state.read', 'event.read', 'hypothesis.read', 'field.message.send', 'field.message.read', 'field.message.acknowledge'],
   'field.operative': ['field.acknowledge', 'field.assignment.act', 'field.state.write', 'incident.view', 'field.message.send', 'field.message.read', 'field.message.acknowledge'],
   investigator: ['evidence.read', 'evidence.verify', 'ledger.read', 'ledger.verify', 'incident.view', 'event.read', 'hypothesis.read'],
   'evidence.custodian': ['evidence.read', 'evidence.ingest', 'evidence.verify'],
