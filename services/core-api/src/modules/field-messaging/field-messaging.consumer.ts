@@ -122,7 +122,7 @@ export class FieldMessagingConsumer implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    await this.repository.recordTransportDelivery(payload.message_id, recipientUserId, (from) =>
+    await this.repository.recordTransportDelivery(organisationId, payload.incident_id, payload.message_id, recipientUserId, (from) =>
       canTransition(from as Parameters<typeof canTransition>[0], 'DELIVERED'),
     );
   }

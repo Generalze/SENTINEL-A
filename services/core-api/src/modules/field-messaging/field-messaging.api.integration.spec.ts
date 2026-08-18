@@ -421,6 +421,74 @@ describe('WP-18 incident field messaging (live stack)', () => {
     expect(await prisma.incidentFieldMessageOutbox.count({ where: { payload: { path: ['message_id'], equals: idOne } } })).toBe(1);
   });
 
+  it('C8-05: a colliding idempotency key from a DIFFERENT sender never discloses the first message', async () => {
+    // The disclosure this closes: with the key scoped only to
+    // (organisation, incident, key), B's collision returned A's message —
+    // body included — to a caller who was neither its sender nor a recipient.
+    const key = 'shared-key-c8-05';
+
+    const aRes = await post(`/api/v1/field-messages/incidents/${fx.incidentA1}`, fx.commanderA1, sendBody({
+      idempotency_key: key, body: 'A confidential', recipient_user_ids: [fx.assignedOp],
+    }));
+    expect(aRes.status).toBe(201);
+    const m1 = (await aRes.json()) as { id: string; sender_user_id: string; body: string };
+
+    // B is an eligible sender on the same incident, but is neither M1's sender
+    // nor one of its named recipients.
+    const bRes = await post(`/api/v1/field-messages/incidents/${fx.incidentA1}`, fx.dispatcherA1, sendBody({
+      idempotency_key: key, body: 'B confidential', recipient_user_ids: [fx.dispatcherA1],
+    }));
+    expect(bRes.status).toBe(201);
+    const m2 = (await bRes.json()) as { id: string; sender_user_id: string; body: string };
+
+    expect(m2.id).not.toBe(m1.id);
+    expect(m2.sender_user_id).toBe(fx.dispatcherA1);
+    expect(m2.body).toBe('B confidential');
+    // The decisive assertion: A's content never reached B.
+    expect(JSON.stringify(m2)).not.toContain('A confidential');
+
+    // And B still cannot read M1 through the ordinary route.
+    expect((await get(`/api/v1/field-messages/mine/${m1.id}`, fx.dispatcherA1)).status).toBe(404);
+  });
+
+  it('C8-05: the same sender replaying the same key still gets their own message and no duplicate side effects', async () => {
+    const key = `replay-${randomUUID()}`;
+    const first = await post(`/api/v1/field-messages/incidents/${fx.incidentA1}`, fx.commanderA1, sendBody({ idempotency_key: key }));
+    expect(first.status).toBe(201);
+    const m1 = (await first.json()) as { id: string };
+
+    const recipientsBefore = await prisma.incidentFieldMessageRecipient.count({ where: { messageId: m1.id } });
+
+    const replay = await post(`/api/v1/field-messages/incidents/${fx.incidentA1}`, fx.commanderA1, sendBody({ idempotency_key: key }));
+    expect(replay.status).toBe(201);
+    expect(((await replay.json()) as { id: string }).id).toBe(m1.id);
+
+    expect(await prisma.incidentFieldMessage.count({ where: { incidentId: fx.incidentA1, senderUserId: fx.commanderA1, idempotencyKey: key } })).toBe(1);
+    expect(await prisma.incidentFieldMessageRecipient.count({ where: { messageId: m1.id } })).toBe(recipientsBefore);
+    expect(await prisma.incidentFieldMessageOutbox.count({ where: { payload: { path: ['message_id'], equals: m1.id } } })).toBe(1);
+    expect(
+      await prisma.incidentTimelineEntry.count({
+        where: { incidentId: fx.incidentA1, kind: 'INCIDENT_FIELD_MESSAGE_SENT', payload: { path: ['incident_field_message_id'], equals: m1.id } },
+      }),
+    ).toBe(1);
+  });
+
+  it('C8-05: the database itself enforces the sender-scoped identity', async () => {
+    const key = `db-idem-${randomUUID()}`;
+    const row = (sender: string) => ({
+      organisationId: fx.orgA, siteId: fx.siteA1, incidentId: fx.incidentA1, senderUserId: sender,
+      body: 'x', retentionClass: 'r', idempotencyKey: key, traceId: 't',
+    });
+
+    // Same key, DIFFERENT senders: permitted.
+    const a = await prisma.incidentFieldMessage.create({ data: row(fx.commanderA1) });
+    const b = await prisma.incidentFieldMessage.create({ data: row(fx.dispatcherA1) });
+    expect(a.id).not.toBe(b.id);
+
+    // Same key, SAME sender: rejected by the unique index.
+    await expect(prisma.incidentFieldMessage.create({ data: row(fx.commanderA1) })).rejects.toThrow();
+  });
+
   it('the transactional bundle is written together, and the outbox signal carries no content', async () => {
     const created = await sendMessage({ recipient_user_ids: [fx.assignedOp, fx.assignedOp2], body: 'sensitive operational detail' });
 

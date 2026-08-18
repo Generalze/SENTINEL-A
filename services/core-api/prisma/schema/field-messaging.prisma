@@ -49,7 +49,13 @@ model IncidentFieldMessage {
   site Site @relation(fields: [siteId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
   incident Incident @relation(fields: [incidentId, organisationId, siteId], references: [id, organisationId, siteId], onDelete: Restrict, onUpdate: Cascade)
 
-  @@unique([organisationId, incidentId, idempotencyKey], map: "incident_field_message_idem_key")
+  /// WP-18/C8-05. The send-idempotency identity MUST include the sender.
+  /// Scoped only to (organisation, incident, key), a replay by a DIFFERENT
+  /// sender collided with an existing message and the repository returned that
+  /// message — body included — to a caller who was neither its sender nor a
+  /// named recipient, bypassing the entitlement layer entirely. Adding the
+  /// sender also stops one sender from squatting another's keys.
+  @@unique([organisationId, incidentId, senderUserId, idempotencyKey], map: "incident_field_message_sender_idem_key")
   @@index([organisationId, incidentId, sentAt], map: "incident_field_message_incident_sent_idx")
   @@index([organisationId, senderUserId, sentAt], map: "incident_field_message_sender_idx")
   @@map("incident_field_messages")

@@ -264,8 +264,8 @@ describe('WP-18 realtime delivery evidence (live stack, C8-01)', () => {
     // Uses the REAL section 76 predicate the consumer passes, and the row's own
     // guard holds even against a permissive caller.
     const realPredicate = (from: string): boolean => canTransition(from as Parameters<typeof canTransition>[0], 'DELIVERED');
-    expect(await repository.recordTransportDelivery(messageId, fx.multiRecipient, realPredicate)).toBe(false);
-    expect(await repository.recordTransportDelivery(messageId, fx.multiRecipient, () => true)).toBe(false);
+    expect(await repository.recordTransportDelivery(fx.org, fx.incident, messageId, fx.multiRecipient, realPredicate)).toBe(false);
+    expect(await repository.recordTransportDelivery(fx.org, fx.incident, messageId, fx.multiRecipient, () => true)).toBe(false);
     const after = await stateOf(messageId, fx.multiRecipient);
     expect(after.deliveryState).toBe('DELIVERED');
     expect(after.deliveredAt?.toISOString()).toBe(firstDeliveredAt?.toISOString());
@@ -284,5 +284,46 @@ describe('WP-18 realtime delivery evidence (live stack, C8-01)', () => {
     expect((await stateOf(messageId, fx.silentRecipient)).deliveryState).toBe('REQUESTED');
     // ...and the bystander was never made a recipient of it.
     expect(await prisma.incidentFieldMessageRecipient.count({ where: { messageId, recipientUserId: fx.bystander } })).toBe(0);
+  }, 30_000);
+
+  // ------------------------------------------------------------- C8-06
+
+  it('C8-06: a wrong organisation cannot advance delivery, even with the correct message and recipient', async () => {
+    const messageId = await sendTo([fx.silentRecipient]);
+    const always = (): boolean => true;
+
+    expect(await repository.recordTransportDelivery(`${fx.org}_other`, fx.incident, messageId, fx.silentRecipient, always)).toBe(false);
+
+    const row = await stateOf(messageId, fx.silentRecipient);
+    expect(row.deliveryState).toBe('REQUESTED');
+    expect(row.deliveredAt).toBeNull();
+  }, 30_000);
+
+  it('C8-06: a wrong incident cannot advance delivery, even within the correct organisation', async () => {
+    // The same-tenant integrity gap: a forged internal event pairing a real
+    // message_id with a different incident_id must not be accepted.
+    const messageId = await sendTo([fx.silentRecipient]);
+    const always = (): boolean => true;
+
+    expect(await repository.recordTransportDelivery(fx.org, randomUUID(), messageId, fx.silentRecipient, always)).toBe(false);
+
+    const row = await stateOf(messageId, fx.silentRecipient);
+    expect(row.deliveryState).toBe('REQUESTED');
+    expect(row.deliveredAt).toBeNull();
+  }, 30_000);
+
+  it('C8-06: a wrong recipient cannot advance another recipient row, and the fully bound scope does', async () => {
+    const messageId = await sendTo([fx.silentRecipient]);
+    const always = (): boolean => true;
+
+    expect(await repository.recordTransportDelivery(fx.org, fx.incident, messageId, fx.bystander, always)).toBe(false);
+    expect((await stateOf(messageId, fx.silentRecipient)).deliveryState).toBe('REQUESTED');
+
+    // All four bound values correct -> the normal transition proceeds.
+    const realPredicate = (from: string): boolean => canTransition(from as Parameters<typeof canTransition>[0], 'DELIVERED');
+    expect(await repository.recordTransportDelivery(fx.org, fx.incident, messageId, fx.silentRecipient, realPredicate)).toBe(true);
+    const row = await stateOf(messageId, fx.silentRecipient);
+    expect(row.deliveryState).toBe('DELIVERED');
+    expect(row.deliveredAt).not.toBeNull();
   }, 30_000);
 });

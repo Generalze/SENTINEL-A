@@ -167,8 +167,16 @@ export class FieldMessagingRepository {
       return { message: created, created: true };
     } catch (error) {
       if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== 'P2002') throw error;
+      // C8-05: the replay lookup is sender-scoped, matching the uniqueness
+      // identity. A replay may only ever return a message this same
+      // authenticated sender created.
       const existing = await this.prisma.incidentFieldMessage.findFirst({
-        where: { organisationId: input.organisationId, incidentId: input.incidentId, idempotencyKey: input.idempotencyKey },
+        where: {
+          organisationId: input.organisationId,
+          incidentId: input.incidentId,
+          senderUserId: input.senderUserId,
+          idempotencyKey: input.idempotencyKey,
+        },
         include: withRecipients,
       });
       if (!existing) throw error;
@@ -187,9 +195,27 @@ export class FieldMessagingRepository {
    * a no-op for any row already past REQUESTED, so a reconnect storm cannot
    * rewrite an established state or an acknowledgement.
    */
-  async recordTransportDelivery(messageId: string, recipientUserId: string, canAdvance: (from: string) => boolean): Promise<boolean> {
+  async recordTransportDelivery(
+    organisationId: string,
+    incidentId: string,
+    messageId: string,
+    recipientUserId: string,
+    canAdvance: (from: string) => boolean,
+  ): Promise<boolean> {
+    // C8-06: every authoritative scope value available on the wire is bound
+    // before the row may move. The organisation and recipient come from the
+    // NATS subject, the incident and message from the validated payload, and
+    // all four must agree with the stored row AND its parent message. This
+    // closes both the missing subject-organisation binding (the C4-01
+    // precedent) and a same-tenant integrity gap where a forged internal event
+    // could pair a real message_id with a different incident_id.
     const recipient = await this.prisma.incidentFieldMessageRecipient.findFirst({
-      where: { messageId, recipientUserId },
+      where: {
+        messageId,
+        recipientUserId,
+        organisationId,
+        message: { organisationId, incidentId },
+      },
       select: { id: true, deliveryState: true },
     });
     if (!recipient) return false;
