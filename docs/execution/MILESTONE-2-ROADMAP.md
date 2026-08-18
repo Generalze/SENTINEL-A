@@ -96,7 +96,7 @@ the whole log.
 | WP-17 | Done — site-scoped Field delivery, need-to-know payloads, subject-token safety across every NATS builder, operative REST refetch, WP-16 AC7 API tests | merged `83a5d7d` |
 | WP-17A | Done — Field `site_id` referential integrity, closing Wave-7 finding C7-07 | merged `5f01b15` |
 | WP-18 | Done — incident field messaging: named-recipient entitlement, commander oversight as its own action, immutable recipients, tuple-bound persistence, transport-evidence delivery | merged `5868bf7` |
-| WP-19 | Contract PASS (C9-01..C9-06); full implementation pass delivered per the lead's consolidated GO, incorporating C9-07..C9-09 — schema, RBAC, lifecycle, verification, missed sweep, audit/timeline/outbox, 24 patrol tests. **MERGE HOLD** pending whole-system adversarial audit + hosted CI | branch `wp-19-patrol-foundation` |
+| WP-19 | Contract PASS (C9-01..C9-06); implementation pass delivered (C9-07..C9-09); whole-system audit correction batch applied — evidence tuple completed, request-bound idempotency, locked mutable dependencies, fail-closed START, boundary-bounded JSON — with 34 patrol tests. **MERGE HOLD** pending final effective-diff audit + hosted CI at the corrected head | branch `wp-19-patrol-foundation` |
 | WP-20 .. WP-22 | Not started | — |
 
 **Wave 7 is closed.** WP-17 and WP-17A are both on `main`; C7-07 is closed.

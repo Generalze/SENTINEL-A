@@ -3,10 +3,11 @@
 **Issued by:** Lead (/root) - **Lane:** Core with senior review - **Wave:** 8
 **Depends:** WP-15 Field Contracts, WP-16 Field Domain, WP-17 Field Realtime, WP-17A Field Site Integrity, WP-18 Incident Field Messaging
 **Review chain:** Cipher adversarial review -> Lead merge gate
-**Status:** Contract **PASS** (C9-01..C9-06 applied; scheduling authority ruled
-to the route version). Implementation pass **delivered** under the lead's
-consolidated GO, incorporating C9-07, C9-08 and C9-09 as requirements.
-**MERGE HOLD** until the whole-system adversarial audit and hosted CI.
+**Status:** Contract **PASS** (C9-01..C9-06). Implementation pass delivered
+(C9-07..C9-09). Whole-system audit returned **one consolidated correction
+batch** (five corrections, below), now applied with its regression set.
+**MERGE HOLD** until the final effective-diff audit and hosted CI at the
+corrected head.
 
 ## Objective
 
@@ -253,6 +254,51 @@ Verification idempotency stays namespaced as ruled:
 `organisation_id + patrol_run_id + patrol_run_checkpoint_id +
 operative_user_id + idempotency_key`.
 
+## Whole-system audit — correction batch (applied)
+
+The lead's adversarial audit accepted the architecture and returned five
+corrections in one batch, each now applied with a permanent regression:
+
+1. **Verification evidence tuple completed (P1).** The evidence record gains
+   `route_version`, the run checkpoint contract carries its route identity,
+   and the verification binds the run checkpoint's COMPLETE authoritative
+   identity — run + tenant + site + route + version + definition checkpoint —
+   through one composite FK (additive migration
+   `20260819160000_wp19a_verification_evidence_tuple`). Direct-DB regressions
+   prove a forged site, route, version or checkpoint cannot be inserted.
+2. **Idempotency is request-bound (P1).** Across verification, route
+   creation, version publish, run scheduling and abandonment: same identity +
+   key + same semantic request replays; materially different input is a
+   generic 409 with zero mutation. `trace_id` is not semantic. A route-create
+   replay returns the representation the ORIGINAL creation established, not
+   the route's current version.
+3. **Mutable dependencies are locked (P1).** Incident-linked START, VERIFY and
+   SCHEDULE read the operative's Field-assignment rows locked inside the
+   patrol transaction (deterministic order: run → assignment rows by id → run
+   checkpoint; schedule/publish lock the route row first), and schedule pins
+   `currentVersion` from the locked route row. Deterministic concurrent
+   regressions cover assignment-termination vs START and VERIFY, and
+   publish vs schedule version pinning.
+4. **START fails closed (P1).** A pinned version that materialises no
+   checkpoints — or fewer rows than definitions — aborts the transaction with
+   a generic version-integrity conflict; no status change, audit, timeline or
+   outbox row survives.
+5. **Bounded JSON at the boundary (P1).** The contract's 16 KiB budget for
+   checkpoint `location` and `verification_context` is enforced at the request
+   boundary with the contract's own exported predicate; oversized input is a
+   400 before any transaction.
+
+One documentation truth fix rode along: the schema commentary now names the
+replay-guard exception — `patrol_run_action_idempotency -> patrol_runs` is
+deliberately ON DELETE CASCADE per the WP-16/WP-18 replay-guard precedent;
+every EVIDENCE relation remains RESTRICT. The applied WP-19 migration was not
+edited; the correction is recorded in the WP-19A migration's preamble.
+
+The inherited C7-08 wire protection is now also a permanent WP-19 regression:
+a same-site peer's received WebSocket payload carries `kind`,
+`organisation_id` and `site_id` only — never `patrol_run_id` — while REST
+answers that peer 404 for the same run.
+
 ## Delivered implementation
 
 - `packages/contracts/src/field.ts` — patrol contracts with C9-01..C9-04 and
@@ -269,8 +315,8 @@ operative_user_id + idempotency_key`.
 - Audit to `FieldAuditLog`, incident timeline entries for incident-linked
   runs, and content-free realtime signals over the existing WP-17 Field
   outbox path.
-- 24 patrol tests (4 eligibility unit, 20 live-stack API) plus the contract
-  suites.
+- 34 patrol tests (4 eligibility unit, 20 live-stack API, 10 audit-batch
+  regressions including the realtime projection pin) plus the contract suites.
 
 ## Acceptance criteria (implementation stage)
 

@@ -34,11 +34,22 @@ import {
   TIMELINE_PATROL_RUN_SCHEDULED,
   TIMELINE_PATROL_RUN_STARTED,
 } from './patrol.constants';
-import { assignmentAllowsExecution } from './patrol.eligibility';
+import { assignmentAllowsExecution, assignmentAllowsScheduling } from './patrol.eligibility';
 import type { SiteScope } from './patrol.types';
 
 export function isUniqueViolation(error: unknown): boolean {
   return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002';
+}
+
+/**
+ * Audit batch, correction 4: raised when START cannot atomically materialise
+ * exactly one run checkpoint per definition. Thrown INSIDE the transaction so
+ * everything — rows, audit, outbox, status — rolls back together.
+ */
+class PatrolVersionIntegrityError extends Error {
+  constructor() {
+    super('patrol route version produced no coherent materialisation');
+  }
 }
 
 function routeSiteScopeWhere(siteScope: SiteScope): Prisma.PatrolRouteWhereInput {
@@ -51,6 +62,28 @@ function runSiteScopeWhere(siteScope: SiteScope): Prisma.PatrolRunWhereInput {
 
 type Tx = Prisma.TransactionClient;
 
+/**
+ * Audit batch, correction 2: canonical JSON for semantic request comparison.
+ * Key order must not distinguish two identical requests, and a stored JSONB
+ * value read back is not guaranteed to preserve the request's key order.
+ */
+function sortKeysDeep(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortKeysDeep);
+  if (typeof value === 'object' && value !== null) {
+    const record = value as Record<string, unknown>;
+    return Object.fromEntries(
+      Object.keys(record)
+        .sort()
+        .map((key) => [key, sortKeysDeep(record[key])]),
+    );
+  }
+  return value;
+}
+
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(sortKeysDeep(value)) ?? 'null';
+}
+
 export interface CheckpointDefinitionInput {
   name: string;
   zoneId: string | null;
@@ -58,6 +91,27 @@ export interface CheckpointDefinitionInput {
   windowOpenOffsetMs: number;
   lateAfterOffsetMs: number;
   missedAfterOffsetMs: number;
+}
+
+/**
+ * Correction 2: same identity + key + same semantic request is a replay; same
+ * identity + key + materially different request is a 409, never a mutation
+ * and never the old representation. `trace_id` is deliberately NOT semantic —
+ * a legitimate retry may carry a fresh trace.
+ */
+function sameCheckpointDefinitions(rows: readonly PatrolCheckpoint[], defs: readonly CheckpointDefinitionInput[]): boolean {
+  if (rows.length !== defs.length) return false;
+  return rows.every((row, index) => {
+    const def = defs[index];
+    return (
+      row.name === def.name &&
+      row.zoneId === def.zoneId &&
+      canonicalJson(row.location) === canonicalJson(def.location) &&
+      row.windowOpenOffsetMs === def.windowOpenOffsetMs &&
+      row.lateAfterOffsetMs === def.lateAfterOffsetMs &&
+      row.missedAfterOffsetMs === def.missedAfterOffsetMs
+    );
+  });
 }
 
 export interface CreateRouteInput {
@@ -72,9 +126,8 @@ export interface CreateRouteInput {
 
 export interface ScheduleRunInput {
   organisationId: string;
-  siteId: string;
   patrolRouteId: string;
-  routeVersion: number;
+  siteScope: SiteScope;
   assignedOperativeUserId: string;
   incidentId: string | null;
   scheduledStartAt: Date;
@@ -103,11 +156,24 @@ export interface VerifyInput extends RunActionInput {
 export type RouteWithCheckpoints = { route: PatrolRoute; checkpoints: PatrolCheckpoint[] };
 export type RunWithCheckpoints = { run: PatrolRun; checkpoints: PatrolRunCheckpoint[] };
 
+export type RouteWriteResult =
+  | { kind: 'created' | 'duplicate'; result: RouteWithCheckpoints }
+  | { kind: 'idempotency_conflict' };
+
+export type ScheduleRunResult =
+  | { kind: 'created' | 'duplicate'; result: RunWithCheckpoints }
+  | { kind: 'route_not_found' }
+  | { kind: 'incident_not_in_scope' }
+  | { kind: 'operative_not_eligible' }
+  | { kind: 'idempotency_conflict' };
+
 export type RunActionResult =
   | { kind: 'updated' | 'duplicate' | 'noop'; run: PatrolRun; checkpoints: PatrolRunCheckpoint[] }
   | { kind: 'not_found' }
   | { kind: 'conflict'; currentStatus: string }
-  | { kind: 'assignment_not_active'; currentStatus: string | null };
+  | { kind: 'assignment_not_active'; currentStatus: string | null }
+  | { kind: 'idempotency_conflict' }
+  | { kind: 'version_integrity' };
 
 export type VerifyResult =
   | {
@@ -122,7 +188,8 @@ export type VerifyResult =
   | { kind: 'already_resolved'; currentState: string }
   | { kind: 'out_of_order'; blockingSequence: number }
   | { kind: 'too_early'; windowOpensAt: Date }
-  | { kind: 'expired'; missedAfter: Date };
+  | { kind: 'expired'; missedAfter: Date }
+  | { kind: 'idempotency_conflict' };
 
 const runCheckpointOrder = { sequenceNumber: 'asc' } as const;
 
@@ -149,18 +216,43 @@ export class PatrolRepository {
   }
 
   /**
-   * Every patrol mutation locks the RUN row first, then any checkpoint row,
-   * in that order. Verification, the missed sweep, abandonment and completion
-   * therefore serialize on the same boundary, which is what makes "exactly one
-   * PENDING terminal transition wins" (C9-06) a property of the schema rather
-   * than of scheduler luck — and a single consistent order cannot deadlock.
+   * Deterministic lock order across the whole feature (audit batch,
+   * correction 3): run row -> matching FieldAssignment rows ordered by id ->
+   * run checkpoint row. Schedule and publish, which have no run yet, lock the
+   * ROUTE row first and touch nothing later in the order. One consistent
+   * order cannot deadlock, and every patrol decision that depends on a
+   * mutable row now reads it under a lock the mutator must also take.
    */
   private async lockRun(tx: Tx, runId: string): Promise<void> {
     await tx.$queryRaw(Prisma.sql`SELECT id FROM patrol_runs WHERE id = ${runId}::uuid FOR UPDATE`);
   }
 
+  private async lockRoute(tx: Tx, routeId: string): Promise<void> {
+    await tx.$queryRaw(Prisma.sql`SELECT id FROM patrol_routes WHERE id = ${routeId}::uuid FOR UPDATE`);
+  }
+
   private async lockRunCheckpoint(tx: Tx, runCheckpointId: string): Promise<void> {
     await tx.$queryRaw(Prisma.sql`SELECT id FROM patrol_run_checkpoints WHERE id = ${runCheckpointId}::uuid FOR UPDATE`);
+  }
+
+  /**
+   * Correction 3: the Field assignment rows an incident-linked decision reads
+   * are locked INSIDE the patrol transaction, in deterministic id order, and
+   * the statuses are read from the locked rows. A concurrent assignment
+   * transition (its own row update) must now wait for — or be waited on by —
+   * this transaction, so eligibility can no longer flip between the read and
+   * the patrol mutation's commit.
+   */
+  private async lockAssignmentStatuses(tx: Tx, organisationId: string, siteId: string, incidentId: string, userId: string): Promise<string[]> {
+    const rows = await tx.$queryRaw<Array<{ status: string }>>(Prisma.sql`
+      SELECT status FROM field_assignments
+      WHERE organisation_id = ${organisationId}
+        AND site_id = ${siteId}
+        AND incident_id = ${incidentId}::uuid
+        AND assignee_user_id = ${userId}
+      ORDER BY id
+      FOR UPDATE`);
+    return rows.map((row) => row.status);
   }
 
   /** Content-free realtime signal on the WP-17 Field path (directive s.12). */
@@ -236,28 +328,11 @@ export class PatrolRepository {
     return user !== null;
   }
 
-  async incidentExists(organisationId: string, siteId: string, incidentId: string): Promise<boolean> {
-    const incident = await this.prisma.incident.findFirst({ where: { id: incidentId, organisationId, siteId }, select: { id: true } });
-    return incident !== null;
-  }
-
-  /**
-   * C9-05: the operative's Field-assignment statuses for this exact
-   * organisation + site + incident. Empty means no assignment at all.
-   */
-  async assignmentStatuses(organisationId: string, siteId: string, incidentId: string, userId: string): Promise<string[]> {
-    const assignments = await this.prisma.fieldAssignment.findMany({
-      where: { organisationId, siteId, incidentId, assigneeUserId: userId },
-      select: { status: true },
-    });
-    return assignments.map((assignment) => assignment.status);
-  }
-
   // -------------------------------------------------------------------------
   // Routes
   // -------------------------------------------------------------------------
 
-  async createRoute(input: CreateRouteInput): Promise<{ result: RouteWithCheckpoints; created: boolean }> {
+  async createRoute(input: CreateRouteInput): Promise<RouteWriteResult> {
     try {
       const created = await this.prisma.$transaction(async (tx) => {
         const route = await tx.patrolRoute.create({
@@ -295,7 +370,7 @@ export class PatrolRepository {
         });
         return { route, checkpoints };
       });
-      return { result: created, created: true };
+      return { kind: 'created', result: created };
     } catch (error) {
       if (!isUniqueViolation(error)) throw error;
       // Replay lookup is scoped to the full idempotency identity, creator
@@ -310,11 +385,27 @@ export class PatrolRepository {
         },
       });
       if (!route) throw error;
+      // Correction 2: the replay returns the representation ESTABLISHED BY THE
+      // ORIGINAL CREATION — the version row published under this same actor +
+      // key — never whatever the route's current version has since become.
+      const established = await this.prisma.patrolRouteVersion.findUnique({
+        where: {
+          patrolRouteId_publishedByUserId_idempotencyKey: {
+            patrolRouteId: route.id,
+            publishedByUserId: input.actorUserId,
+            idempotencyKey: input.idempotencyKey,
+          },
+        },
+      });
+      if (!established) throw error;
       const checkpoints = await this.prisma.patrolCheckpoint.findMany({
-        where: { patrolRouteId: route.id, routeVersion: route.currentVersion },
+        where: { patrolRouteId: route.id, routeVersion: established.version },
         orderBy: runCheckpointOrder,
       });
-      return { result: { route, checkpoints }, created: false };
+      if (route.name !== input.name || !sameCheckpointDefinitions(checkpoints, input.checkpoints)) {
+        return { kind: 'idempotency_conflict' };
+      }
+      return { kind: 'duplicate', result: { route: { ...route, currentVersion: established.version }, checkpoints } };
     }
   }
 
@@ -342,7 +433,9 @@ export class PatrolRepository {
   /**
    * C9-04: publishing is the ONLY way to change a patrol standard. The route
    * row is locked so two concurrent publishes cannot mint the same version
-   * number, and the previous version's rows are never touched.
+   * number — and so a concurrent schedule, which locks the same row before
+   * pinning, cannot pin a version this publish is about to supersede without
+   * one of the two strictly ordering before the other (correction 3).
    */
   async publishVersion(
     organisationId: string,
@@ -352,14 +445,14 @@ export class PatrolRepository {
     actorUserId: string,
     idempotencyKey: string,
     traceId: string,
-  ): Promise<{ result: RouteWithCheckpoints; created: boolean } | null> {
+  ): Promise<RouteWriteResult | null> {
     return this.prisma.$transaction(async (tx) => {
       const found = await tx.patrolRoute.findFirst({
         where: { id: routeId, organisationId, ...routeSiteScopeWhere(siteScope) },
         select: { id: true },
       });
       if (!found) return null;
-      await tx.$queryRaw(Prisma.sql`SELECT id FROM patrol_routes WHERE id = ${found.id}::uuid FOR UPDATE`);
+      await this.lockRoute(tx, found.id);
       const route = await tx.patrolRoute.findUniqueOrThrow({ where: { id: found.id } });
 
       const duplicate = await tx.patrolRouteVersion.findUnique({
@@ -372,7 +465,9 @@ export class PatrolRepository {
           where: { patrolRouteId: route.id, routeVersion: duplicate.version },
           orderBy: runCheckpointOrder,
         });
-        return { result: { route, checkpoints: existing }, created: false };
+        // Correction 2: a reused key must carry the same semantic request.
+        if (!sameCheckpointDefinitions(existing, checkpoints)) return { kind: 'idempotency_conflict' };
+        return { kind: 'duplicate', result: { route: { ...route, currentVersion: duplicate.version }, checkpoints: existing } };
       }
 
       const version = route.currentVersion + 1;
@@ -399,7 +494,7 @@ export class PatrolRepository {
         where: { patrolRouteId: route.id, routeVersion: version },
         orderBy: runCheckpointOrder,
       });
-      return { result: { route: updated, checkpoints: created }, created: true };
+      return { kind: 'created', result: { route: updated, checkpoints: created } };
     });
   }
 
@@ -437,15 +532,43 @@ export class PatrolRepository {
   // Run lifecycle
   // -------------------------------------------------------------------------
 
-  async scheduleRun(input: ScheduleRunInput): Promise<{ result: RunWithCheckpoints; created: boolean }> {
+  /**
+   * Correction 3: everything a schedule decision depends on is resolved and
+   * locked INSIDE the creating transaction — the route row (so a concurrent
+   * publish serializes against the version pin) and, for an incident-linked
+   * run, the operative's Field assignment rows (so eligibility cannot go
+   * terminal between the check and the insert).
+   */
+  async scheduleRun(input: ScheduleRunInput): Promise<ScheduleRunResult> {
     try {
-      const run = await this.prisma.$transaction(async (tx) => {
+      const outcome = await this.prisma.$transaction(async (tx): Promise<{ kind: 'created'; run: PatrolRun } | Exclude<ScheduleRunResult, { kind: 'created' | 'duplicate' | 'idempotency_conflict' }>> => {
+        const found = await tx.patrolRoute.findFirst({
+          where: { id: input.patrolRouteId, organisationId: input.organisationId, ...routeSiteScopeWhere(input.siteScope) },
+          select: { id: true },
+        });
+        if (!found) return { kind: 'route_not_found' };
+        await this.lockRoute(tx, found.id);
+        const route = await tx.patrolRoute.findUniqueOrThrow({ where: { id: found.id } });
+
+        if (input.incidentId !== null) {
+          const incident = await tx.incident.findFirst({
+            where: { id: input.incidentId, organisationId: input.organisationId, siteId: route.siteId },
+            select: { id: true },
+          });
+          if (!incident) return { kind: 'incident_not_in_scope' };
+          // C9-05 scheduling eligibility, from rows locked in this transaction.
+          const statuses = await this.lockAssignmentStatuses(tx, input.organisationId, route.siteId, input.incidentId, input.assignedOperativeUserId);
+          if (!statuses.some(assignmentAllowsScheduling)) return { kind: 'operative_not_eligible' };
+        }
+
         const row = await tx.patrolRun.create({
           data: {
             organisationId: input.organisationId,
-            siteId: input.siteId,
-            patrolRouteId: input.patrolRouteId,
-            routeVersion: input.routeVersion,
+            siteId: route.siteId,
+            patrolRouteId: route.id,
+            // Pinned from the LOCKED route row, so a concurrent publish either
+            // completed before this (new version pinned) or waits for us.
+            routeVersion: route.currentVersion,
             assignedOperativeUserId: input.assignedOperativeUserId,
             incidentId: input.incidentId,
             status: 'SCHEDULED',
@@ -457,28 +580,36 @@ export class PatrolRepository {
         });
         await this.audit(tx, row, input.actorUserId, AUDIT_PATROL_RUN_SCHEDULED, {
           patrol_run_id: row.id,
-          patrol_route_id: input.patrolRouteId,
-          route_version: input.routeVersion,
+          patrol_route_id: route.id,
+          route_version: row.routeVersion,
           assigned_operative_user_id: input.assignedOperativeUserId,
           incident_id: input.incidentId,
           trace_id: input.traceId,
         });
         await this.timeline(tx, input.incidentId, input.actorUserId, TIMELINE_PATROL_RUN_SCHEDULED, {
           patrol_run_id: row.id,
-          patrol_route_id: input.patrolRouteId,
-          route_version: input.routeVersion,
+          patrol_route_id: route.id,
+          route_version: row.routeVersion,
           trace_id: input.traceId,
         });
         await this.signalRunUpdated(tx, row);
-        return row;
+        return { kind: 'created', run: row };
       });
-      return { result: { run, checkpoints: [] }, created: true };
+      if (outcome.kind !== 'created') return outcome;
+      return { kind: 'created', result: { run: outcome.run, checkpoints: [] } };
     } catch (error) {
       if (!isUniqueViolation(error)) throw error;
+      // The schedule idempotency identity is (organisation, site, creator,
+      // key); site comes from the route, resolved read-only here.
+      const route = await this.prisma.patrolRoute.findFirst({
+        where: { id: input.patrolRouteId, organisationId: input.organisationId, ...routeSiteScopeWhere(input.siteScope) },
+        select: { siteId: true },
+      });
+      if (!route) throw error;
       const existing = await this.prisma.patrolRun.findFirst({
         where: {
           organisationId: input.organisationId,
-          siteId: input.siteId,
+          siteId: route.siteId,
           createdByUserId: input.actorUserId,
           idempotencyKey: input.idempotencyKey,
         },
@@ -486,7 +617,17 @@ export class PatrolRepository {
       });
       if (!existing) throw error;
       const { checkpoints, ...run } = existing;
-      return { result: { run, checkpoints }, created: false };
+      // Correction 2 semantic identity: route, operative, incident and the
+      // scheduled start. route_version is deliberately absent — it is derived
+      // server-side, so two identical requests replay even if a publish moved
+      // the pointer in between; the established run is the answer.
+      const sameRequest =
+        run.patrolRouteId === input.patrolRouteId &&
+        run.assignedOperativeUserId === input.assignedOperativeUserId &&
+        run.incidentId === input.incidentId &&
+        run.scheduledStartAt.getTime() === input.scheduledStartAt.getTime();
+      if (!sameRequest) return { kind: 'idempotency_conflict' };
+      return { kind: 'duplicate', result: { run, checkpoints } };
     }
   }
 
@@ -496,87 +637,98 @@ export class PatrolRepository {
    *
    * Materialisation happens here, exactly once (directive s.2/3): the pinned
    * version's offsets and the database-clock `started_at` produce the run's
-   * absolute instants; nothing ever recomputes them.
+   * absolute instants; nothing ever recomputes them. Correction 4: START is
+   * fail-closed — a pinned version that yields no checkpoints, or a
+   * materialisation that writes fewer rows than definitions, aborts the whole
+   * transaction; no status change, audit, timeline or outbox row survives.
    */
   async startRun(input: RunActionInput): Promise<RunActionResult> {
-    return this.prisma.$transaction(async (tx) => {
-      const found = await tx.patrolRun.findFirst({
-        where: { id: input.runId, organisationId: input.organisationId, ...runSiteScopeWhere(input.siteScope) },
-        select: { id: true, assignedOperativeUserId: true },
-      });
-      // An unassigned reader gets the same 404 as a nonexistent run (C9-05).
-      if (!found || found.assignedOperativeUserId !== input.actorUserId) return { kind: 'not_found' };
-
-      await this.lockRun(tx, found.id);
-      const run = await tx.patrolRun.findUniqueOrThrow({ where: { id: found.id } });
-
-      const duplicate = await this.findActionDuplicate(tx, run.id, input.actorUserId, RUN_ACTION_START, input.idempotencyKey);
-      if (duplicate) return { kind: 'duplicate', run, checkpoints: await this.runCheckpoints(tx, run.id) };
-      if (run.status === 'IN_PROGRESS') return { kind: 'noop', run, checkpoints: await this.runCheckpoints(tx, run.id) };
-      if (!canTransitionPatrolRunStatus(run.status as PatrolRunStatus, 'IN_PROGRESS')) {
-        return { kind: 'conflict', currentStatus: run.status };
-      }
-
-      // C9-05: an incident-linked patrol may only be EXECUTED under an
-      // assignment the operative has actually taken on. Checked under the run
-      // lock so a concurrent assignment transition cannot slip between check
-      // and start.
-      if (run.incidentId !== null) {
-        const statuses = await tx.fieldAssignment.findMany({
-          where: { organisationId: run.organisationId, siteId: run.siteId, incidentId: run.incidentId, assigneeUserId: input.actorUserId },
-          select: { status: true },
+    try {
+      return await this.prisma.$transaction(async (tx): Promise<RunActionResult> => {
+        const found = await tx.patrolRun.findFirst({
+          where: { id: input.runId, organisationId: input.organisationId, ...runSiteScopeWhere(input.siteScope) },
+          select: { id: true, assignedOperativeUserId: true },
         });
-        if (!statuses.some((assignment) => assignmentAllowsExecution(assignment.status))) {
-          return { kind: 'assignment_not_active', currentStatus: statuses[0]?.status ?? null };
-        }
-      }
+        // An unassigned reader gets the same 404 as a nonexistent run (C9-05).
+        if (!found || found.assignedOperativeUserId !== input.actorUserId) return { kind: 'not_found' };
 
-      const startedAt = await this.dbNow(tx);
-      const definitions = await tx.patrolCheckpoint.findMany({
-        where: { patrolRouteId: run.patrolRouteId, routeVersion: run.routeVersion },
-        orderBy: runCheckpointOrder,
+        await this.lockRun(tx, found.id);
+        const run = await tx.patrolRun.findUniqueOrThrow({ where: { id: found.id } });
+
+        const duplicate = await this.findActionDuplicate(tx, run.id, input.actorUserId, RUN_ACTION_START, input.idempotencyKey);
+        if (duplicate) return { kind: 'duplicate', run, checkpoints: await this.runCheckpoints(tx, run.id) };
+        if (run.status === 'IN_PROGRESS') return { kind: 'noop', run, checkpoints: await this.runCheckpoints(tx, run.id) };
+        if (!canTransitionPatrolRunStatus(run.status as PatrolRunStatus, 'IN_PROGRESS')) {
+          return { kind: 'conflict', currentStatus: run.status };
+        }
+
+        // C9-05: an incident-linked patrol may only be EXECUTED under an
+        // assignment the operative has actually taken on — read from rows
+        // locked in THIS transaction (correction 3), so a concurrent
+        // assignment transition cannot slip between check and start.
+        if (run.incidentId !== null) {
+          const statuses = await this.lockAssignmentStatuses(tx, run.organisationId, run.siteId, run.incidentId, input.actorUserId);
+          if (!statuses.some(assignmentAllowsExecution)) {
+            return { kind: 'assignment_not_active', currentStatus: statuses[0] ?? null };
+          }
+        }
+
+        const startedAt = await this.dbNow(tx);
+        const definitions = await tx.patrolCheckpoint.findMany({
+          where: { patrolRouteId: run.patrolRouteId, routeVersion: run.routeVersion },
+          orderBy: runCheckpointOrder,
+        });
+        // Correction 4: the public API cannot publish an empty version, but a
+        // corrupted or bypassed database could present one. A patrol that
+        // "starts" with nothing it must prove may not exist.
+        if (definitions.length === 0) return { kind: 'version_integrity' };
+        const created = await tx.patrolRunCheckpoint.createMany({
+          data: definitions.map((definition) => {
+            const window = materialiseCheckpointWindow(startedAt, {
+              window_open_offset_ms: definition.windowOpenOffsetMs,
+              late_after_offset_ms: definition.lateAfterOffsetMs,
+              missed_after_offset_ms: definition.missedAfterOffsetMs,
+            });
+            return {
+              patrolRunId: run.id,
+              patrolCheckpointId: definition.id,
+              organisationId: run.organisationId,
+              siteId: run.siteId,
+              patrolRouteId: run.patrolRouteId,
+              routeVersion: run.routeVersion,
+              sequenceNumber: definition.sequenceNumber,
+              windowOpensAt: new Date(window.window_opens_at),
+              lateAfter: new Date(window.late_after),
+              missedAfter: new Date(window.missed_after),
+              state: 'PENDING',
+              traceId: input.traceId,
+            };
+          }),
+        });
+        // One materialised expectation per definition, atomically, or nothing.
+        if (created.count !== definitions.length) throw new PatrolVersionIntegrityError();
+        const updated = await tx.patrolRun.update({ where: { id: run.id }, data: { status: 'IN_PROGRESS', startedAt } });
+        await this.recordAction(tx, run.id, input.actorUserId, RUN_ACTION_START, input.idempotencyKey);
+        await this.audit(tx, run, input.actorUserId, AUDIT_PATROL_RUN_STARTED, {
+          patrol_run_id: run.id,
+          from_status: 'SCHEDULED',
+          to_status: 'IN_PROGRESS',
+          started_at: startedAt.toISOString(),
+          checkpoint_count: definitions.length,
+          trace_id: input.traceId,
+        });
+        await this.timeline(tx, run.incidentId, input.actorUserId, TIMELINE_PATROL_RUN_STARTED, {
+          patrol_run_id: run.id,
+          started_at: startedAt.toISOString(),
+          trace_id: input.traceId,
+        });
+        await this.signalRunUpdated(tx, run);
+        return { kind: 'updated', run: updated, checkpoints: await this.runCheckpoints(tx, run.id) };
       });
-      await tx.patrolRunCheckpoint.createMany({
-        data: definitions.map((definition) => {
-          const window = materialiseCheckpointWindow(startedAt, {
-            window_open_offset_ms: definition.windowOpenOffsetMs,
-            late_after_offset_ms: definition.lateAfterOffsetMs,
-            missed_after_offset_ms: definition.missedAfterOffsetMs,
-          });
-          return {
-            patrolRunId: run.id,
-            patrolCheckpointId: definition.id,
-            organisationId: run.organisationId,
-            siteId: run.siteId,
-            patrolRouteId: run.patrolRouteId,
-            routeVersion: run.routeVersion,
-            sequenceNumber: definition.sequenceNumber,
-            windowOpensAt: new Date(window.window_opens_at),
-            lateAfter: new Date(window.late_after),
-            missedAfter: new Date(window.missed_after),
-            state: 'PENDING',
-            traceId: input.traceId,
-          };
-        }),
-      });
-      const updated = await tx.patrolRun.update({ where: { id: run.id }, data: { status: 'IN_PROGRESS', startedAt } });
-      await this.recordAction(tx, run.id, input.actorUserId, RUN_ACTION_START, input.idempotencyKey);
-      await this.audit(tx, run, input.actorUserId, AUDIT_PATROL_RUN_STARTED, {
-        patrol_run_id: run.id,
-        from_status: 'SCHEDULED',
-        to_status: 'IN_PROGRESS',
-        started_at: startedAt.toISOString(),
-        checkpoint_count: definitions.length,
-        trace_id: input.traceId,
-      });
-      await this.timeline(tx, run.incidentId, input.actorUserId, TIMELINE_PATROL_RUN_STARTED, {
-        patrol_run_id: run.id,
-        started_at: startedAt.toISOString(),
-        trace_id: input.traceId,
-      });
-      await this.signalRunUpdated(tx, run);
-      return { kind: 'updated', run: updated, checkpoints: await this.runCheckpoints(tx, run.id) };
-    });
+    } catch (error) {
+      if (error instanceof PatrolVersionIntegrityError) return { kind: 'version_integrity' };
+      throw error;
+    }
   }
 
   /** CANCEL (C9-09: command authority; a run that never started, called off). */
@@ -635,7 +787,12 @@ export class PatrolRepository {
       const run = await tx.patrolRun.findUniqueOrThrow({ where: { id: found.id } });
 
       const duplicate = await this.findActionDuplicate(tx, run.id, input.actorUserId, RUN_ACTION_ABANDON, input.idempotencyKey);
-      if (duplicate) return { kind: 'duplicate', run, checkpoints: await this.runCheckpoints(tx, run.id) };
+      if (duplicate) {
+        // Correction 2: the reason is part of the semantic request. A reused
+        // key with a different reason is a conflict, not a replay.
+        if ((input.reason ?? null) !== run.abandonReason) return { kind: 'idempotency_conflict' };
+        return { kind: 'duplicate', run, checkpoints: await this.runCheckpoints(tx, run.id) };
+      }
       if (run.status === 'ABANDONED') return { kind: 'noop', run, checkpoints: await this.runCheckpoints(tx, run.id) };
       if (!canTransitionPatrolRunStatus(run.status as PatrolRunStatus, 'ABANDONED')) {
         return { kind: 'conflict', currentStatus: run.status };
@@ -703,18 +860,19 @@ export class PatrolRepository {
       // C9-05: only the assigned operative may even learn the run exists.
       if (!found || found.assignedOperativeUserId !== input.actorUserId) return { kind: 'not_found' };
 
-      // C9-06 serialization: run first, then the checkpoint row.
+      // Correction 3 lock order: run -> assignment rows -> run checkpoint.
       await this.lockRun(tx, found.id);
       const run = await tx.patrolRun.findUniqueOrThrow({ where: { id: found.id } });
 
       // A device may not nominate a checkpoint outside its own run.
       const target = await tx.patrolRunCheckpoint.findFirst({ where: { id: input.runCheckpointId, patrolRunId: run.id } });
       if (!target) return { kind: 'not_found' };
-      await this.lockRunCheckpoint(tx, target.id);
 
       // Replay: the full C9-06 namespace, actor and run scope included. A
       // replay may only ever return a verification this same operative
-      // recorded on this same run checkpoint.
+      // recorded on this same run checkpoint — and only for the same request:
+      // a reused key with different device, method, context or source time is
+      // a conflict, never the old record (correction 2).
       const established = await tx.patrolCheckpointVerification.findUnique({
         where: {
           organisationId_patrolRunId_patrolRunCheckpointId_operativeUserId_idempotencyKey: {
@@ -727,23 +885,28 @@ export class PatrolRepository {
         },
       });
       if (established) {
+        const sameRequest =
+          established.deviceId === input.deviceId &&
+          established.verificationMethod === input.verificationMethod &&
+          canonicalJson(established.verificationContext) === canonicalJson(input.verificationContext) &&
+          established.sourceAt.getTime() === input.sourceAt.getTime();
+        if (!sameRequest) return { kind: 'idempotency_conflict' };
         const checkpoint = await tx.patrolRunCheckpoint.findUniqueOrThrow({ where: { id: target.id } });
         return { kind: 'duplicate', verification: established, runCheckpoint: checkpoint, runStatus: run.status as PatrolRunStatus };
       }
 
       if (run.status !== 'IN_PROGRESS') return { kind: 'run_not_in_progress', currentStatus: run.status };
 
-      // C9-05: executing an incident-linked patrol requires a live assignment.
+      // C9-05: executing an incident-linked patrol requires a live assignment,
+      // read from rows locked in THIS transaction (correction 3).
       if (run.incidentId !== null) {
-        const statuses = await tx.fieldAssignment.findMany({
-          where: { organisationId: run.organisationId, siteId: run.siteId, incidentId: run.incidentId, assigneeUserId: input.actorUserId },
-          select: { status: true },
-        });
-        if (!statuses.some((assignment) => assignmentAllowsExecution(assignment.status))) {
-          return { kind: 'assignment_not_active', currentStatus: statuses[0]?.status ?? null };
+        const statuses = await this.lockAssignmentStatuses(tx, run.organisationId, run.siteId, run.incidentId, input.actorUserId);
+        if (!statuses.some(assignmentAllowsExecution)) {
+          return { kind: 'assignment_not_active', currentStatus: statuses[0] ?? null };
         }
       }
 
+      await this.lockRunCheckpoint(tx, target.id);
       const checkpoint = await tx.patrolRunCheckpoint.findUniqueOrThrow({ where: { id: target.id } });
       if (checkpoint.state !== 'PENDING') return { kind: 'already_resolved', currentState: checkpoint.state };
 
@@ -787,6 +950,9 @@ export class PatrolRepository {
           patrolRunId: run.id,
           patrolRunCheckpointId: checkpoint.id,
           patrolRouteId: run.patrolRouteId,
+          // Correction 1: the pinned version is part of the evidence identity,
+          // and the composite FK proves it agrees with the run checkpoint.
+          routeVersion: run.routeVersion,
           patrolCheckpointId: checkpoint.patrolCheckpointId,
           operativeUserId: input.actorUserId,
           deviceId: input.deviceId,

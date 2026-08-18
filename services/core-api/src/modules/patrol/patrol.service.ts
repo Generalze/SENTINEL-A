@@ -2,6 +2,8 @@ import { BadRequestException, ConflictException, ForbiddenException, Inject, Inj
 import { Prisma } from '@prisma/client';
 import {
   CheckpointVerificationSchema,
+  isWithinJsonByteBudget,
+  MAX_BOUNDED_JSON_BYTES,
   PatrolCheckpointSchema,
   PatrolRouteSchema,
   PatrolRunCheckpointSchema,
@@ -12,14 +14,15 @@ import { z } from 'zod';
 import { isSafeSubjectToken, SUBJECT_TOKEN_RULE } from '../../common/messaging/subject-token';
 import type { Principal } from '../../common/security/principal';
 import { ACTION_PATROL_RUN_MANAGE } from './patrol.constants';
-import { assignmentAllowsScheduling } from './patrol.eligibility';
 import { mapRoute, mapRun, mapRunCheckpoint, mapVerification } from './patrol.mapper';
 import {
   PatrolRepository,
   type CheckpointDefinitionInput,
   type RouteWithCheckpoints,
+  type RouteWriteResult,
   type RunActionResult,
   type RunWithCheckpoints,
+  type ScheduleRunResult,
   type VerifyResult,
 } from './patrol.repository';
 import type { PatrolRouteView, PatrolRunView, SiteScope, VerifyCheckpointResultView } from './patrol.types';
@@ -36,11 +39,24 @@ const subjectSafeSiteId = z.string().min(1).refine(isSafeSubjectToken, { message
  * C9-02 ordered triple and are re-validated here so a violation is a 400 with
  * a usable message rather than a contract assertion failure after the write.
  */
+/**
+ * Audit batch, correction 5: the contract's byte budget is enforced HERE, at
+ * the request boundary, with the exact predicate the contract schema applies.
+ * An oversized object is a 400 before any transaction begins; the service's
+ * post-write contract assertion is thereby an unreachable backstop rather
+ * than a path to "request failed, durable side effect succeeded".
+ */
+const boundedJson = z
+  .record(z.unknown())
+  .refine((value) => isWithinJsonByteBudget(value, MAX_BOUNDED_JSON_BYTES), {
+    message: `bounded JSON must serialize to at most ${MAX_BOUNDED_JSON_BYTES} bytes`,
+  });
+
 const CheckpointDefinitionSchema = z
   .object({
     name: z.string().min(1).max(256),
     zone_id: z.string().min(1).max(256).nullable().optional(),
-    location: z.record(z.unknown()).nullable().optional(),
+    location: boundedJson.nullable().optional(),
     window_open_offset_ms: z.number().int().nonnegative(),
     late_after_offset_ms: z.number().int().nonnegative(),
     missed_after_offset_ms: z.number().int().nonnegative(),
@@ -114,7 +130,7 @@ const VerifyInputSchema = z
   .object({
     device_id: z.string().min(1).max(256),
     verification_method: z.string().min(1).max(128),
-    verification_context: z.record(z.unknown()).optional(),
+    verification_context: boundedJson.optional(),
     /** Client-observed time. Telemetry only — never part of the timing decision. */
     source_at: z.string().datetime(),
     idempotency_key: z.string().min(1).max(256),
@@ -131,6 +147,15 @@ function parseOrBadRequest<T>(schema: z.ZodSchema<T>, raw: unknown): T {
 
 function siteAllowed(siteScope: SiteScope, siteId: string): boolean {
   return siteScope.orgWide || siteScope.siteIds.includes(siteId);
+}
+
+/**
+ * Correction 2: one deliberately generic shape for every idempotency-reuse
+ * refusal, so the response cannot disclose WHICH field differed from the
+ * request that established the key.
+ */
+function idempotencyConflict(): ConflictException {
+  return new ConflictException('Idempotency key was already used with a different request');
 }
 
 function toDefinitionInputs(checkpoints: CreateRouteInput['checkpoints']): CheckpointDefinitionInput[] {
@@ -192,7 +217,7 @@ export class PatrolService {
       throw new NotFoundException('Site not found');
     }
     await this.validateZones(input.site_id, input.checkpoints);
-    const { result } = await this.repository.createRoute({
+    const outcome = await this.repository.createRoute({
       organisationId: principal.organisation_id,
       siteId: input.site_id,
       name: input.name,
@@ -201,7 +226,7 @@ export class PatrolService {
       idempotencyKey: input.idempotency_key,
       traceId: input.trace_id,
     });
-    return this.toRouteView(result);
+    return this.mapRouteWriteResult(outcome);
   }
 
   async publishVersion(principal: Principal, siteScope: SiteScope, routeId: string, input: PublishVersionInput): Promise<PatrolRouteView> {
@@ -218,7 +243,7 @@ export class PatrolService {
       input.trace_id,
     );
     if (!published) throw new NotFoundException('Patrol route not found');
-    return this.toRouteView(published.result);
+    return this.mapRouteWriteResult(published);
   }
 
   async getRoute(principal: Principal, siteScope: SiteScope, routeId: string): Promise<PatrolRouteView> {
@@ -238,41 +263,30 @@ export class PatrolService {
 
   async scheduleRun(principal: Principal, siteScope: SiteScope, input: ScheduleRunInput): Promise<PatrolRunView> {
     // Site and version are derived from the route server-side; the body cannot
-    // choose either (lead ruling / C9-04).
+    // choose either (lead ruling / C9-04). This read only shapes the 404 and
+    // the operative-role check — the repository re-resolves and LOCKS the
+    // route inside the creating transaction (audit batch, correction 3), so
+    // the version pinned is the one current when the run row is inserted, and
+    // incident-assignment eligibility is judged from rows locked there too.
     const route = await this.repository.getRoute(principal.organisation_id, input.patrol_route_id, siteScope);
     if (!route) throw new NotFoundException('Patrol route not found');
-    const siteId = route.route.siteId;
 
-    if (!(await this.repository.operativeCanReceive(principal.organisation_id, siteId, input.assigned_operative_user_id))) {
+    if (!(await this.repository.operativeCanReceive(principal.organisation_id, route.route.siteId, input.assigned_operative_user_id))) {
       throw new BadRequestException('Assignee is not a field operative at this site');
     }
 
-    const incidentId = input.incident_id ?? null;
-    if (incidentId !== null) {
-      if (!(await this.repository.incidentExists(principal.organisation_id, siteId, incidentId))) {
-        throw new BadRequestException('Incident is not in the caller organisation/site scope');
-      }
-      // C9-05: scheduling an incident-linked patrol requires the operative to
-      // satisfy exact organisation + site + incident assignment eligibility.
-      const statuses = await this.repository.assignmentStatuses(principal.organisation_id, siteId, incidentId, input.assigned_operative_user_id);
-      if (!statuses.some(assignmentAllowsScheduling)) {
-        throw new BadRequestException('Operative is not eligible for this incident');
-      }
-    }
-
-    const { result } = await this.repository.scheduleRun({
+    const outcome = await this.repository.scheduleRun({
       organisationId: principal.organisation_id,
-      siteId,
-      patrolRouteId: route.route.id,
-      routeVersion: route.route.currentVersion,
+      patrolRouteId: input.patrol_route_id,
+      siteScope,
       assignedOperativeUserId: input.assigned_operative_user_id,
-      incidentId,
+      incidentId: input.incident_id ?? null,
       scheduledStartAt: new Date(input.scheduled_start_at),
       actorUserId: principal.user.id,
       idempotencyKey: input.idempotency_key,
       traceId: input.trace_id,
     });
-    return this.toRunView(result);
+    return this.mapScheduleResult(outcome);
   }
 
   async startRun(principal: Principal, siteScope: SiteScope, runId: string, input: RunActionInput): Promise<PatrolRunView> {
@@ -394,9 +408,31 @@ export class PatrolService {
   // Result mapping and contract assertions
   // -------------------------------------------------------------------------
 
+  private mapRouteWriteResult(result: RouteWriteResult): PatrolRouteView {
+    if (result.kind === 'idempotency_conflict') throw idempotencyConflict();
+    return this.toRouteView(result.result);
+  }
+
+  private mapScheduleResult(result: ScheduleRunResult): PatrolRunView {
+    switch (result.kind) {
+      case 'route_not_found':
+        throw new NotFoundException('Patrol route not found');
+      case 'incident_not_in_scope':
+        throw new BadRequestException('Incident is not in the caller organisation/site scope');
+      case 'operative_not_eligible':
+        throw new BadRequestException('Operative is not eligible for this incident');
+      case 'idempotency_conflict':
+        throw idempotencyConflict();
+      default:
+        return this.toRunView(result.result);
+    }
+  }
+
   private mapRunActionResult(result: RunActionResult): PatrolRunView {
     if (result.kind === 'not_found') throw new NotFoundException('Patrol run not found');
     if (result.kind === 'conflict') throw new ConflictException(`Patrol run status is ${result.currentStatus}`);
+    if (result.kind === 'idempotency_conflict') throw idempotencyConflict();
+    if (result.kind === 'version_integrity') throw new ConflictException('Patrol route version integrity conflict');
     if (result.kind === 'assignment_not_active') {
       throw new ConflictException(
         result.currentStatus === null
@@ -427,6 +463,8 @@ export class PatrolService {
         throw new ConflictException(`Verification window opens at ${result.windowOpensAt.toISOString()}`);
       case 'expired':
         throw new ConflictException(`Verification deadline passed at ${result.missedAfter.toISOString()}`);
+      case 'idempotency_conflict':
+        throw idempotencyConflict();
       default: {
         const outcome = result.runCheckpoint.state as Extract<CheckpointTimingOutcome, 'VERIFIED' | 'LATE'>;
         this.assertVerificationContract(result);
@@ -500,6 +538,8 @@ export class PatrolService {
         patrol_run_checkpoint_id: checkpoint.id,
         patrol_run_id: checkpoint.patrol_run_id,
         patrol_checkpoint_id: checkpoint.patrol_checkpoint_id,
+        patrol_route_id: checkpoint.patrol_route_id,
+        route_version: checkpoint.route_version,
         organisation_id: view.organisation_id,
         site_id: view.site_id,
         sequence_number: checkpoint.sequence_number,
@@ -524,6 +564,7 @@ export class PatrolService {
       patrol_run_id: result.verification.patrolRunId,
       patrol_run_checkpoint_id: result.verification.patrolRunCheckpointId,
       patrol_route_id: result.verification.patrolRouteId,
+      route_version: result.verification.routeVersion,
       patrol_checkpoint_id: result.verification.patrolCheckpointId,
       operative_user_id: result.verification.operativeUserId,
       device_id: result.verification.deviceId,

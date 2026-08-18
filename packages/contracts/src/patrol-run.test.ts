@@ -27,6 +27,8 @@ function window_(overrides: Partial<PatrolRunCheckpoint> = {}): PatrolRunCheckpo
     patrol_run_checkpoint_id: 'rc-1',
     patrol_run_id: 'run-1',
     patrol_checkpoint_id: 'cp-1',
+    patrol_route_id: 'route-1',
+    route_version: 3,
     organisation_id: 'org-1',
     site_id: 'site-1',
     sequence_number: 1,
@@ -118,6 +120,7 @@ describe('WP-19/C9-01 verification is bound to its execution', () => {
     patrol_run_id: 'run-1',
     patrol_run_checkpoint_id: 'rc-1',
     patrol_route_id: 'route-1',
+    route_version: 3,
     patrol_checkpoint_id: 'cp-1',
     operative_user_id: 'user-1',
     device_id: 'device-1',
@@ -131,7 +134,7 @@ describe('WP-19/C9-01 verification is bound to its execution', () => {
 
   it('requires the run and run-checkpoint identity', () => {
     expect(CheckpointVerificationSchema.parse(verification)).toMatchObject({ patrol_run_id: 'run-1', patrol_run_checkpoint_id: 'rc-1' });
-    for (const bindingField of ['patrol_run_id', 'patrol_run_checkpoint_id'] as const) {
+    for (const bindingField of ['patrol_run_id', 'patrol_run_checkpoint_id', 'patrol_route_id', 'route_version'] as const) {
       const unbound: Record<string, unknown> = { ...verification };
       delete unbound[bindingField];
       expect(() => CheckpointVerificationSchema.parse(unbound)).toThrow();

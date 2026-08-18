@@ -3,6 +3,14 @@ import { DeliveryStateSchema, type DeliveryState } from './delivery.js';
 import { OperationalSeveritySchema } from './threat.js';
 
 const MAX_SUMMARY_BYTES = 8 * 1024;
+/**
+ * WP-19 audit batch, correction 5: the byte budget for patrol's bounded JSON
+ * objects (checkpoint `location`, verification `verification_context`) is
+ * exported so the HTTP boundary can refuse an oversized object with a 400
+ * BEFORE any mutating transaction, instead of the contract assertion throwing
+ * after a durable write already happened.
+ */
+export const MAX_BOUNDED_JSON_BYTES = 16 * 1024;
 export const MAX_INCIDENT_FIELD_MESSAGE_BODY_BYTES = 16 * 1024;
 export const MAX_INCIDENT_FIELD_MESSAGE_BYTES = 64 * 1024;
 export const MAX_INCIDENT_FIELD_MESSAGE_MEDIA_REFS = 64;
@@ -20,6 +28,11 @@ function serializedByteLength(value: unknown): number {
     // contract and must fail the same bounded-payload validation.
     return Number.POSITIVE_INFINITY;
   }
+}
+
+/** The exact predicate the bounded-object schemas apply, for boundary reuse. */
+export function isWithinJsonByteBudget(value: unknown, maxBytes: number): boolean {
+  return serializedByteLength(value) <= maxBytes;
 }
 
 const boundedObject = (maxBytes: number, name: string) => z.record(z.unknown()).refine(
@@ -126,7 +139,7 @@ export const FieldOperativeStateUpdateSchema = z.object({
   actor_user_id: scopedId,
   device_id: scopedId,
   state: FieldStateSchema,
-  location: boundedObject(16 * 1024, 'location').nullable(),
+  location: boundedObject(MAX_BOUNDED_JSON_BYTES, 'location').nullable(),
   source_at: timestamp,
   /**
    * Client-observed telemetry only. Server modules must calculate
@@ -182,7 +195,7 @@ export const PatrolCheckpointSchema = z.object({
   sequence_number: z.number().int().positive(),
   name: z.string().min(1).max(256),
   zone_id: scopedId.nullable(),
-  location: boundedObject(16 * 1024, 'location').nullable(),
+  location: boundedObject(MAX_BOUNDED_JSON_BYTES, 'location').nullable(),
   /** Earliest a verification counts. Arriving before this is TOO_EARLY, not credit. */
   window_open_offset_ms: z.number().int().nonnegative(),
   /** End of the on-time window. */
@@ -223,11 +236,13 @@ export const CheckpointVerificationSchema = z.object({
   patrol_run_id: scopedId,
   patrol_run_checkpoint_id: scopedId,
   patrol_route_id: scopedId,
+  /** The version the run pinned. Part of the evidence identity, DB-enforced. */
+  route_version: z.number().int().positive(),
   patrol_checkpoint_id: scopedId,
   operative_user_id: scopedId,
   device_id: scopedId,
   verification_method: z.string().min(1).max(128),
-  verification_context: boundedObject(16 * 1024, 'verification_context'),
+  verification_context: boundedObject(MAX_BOUNDED_JSON_BYTES, 'verification_context'),
   /** Client-reported observation time. Telemetry only. */
   source_at: timestamp,
   /** Server receipt time. The only value any timing decision may use. */
@@ -324,6 +339,10 @@ export const PatrolRunCheckpointSchema = z.object({
   patrol_run_checkpoint_id: scopedId,
   patrol_run_id: scopedId,
   patrol_checkpoint_id: scopedId,
+  /** Snapshot of the run's pinned route identity, so the expectation row is
+   * self-describing evidence and the verification tuple can bind it (C9-07). */
+  patrol_route_id: scopedId,
+  route_version: z.number().int().positive(),
   organisation_id: scopedId,
   site_id: scopedId,
   /** Authoritative ordering, snapshotted from the route version this run pinned. */

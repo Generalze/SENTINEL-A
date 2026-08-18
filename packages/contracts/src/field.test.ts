@@ -126,7 +126,7 @@ describe('PatrolRouteSchema / PatrolCheckpointSchema / CheckpointVerificationSch
   // belongs to, otherwise two executions of one route are indistinguishable.
   const verification = {
     schema_version: 1 as const, checkpoint_verification_id: 'verification-1', organisation_id: 'org-1', site_id: 'site-1',
-    patrol_run_id: 'run-1', patrol_run_checkpoint_id: 'run-checkpoint-1', patrol_route_id: 'route-1',
+    patrol_run_id: 'run-1', patrol_run_checkpoint_id: 'run-checkpoint-1', patrol_route_id: 'route-1', route_version: 1,
     patrol_checkpoint_id: 'checkpoint-1', operative_user_id: 'user-1', device_id: 'device-1', verification_method: 'NFC', verification_context: {},
     source_at: at, recorded_at: at, idempotency_key: 'verification-op-1', trace_id: 'trace-1',
   };

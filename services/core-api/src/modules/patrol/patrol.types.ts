@@ -30,6 +30,8 @@ export interface PatrolRunCheckpointView {
   id: string;
   patrol_run_id: string;
   patrol_checkpoint_id: string;
+  patrol_route_id: string;
+  route_version: number;
   sequence_number: number;
   window_opens_at: string;
   late_after: string;
@@ -64,6 +66,7 @@ export interface CheckpointVerificationView {
   patrol_run_id: string;
   patrol_run_checkpoint_id: string;
   patrol_route_id: string;
+  route_version: number;
   patrol_checkpoint_id: string;
   operative_user_id: string;
   device_id: string;
