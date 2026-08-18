@@ -567,6 +567,15 @@ export const IncidentFieldMessageSchema = z.object({
 });
 export type IncidentFieldMessage = z.infer<typeof IncidentFieldMessageSchema>;
 
+/**
+ * LEGACY V1 (WP-15 scaffold) — superseded for executable replay by
+ * `FieldOfflineOperationV2Schema` in field-offline.ts (WP-20/C10-01).
+ *
+ * Retained, parseable and unchanged as contract history: schema_version 1's
+ * wire meaning is never silently mutated. Its free-form `operation_kind` and
+ * generic bounded `payload` are exactly why it may not reach a replay
+ * executor — V2's discriminated union replaces them.
+ */
 export const FieldOfflineOperationSchema = z.object({
   schema_version: z.literal(1),
   offline_operation_id: scopedId,
@@ -587,7 +596,11 @@ export function offlineOperationReplayKey(operation: Pick<FieldOfflineOperation,
   return `${operation.organisation_id}:${operation.site_id}:${operation.device_id}:${operation.device_sequence}`;
 }
 
-/** True only when candidate advances the same device's monotonic queue. */
+/**
+ * LEGACY V1: "newer" here means merely `next > previous`, which admits gaps.
+ * Executable replay uses WP-20's `classifyOfflineSequence`, where sequences
+ * are CONTIGUOUS (C10-03) and a gap is a refusal, not progress.
+ */
 export function isNewerOfflineOperation(
   previous: Pick<FieldOfflineOperation, 'device_id' | 'device_sequence'>,
   candidate: Pick<FieldOfflineOperation, 'device_id' | 'device_sequence'>,
