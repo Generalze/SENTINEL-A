@@ -53,6 +53,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Build contracts prerequisite
+        run: pnpm --filter @sentinel/contracts build
+
       - name: Typecheck
         run: pnpm -r typecheck
 
