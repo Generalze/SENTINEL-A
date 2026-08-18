@@ -226,7 +226,10 @@ to its definition checkpoint on
 `(patrol_checkpoint_id, patrol_route_id, route_version)`. A row that disagrees
 with its run about tenant, site, route or pinned version cannot exist, even for
 a writer that bypasses the service. The verification record is bound the same
-way to `(patrol_run_checkpoint_id, patrol_run_id, organisation_id)`.
+way, through the run checkpoint's complete authoritative identity:
+`(patrol_run_checkpoint_id, patrol_run_id, organisation_id, site_id,
+patrol_route_id, route_version, patrol_checkpoint_id)` (final form per the
+audit correction batch; migration `20260819160000_wp19a`).
 
 **C9-08 — completion fails closed.** `canCompletePatrolRun` accepts only a
 non-empty set in which every checkpoint is VERIFIED, LATE or MISSED. An empty
