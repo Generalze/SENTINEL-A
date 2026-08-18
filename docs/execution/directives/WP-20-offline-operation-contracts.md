@@ -4,9 +4,13 @@
 **Depends:** WP-15 Field Contracts, WP-16 Field Domain, WP-18 Incident Field Messaging, WP-19 Patrol Foundation
 **Review chain:** Opus adversarial review -> Lead merge gate
 **Accepted base:** `e4092e2` (WP-19 closure boundary)
-**Status:** Directive + **Checkpoint A contracts only** are GO. Persistence,
-replay executor and any public API are **HOLD** pending the lead's
-Checkpoint A review.
+**Status:** Checkpoint A contract lock **ACCEPTED** and merged (`eb5e0cf`,
+post-main run green). Checkpoint B server replay harness **delivered** on
+`wp-20-offline-replay-harness` under the lead's consolidated release,
+incorporating the three locked integration rules and the inherited WP-18
+aggregate-size correction. **MERGE HOLD** pending the lead's audit and hosted
+CI. Any public HTTP/mobile replay API remains **HOLD** until a genuine
+server-authenticated device identity exists.
 
 ## Objective
 
@@ -279,7 +283,26 @@ endpoint**. A public mobile replay API remains outside WP-20 until a genuine
 server-authenticated device identity can populate
 `AuthenticatedFieldDeviceContext`.
 
-### Checkpoint B acceptance tests (locked now)
+#### Locked integration rules (issued at the Checkpoint A gate)
+
+1. **Aggregate message size (inherited WP-18 hardening).** Before
+   `INCIDENT_FIELD_MESSAGE_SEND` is admitted by the replay executor, the
+   canonical 64 KiB aggregate message validation moves BEFORE the mutating
+   repository transaction, with a regression proving an oversized aggregate
+   produces zero message, recipient, timeline and outbox rows. WP-18 is not
+   reopened generally.
+2. **Receipt-before-FRESH.** At `device_sequence == next_expected`, an
+   existing durable receipt from a crashed attempt (RECEIVED/APPLYING/
+   UNKNOWN) is examined before any new execution: same fingerprint resumes
+   per receipt status, different fingerprint conflicts. The cursor alone
+   never authorizes a second effect.
+3. **Snapshot allowlists.** `result_snapshot` is populated only from
+   per-operation safe allowlists (assignment: id + status; send: message id +
+   incident id + recipient count; acknowledge: message id) — never by
+   serializing a domain object. No message body, recipient list or
+   need-to-know content enters the generic receipt, result, audit or logs.
+
+## Checkpoint B acceptance tests (locked now)
 
 Same device + concurrent same sequence -> exactly one domain effect. Same
 sequence + changed request -> conflict, zero second effect. Sequence gap ->

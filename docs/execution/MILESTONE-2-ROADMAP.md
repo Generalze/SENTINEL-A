@@ -97,7 +97,7 @@ the whole log.
 | WP-17A | Done — Field `site_id` referential integrity, closing Wave-7 finding C7-07 | merged `5f01b15` |
 | WP-18 | Done — incident field messaging: named-recipient entitlement, commander oversight as its own action, immutable recipients, tuple-bound persistence, transport-evidence delivery | merged `5868bf7` |
 | WP-19 | Done — versioned patrol standards, materialised run expectations, server-owned timing (C9-01..C9-09), whole-system audit correction batch (complete evidence tuple, request-bound idempotency, locked mutable dependencies, fail-closed START, boundary-bounded JSON), 34 patrol tests | merged `e4092e2` |
-| WP-20 | Directive issued — offline operation contracts & replay foundation (C10-01..C10-11). **Checkpoint A (contracts) GO after directive acceptance; persistence/executor/HTTP HOLD** | branch `docs/wp-20-directive` |
+| WP-20 | Checkpoint A contracts merged (`eb5e0cf`, 141 contract tests); Checkpoint B replay harness delivered — cursor/receipt persistence, effectively-once executor over the six-kind allowlist, authenticated device-context seam, WP-18 aggregate-size correction, 17 acceptance tests. **MERGE HOLD** pending lead audit + hosted CI; HTTP/mobile API HOLD | branch `wp-20-offline-replay-harness` |
 | WP-21 .. WP-22 | Not started | — |
 
 **Wave 7 is closed.** WP-17 and WP-17A are both on `main`; C7-07 is closed.
