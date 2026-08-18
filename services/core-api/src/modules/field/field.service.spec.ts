@@ -59,6 +59,7 @@ function assignmentRow(overrides: Record<string, unknown> = {}) {
 
 function repositoryDouble(overrides: Partial<FieldRepository> = {}): FieldRepository {
   return {
+    siteExistsInOrganisation: vi.fn().mockResolvedValue(true),
     assigneeCanReceive: vi.fn().mockResolvedValue(true),
     incidentExists: vi.fn().mockResolvedValue(true),
     createAssignment: vi.fn().mockResolvedValue({ assignment: assignmentRow(), created: true }),
@@ -116,6 +117,33 @@ describe('FieldService', () => {
   it('rejects assignment creation outside the principal site scope', async () => {
     const service = new FieldService(repositoryDouble());
     await expect(service.createAssignment(principal(), siteScope, assignment({ site_id: 'site-2' }))).rejects.toBeInstanceOf(ForbiddenException);
+  });
+
+  it('WP-17A: refuses a Field write naming a site that is not in the caller organisation, before any mutation', async () => {
+    // One repository answer covers both "no such site" and "a real site in
+    // another tenant" — the service must not distinguish them.
+    const repository = repositoryDouble({ siteExistsInOrganisation: vi.fn().mockResolvedValue(false) } as Partial<FieldRepository>);
+    const service = new FieldService(repository);
+
+    await expect(service.createAssignment(principal(), siteScope, assignment())).rejects.toBeInstanceOf(NotFoundException);
+    await expect(
+      service.recordState(principal('user-field', 'field.operative'), siteScope, {
+        site_id: 'site-1',
+        device_id: 'device-1',
+        state: 'RESPONDING',
+        location: null,
+        source_at: '2026-08-16T09:59:30.000Z',
+        freshness_ms: 0,
+        idempotency_key: 'state-1',
+        trace_id: 'trace-state',
+      }),
+    ).rejects.toBeInstanceOf(NotFoundException);
+
+    expect(repository.siteExistsInOrganisation).toHaveBeenCalledWith('org-1', 'site-1');
+    // Checked before the transactional write, not after a constraint error.
+    expect(repository.createAssignment).not.toHaveBeenCalled();
+    expect(repository.recordState).not.toHaveBeenCalled();
+    expect(repository.assigneeCanReceive).not.toHaveBeenCalled();
   });
 
   it('rejects assignment creation for a non-field assignee at the site', async () => {
