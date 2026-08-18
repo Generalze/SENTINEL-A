@@ -115,12 +115,18 @@ describe('PatrolRouteSchema / PatrolCheckpointSchema / CheckpointVerificationSch
     schema_version: 1 as const, patrol_route_id: 'route-1', organisation_id: 'org-1', site_id: 'site-1', name: 'Perimeter', route_version: 1,
     checkpoint_ids: ['checkpoint-1'], created_at: at, updated_at: at, created_by_user_id: 'supervisor-1', trace_id: 'trace-1',
   };
+  // WP-19/C9-04: a checkpoint now belongs to an exact route version and carries
+  // that version's timing standard.
   const checkpoint = {
-    schema_version: 1 as const, patrol_checkpoint_id: 'checkpoint-1', patrol_route_id: 'route-1', organisation_id: 'org-1', site_id: 'site-1',
-    sequence_number: 1, name: 'North gate', zone_id: null, location: null, trace_id: 'trace-1',
+    schema_version: 1 as const, patrol_checkpoint_id: 'checkpoint-1', patrol_route_id: 'route-1', route_version: 1,
+    organisation_id: 'org-1', site_id: 'site-1', sequence_number: 1, name: 'North gate', zone_id: null, location: null,
+    window_open_offset_ms: 0, late_after_offset_ms: 300_000, missed_after_offset_ms: 900_000, trace_id: 'trace-1',
   };
+  // WP-19/C9-01: a verification is bound to the run and run-checkpoint it
+  // belongs to, otherwise two executions of one route are indistinguishable.
   const verification = {
-    schema_version: 1 as const, checkpoint_verification_id: 'verification-1', organisation_id: 'org-1', site_id: 'site-1', patrol_route_id: 'route-1',
+    schema_version: 1 as const, checkpoint_verification_id: 'verification-1', organisation_id: 'org-1', site_id: 'site-1',
+    patrol_run_id: 'run-1', patrol_run_checkpoint_id: 'run-checkpoint-1', patrol_route_id: 'route-1',
     patrol_checkpoint_id: 'checkpoint-1', operative_user_id: 'user-1', device_id: 'device-1', verification_method: 'NFC', verification_context: {},
     source_at: at, recorded_at: at, idempotency_key: 'verification-op-1', trace_id: 'trace-1',
   };
@@ -137,8 +143,12 @@ describe('PatrolRouteSchema / PatrolCheckpointSchema / CheckpointVerificationSch
     expect(() => CheckpointVerificationSchema.parse({ ...verification, organisation_id: '' })).toThrow();
   });
 
-  it('rejects a verification recorded before its source event', () => {
-    expect(() => CheckpointVerificationSchema.parse({ ...verification, recorded_at: '2026-08-16T09:59:59Z' })).toThrow();
+  // WP-19/C9-01: the old rule here required recorded_at >= source_at. It is
+  // removed deliberately — source_at is device telemetry and recorded_at is the
+  // server's authority, so a device clock running fast must not be able to veto
+  // a valid receipt.
+  it('accepts a verification whose device clock runs ahead of the server receipt', () => {
+    expect(CheckpointVerificationSchema.parse({ ...verification, source_at: '2026-08-16T10:30:00Z' })).toMatchObject({ recorded_at: at });
   });
 });
 

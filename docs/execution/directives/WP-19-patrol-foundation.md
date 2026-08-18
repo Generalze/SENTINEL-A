@@ -4,7 +4,9 @@
 **Depends:** WP-15 Field Contracts, WP-16 Field Domain, WP-17 Field Realtime, WP-17A Field Site Integrity, WP-18 Incident Field Messaging
 **Review chain:** Cipher adversarial review -> Lead merge gate
 **Status:** Directive and contract design only. **Implementation is HOLD** until
-the lead reviews and locks the patrol-execution and missed/late contract below.
+the lead locks this contract. Checkpoint corrections C9-01 through C9-06 are
+applied; the scheduling-authority question is ruled (route version owns the
+standard).
 
 ## Objective
 
@@ -37,103 +39,177 @@ express the timing decision once.
 
 ### 1. Route versus execution are different objects
 
-`PatrolRoute` remains a **definition**: versioned, editable, describing intent.
-`PatrolRun` is an **execution**: it snapshots the exact `route_version` it began
-under and materialises its own checkpoint expectations at start time.
+`PatrolRoute` is a **definition**; `PatrolRun` is an **execution**. A run pins
+the exact `route_version` it began under and materialises its own checkpoint
+instants at start.
 
-Editing a route afterwards therefore cannot rewrite what a completed patrol was
-required to do. The historical truth of a patrol lives on the run, never on the
-definition — the same instinct as WP-18's immutable message and WP-17A's
-recorded-at-the-time site identifier.
+**C9-04 — version identity is structural, not decorative.** `route_version` now
+lives on `PatrolCheckpoint`, so `(patrol_route_id, route_version)` is a real
+version key and every run checkpoint must originate from the one version its run
+pinned. A published version is immutable: changing a patrol standard means
+publishing a **new** version, never editing version N in place. That is what
+makes "later route edits cannot rewrite historical patrol truth" enforceable
+rather than conventional.
 
-### 2. The timing model: materialised absolute instants
+### 2. Scheduling authority: the route version owns the standard
 
-**This is the design decision the checkpoint asked to be posed and resolved.**
-
-Each `PatrolRunCheckpoint` carries three server-computed absolute timestamps,
-written once when the run starts:
-
-```text
-expected_at    when the operative should reach it
-late_after     the end of the on-time window
-missed_after   the deadline, after which it can no longer be verified
-```
-
-and the decision is exactly:
+**Lead ruling.** Timing policy belongs to the versioned checkpoint definition:
 
 ```text
-received_at <= late_after                  -> VERIFIED
-late_after  <  received_at <= missed_after -> LATE
-now         >  missed_after, still PENDING -> MISSED
+route-version checkpoint:      window_open_offset_ms
+                               late_after_offset_ms
+                               missed_after_offset_ms
+
+at server-owned run start:     window_opens_at = started_at + window_open_offset_ms
+                               late_after      = started_at + late_after_offset_ms
+                               missed_after    = started_at + missed_after_offset_ms
 ```
 
-**Absolute instants rather than offsets, deliberately.** An offset must be
-re-evaluated against a start time every time it is read, so any later drift,
-clock disagreement, or edit to the run's start would silently change historical
-judgements. A materialised instant is a fact; an offset is a recomputation.
+There is **no per-run commander or dispatcher cadence in WP-19**. Otherwise a
+scheduler could quietly weaken a patrol standard for one shift without changing
+the approved definition. A different standard requires a new route version. An
+override mechanism would need its own authorization, reason, audit and policy —
+not WP-19.
 
-**Materialised on the run, not written back onto the route.** Starting a patrol
-must never mutate a shared definition — two concurrent runs of the same route
-would otherwise fight over the same rows, and a route edit would retroactively
-move a finished patrol's deadlines.
+Materialisation uses the **server-owned actual `started_at`**, never a client
+time and never `scheduled_start_at`. The two are stored separately so a late
+start remains visible as evidence rather than being absorbed into the schedule.
 
-The two functions `resolveCheckpointState` and `isCheckpointMissed` are pure and
-live in the contract package so no call site can reinvent the rule.
-
-### 3. Ordering is authoritative on the server
-
-`sequence_number` is snapshotted onto the run's checkpoints from the route
-version. A device may not nominate a checkpoint outside its own run, invent a
-sequence, or reorder one.
-
-### 4. Verification input versus authoritative record
+### 3. The timing model: materialised absolute instants
 
 ```text
-the device may supply          the server DERIVES
-------------------            -------------------
-checkpoint reference          tenant/site validity
-source time (telemetry)       authenticated operative identity
-verification method           route/run membership
-device evidence               authoritative receipt time
-idempotency key               ordering and resulting checkpoint state
+received  <  window_opens_at              -> TOO_EARLY   (no mutation)
+window_opens_at <= received <= late_after -> VERIFIED
+late_after   <  received <= missed_after  -> LATE
+received  >  missed_after                 -> EXPIRED     (no verification transition)
+now       >  missed_after, still PENDING  -> MISSED      (server sweep only)
 ```
 
-Client source time is **telemetry only**, exactly as WP-16 established for Field
-state freshness. Only server receipt time may be passed to
-`resolveCheckpointState`.
+**C9-02 — `TOO_EARLY` closes an early-arrival hole.** The first draft counted
+*any* receipt before `late_after` as VERIFIED, so a patrol could have been
+"completed" the moment it started. `window_opens_at` replaces the vaguer
+`expected_at` and names what it actually governs.
 
-### 5. Missed is never a client claim, and never a side effect
+**Absolute instants rather than offsets on the run, deliberately.** An offset
+must be re-evaluated against a start time every time it is read, so drift, clock
+disagreement or an edit to the start would silently change historical
+judgements. A materialised instant is a fact.
 
-A checkpoint must not become MISSED because a device said so, and must not
-become MISSED merely because a **later** checkpoint was verified. Both would let
-field behaviour rewrite the record. MISSED arises only from the run's own
-schedule and the server clock, via a sweep, and must be auditable.
+### 4. Checkpoint state must never contradict itself
 
-`isCheckpointMissed` therefore reads only that checkpoint's own state and
-deadline — it is structurally incapable of consulting a sibling.
+**C9-02.** `PENDING`, `MISSED` and `CANCELLED` carry no `resolved_at` and no
+verification id; `VERIFIED` and `LATE` require both. Beyond that, a resolved
+row's recorded state must **equal** what the timing rule says about its own
+`resolved_at` — a row can no longer claim VERIFIED while its resolution sits
+inside the LATE window. The contract enforces this; it is not left to the
+service.
 
-### 6. Idempotency and immutability
+### 5. Run termination is fully specified
 
-A replayed verification must create no second verification record, no second
-timeline effect, and no second missed-checkpoint effect. Run, checkpoint and
-verification facts are append-only or state-transition controlled; nothing is
-silently rewritten (§61).
+**C9-03.**
 
-### 7. Site and incident integrity follow the established precedents
+```text
+SCHEDULED   -> IN_PROGRESS | CANCELLED
+IN_PROGRESS -> COMPLETED   | ABANDONED
+```
 
-Patrol live state must be database-bound to a real `(site_id, organisation_id)`
-tuple per WP-17A. A patrol associated with an incident must additionally bind
-the exact `(incident_id, organisation_id, site_id)` tuple per WP-18. **Do not
-weaken either boundary**, and do not change `Incident`/`Event` scalar site
-semantics — that remains the WP-22 prerequisite.
+`EXPIRED` is **removed**: it existed with no rule defining what expiry meant, and
+an unspecified terminal state is where ambiguity hides. `started_at` exists only
+for runs that started; `ended_at` only for runs that ended. A run may become
+COMPLETED only when no checkpoint remains PENDING (`canCompletePatrolRun`).
 
-### 8. Audit
+**Abandonment cannot launder an overdue obligation.** On abandonment, a pending
+checkpoint already past `missed_after` becomes **MISSED**; only a still-future
+expectation is withdrawn as **CANCELLED** (`resolveAbandonedCheckpointState`).
 
-Run lifecycle transitions, checkpoint verifications, and missed/late transitions
-each create durable Field or incident timeline/audit records carrying trace ids.
-No client-authored timestamp is ever stored as authoritative.
+### 6. Ordering is server-authoritative
 
-### 9. Realtime
+**C9-02/C9-05.** A checkpoint may be verified only once every **lower** sequence
+number has left PENDING. An earlier checkpoint that is VERIFIED, LATE, MISSED or
+CANCELLED permits progression; one still PENDING blocks it. A later verification
+never auto-resolves an earlier checkpoint — that belongs to the missed sweep
+alone (`canVerifySequence`).
+
+A device may not nominate a checkpoint outside its own run, invent a sequence,
+or reorder one.
+
+### 7. Verification input versus authoritative record
+
+**C9-01.** The verification record is bound to its execution: it carries both
+`patrol_run_id` and `patrol_run_checkpoint_id`. Without them, one route executed
+twice — or twice concurrently — yields indistinguishable evidence and no audit
+can say which patrol a verification belonged to.
+
+```text
+the device may supply              the server DERIVES
+---------------------              ------------------
+run / run-checkpoint reference     route and checkpoint identity
+source time (telemetry)            organisation and site
+verification method                authenticated operative identity
+device evidence                    authoritative recorded_at
+idempotency key                    ordering and resulting state
+```
+
+The old `recorded_at >= source_at` constraint is **removed**. A device clock five
+minutes fast must not veto a valid server receipt; `source_at` is telemetry and
+`recorded_at` is authority, stored side by side so skew is visible rather than
+decisive.
+
+### 8. Authorization and incident eligibility
+
+**C9-05.** Locked matrix for WP-19:
+
+```text
+                      read routes   manage routes   schedule/manage runs   verify
+site.commander             y              y                  y              -
+dispatcher                 y              -                  y              -
+field.operative       own run only        -                  -          own run only
+operator / investigator / admin:  no patrol capability from existing roles
+```
+
+`dispatcher` may schedule runs but **may not redefine patrol standards** — that
+is the whole point of ruling scheduling authority onto the route version. A
+`field.operative` may act only on their own run and verify only their own
+`IN_PROGRESS` checkpoint.
+
+For an incident-linked patrol, **scheduling** eligibility additionally requires
+the operative to satisfy exact organisation + site + incident Field-assignment
+eligibility; **starting or verifying** additionally requires that assignment to
+be `ACCEPTED` or `IN_PROGRESS`. An eligible same-site operative who is not
+assigned this run gets **404** on the run object, per the WP-18 precedent that
+existence is itself need-to-know.
+
+### 9. Deadline race and idempotency
+
+**C9-06.** Verification and the MISSED sweep will eventually contend for the
+same row. Both serialize on the run-checkpoint row, and the authoritative
+`recorded_at` is taken from the database **inside the transaction, after
+acquiring that serialization boundary** — so the outcome can never depend on a
+client clock or a stale application timestamp. Exactly one PENDING terminal
+transition wins, producing exactly one audit and timeline effect.
+
+Carrying the WP-18/C8-05 lesson forward: **idempotency namespaces must include
+the authoritative actor and run scope**, so another actor's key collision can
+never return their verification record.
+
+Permanent regressions required at implementation: concurrent sweep-versus-
+verification, and duplicate verification.
+
+### 10. Site and incident integrity
+
+Patrol live state is database-bound to a real `(site_id, organisation_id)` tuple
+per WP-17A. An incident-linked patrol additionally binds the exact
+`(incident_id, organisation_id, site_id)` tuple per WP-18. Neither boundary is
+weakened, and `Incident`/`Event` scalar site semantics stay unchanged — that
+remains the WP-22 prerequisite.
+
+### 11. Audit
+
+Run lifecycle transitions, checkpoint verifications and missed/late transitions
+each write durable Field or incident timeline/audit records with trace ids. No
+client-authored timestamp is ever stored as authoritative.
+
+### 12. Realtime
 
 Socket notifications are identifier and state-change signals only; REST and the
 database remain authoritative. **A socket acknowledgement is not a checkpoint
@@ -174,21 +250,14 @@ Explicitly **not** in WP-19 unless separately authorized: GPS geofence proof,
 NFC/QR cryptographic checkpoint proof, biometric recognition, a native mobile
 offline queue, the WP-20 replay engine, Whisper, and any patrol UI polish.
 
-## Open question for the lead
+## Previously open question — now ruled
 
-One decision is deliberately left open rather than guessed:
+> Where do the per-checkpoint durations come from at run start?
 
-> **Where do the per-checkpoint durations come from at run start?**
+**Answered: the route version owns them** (section 2). The alternative — a
+per-run cadence supplied at scheduling time — is rejected for WP-19 because it
+would let a scheduler weaken an approved patrol standard for one shift without
+changing the definition anyone reviewed.
 
-The contract fixes the *shape* (three absolute instants per checkpoint) without
-fixing their *source*. Two candidates:
-
-- **(a) Route-level cadence.** `PatrolRoute` gains an expected duration per
-  checkpoint, and a run materialises instants from it. Consistent scheduling,
-  but it is a WP-15 contract change.
-- **(b) Run-level schedule input.** The commander/dispatcher supplies the
-  cadence when scheduling the run. No WP-15 change, more flexible per shift, but
-  the same route can be walked to different standards.
-
-Both satisfy every locked rule above; the difference is where scheduling
-authority lives. This needs a lead ruling before persistence is designed.
+No open questions remain. Implementation is HOLD only pending the lead's lock of
+this contract.

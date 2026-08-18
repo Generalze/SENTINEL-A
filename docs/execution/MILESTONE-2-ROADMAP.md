@@ -96,7 +96,7 @@ the whole log.
 | WP-17 | Done — site-scoped Field delivery, need-to-know payloads, subject-token safety across every NATS builder, operative REST refetch, WP-16 AC7 API tests | merged `83a5d7d` |
 | WP-17A | Done — Field `site_id` referential integrity, closing Wave-7 finding C7-07 | merged `5f01b15` |
 | WP-18 | Done — incident field messaging: named-recipient entitlement, commander oversight as its own action, immutable recipients, tuple-bound persistence, transport-evidence delivery | merged `5868bf7` |
-| WP-19 | Directive and execution contract written; **implementation HOLD** pending the lead's ruling on the open scheduling question | branch `docs/wp-19-directive` |
+| WP-19 | Directive and execution contract written, checkpoint corrections C9-01..C9-06 applied, scheduling authority ruled to the route version; **implementation HOLD** pending the lead's contract lock | branch `docs/wp-19-directive` |
 | WP-20 .. WP-22 | Not started | — |
 
 **Wave 7 is closed.** WP-17 and WP-17A are both on `main`; C7-07 is closed.
@@ -107,9 +107,9 @@ foundation closes it.
 **Next:** WP-19 implementation, once the lead locks the patrol-execution and
 missed/late contract. See
 [`directives/WP-19-patrol-foundation.md`](directives/WP-19-patrol-foundation.md),
-which resolves the execution-anchor gap and leaves exactly one question open:
-whether per-checkpoint durations come from a route-level cadence (a WP-15
-contract change) or a run-level schedule supplied at scheduling time.
+which resolves the execution-anchor gap and carries no open questions: timing
+policy belongs to the versioned route checkpoint, and a run materialises
+absolute expectations from its server-owned start.
 
 ### CI contract
 
@@ -117,8 +117,9 @@ The hosted security source gate was a false green for the whole life of the
 pipeline: `ripgrep` is absent from the runner image, and the inline step read
 its exit 127 as "no matches". Repaired in `a761763` — the scanner is installed
 explicitly, exit statuses are interpreted, every canonical root is required, and
-the gate has eight regressions of its own. Any green build before that commit
-asserted a source scan that did not happen.
+the gate has eight regressions of its own. Any hosted GitHub Actions CI run
+before `a761763` that claimed the security source gate passed did not actually
+execute that scan.
 
 Wave-7 review findings, the delivery-semantics ruling, and the remaining
 accepted limitations are in
