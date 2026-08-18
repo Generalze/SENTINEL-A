@@ -44,6 +44,7 @@ model Site {
 
   fieldAssignments   FieldAssignment[]
   fieldCurrentStates FieldOperativeCurrentState[]
+  incidentFieldMessages IncidentFieldMessage[]
 
   @@unique([id, organisationId], map: "sites_id_organisation_key")
   @@index([organisationId])

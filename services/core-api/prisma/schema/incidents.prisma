@@ -41,7 +41,13 @@ model Incident {
 
   timeline IncidentTimelineEntry[]
   responseTasks ResponseTask[]
+  fieldMessages IncidentFieldMessage[]
 
+  /// WP-18 candidate key. Deliberately redundant with the primary key: it makes
+  /// (id, organisation_id, site_id) referenceable, so a Field message can be
+  /// bound to THIS incident under THIS tenant and site rather than to an id
+  /// that merely exists. Incident's own scalar site semantics are unchanged.
+  @@unique([id, organisationId, siteId], map: "incidents_id_org_site_key")
   @@index([organisationId, status])
   @@index([organisationId, severity])
   @@index([organisationId, openedAt])

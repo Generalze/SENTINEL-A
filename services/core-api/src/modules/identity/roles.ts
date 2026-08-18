@@ -22,6 +22,10 @@
  * | site.admin         | Create/administer sites and zones                 |
  * | user.admin         | Create/administer users and role assignments      |
  * | presence.view      | Read Field operative presence/location            |
+ * | field.message.send | Send an incident-scoped Field message              |
+ * | field.message.read | Read a Field message you sent or were addressed in |
+ * | field.message.acknowledge | Acknowledge a Field message addressed to you |
+ * | incident.field-message.oversight.read | Read incident Field messages as command oversight |
  *
  * §62 role -> action table (source of truth for RBAC; site/clearance/
  * purpose are attribute-based constraints layered on top by AccessGuard,
@@ -46,6 +50,14 @@ export const ACTIONS = [
   'field.assignment.act',
   'field.state.write',
   'field.state.read',
+  'field.message.send',
+  'field.message.read',
+  'field.message.acknowledge',
+  // WP-18: command oversight of incident Field messages. Deliberately its
+  // OWN action and NOT implied by incident.view — six roles hold
+  // incident.view, so binding message content to it would disclose messages
+  // to all six at once. Granted to site.commander only.
+  'incident.field-message.oversight.read',
   'event.ingest',
   'event.read',
   'evidence.ingest',
@@ -76,10 +88,10 @@ export const ROLES = [
 export type Role = (typeof ROLES)[number];
 
 export const ROLE_ACTIONS: Readonly<Record<Role, readonly Action[]>> = {
-  'site.commander': ['incident.view', 'incident.close', 'incident.silent.approve', 'field.acknowledge', 'field.assignment.manage', 'field.state.read', 'evidence.read', 'event.read', 'hypothesis.read'],
+  'site.commander': ['incident.view', 'incident.close', 'incident.silent.approve', 'field.acknowledge', 'field.assignment.manage', 'field.state.read', 'evidence.read', 'event.read', 'hypothesis.read', 'field.message.send', 'field.message.read', 'field.message.acknowledge', 'incident.field-message.oversight.read'],
   operator: ['incident.view', 'presence.view', 'field.state.read', 'event.ingest', 'event.read', 'hypothesis.read'],
   dispatcher: ['incident.view', 'presence.view', 'field.assignment.manage', 'field.state.read', 'event.read', 'hypothesis.read'],
-  'field.operative': ['field.acknowledge', 'field.assignment.act', 'field.state.write', 'incident.view'],
+  'field.operative': ['field.acknowledge', 'field.assignment.act', 'field.state.write', 'incident.view', 'field.message.send', 'field.message.read', 'field.message.acknowledge'],
   investigator: ['evidence.read', 'evidence.verify', 'ledger.read', 'ledger.verify', 'incident.view', 'event.read', 'hypothesis.read'],
   'evidence.custodian': ['evidence.read', 'evidence.ingest', 'evidence.verify'],
   admin: ['org.admin', 'site.admin', 'user.admin', 'incident.view', 'constitution.policy.read', 'ledger.verify'],

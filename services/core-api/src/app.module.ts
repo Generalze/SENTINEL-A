@@ -18,6 +18,7 @@ import { RealtimeModule } from './modules/realtime/realtime.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { IncidentsModule } from './modules/incidents/incidents.module';
 import { FieldModule } from './modules/field/field.module';
+import { FieldMessagingModule } from './modules/field-messaging/field-messaging.module';
 
 @Module({
   imports: [
@@ -52,6 +53,7 @@ import { FieldModule } from './modules/field/field.module';
     FusionModule,
     IncidentsModule,
     FieldModule,
+    FieldMessagingModule,
   ],
 })
 export class AppModule {}

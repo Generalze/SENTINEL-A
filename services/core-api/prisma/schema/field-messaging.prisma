@@ -1,0 +1,124 @@
+// SENTINEL Incident Field Messaging domain (WP-18, architecture sections 13,
+// 41.2, 44A.11, 62.1, 76). Owned exclusively by
+// services/core-api/src/modules/field-messaging.
+//
+// WP-18 tuple integrity — the message record is the strictest binding in the
+// codebase so far, extending WP-17A's composite precedent one level:
+//
+//   (site_id, organisation_id)              -> Site(id, organisation_id)
+//   (incident_id, organisation_id, site_id) -> Incident(id, organisation_id, site_id)
+//
+// Both ON DELETE RESTRICT. The second reference is deliberately redundant with
+// Incident's primary key: it lets the database prove that THIS incident belongs
+// to THIS tenant and site, not merely that the incident id exists. A message
+// therefore cannot be created against a fictional, cross-tenant, or
+// scope-mismatched incident even by a caller that bypasses the service.
+//
+// Existing Incident/Event scalar site semantics are NOT changed by WP-18; that
+// divergence is an explicit WP-22 / Milestone-2 sign-off prerequisite.
+
+/// One incident-scoped message. Append-only: body, sender, recipient set,
+/// incident and site are immutable once written. Only per-recipient delivery
+/// state advances (see IncidentFieldMessageRecipient).
+model IncidentFieldMessage {
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  siteId String @map("site_id") @db.Text
+  incidentId String @map("incident_id") @db.Uuid
+
+  senderUserId String @map("sender_user_id") @db.Text
+
+  /// Nullable: a message may carry media instead of a body. The WP-15 contract
+  /// requires at least one of the two; that is enforced in the service.
+  body String? @db.Text
+  mediaRefs String[] @default([]) @map("media_refs")
+
+  retentionClass String @map("retention_class") @db.Text
+  sentAt DateTime @default(now()) @map("sent_at") @db.Timestamptz(3)
+  expiresAt DateTime? @map("expires_at") @db.Timestamptz(3)
+
+  idempotencyKey String @map("idempotency_key") @db.Text
+  traceId String @map("trace_id") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  recipients IncidentFieldMessageRecipient[]
+  actionIdempotency IncidentFieldMessageActionIdempotency[]
+
+  site Site @relation(fields: [siteId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  incident Incident @relation(fields: [incidentId, organisationId, siteId], references: [id, organisationId, siteId], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([organisationId, incidentId, idempotencyKey], map: "incident_field_message_idem_key")
+  @@index([organisationId, incidentId, sentAt], map: "incident_field_message_incident_sent_idx")
+  @@index([organisationId, senderUserId, sentAt], map: "incident_field_message_sender_idx")
+  @@map("incident_field_messages")
+}
+
+/// Immutable named-recipient membership, plus that recipient's own delivery
+/// state. Membership is frozen at send: WP-18 exposes no API to add a recipient
+/// to an existing message, so a later participant never gains retrospective
+/// access to historical content.
+///
+/// Delivery state is PER RECIPIENT because one message can be delivered to one
+/// operative and not another. A commander reading by oversight authority gets
+/// no row here at all — otherwise command visibility would corrupt the meaning
+/// of section 76 delivery state.
+model IncidentFieldMessageRecipient {
+  id String @id @default(uuid()) @db.Uuid
+
+  messageId String @map("message_id") @db.Uuid
+  message IncidentFieldMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  /// Denormalised from the parent message so recipient reads stay tenant-scoped
+  /// without a join. Always written from the message's own validated scope.
+  organisationId String @map("organisation_id") @db.Text
+  siteId String @map("site_id") @db.Text
+
+  recipientUserId String @map("recipient_user_id") @db.Text
+
+  deliveryState String @default("REQUESTED") @map("delivery_state") @db.Text
+  deliveredAt DateTime? @map("delivered_at") @db.Timestamptz(3)
+  acknowledgedAt DateTime? @map("acknowledged_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([messageId, recipientUserId], map: "incident_field_message_recipient_key")
+  @@index([organisationId, recipientUserId, createdAt], map: "incident_field_message_recipient_user_idx")
+  @@map("incident_field_message_recipients")
+}
+
+/// Replay guard for recipient-side actions (acknowledge). Same shape as WP-16's
+/// assignment action idempotency: a duplicate request returns the established
+/// result and appends no second timeline or outbox row.
+model IncidentFieldMessageActionIdempotency {
+  id String @id @default(uuid()) @db.Uuid
+  messageId String @map("message_id") @db.Uuid
+  message IncidentFieldMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  recipientUserId String @map("recipient_user_id") @db.Text
+  action String @db.Text
+  idempotencyKey String @map("idempotency_key") @db.Text
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([messageId, recipientUserId, action, idempotencyKey], map: "incident_field_message_action_idem_key")
+  @@map("incident_field_message_action_idempotency")
+}
+
+/// Realtime signal rows, written in the same transaction as the message.
+/// `recipient_user_id` is the routing key: delivery is per entitled user, never
+/// a site-wide room (WP-17/C7-08 established that a shared room may not carry
+/// object identifiers; a per-user room may, because its audience IS the
+/// entitled set). The payload deliberately carries no body, media, or sender.
+model IncidentFieldMessageOutbox {
+  id String @id @default(uuid()) @db.Uuid
+  organisationId String @map("organisation_id") @db.Text
+  siteId String @map("site_id") @db.Text
+  recipientUserId String @map("recipient_user_id") @db.Text
+  payload Json
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  publishedAt DateTime? @map("published_at") @db.Timestamptz(3)
+
+  @@index([publishedAt, createdAt], map: "incident_field_message_outbox_publish_idx")
+  @@map("incident_field_message_outbox")
+}
