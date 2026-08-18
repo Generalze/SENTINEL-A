@@ -10,7 +10,7 @@ import {
   bootstrapRealtimeApp,
   cleanupOrgsAndUsers,
   makeOrgAndUser,
-  sleep,
+  publishUntilReceived,
   waitForEvent,
   withLiveStackEnv,
   type TestOrgUser,
@@ -39,14 +39,14 @@ describe('Realtime gateway — org isolation + whitelist enforcement (live stack
     ({ app, baseUrl, prisma, natsProvider } = await bootstrapRealtimeApp());
     [orgA, orgB] = await Promise.all([makeOrgAndUser(prisma, 'iso-a'), makeOrgAndUser(prisma, 'iso-b')]);
     // Reuse the app's own NatsProvider connection to publish test messages
-    // (see BootstrappedApp's doc comment on `natsProvider` for why: a
-    // second independent `connect()` in this same process hits a known
-    // `nats` client reconnect quirk and stalls for ~25-30s).
+    // rather than opening a second one (see BootstrappedApp's doc comment on
+    // `natsProvider`).
     nc = await natsProvider.getConnection();
-    // Give the bridge's own subscriptions (started from onModuleInit, in the
-    // background) time to actually register with the NATS server before any
-    // test publishes — otherwise an early publish can race ahead of it.
-    await sleep(700);
+    // No fixed sleep here any more. Waiting a guessed interval for the
+    // bridge's background subscriptions to register is exactly the
+    // "instantaneous assumption" that made this hook flaky; the tests below
+    // republish until delivery instead (`publishUntilReceived`), which
+    // converges on a slow machine and costs nothing on a fast one.
   }, 30_000);
 
   afterEach(() => {
@@ -96,9 +96,9 @@ describe('Realtime gateway — org isolation + whitelist enforcement (live stack
     const receivedByA = waitForEvent<Record<string, unknown>>(clientA, WS_EVENT_INCIDENT_UPDATED);
     const noneForB = assertNoEvent(clientB, WS_EVENT_INCIDENT_UPDATED, 1500);
 
-    nc.publish(`sentinel.incidents.updated.${orgA.organisationId}`, jsonCodec.encode(payload));
+    const delivered = publishUntilReceived(nc, `sentinel.incidents.updated.${orgA.organisationId}`, jsonCodec.encode(payload), receivedByA);
 
-    const [received] = await Promise.all([receivedByA, noneForB]);
+    const [received] = await Promise.all([delivered, noneForB]);
 
     expect(received).toEqual({
       id: incidentId,
@@ -130,9 +130,9 @@ describe('Realtime gateway — org isolation + whitelist enforcement (live stack
     const receivedByB = waitForEvent<Record<string, unknown>>(clientB, WS_EVENT_HYPOTHESIS_UPDATED);
     const noneForA = assertNoEvent(clientA, WS_EVENT_HYPOTHESIS_UPDATED, 1500);
 
-    nc.publish(`sentinel.fusion.hypothesis.${orgB.organisationId}`, jsonCodec.encode(payload));
+    const delivered = publishUntilReceived(nc, `sentinel.fusion.hypothesis.${orgB.organisationId}`, jsonCodec.encode(payload), receivedByB);
 
-    const [received] = await Promise.all([receivedByB, noneForA]);
+    const [received] = await Promise.all([delivered, noneForA]);
 
     expect(received).toEqual({
       id: 'hyp_isolation_1',

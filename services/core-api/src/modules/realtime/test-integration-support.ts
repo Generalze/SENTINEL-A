@@ -24,7 +24,25 @@ import { RealtimeModule } from './realtime.module';
  */
 export const LIVE_STACK_ENV: Readonly<Record<string, string>> = {
   DATABASE_URL: 'postgresql://sentinel:sentinel@localhost:5433/sentinel',
-  NATS_URL: 'nats://localhost:4222',
+  /**
+   * CI-stability fix: `127.0.0.1`, NOT `localhost`.
+   *
+   * The compose stack publishes NATS on 127.0.0.1 only (IPv4 loopback). On a
+   * host where `localhost` resolves to `::1` first — Windows does — the `nats`
+   * client attempts IPv6 and stalls for ~27 SECONDS before falling back, and
+   * its own `timeout` option does not bound that. Measured on this stack:
+   *
+   *     nats://localhost:4222  -> 27,223ms
+   *     nats://127.0.0.1:4222  ->      2ms
+   *
+   * That single connect is what pushed this module's `beforeAll` hooks up
+   * against their 30s timeout, producing an intermittent "Hook timed out"
+   * failure that looks like a realtime bug and is not one. Addressing the
+   * loopback address removes the cause rather than raising the timeout to
+   * accommodate it. Production is unaffected: it reads NATS_URL from real
+   * configuration and never uses this fixture.
+   */
+  NATS_URL: 'nats://127.0.0.1:4222',
   REDIS_URL: 'redis://localhost:6379',
   S3_ENDPOINT: 'http://localhost:9000',
   S3_ACCESS_KEY: 'sentinel',
@@ -206,4 +224,42 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+/**
+ * Publishes `payload` on `subject` repeatedly until `awaited` settles.
+ *
+ * The bridge establishes its NATS subscriptions in the background from
+ * `onModuleInit`, so a single publish issued immediately after boot can race
+ * ahead of the subscription and be dropped by the server — NATS has no
+ * store-and-forward for plain subscriptions. This module previously papered
+ * over that with a fixed `sleep(700)` in `beforeAll`, which is a guess: too
+ * short on a loaded machine, and pure dead time otherwise.
+ *
+ * Republishing until the expectation resolves is the convergence form of the
+ * same intent, and it is safe for these specs: the waiter takes the FIRST
+ * matching event, and a duplicate delivery of an identical payload changes no
+ * assertion. Any negative assertion running alongside (`assertNoEvent` for
+ * another organisation) is strengthened, not weakened, by the extra publishes —
+ * more chances to leak, not fewer.
+ */
+export async function publishUntilReceived<T>(
+  nc: { publish: (subject: string, data: Uint8Array) => void },
+  subject: string,
+  data: Uint8Array,
+  awaited: Promise<T>,
+  intervalMs = 200,
+): Promise<T> {
+  let settled = false;
+  const tracked = awaited.finally(() => {
+    settled = true;
+  });
+
+  nc.publish(subject, data);
+  while (!settled) {
+    await sleep(intervalMs);
+    if (settled) break;
+    nc.publish(subject, data);
+  }
+  return tracked;
 }
