@@ -3,6 +3,7 @@ import { WebSocketGateway, WebSocketServer, type OnGatewayConnection, type OnGat
 import type { DefaultEventsMap, Server, Socket } from 'socket.io';
 import { AppConfigService } from '../../config/config.service';
 import { PrismaService } from '../../prisma/prisma.service';
+import { fieldRoomsFor } from './field-rooms.util';
 import { PresenceService } from './presence.service';
 import { loadRealtimePrincipal } from './realtime-principal.loader';
 import { orgRoom, resolveWsCorsOrigin, WS_EVENT_PRESENCE_CHANGED, WS_PATH } from './realtime.constants';
@@ -88,8 +89,19 @@ export class RealtimeGateway implements OnGatewayInit<RealtimeServer>, OnGateway
       return;
     }
 
-    await client.join(orgRoom(principal.organisation_id));
-    this.logger.log(`socket ${client.id} connected: user=${principal.user_id} org=${principal.organisation_id}`);
+    // WP-17/D1: Field rooms are additional to the org room and are derived
+    // from the principal's own role assignments — a principal with no Field
+    // visibility action joins none, and so receives no Field traffic.
+    //
+    // Joined in ONE call rather than two awaits: presence is recorded after
+    // this, and every await here delays the point at which a just-connected
+    // socket becomes visible to `GET /api/v1/presence`. Adding a second await
+    // measurably widened that window (it surfaced as a flake in
+    // realtime.presence.integration.spec.ts). socket.io accepts an array, so
+    // there is no reason to pay for two round trips.
+    const fieldRooms = fieldRoomsFor(principal);
+    await client.join([orgRoom(principal.organisation_id), ...fieldRooms]);
+    this.logger.log(`socket ${client.id} connected: user=${principal.user_id} org=${principal.organisation_id} field_rooms=${fieldRooms.length}`);
 
     const wentOnline = await this.presence.recordConnect(principal.organisation_id, principal.user_id);
     if (wentOnline) {
@@ -126,6 +138,23 @@ export class RealtimeGateway implements OnGatewayInit<RealtimeServer>, OnGateway
       return;
     }
     this.server.to(orgRoom(organisationId)).emit(event, payload);
+  }
+
+  /**
+   * WP-17/D2: emit to an explicit set of server-derived rooms. socket.io
+   * de-duplicates across the room set, so a socket that somehow sat in two of
+   * the given rooms would still receive the event once. Room names must come
+   * from `realtime.constants.ts` helpers fed by server-side state.
+   */
+  broadcastToRooms(rooms: readonly string[], event: string, payload: unknown): void {
+    if (rooms.length === 0) {
+      return;
+    }
+    if (!this.server) {
+      this.logger.warn(`broadcastToRooms(${event}) dropped: socket.io server not yet initialised`);
+      return;
+    }
+    this.server.to([...rooms]).emit(event, payload);
   }
 
   private async authenticate(socket: RealtimeSocket): Promise<RealtimePrincipal> {

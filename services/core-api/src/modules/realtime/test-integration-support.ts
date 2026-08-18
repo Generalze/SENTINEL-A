@@ -24,7 +24,25 @@ import { RealtimeModule } from './realtime.module';
  */
 export const LIVE_STACK_ENV: Readonly<Record<string, string>> = {
   DATABASE_URL: 'postgresql://sentinel:sentinel@localhost:5433/sentinel',
-  NATS_URL: 'nats://localhost:4222',
+  /**
+   * CI-stability fix: `127.0.0.1`, NOT `localhost`.
+   *
+   * The compose stack publishes NATS on 127.0.0.1 only (IPv4 loopback). On a
+   * host where `localhost` resolves to `::1` first — Windows does — the `nats`
+   * client attempts IPv6 and stalls for ~27 SECONDS before falling back, and
+   * its own `timeout` option does not bound that. Measured on this stack:
+   *
+   *     nats://localhost:4222  -> 27,223ms
+   *     nats://127.0.0.1:4222  ->      2ms
+   *
+   * That single connect is what pushed this module's `beforeAll` hooks up
+   * against their 30s timeout, producing an intermittent "Hook timed out"
+   * failure that looks like a realtime bug and is not one. Addressing the
+   * loopback address removes the cause rather than raising the timeout to
+   * accommodate it. Production is unaffected: it reads NATS_URL from real
+   * configuration and never uses this fixture.
+   */
+  NATS_URL: 'nats://127.0.0.1:4222',
   REDIS_URL: 'redis://localhost:6379',
   S3_ENDPOINT: 'http://localhost:9000',
   S3_ACCESS_KEY: 'sentinel',
@@ -105,13 +123,66 @@ export async function makeOrgAndUser(prisma: PrismaService, label: string): Prom
   return { organisationId: organisation.id, userId: user.id };
 }
 
-/** Deletes everything `makeOrgAndUser` created for the given orgs (users first, then organisations, respecting FKs). */
+/** WP-17: one §62 role assignment for a fixture user. `siteId: null` is organisation-wide. */
+export interface TestRoleSpec {
+  readonly role: string;
+  readonly siteId: string | null;
+}
+
+/** WP-17: a site inside an existing fixture organisation, for site-scoped room tests. */
+export async function makeSite(prisma: PrismaService, organisationId: string, label: string): Promise<string> {
+  const site = await prisma.site.create({ data: { organisationId, name: `wp17-${label}-${randomUUID()}` } });
+  return site.id;
+}
+
+/** WP-17: a fixture user carrying real §62 role assignments, so Field room derivation is exercised against real rows. */
+export async function makeUserWithRoles(prisma: PrismaService, organisationId: string, label: string, roles: readonly TestRoleSpec[]): Promise<TestOrgUser> {
+  const suffix = `${label}-${randomUUID()}`;
+  const user = await prisma.user.create({
+    data: {
+      organisationId,
+      email: `${suffix}@example.invalid`,
+      displayName: `WP-17 ${label}`,
+      clearance: 5,
+      roles: { create: roles.map((spec) => ({ role: spec.role, siteId: spec.siteId })) },
+    },
+  });
+  return { organisationId, userId: user.id };
+}
+
+/**
+ * Deletes everything the fixture helpers created for the given orgs, in FK
+ * order: Field live state, then role assignments, then users, then zones, then
+ * sites, then organisations. (`UserRole` references both `User` and `Site`
+ * without a cascade — see prisma/schema/identity.prisma.)
+ *
+ * WP-17A: the two Field live-state tables now hold an `ON DELETE RESTRICT`
+ * composite foreign key to `sites`, so a site cannot be deleted while a Field
+ * assignment or current-state row still names it. No spec using this helper
+ * writes Field rows today, but this is a *shared* helper that deletes sites,
+ * and leaving the gap would turn the first spec that does into a confusing
+ * foreign-key error inside `afterAll` rather than an obvious test failure.
+ * Deleting them here is cheap and keeps the helper honest about its promise to
+ * remove everything for the given organisations.
+ *
+ * Deliberately NOT deleted here: Field history, idempotency, audit, and outbox
+ * rows. They carry no site foreign key by design (they are the record of what
+ * was known at the time), so they never block a site delete — and a shared test
+ * helper is not the place to establish habits about erasing audit history.
+ */
 export async function cleanupOrgsAndUsers(prisma: PrismaService, organisationIds: readonly string[]): Promise<void> {
   if (organisationIds.length === 0) {
     return;
   }
-  await prisma.user.deleteMany({ where: { organisationId: { in: [...organisationIds] } } });
-  await prisma.organisation.deleteMany({ where: { id: { in: [...organisationIds] } } });
+  const ids = [...organisationIds];
+  await prisma.fieldAssignmentActionIdempotency.deleteMany({ where: { assignment: { organisationId: { in: ids } } } });
+  await prisma.fieldAssignment.deleteMany({ where: { organisationId: { in: ids } } });
+  await prisma.fieldOperativeCurrentState.deleteMany({ where: { organisationId: { in: ids } } });
+  await prisma.userRole.deleteMany({ where: { user: { organisationId: { in: ids } } } });
+  await prisma.user.deleteMany({ where: { organisationId: { in: ids } } });
+  await prisma.zone.deleteMany({ where: { site: { organisationId: { in: ids } } } });
+  await prisma.site.deleteMany({ where: { organisationId: { in: ids } } });
+  await prisma.organisation.deleteMany({ where: { id: { in: ids } } });
 }
 
 /** Resolves with the next `event` emitted on `emitter`, or rejects if none arrives within `timeoutMs`. */
@@ -153,4 +224,42 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+/**
+ * Publishes `payload` on `subject` repeatedly until `awaited` settles.
+ *
+ * The bridge establishes its NATS subscriptions in the background from
+ * `onModuleInit`, so a single publish issued immediately after boot can race
+ * ahead of the subscription and be dropped by the server — NATS has no
+ * store-and-forward for plain subscriptions. This module previously papered
+ * over that with a fixed `sleep(700)` in `beforeAll`, which is a guess: too
+ * short on a loaded machine, and pure dead time otherwise.
+ *
+ * Republishing until the expectation resolves is the convergence form of the
+ * same intent, and it is safe for these specs: the waiter takes the FIRST
+ * matching event, and a duplicate delivery of an identical payload changes no
+ * assertion. Any negative assertion running alongside (`assertNoEvent` for
+ * another organisation) is strengthened, not weakened, by the extra publishes —
+ * more chances to leak, not fewer.
+ */
+export async function publishUntilReceived<T>(
+  nc: { publish: (subject: string, data: Uint8Array) => void },
+  subject: string,
+  data: Uint8Array,
+  awaited: Promise<T>,
+  intervalMs = 200,
+): Promise<T> {
+  let settled = false;
+  const tracked = awaited.finally(() => {
+    settled = true;
+  });
+
+  nc.publish(subject, data);
+  while (!settled) {
+    await sleep(intervalMs);
+    if (settled) break;
+    nc.publish(subject, data);
+  }
+  return tracked;
 }

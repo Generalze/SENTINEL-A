@@ -3,7 +3,7 @@ import type { AppConfigService } from '../../config/config.service';
 import type { PrismaService } from '../../prisma/prisma.service';
 import { PresenceService } from './presence.service';
 import { RealtimeGateway } from './realtime.gateway';
-import { orgRoom, WS_EVENT_PRESENCE_CHANGED } from './realtime.constants';
+import { fieldOrgWideRoom, fieldSiteRoom, orgRoom, WS_EVENT_PRESENCE_CHANGED } from './realtime.constants';
 
 function fakeConfig(devAuthEnabled: boolean): AppConfigService {
   return { values: { DEV_AUTH_ENABLED: devAuthEnabled } } as unknown as AppConfigService;
@@ -91,7 +91,7 @@ describe('RealtimeGateway — handshake auth (deliverable #2, auth boundary)', (
 
   it('accepts a known user id via handshake.auth.userId and attaches the principal to socket.data', async () => {
     const gateway = new RealtimeGateway(
-      fakePrisma({ id: 'user_1', organisationId: 'org_1', roles: [{ role: 'operator' }] }),
+      fakePrisma({ id: 'user_1', organisationId: 'org_1', roles: [{ role: 'operator', siteId: null }] }),
       fakeConfig(true),
       fakePresence(),
     );
@@ -100,7 +100,7 @@ describe('RealtimeGateway — handshake auth (deliverable #2, auth boundary)', (
     const error = await runHandshakeMiddleware(gateway, socket);
 
     expect(error).toBeUndefined();
-    expect(socket.data.principal).toEqual({ user_id: 'user_1', organisation_id: 'org_1', roles: ['operator'] });
+    expect(socket.data.principal).toEqual({ user_id: 'user_1', organisation_id: 'org_1', roles: [{ role: 'operator', site_id: null }] });
   });
 
   it('falls back to the x-dev-user-id header when handshake.auth.userId is absent', async () => {
@@ -133,8 +133,49 @@ describe('RealtimeGateway — room selection and presence broadcast (deliverable
 
     await gateway.handleConnection(socket as never);
 
+    // No Field-granting role, so no Field room: the org room is the only entry.
+    // One join call, always — every await before `recordConnect` delays the
+    // point at which the socket becomes visible to the presence endpoint.
     expect(socket.join).toHaveBeenCalledTimes(1);
-    expect(socket.join).toHaveBeenCalledWith(orgRoom('org_1'));
+    expect(socket.join).toHaveBeenCalledWith([orgRoom('org_1')]);
+  });
+
+  it('additionally joins the Field site room for a site-scoped operative (WP-17/D1)', async () => {
+    const gateway = new RealtimeGateway(fakePrisma(null), fakeConfig(true), fakePresence());
+    gateway.server = { to: vi.fn().mockReturnValue({ emit: vi.fn() }), use: vi.fn() } as never;
+
+    const socket = fakeSocket();
+    socket.data.principal = { user_id: 'user_1', organisation_id: 'org_1', roles: [{ role: 'field.operative', site_id: 'site_a' }] };
+
+    await gateway.handleConnection(socket as never);
+
+    expect(socket.join).toHaveBeenCalledTimes(1);
+    expect(socket.join).toHaveBeenCalledWith([orgRoom('org_1'), fieldSiteRoom('org_1', 'site_a')]);
+  });
+
+  it('joins the org-wide Field room for an organisation-wide dispatcher, and no site room (WP-17/D1)', async () => {
+    const gateway = new RealtimeGateway(fakePrisma(null), fakeConfig(true), fakePresence());
+    gateway.server = { to: vi.fn().mockReturnValue({ emit: vi.fn() }), use: vi.fn() } as never;
+
+    const socket = fakeSocket();
+    socket.data.principal = { user_id: 'user_1', organisation_id: 'org_1', roles: [{ role: 'dispatcher', site_id: null }] };
+
+    await gateway.handleConnection(socket as never);
+
+    expect(socket.join).toHaveBeenCalledWith([orgRoom('org_1'), fieldOrgWideRoom('org_1')]);
+  });
+
+  it('joins no Field room for a principal whose roles grant no Field action (WP-17/AC3)', async () => {
+    const gateway = new RealtimeGateway(fakePrisma(null), fakeConfig(true), fakePresence());
+    gateway.server = { to: vi.fn().mockReturnValue({ emit: vi.fn() }), use: vi.fn() } as never;
+
+    const socket = fakeSocket();
+    socket.data.principal = { user_id: 'user_1', organisation_id: 'org_1', roles: [{ role: 'evidence.custodian', site_id: 'site_a' }] };
+
+    await gateway.handleConnection(socket as never);
+
+    expect(socket.join).toHaveBeenCalledTimes(1);
+    expect(socket.join).toHaveBeenCalledWith([orgRoom('org_1')]);
   });
 
   it('disconnects a socket that somehow reaches handleConnection with no principal (defence in depth)', async () => {
@@ -234,5 +275,34 @@ describe('RealtimeGateway#broadcastToOrg', () => {
     expect(to).toHaveBeenCalledTimes(1);
     expect(to).toHaveBeenCalledWith('org:org_42');
     expect(emit).toHaveBeenCalledWith('incident.updated', { id: 'inc_1' });
+  });
+});
+
+describe('RealtimeGateway#broadcastToRooms (WP-17/D2)', () => {
+  it('emits once to exactly the given room set', () => {
+    const gateway = new RealtimeGateway(fakePrisma(null), fakeConfig(true), fakePresence());
+    const emit = vi.fn();
+    const to = vi.fn().mockReturnValue({ emit });
+    gateway.server = { to, use: vi.fn() } as never;
+
+    const rooms = [fieldSiteRoom('org_42', 'site_a'), fieldOrgWideRoom('org_42')];
+    gateway.broadcastToRooms(rooms, 'field.updated', { kind: 'FIELD_ASSIGNMENT_CREATED' });
+
+    expect(to).toHaveBeenCalledTimes(1);
+    expect(to).toHaveBeenCalledWith(rooms);
+    expect(emit).toHaveBeenCalledTimes(1);
+    expect(emit).toHaveBeenCalledWith('field.updated', { kind: 'FIELD_ASSIGNMENT_CREATED' });
+  });
+
+  it('is a no-op for an empty room set, and never throws before the server is initialised', () => {
+    const gateway = new RealtimeGateway(fakePrisma(null), fakeConfig(true), fakePresence());
+    const to = vi.fn();
+    gateway.server = { to, use: vi.fn() } as never;
+
+    gateway.broadcastToRooms([], 'field.updated', { kind: 'x' });
+    expect(to).not.toHaveBeenCalled();
+
+    const uninitialised = new RealtimeGateway(fakePrisma(null), fakeConfig(true), fakePresence());
+    expect(() => uninitialised.broadcastToRooms([fieldOrgWideRoom('org_1')], 'field.updated', { kind: 'x' })).not.toThrow();
   });
 });

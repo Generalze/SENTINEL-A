@@ -53,6 +53,12 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Build contracts prerequisite
+        run: pnpm --filter @sentinel/contracts build
+
+      - name: Generate Prisma client prerequisite
+        run: pnpm --filter @sentinel/core-api exec prisma generate --schema prisma/schema
+
       - name: Typecheck
         run: pnpm -r typecheck
 

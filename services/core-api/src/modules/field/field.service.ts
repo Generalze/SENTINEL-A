@@ -1,14 +1,23 @@
 import { BadRequestException, ConflictException, ForbiddenException, Inject, Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { z } from 'zod';
+import { isSafeSubjectToken, SUBJECT_TOKEN_RULE } from '../../common/messaging/subject-token';
 import type { Principal } from '../../common/security/principal';
 import type { SiteScope } from '../identity/list-pagination';
 import { mapFieldAssignment, mapFieldState } from './field.mapper';
 import { FieldRepository, type TransitionResult } from './field.repository';
 import type { FieldAssignmentAction, FieldAssignmentView, FieldOperativeStateView } from './field.types';
 
+/**
+ * WP-17/D3: every Field mutation names the site it writes to, and that site id
+ * becomes a NATS subject token on the delivery path. Reject an unsafe id here,
+ * at the API boundary, so it is never persisted — the publisher's identical
+ * check is then an unreachable backstop rather than the only guard.
+ */
+const subjectSafeSiteId = z.string().min(1).refine(isSafeSubjectToken, { message: `site_id ${SUBJECT_TOKEN_RULE}` });
+
 const CreateAssignmentInputSchema = z.object({
-  site_id: z.string().min(1),
+  site_id: subjectSafeSiteId,
   incident_id: z.string().uuid().nullable().optional(),
   assignee_user_id: z.string().min(1),
   assignment_type: z.string().min(1).max(128),
@@ -26,7 +35,7 @@ const AssignmentActionInputSchema = z.object({
 export type AssignmentActionInput = z.infer<typeof AssignmentActionInputSchema>;
 
 const StateUpdateInputSchema = z.object({
-  site_id: z.string().min(1),
+  site_id: subjectSafeSiteId,
   device_id: z.string().min(1).max(256),
   state: z.enum(['AVAILABLE', 'PATROL', 'OBSERVING', 'RESPONDING', 'ON_SCENE', 'NEED_SUPPORT', 'COMPROMISED', 'OFF_DUTY']),
   location: z.record(z.unknown()).nullable().optional(),
@@ -71,8 +80,21 @@ export class FieldService {
     return parseOrBadRequest(StateUpdateInputSchema, raw);
   }
 
+  /**
+   * WP-17A/C7-07: the site a Field write names must exist in the caller's own
+   * organisation. A nonexistent site and another tenant's real site produce the
+   * identical 404 — the caller must not be able to use this endpoint to learn
+   * that some id is a real site somewhere else in the platform.
+   */
+  private async assertSiteInOrganisation(organisationId: string, siteId: string): Promise<void> {
+    if (!(await this.repository.siteExistsInOrganisation(organisationId, siteId))) {
+      throw new NotFoundException('Site not found');
+    }
+  }
+
   async createAssignment(principal: Principal, siteScope: SiteScope, input: CreateAssignmentInput): Promise<FieldAssignmentView> {
     if (!siteAllowed(siteScope, input.site_id)) throw new ForbiddenException('Principal is not scoped to this site');
+    await this.assertSiteInOrganisation(principal.organisation_id, input.site_id);
     if (!(await this.repository.assigneeCanReceive(principal.organisation_id, input.site_id, input.assignee_user_id))) {
       throw new BadRequestException('Assignee is not a field operative at this site');
     }
@@ -99,6 +121,35 @@ export class FieldService {
     return rows.map(mapFieldAssignment);
   }
 
+  /**
+   * WP-17/D5: the refetch path for an operative. A socket only signals that
+   * something in scope changed; the authoritative record is read here, where
+   * organisation, site, and assignee are all re-checked server-side.
+   */
+  async listOwnAssignments(principal: Principal, siteScope: SiteScope): Promise<FieldAssignmentView[]> {
+    const rows = await this.repository.listAssignments(principal.organisation_id, siteScope, principal.user.id);
+    return rows.map(mapFieldAssignment);
+  }
+
+  /**
+   * WP-17/D5: one own assignment. A non-assignee gets 404 rather than 403 —
+   * the same "never reveal existence" rule the AccessGuard applies to a
+   * cross-organisation match, since the assignee set of an assignment is
+   * itself need-to-know.
+   */
+  async getOwnAssignment(principal: Principal, siteScope: SiteScope, assignmentId: string): Promise<FieldAssignmentView> {
+    const row = await this.repository.getAssignment(principal.organisation_id, assignmentId, siteScope);
+    if (!row || row.assigneeUserId !== principal.user.id) throw new NotFoundException('Assignment not found');
+    return mapFieldAssignment(row);
+  }
+
+  /** WP-17/D5: one assignment for a dispatcher/commander, org- and site-scoped. */
+  async getAssignment(principal: Principal, siteScope: SiteScope, assignmentId: string): Promise<FieldAssignmentView> {
+    const row = await this.repository.getAssignment(principal.organisation_id, assignmentId, siteScope);
+    if (!row) throw new NotFoundException('Assignment not found');
+    return mapFieldAssignment(row);
+  }
+
   async transitionAssignment(
     principal: Principal,
     siteScope: SiteScope,
@@ -122,6 +173,7 @@ export class FieldService {
 
   async recordState(principal: Principal, siteScope: SiteScope, input: StateUpdateInput): Promise<FieldOperativeStateView> {
     if (!siteAllowed(siteScope, input.site_id)) throw new ForbiddenException('Principal is not scoped to this site');
+    await this.assertSiteInOrganisation(principal.organisation_id, input.site_id);
     const sourceAt = new Date(input.source_at);
     const receivedAt = new Date();
     const authoritativeFreshnessMs = Math.max(0, receivedAt.getTime() - sourceAt.getTime());

@@ -2,6 +2,7 @@ import type { NormalisedEvent } from '@sentinel/contracts';
 import { JSONCodec } from 'nats';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { NatsProvider } from '../../infra/nats.provider';
+import { EventsPublisherService } from '../events/events-publisher.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { FUSION_DURABLE_NAME } from './fusion.constants';
 import { FusionConsumerService } from './fusion-consumer.service';
@@ -32,6 +33,7 @@ describe('Fusion durable consumer (live stack)', () => {
   const appConfig = makeAppConfig();
   const prisma = new PrismaService(appConfig);
   const nats = new NatsProvider(appConfig);
+  const eventsPublisher = new EventsPublisherService(nats);
   const repository = new FusionRepository(prisma);
   const publisher = new FusionPublisherService(nats);
   const service = new FusionService(repository, publisher);
@@ -62,6 +64,12 @@ describe('Fusion durable consumer (live stack)', () => {
 
   beforeAll(async () => {
     await prisma.$connect();
+
+    // SENTINEL_EVENTS is owned by the Events module. This integration spec
+    // invokes that owner's normal idempotent bootstrap rather than relying
+    // on prior test execution or persistent local JetStream state.
+    await eventsPublisher.onModuleInit();
+
     await consumer.start({ durableName, deliverNewOnly: true });
   }, 60_000);
 

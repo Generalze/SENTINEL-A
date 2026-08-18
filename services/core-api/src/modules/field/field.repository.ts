@@ -71,6 +71,22 @@ export type TransitionResult =
 export class FieldRepository {
   constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
 
+  /**
+   * WP-17A: the site must exist AND belong to the caller's organisation.
+   *
+   * Deliberately one query answering one question, so "no such site" and
+   * "a real site in another tenant" are indistinguishable to the caller — the
+   * service turns both into the same 404. The composite foreign key added in
+   * `20260817210000_wp17a_field_site_integrity` enforces the same invariant at
+   * the database, but this runs first: a Field mutation must be refused before
+   * the transaction that would write the live row, the history row, the audit
+   * row and the outbox row, not by catching a constraint error afterwards.
+   */
+  async siteExistsInOrganisation(organisationId: string, siteId: string): Promise<boolean> {
+    const site = await this.prisma.site.findFirst({ where: { id: siteId, organisationId }, select: { id: true } });
+    return site !== null;
+  }
+
   async assigneeCanReceive(organisationId: string, siteId: string, userId: string): Promise<boolean> {
     const user = await this.prisma.user.findFirst({
       where: { id: userId, organisationId, roles: { some: { role: 'field.operative', siteId } } },
@@ -271,20 +287,25 @@ export class FieldRepository {
           payload: { user_id: input.actorUserId, state: input.state, source_at: input.sourceAt.toISOString(), received_at: input.receivedAt.toISOString() },
         },
       });
+      // WP-17/D4: the wire carries a signal, not the domain record. The
+      // operative's `state` (COMPROMISED, NEED_SUPPORT, ...) stays out of the
+      // outbox payload and is read over REST behind `field.state.read`; the
+      // audit row above keeps the full detail.
       await tx.fieldOutbox.create({
         data: {
           organisationId: input.organisationId,
           siteId: input.siteId,
-          payload: { kind: 'FIELD_STATE_UPDATED', user_id: input.actorUserId, state: input.state, organisation_id: input.organisationId, site_id: input.siteId },
+          payload: { kind: 'FIELD_STATE_UPDATED', user_id: input.actorUserId, organisation_id: input.organisationId, site_id: input.siteId },
         },
       });
       return { state: current, created: true };
     });
   }
 
-  async listAssignments(organisationId: string, siteScope: SiteScope): Promise<FieldAssignment[]> {
+  /** `assigneeUserId` narrows the read to one operative's own assignments (WP-17/D5). */
+  async listAssignments(organisationId: string, siteScope: SiteScope, assigneeUserId?: string): Promise<FieldAssignment[]> {
     return this.prisma.fieldAssignment.findMany({
-      where: { organisationId, ...siteScopeWhere(siteScope) },
+      where: { organisationId, ...siteScopeWhere(siteScope), ...(assigneeUserId === undefined ? {} : { assigneeUserId }) },
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: 200,
     });

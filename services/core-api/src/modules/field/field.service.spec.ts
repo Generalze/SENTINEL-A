@@ -1,4 +1,4 @@
-import { BadRequestException, ConflictException, ForbiddenException } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { buildPrincipal, type Principal } from '../../common/security/principal';
 import type { FieldRepository } from './field.repository';
@@ -59,6 +59,7 @@ function assignmentRow(overrides: Record<string, unknown> = {}) {
 
 function repositoryDouble(overrides: Partial<FieldRepository> = {}): FieldRepository {
   return {
+    siteExistsInOrganisation: vi.fn().mockResolvedValue(true),
     assigneeCanReceive: vi.fn().mockResolvedValue(true),
     incidentExists: vi.fn().mockResolvedValue(true),
     createAssignment: vi.fn().mockResolvedValue({ assignment: assignmentRow(), created: true }),
@@ -118,6 +119,33 @@ describe('FieldService', () => {
     await expect(service.createAssignment(principal(), siteScope, assignment({ site_id: 'site-2' }))).rejects.toBeInstanceOf(ForbiddenException);
   });
 
+  it('WP-17A: refuses a Field write naming a site that is not in the caller organisation, before any mutation', async () => {
+    // One repository answer covers both "no such site" and "a real site in
+    // another tenant" — the service must not distinguish them.
+    const repository = repositoryDouble({ siteExistsInOrganisation: vi.fn().mockResolvedValue(false) } as Partial<FieldRepository>);
+    const service = new FieldService(repository);
+
+    await expect(service.createAssignment(principal(), siteScope, assignment())).rejects.toBeInstanceOf(NotFoundException);
+    await expect(
+      service.recordState(principal('user-field', 'field.operative'), siteScope, {
+        site_id: 'site-1',
+        device_id: 'device-1',
+        state: 'RESPONDING',
+        location: null,
+        source_at: '2026-08-16T09:59:30.000Z',
+        freshness_ms: 0,
+        idempotency_key: 'state-1',
+        trace_id: 'trace-state',
+      }),
+    ).rejects.toBeInstanceOf(NotFoundException);
+
+    expect(repository.siteExistsInOrganisation).toHaveBeenCalledWith('org-1', 'site-1');
+    // Checked before the transactional write, not after a constraint error.
+    expect(repository.createAssignment).not.toHaveBeenCalled();
+    expect(repository.recordState).not.toHaveBeenCalled();
+    expect(repository.assigneeCanReceive).not.toHaveBeenCalled();
+  });
+
   it('rejects assignment creation for a non-field assignee at the site', async () => {
     const repository = repositoryDouble({ assigneeCanReceive: vi.fn().mockResolvedValue(false) } as Partial<FieldRepository>);
     const service = new FieldService(repository);
@@ -147,6 +175,57 @@ describe('FieldService', () => {
         idempotency_key: 'start-1',
       }),
     ).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it('rejects a site_id that is not a safe NATS subject token before any repository call (WP-17/D3)', () => {
+    const repository = repositoryDouble();
+    const service = new FieldService(repository);
+
+    for (const unsafe of ['site.a1', 'site-a1.>', 'site *', '']) {
+      expect(() => service.parseCreateAssignment(assignment({ site_id: unsafe }))).toThrow(BadRequestException);
+      expect(() =>
+        service.parseStateUpdate({
+          site_id: unsafe,
+          device_id: 'device-1',
+          state: 'RESPONDING',
+          location: null,
+          source_at: '2026-08-16T09:59:30.000Z',
+          freshness_ms: 0,
+          idempotency_key: 'state-1',
+          trace_id: 'trace-state',
+        }),
+      ).toThrow(BadRequestException);
+    }
+
+    expect(repository.createAssignment).not.toHaveBeenCalled();
+    expect(repository.recordState).not.toHaveBeenCalled();
+  });
+
+  it('lists only the caller own assignments for the operative refetch route (WP-17/D5)', async () => {
+    const repository = repositoryDouble();
+    const service = new FieldService(repository);
+
+    await service.listOwnAssignments(principal('user-field', 'field.operative'), siteScope);
+
+    expect(repository.listAssignments).toHaveBeenCalledWith('org-1', siteScope, 'user-field');
+  });
+
+  it('hides another operative assignment behind 404 rather than 403 (WP-17/D5)', async () => {
+    const repository = repositoryDouble({
+      getAssignment: vi.fn().mockResolvedValue(assignmentRow({ assigneeUserId: 'someone-else' })),
+    } as Partial<FieldRepository>);
+    const service = new FieldService(repository);
+
+    await expect(service.getOwnAssignment(principal('user-field', 'field.operative'), siteScope, assignmentRow().id)).rejects.toBeInstanceOf(NotFoundException);
+  });
+
+  it('returns the caller own assignment when they are the assignee', async () => {
+    const repository = repositoryDouble({ getAssignment: vi.fn().mockResolvedValue(assignmentRow()) } as Partial<FieldRepository>);
+    const service = new FieldService(repository);
+
+    const result = await service.getOwnAssignment(principal('user-field', 'field.operative'), siteScope, assignmentRow().id);
+
+    expect(result.assignee_user_id).toBe('user-field');
   });
 
   it('computes authoritative freshness server-side and preserves client freshness as telemetry', async () => {

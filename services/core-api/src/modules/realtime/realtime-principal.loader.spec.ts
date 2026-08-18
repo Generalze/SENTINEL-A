@@ -28,10 +28,15 @@ describe('loadRealtimePrincipal', () => {
 
     const result = await loadRealtimePrincipal(fakePrisma(findUnique), 'user_1');
 
+    // WP-17/D1: site_id is carried through, not discarded — Field room
+    // membership is derived from it.
     expect(result).toEqual({
       user_id: 'user_1',
       organisation_id: 'org_1',
-      roles: ['operator', 'dispatcher'],
+      roles: [
+        { role: 'operator', site_id: null },
+        { role: 'dispatcher', site_id: 'site_1' },
+      ],
     });
   });
 

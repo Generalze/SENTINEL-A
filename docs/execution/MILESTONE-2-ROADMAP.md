@@ -84,6 +84,46 @@ realtime, and test foundation that a mobile app can safely depend on.
 5. **Wave 10:** WP-21 Whisper foundation gate.
 6. **Wave 11:** WP-22 live regression, sign-off, and tag.
 
+## Execution Progress
+
+Kept current so a resumed session can see where work stopped without reading
+the whole log.
+
+| WP | State | Landed in |
+|---|---|---|
+| WP-15 / WP-15A | Done | `631fa8a`, `ff083cc` |
+| WP-16 | Done, with Wave-7 review findings closed by WP-17 | `bd6076e` |
+| WP-17 | Done — site-scoped Field delivery, need-to-know payloads, subject-token safety across every NATS builder, operative REST refetch, WP-16 AC7 API tests | this wave |
+| WP-17A | Implemented — final Wave-7 closure change for Field `site_id` referential integrity (C7-07) | `wp-17a-field-site-integrity` |
+| WP-18 .. WP-22 | Not started | — |
+
+**Wave-7 closure rule.** WP-17 is merged and accepted. WP-17A is the final
+Wave-7 hardening change. Presence of WP-17A on `main` closes C7-07 and completes
+Wave 7.
+
+Site referential integrity is foundational to both of the next domains —
+incident messaging and patrol persistence must not inherit the ability to write
+authoritative Field history against fictional sites.
+
+**Next:** after WP-17A is present on `main`, Wave 8 begins with WP-18 incident
+field messaging, followed by WP-19 patrol foundation.
+
+Wave-7 review findings, the delivery-semantics ruling, and the remaining
+accepted limitations are in
+[`security/WAVE-7-FINDINGS.md`](security/WAVE-7-FINDINGS.md). Two items there
+are binding on later work:
+
+- **WP-18 must not inherit WP-17's site-room need-to-know boundary.** Incident
+  messages have named recipients and an incident purpose, so visibility must be
+  narrower than site membership, and message content must not ride the socket.
+  The required scope chain is written out in the findings register.
+- **WP-19 checkpoint verification follows the Field-state precedent.** The
+  client supplies checkpoint, source time, method, and device evidence; the
+  server determines tenant/site validity, route membership, checkpoint
+  ordering, device/actor authority, authoritative receipt time, replay and
+  idempotency, missed/late state, and the audit and timeline effects. Client
+  time and client freshness stay telemetry.
+
 ## Risk Register
 
 | Risk | Control |
