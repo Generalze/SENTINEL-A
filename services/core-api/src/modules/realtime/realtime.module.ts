@@ -11,5 +11,8 @@ import { RealtimeGateway } from './realtime.gateway';
   imports: [PrismaModule, InfraModule],
   controllers: [PresenceController],
   providers: [RealtimeGateway, RealtimeNatsBridgeService, PresenceService, PresenceRedisClient],
+  // WP-18: field-messaging owns its own delivery semantics but needs the one
+  // socket server to obtain transport evidence.
+  exports: [RealtimeGateway],
 })
 export class RealtimeModule {}
