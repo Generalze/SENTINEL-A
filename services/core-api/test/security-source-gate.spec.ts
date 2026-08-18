@@ -41,6 +41,25 @@ function locateGate(): string {
 
 const GATE = locateGate();
 
+/**
+ * Resolves bash absolutely where possible.
+ *
+ * The scanner-unavailable test removes PATH entries that provide `rg`, and on
+ * Linux `rg` and `bash` share /usr/bin — so relying on PATH to find bash made
+ * that test measure a spawn failure instead of the gate's exit code. Calling
+ * bash by absolute path keeps the PATH edit meaning only "the scanner is
+ * missing". Falls back to PATH lookup on platforms where these paths do not
+ * exist (Git Bash on Windows).
+ */
+function resolveBash(): string {
+  for (const candidate of ['/bin/bash', '/usr/bin/bash']) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return 'bash';
+}
+
+const BASH = resolveBash();
+
 /** The deferred-work marker the gate rejects, assembled so it is not a literal here. */
 const DEFERRED_MARKER = ['TO', 'DO'].join('');
 /** The type-suppression directive the gate rejects, likewise assembled. */
@@ -55,7 +74,7 @@ interface GateResult {
 
 function runGate(root: string, env: Record<string, string | undefined> = process.env): GateResult {
   try {
-    const stdout = execFileSync('bash', [GATE, root], { encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'] });
+    const stdout = execFileSync(BASH, [GATE, root], { encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'] });
     return { status: 0, output: stdout };
   } catch (error) {
     const failure = error as { status?: number; stdout?: string; stderr?: string };
