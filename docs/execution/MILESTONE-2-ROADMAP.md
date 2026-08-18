@@ -93,20 +93,32 @@ the whole log.
 |---|---|---|
 | WP-15 / WP-15A | Done | `631fa8a`, `ff083cc` |
 | WP-16 | Done, with Wave-7 review findings closed by WP-17 | `bd6076e` |
-| WP-17 | Done — site-scoped Field delivery, need-to-know payloads, subject-token safety across every NATS builder, operative REST refetch, WP-16 AC7 API tests | this wave |
-| WP-17A | Implemented — final Wave-7 closure change for Field `site_id` referential integrity (C7-07) | `wp-17a-field-site-integrity` |
-| WP-18 .. WP-22 | Not started | — |
+| WP-17 | Done — site-scoped Field delivery, need-to-know payloads, subject-token safety across every NATS builder, operative REST refetch, WP-16 AC7 API tests | merged `83a5d7d` |
+| WP-17A | Done — Field `site_id` referential integrity, closing Wave-7 finding C7-07 | merged `5f01b15` |
+| WP-18 | Done — incident field messaging: named-recipient entitlement, commander oversight as its own action, immutable recipients, tuple-bound persistence, transport-evidence delivery | merged `5868bf7` |
+| WP-19 | Directive and execution contract written; **implementation HOLD** pending the lead's ruling on the open scheduling question | branch `docs/wp-19-directive` |
+| WP-20 .. WP-22 | Not started | — |
 
-**Wave-7 closure rule.** WP-17 is merged and accepted. WP-17A is the final
-Wave-7 hardening change. Presence of WP-17A on `main` closes C7-07 and completes
-Wave 7.
+**Wave 7 is closed.** WP-17 and WP-17A are both on `main`; C7-07 is closed.
 
-Site referential integrity is foundational to both of the next domains —
-incident messaging and patrol persistence must not inherit the ability to write
-authoritative Field history against fictional sites.
+**Wave 8 is open.** WP-18 is the first half and has landed. WP-19 patrol
+foundation closes it.
 
-**Next:** after WP-17A is present on `main`, Wave 8 begins with WP-18 incident
-field messaging, followed by WP-19 patrol foundation.
+**Next:** WP-19 implementation, once the lead locks the patrol-execution and
+missed/late contract. See
+[`directives/WP-19-patrol-foundation.md`](directives/WP-19-patrol-foundation.md),
+which resolves the execution-anchor gap and leaves exactly one question open:
+whether per-checkpoint durations come from a route-level cadence (a WP-15
+contract change) or a run-level schedule supplied at scheduling time.
+
+### CI contract
+
+The hosted security source gate was a false green for the whole life of the
+pipeline: `ripgrep` is absent from the runner image, and the inline step read
+its exit 127 as "no matches". Repaired in `a761763` — the scanner is installed
+explicitly, exit statuses are interpreted, every canonical root is required, and
+the gate has eight regressions of its own. Any green build before that commit
+asserted a source scan that did not happen.
 
 Wave-7 review findings, the delivery-semantics ruling, and the remaining
 accepted limitations are in
