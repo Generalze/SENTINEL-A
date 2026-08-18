@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { canTransition } from '@sentinel/contracts';
 import type { INestApplication } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { io, type Socket as ClientSocket } from 'socket.io-client';
@@ -7,6 +8,7 @@ import { AppModule } from '../../app.module';
 import { PrismaService } from '../../prisma/prisma.service';
 import { WS_EVENT_FIELD_MESSAGE_UPDATED, WS_PATH } from '../realtime/realtime.constants';
 import { FieldMessagingOutboxPublisher } from './field-messaging-outbox.publisher';
+import { FieldMessagingRepository } from './field-messaging.repository';
 
 /**
  * WP-18/C8-01 delivery evidence, end to end on the live stack.
@@ -36,6 +38,8 @@ const fx = {
   commander: `${tag}_commander`,
   recipient: `${tag}_recipient`,
   silentRecipient: `${tag}_silent`,
+  multiRecipient: `${tag}_multi`,
+  bystander: `${tag}_bystander`,
   incident: randomUUID(),
 };
 
@@ -61,6 +65,7 @@ describe('WP-18 realtime delivery evidence (live stack, C8-01)', () => {
   let base: string;
   let prisma: PrismaService;
   let publisher: FieldMessagingOutboxPublisher;
+  let repository: FieldMessagingRepository;
   const openSockets: ClientSocket[] = [];
 
   const post = (path: string, userId: string, body: unknown) =>
@@ -89,10 +94,11 @@ describe('WP-18 realtime delivery evidence (live stack, C8-01)', () => {
     base = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`;
     prisma = app.get(PrismaService);
     publisher = app.get(FieldMessagingOutboxPublisher);
+    repository = app.get(FieldMessagingRepository);
 
     await prisma.organisation.create({ data: { id: fx.org, name: 'WP-18 RT' } });
     await prisma.site.create({ data: { id: fx.site, organisationId: fx.org, name: 'RT site' } });
-    for (const [id, role] of [[fx.commander, 'site.commander'], [fx.recipient, 'dispatcher'], [fx.silentRecipient, 'dispatcher']] as const) {
+    for (const [id, role] of [[fx.commander, 'site.commander'], [fx.recipient, 'dispatcher'], [fx.silentRecipient, 'dispatcher'], [fx.multiRecipient, 'dispatcher'], [fx.bystander, 'dispatcher']] as const) {
       await prisma.user.create({
         data: { id, organisationId: fx.org, email: `${id}@example.invalid`, displayName: id, clearance: 5, roles: { create: [{ role, siteId: fx.site }] } },
       });
@@ -207,5 +213,76 @@ describe('WP-18 realtime delivery evidence (live stack, C8-01)', () => {
     // The delivery timestamp keeps its own evidence, distinct from the ack.
     expect(acked.deliveredAt).not.toBeNull();
     expect(acked.acknowledgedAt).not.toBeNull();
+  }, 30_000);
+
+  // ------------------------------------------------------------- C8-04
+
+  it('C8-04: two sockets for the same recipient, only one acknowledges -> DELIVERED', async () => {
+    // The Crucible regression. A single room-wide broadcast ack expects EVERY
+    // targeted client to answer, so this exact shape previously reported
+    // failure and stranded the row at REQUESTED.
+    const acking = connectAs(fx.multiRecipient, true);
+    const silent = connectAs(fx.multiRecipient, false);
+    await Promise.all([waitForConnect(acking), waitForConnect(silent)]);
+
+    const messageId = await sendTo([fx.multiRecipient]);
+    await publisher.sweep();
+
+    const row = await eventually(() => stateOf(messageId, fx.multiRecipient), (r) => r.deliveryState === 'DELIVERED');
+    expect(row.deliveryState).toBe('DELIVERED');
+    expect(row.deliveredAt).not.toBeNull();
+  }, 30_000);
+
+  it('C8-04: two sockets for the same recipient, neither acknowledges -> REQUESTED', async () => {
+    const first = connectAs(fx.multiRecipient, false);
+    const second = connectAs(fx.multiRecipient, false);
+    await Promise.all([waitForConnect(first), waitForConnect(second)]);
+
+    const messageId = await sendTo([fx.multiRecipient]);
+    await publisher.sweep();
+    await sleep(3500);
+
+    const row = await stateOf(messageId, fx.multiRecipient);
+    expect(row.deliveryState).toBe('REQUESTED');
+    expect(row.deliveredAt).toBeNull();
+  }, 30_000);
+
+  it('C8-04: both sockets acknowledge -> exactly one effective REQUESTED->DELIVERED transition', async () => {
+    const a = connectAs(fx.multiRecipient, true);
+    const b = connectAs(fx.multiRecipient, true);
+    await Promise.all([waitForConnect(a), waitForConnect(b)]);
+
+    const messageId = await sendTo([fx.multiRecipient]);
+    await publisher.sweep();
+
+    const row = await eventually(() => stateOf(messageId, fx.multiRecipient), (r) => r.deliveryState === 'DELIVERED');
+    const firstDeliveredAt = row.deliveredAt;
+    expect(firstDeliveredAt).not.toBeNull();
+
+    // The conditional update is what makes racing evidence safe: a second
+    // attempt reports no effective transition and does not restamp the row.
+    // Uses the REAL section 76 predicate the consumer passes, and the row's own
+    // guard holds even against a permissive caller.
+    const realPredicate = (from: string): boolean => canTransition(from as Parameters<typeof canTransition>[0], 'DELIVERED');
+    expect(await repository.recordTransportDelivery(messageId, fx.multiRecipient, realPredicate)).toBe(false);
+    expect(await repository.recordTransportDelivery(messageId, fx.multiRecipient, () => true)).toBe(false);
+    const after = await stateOf(messageId, fx.multiRecipient);
+    expect(after.deliveryState).toBe('DELIVERED');
+    expect(after.deliveredAt?.toISOString()).toBe(firstDeliveredAt?.toISOString());
+  }, 30_000);
+
+  it("C8-04: another user's acknowledging socket cannot advance this recipient", async () => {
+    // A live, authenticated, freely-acknowledging socket belonging to someone
+    // else must not become evidence for the actual recipient.
+    const bystanderSocket = connectAs(fx.bystander, true);
+    await waitForConnect(bystanderSocket);
+
+    const messageId = await sendTo([fx.silentRecipient]);
+    await publisher.sweep();
+    await sleep(3000);
+
+    expect((await stateOf(messageId, fx.silentRecipient)).deliveryState).toBe('REQUESTED');
+    // ...and the bystander was never made a recipient of it.
+    expect(await prisma.incidentFieldMessageRecipient.count({ where: { messageId, recipientUserId: fx.bystander } })).toBe(0);
   }, 30_000);
 });

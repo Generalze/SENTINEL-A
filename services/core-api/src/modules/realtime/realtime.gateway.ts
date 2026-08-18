@@ -159,25 +159,55 @@ export class RealtimeGateway implements OnGatewayInit<RealtimeServer>, OnGateway
   }
 
   /**
-   * WP-18/C8-01: emits to one user's own room and waits for a socket-level
-   * acknowledgement from at least one of their connections.
+   * WP-18/C8-01 + C8-04: emits to one user's own connections and resolves true
+   * as soon as ANY ONE of them positively acknowledges.
    *
    * The returned boolean is the ONLY thing that may advance a recipient row to
    * DELIVERED. A NATS publish proves the internal bus accepted an event; this
-   * proves the recipient's transport did. Returns false when the user has no
-   * live socket, or none acknowledges within the timeout — in which case the
-   * row correctly stays REQUESTED.
+   * proves the recipient's transport did.
+   *
+   * C8-04 — why this is per socket rather than one room broadcast. A broadcast
+   * ack (`.to(room).timeout(...).emitWithAck(...)`) expects EVERY targeted
+   * client to answer and reports an error when any does not. A recipient with
+   * two devices where only one answers would therefore report failure, leaving
+   * the row at REQUESTED — a false negative that makes the Ledger's delivery
+   * truth wrong and can strand the recipient, since the REST acknowledgement
+   * requires DELIVERED first. The rule is one authenticated socket is
+   * sufficient evidence, so each socket is asked independently and the first
+   * positive answer wins.
+   *
+   * Every target is still server-derived: the socket set comes from
+   * `userRoom(organisation_id, user_id)` built from the authenticated
+   * principal, and each socket is addressed by its own server-known id. No
+   * client supplies a room or a socket id.
    */
   async emitToUserAwaitingReceipt(organisationId: string, userId: string, event: string, payload: unknown, timeoutMs = 2000): Promise<boolean> {
-    if (!this.server) {
+    const server = this.server;
+    if (!server) {
       this.logger.warn(`emitToUserAwaitingReceipt(${event}) dropped: socket.io server not yet initialised`);
       return false;
     }
+
+    const sockets = await server.in(userRoom(organisationId, userId)).fetchSockets();
+    if (sockets.length === 0) {
+      // No live transport. REQUESTED is the honest state.
+      return false;
+    }
+
+    const attempts = sockets.map(async (socket) => {
+      const responses = await server.to(socket.id).timeout(timeoutMs).emitWithAck(event, payload);
+      if (!Array.isArray(responses) || responses.length === 0) throw new Error('no acknowledgement');
+      return true;
+    });
+
     try {
-      const responses = await this.server.to(userRoom(organisationId, userId)).timeout(timeoutMs).emitWithAck(event, payload);
-      return Array.isArray(responses) && responses.length > 0;
+      // Any single positive acknowledgement is sufficient. Promise.any attaches
+      // a handler to every attempt, so slower or silent sockets rejecting after
+      // a winner is found cannot surface as unhandled rejections.
+      await Promise.any(attempts);
+      return true;
     } catch {
-      // socket.io rejects the ack promise when no socket answers in time.
+      // AggregateError: every socket timed out or errored.
       return false;
     }
   }

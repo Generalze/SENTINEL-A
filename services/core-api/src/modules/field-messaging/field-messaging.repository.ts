@@ -192,7 +192,12 @@ export class FieldMessagingRepository {
       where: { messageId, recipientUserId },
       select: { id: true, deliveryState: true },
     });
-    if (!recipient || !canAdvance(recipient.deliveryState)) return false;
+    if (!recipient) return false;
+    // C8-04: several sockets can race to supply the same evidence. Refuse a
+    // re-stamp locally rather than trusting the caller's predicate to encode
+    // it — the invariant belongs to the row, not to the call site.
+    if (recipient.deliveryState === 'DELIVERED') return false;
+    if (!canAdvance(recipient.deliveryState)) return false;
 
     const updated = await this.prisma.incidentFieldMessageRecipient.updateMany({
       where: { id: recipient.id, deliveryState: recipient.deliveryState },
