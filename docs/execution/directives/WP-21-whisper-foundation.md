@@ -316,6 +316,19 @@ rather than left to exhaust the stack. The context schema validates the **raw**
 input before zod rebuilds it, so an unrepresentable member is refused rather
 than quietly normalised.
 
+**C11-07 — Canonical arrays were still lossy.** The array branch traversed with
+`forEach` and returned before the descriptor checks the record branch applies.
+`forEach` skips holes, so `Array(1)` validated cleanly and then serialised to
+`[null]` — colliding with a genuine `[null]`. Two different structures sharing
+one digest is a security property here, not a cosmetic one: an activation
+approval attests to that digest, and server-owned context is compared through
+the same canonical form. Arrays are now validated as genuine dense JSON arrays
+through each index's own property **descriptor** — which proves the element
+exists, proves it is a plain data property, and never executes an accessor to
+find out. Holes, non-index named properties, symbol state, non-enumerable or
+accessor indices, and Array subclasses or re-prototyped arrays are all refused;
+ordinary nested arrays are untouched and array order remains significant.
+
 ## WP-21A deliverables (this checkpoint)
 
 - `packages/contracts/src/whisper.ts` — extended: JSON-safe context values and

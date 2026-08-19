@@ -764,3 +764,95 @@ describe('C11-06 canonicalisation admits only genuine JSON records', () => {
     expect(isCanonicalJsonRecord(accessor)).toBe(false);
   });
 });
+
+describe('C11-07 canonical arrays must be dense and unadorned', () => {
+  const signalFixture = {
+    schema_version: 1 as const, whisper_signal_id: 'whisper-1', organisation_id: 'org-1', site_id: 'site-1', name: 'Assistance',
+    signal_version: 1, status: 'DRAFT' as const, ...SIGNAL_CONFIG, created_at: at, updated_at: at, created_by_user_id: 'admin-1', trace_id: 'trace-1',
+  };
+  const fingerprintWith = (requirements: unknown): string =>
+    whisperConfigurationFingerprint({ ...SIGNAL_CONFIG, context_requirements: requirements as never });
+
+  it('A: a sparse array is refused and can never fingerprint as its [null] lookalike', () => {
+    // Array(1) and [null] are different structures that JSON.stringify renders
+    // identically, so accepting the hole would let two configurations share a
+    // digest that an activation approval attests to.
+    const sparse: unknown[] = Array(1);
+    expect(JSON.stringify(sparse)).toBe(JSON.stringify([null]));
+    expect(isCanonicalJsonRecord({ zones: sparse })).toBe(false);
+    expect(() => fingerprintWith({ zones: sparse })).toThrow(/sparse array hole/);
+    // The honest form still fingerprints, so the rule is not blanket refusal.
+    expect(fingerprintWith({ zones: [null] })).toMatch(/^[0-9a-f]{64}$/);
+    // A hole in a later position is caught too.
+    const trailing: unknown[] = [1, 2];
+    delete trailing[0];
+    expect(isCanonicalJsonRecord({ zones: trailing })).toBe(false);
+  });
+
+  it('B: a sparse server fact does not satisfy a requirement containing an explicit null', () => {
+    expect(evaluateWhisperContextRequirements({ zones: [null] }, { zones: Array(1) })).toEqual({ satisfied: false, unsatisfiedKeys: ['zones'] });
+  });
+
+  it('C: an array carrying an extra named property is refused', () => {
+    const adorned: unknown[] = [1];
+    (adorned as unknown as Record<string, unknown>).extra = 'lost-by-json';
+    expect(isCanonicalJsonRecord({ zones: adorned })).toBe(false);
+    expect(() => fingerprintWith({ zones: adorned })).toThrow(/no named properties/);
+  });
+
+  it('D: an array carrying symbol state is refused', () => {
+    const tagged: unknown[] = [1];
+    (tagged as unknown as Record<symbol, unknown>)[Symbol('hidden')] = 'x';
+    expect(isCanonicalJsonRecord({ zones: tagged })).toBe(false);
+  });
+
+  it('E: an accessor-backed index is refused WITHOUT its getter ever running', () => {
+    let invoked = false;
+    const accessorArray = Object.defineProperty([], '0', {
+      get: () => {
+        invoked = true;
+        return 1;
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    expect(isCanonicalJsonRecord({ zones: accessorArray })).toBe(false);
+    expect(() => fingerprintWith({ zones: accessorArray })).toThrow(/accessor index/);
+    // Validation must not be a side-effect trigger: a getter could observe,
+    // mutate or block, and it runs on server-owned context evaluation.
+    expect(invoked).toBe(false);
+  });
+
+  it('F: an Array subclass or re-prototyped array is refused', () => {
+    class Tagged extends Array {}
+    const subclass = new Tagged();
+    subclass.push(1);
+    expect(isCanonicalJsonRecord({ zones: subclass })).toBe(false);
+    expect(() => fingerprintWith({ zones: subclass })).toThrow(/non-standard prototype/);
+
+    const reprototyped: unknown[] = [1];
+    Object.setPrototypeOf(reprototyped, null);
+    expect(isCanonicalJsonRecord({ zones: reprototyped })).toBe(false);
+  });
+
+  it('G: ordinary dense nested arrays still parse, fingerprint and compare', () => {
+    const requirements = { zones: ['north', 'south'], matrix: [[1, 2], [3, null]], mixed: [{ a: 1 }, true, 'x'] };
+    expect(isCanonicalJsonRecord(requirements)).toBe(true);
+    expect(fingerprintWith(requirements)).toMatch(/^[0-9a-f]{64}$/);
+    expect(evaluateWhisperContextRequirements(requirements, { ...requirements })).toEqual({ satisfied: true });
+    // Order still matters inside an array — it is not a set.
+    expect(fingerprintWith({ zones: ['north', 'south'] })).not.toBe(fingerprintWith({ zones: ['south', 'north'] }));
+    expect(WhisperSignalSchema.parse({ ...signalFixture, context_requirements: requirements }).status).toBe('DRAFT');
+  });
+
+  it('H: the wire schema refuses malformed arrays before Zod can normalise them', () => {
+    const adorned: unknown[] = [1];
+    (adorned as unknown as Record<string, unknown>).extra = 'x';
+    class Tagged extends Array {}
+    const subclass = new Tagged();
+    subclass.push(1);
+    for (const malformed of [Array(1), adorned, subclass]) {
+      expect(() => WhisperSignalSchema.parse({ ...signalFixture, context_requirements: { zones: malformed } })).toThrow();
+    }
+  });
+});

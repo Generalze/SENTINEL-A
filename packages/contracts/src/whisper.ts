@@ -73,7 +73,7 @@ function assertJsonSafe(value: unknown, path: string, seen: Set<object> = new Se
       if (seen.has(object)) throw new TypeError(`${path} is not canonically representable: cyclic reference`);
       seen.add(object);
       if (Array.isArray(object)) {
-        object.forEach((entry, index) => assertJsonSafe(entry, `${path}[${index}]`, seen));
+        assertDenseJsonArray(object, path, seen);
         seen.delete(object);
         return;
       }
@@ -94,6 +94,51 @@ function assertJsonSafe(value: unknown, path: string, seen: Set<object> = new Se
     }
     default:
       throw new TypeError(`${path} is not canonically representable: ${typeof value}`);
+  }
+}
+
+/**
+ * C11-07: an array must be a GENUINE, DENSE JSON array.
+ *
+ * `forEach` was the wrong instrument: it silently skips holes, so `Array(1)`
+ * validated cleanly and then serialised to `[null]` — colliding with a real
+ * `[null]`, two different structures sharing one digest. Since an activation
+ * approval attests to a digest, and server-owned context is compared through
+ * the same canonical form, that collision is a security property, not a
+ * cosmetic one.
+ *
+ * Every index is therefore inspected through its own property DESCRIPTOR:
+ * that proves the element exists, proves it is a plain data property, and —
+ * importantly — never executes an accessor to find out. Anything JSON would
+ * quietly drop is refused instead: a hole, a non-index own property, symbol
+ * state, or an exotic prototype whose semantics are not an ordinary array's.
+ */
+function assertDenseJsonArray(value: readonly unknown[], path: string, seen: Set<object>): void {
+  if (Object.getPrototypeOf(value) !== Array.prototype) {
+    throw new TypeError(`${path} is not canonically representable: array with a non-standard prototype`);
+  }
+  if (Object.getOwnPropertySymbols(value).length > 0) {
+    throw new TypeError(`${path} is not canonically representable: symbol-keyed property on an array`);
+  }
+
+  const { length } = value;
+  for (const name of Object.getOwnPropertyNames(value)) {
+    if (name === 'length') continue;
+    // A canonical index is the exact decimal form of an integer below length.
+    const index = Number(name);
+    if (!Number.isInteger(index) || index < 0 || index >= length || String(index) !== name) {
+      throw new TypeError(`${path}.${name} is not canonically representable: JSON arrays carry no named properties`);
+    }
+  }
+
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, index);
+    // A hole. `JSON.stringify` renders it `null`, which is a DIFFERENT value.
+    if (descriptor === undefined) throw new TypeError(`${path}[${index}] is not canonically representable: sparse array hole`);
+    if (!descriptor.enumerable || typeof descriptor.get === 'function' || typeof descriptor.set === 'function') {
+      throw new TypeError(`${path}[${index}] is not canonically representable: non-enumerable or accessor index`);
+    }
+    assertJsonSafe(descriptor.value, `${path}[${index}]`, seen);
   }
 }
 
