@@ -48,6 +48,11 @@ model Site {
   patrolRoutes PatrolRoute[]
   patrolRuns PatrolRun[]
   fieldOfflineCursors FieldOfflineDeviceCursor[]
+  /// WP-21B back-relation. SITE-SCOPED versions only: a Whisper signal with a
+  /// NULL site_id is organisation-wide (W21-03/C11-02) and by construction
+  /// appears in no site's list, so this is never the set of signals
+  /// recognisable AT this site.
+  whisperSignalVersions WhisperSignalVersion[]
 
   @@unique([id, organisationId], map: "sites_id_organisation_key")
   @@index([organisationId])

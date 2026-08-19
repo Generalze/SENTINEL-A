@@ -32,6 +32,10 @@
  * | patrol.run.manage  | Schedule/cancel patrol runs; command abandonment    |
  * | patrol.run.act     | Start/abandon own assigned patrol run               |
  * | patrol.checkpoint.verify | Verify a checkpoint on own assigned run       |
+ * | whisper.signal.read | Read Whisper signal versions and lifecycle state    |
+ * | whisper.signal.manage | Create/edit a DRAFT signal version; advance lifecycle |
+ * | whisper.signal.approve | Approve activation of a tested signal version     |
+ * | whisper.device-action.invoke | Submit an OWN device-action recognition     |
  *
  * §62 role -> action table (source of truth for RBAC; site/clearance/
  * purpose are attribute-based constraints layered on top by AccessGuard,
@@ -77,6 +81,26 @@ export const ACTIONS = [
   'patrol.run.manage',
   'patrol.run.act',
   'patrol.checkpoint.verify',
+  // WP-21B/B11-02: a MECHANICAL transcription of PROPOSED_WHISPER_ROLE_ACTIONS
+  // in the frozen contract (packages/contracts/src/whisper.ts, W21-12), which
+  // stated the matrix as data precisely so this change would be a reviewable
+  // copy rather than a fresh judgement call.
+  //
+  // Four SEPARATE capabilities, because reading a signal roster, editing a
+  // configuration, approving an activation and firing the thing are four
+  // different powers.
+  //
+  // NO EXISTING ACTION IMPLIES ANY OF THEM. Not incident.view (six roles hold
+  // it), not incident.silent.approve, not field.acknowledge, and not admin's
+  // org/site/user.admin — platform administration is not authority over a
+  // silent duress channel. The WP-18 reasoning for
+  // incident.field-message.oversight.read applies with more force here: an
+  // authority that can raise a silent dispatch must be granted deliberately,
+  // never inherited as a side effect of holding something else.
+  'whisper.signal.read',
+  'whisper.signal.manage',
+  'whisper.signal.approve',
+  'whisper.device-action.invoke',
   'event.ingest',
   'event.read',
   'evidence.ingest',
@@ -107,10 +131,20 @@ export const ROLES = [
 export type Role = (typeof ROLES)[number];
 
 export const ROLE_ACTIONS: Readonly<Record<Role, readonly Action[]>> = {
-  'site.commander': ['incident.view', 'incident.close', 'incident.silent.approve', 'field.acknowledge', 'field.assignment.manage', 'field.state.read', 'evidence.read', 'event.read', 'hypothesis.read', 'field.message.send', 'field.message.read', 'field.message.acknowledge', 'incident.field-message.oversight.read', 'patrol.route.read', 'patrol.route.manage', 'patrol.run.read', 'patrol.run.manage'],
+  // WP-21B: site.commander holds manage AND approve because W21-12's
+  // separation is between distinct PEOPLE, not distinct roles — enforced by
+  // whisperActivationApproverIsDistinct, which refuses a creator approving
+  // their own version. Splitting the two across roles would have been a
+  // different (and unmandated) org design.
+  'site.commander': ['incident.view', 'incident.close', 'incident.silent.approve', 'field.acknowledge', 'field.assignment.manage', 'field.state.read', 'evidence.read', 'event.read', 'hypothesis.read', 'field.message.send', 'field.message.read', 'field.message.acknowledge', 'incident.field-message.oversight.read', 'patrol.route.read', 'patrol.route.manage', 'patrol.run.read', 'patrol.run.manage', 'whisper.signal.read', 'whisper.signal.manage', 'whisper.signal.approve'],
   operator: ['incident.view', 'presence.view', 'field.state.read', 'event.ingest', 'event.read', 'hypothesis.read'],
   dispatcher: ['incident.view', 'presence.view', 'field.assignment.manage', 'field.state.read', 'event.read', 'hypothesis.read', 'field.message.send', 'field.message.read', 'field.message.acknowledge', 'patrol.route.read', 'patrol.run.read', 'patrol.run.manage'],
-  'field.operative': ['field.acknowledge', 'field.assignment.act', 'field.state.write', 'incident.view', 'field.message.send', 'field.message.read', 'field.message.acknowledge', 'patrol.run.read', 'patrol.run.act', 'patrol.checkpoint.verify'],
+  // WP-21B: whisper.device-action.invoke is OWN-ONLY and is not a grant to
+  // fire anything. Every runtime entitlement check in
+  // evaluateWhisperRuntimeEligibility still applies on top of it (W21-04): the
+  // actor must be named on the exact active version AND hold current authority
+  // at that moment, on a TRUSTED device, within scope and freshness.
+  'field.operative': ['field.acknowledge', 'field.assignment.act', 'field.state.write', 'incident.view', 'field.message.send', 'field.message.read', 'field.message.acknowledge', 'patrol.run.read', 'patrol.run.act', 'patrol.checkpoint.verify', 'whisper.device-action.invoke'],
   investigator: ['evidence.read', 'evidence.verify', 'ledger.read', 'ledger.verify', 'incident.view', 'event.read', 'hypothesis.read'],
   'evidence.custodian': ['evidence.read', 'evidence.ingest', 'evidence.verify'],
   admin: ['org.admin', 'site.admin', 'user.admin', 'incident.view', 'constitution.policy.read', 'ledger.verify'],

@@ -64,9 +64,13 @@ async function seed(prisma: PrismaService): Promise<void> {
       },
     });
   }
+  // B11-13: an incident now states its ORIGIN. This fixture is Fusion-shaped,
+  // so source_ref IS the hypothesis id, exactly as the WP-21B migration
+  // backfills every pre-existing row.
+  const fixtureHypothesisId = randomUUID();
   await prisma.incident.create({
     data: {
-      id: fx.incidentA1, hypothesisId: randomUUID(), incidentCandidateId: randomUUID(),
+      id: fx.incidentA1, hypothesisId: fixtureHypothesisId, incidentCandidateId: randomUUID(), sourceKind: 'FUSION_HYPOTHESIS', sourceRef: fixtureHypothesisId,
       organisationId: fx.orgA, siteId: fx.siteA1, incidentType: 'wp19a.test', severity: 'SEV3',
       threatState: 2, confidence: 0.9, responseMode: 'STANDARD',
     },

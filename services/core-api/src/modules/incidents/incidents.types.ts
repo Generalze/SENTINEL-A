@@ -45,6 +45,29 @@ export interface IncidentTransitionInput {
   actorUserId: string | null;
 }
 
+/**
+ * B11-13/B11-14: the narrow internal seam a recognised Whisper device-action
+ * signal enters the incident domain through.
+ *
+ * WHAT IS ABSENT IS THE POINT. There is no hypothesis id and no candidate id,
+ * because a duress recognition is not a Fusion assessment and fabricating one
+ * would destroy the guarantee those columns exist to give. There is no
+ * severity, threat state, response mode, playbook or incident type either:
+ * every one of them is FIXED by the incidents domain for this source, so no
+ * caller — and no future caller — can steer a recognition into a different
+ * response posture. `confidence` is the only judgement that crosses, and it is
+ * the SIGNED figure from the trusted device (C11-04), which can only ever
+ * narrow what the runtime permits.
+ */
+export interface OpenWhisperSilentIncidentInput {
+  organisationId: string;
+  siteId: string;
+  /** The digest of the canonical signed statement; becomes `source_ref`. */
+  recognitionFingerprint: string;
+  confidence: number;
+  traceId: string;
+}
+
 export interface CreateIncidentInput {
   hypothesisId: string;
   incidentCandidateId: string;

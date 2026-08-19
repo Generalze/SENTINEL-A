@@ -4,9 +4,13 @@
 **Depends:** WP-15 Field Contracts, WP-16 Field Domain, WP-18 Incident Field Messaging, WP-20 Offline Operation Contracts
 **Review chain:** Adversarial review -> Lead merge gate
 **Accepted base:** `3b1d7fe` (WP-20 closure boundary)
-**Status:** **WP-21A — Contract + Authority Lock** delivered. Whisper
-persistence, `roles.ts`, services, controllers and SILENT integration code are
-**HOLD** pending the lead's WP-21A review.
+**Status:** **WP-21A COMPLETE** — contract + authority lock merged (`df479f4`,
+post-main CI green); W21-01..W21-14 locked, C11-01..C11-07 closed. The contract
+is now a **frozen implementation dependency**. **WP-21B** server runtime
+delivered on `wp-21b-whisper-runtime` under rulings B11-01..B11-15 and the
+execution amendments; **MERGE HOLD** pending the whole-effective-diff audit and
+hosted CI. Public device-facing invocation remains **PROHIBITED** until a
+genuine authenticated-device facility exists.
 
 ## Objective
 
@@ -357,16 +361,61 @@ Constitution machinery. A public device-facing endpoint remains out of scope
 until a genuine server-authenticated device identity can populate
 `AuthenticatedWhisperDeviceContext`.
 
+## WP-21B — server runtime (delivered, merge HOLD)
+
+Implements the frozen contract without reinterpreting it (B11-01):
+
+- **Persistence** (`whisper.prisma`, migration `20260821090000_wp21b_whisper_foundation`):
+  `WhisperSignalVersion` (composite Site FK RESTRICT, optional because
+  `site_id: null` means organisation-wide; `(org, family, version)` unique),
+  `WhisperActivationApproval` (one per version, no incident/task/dispatch
+  column so it is structurally incapable of standing in for a response
+  approval), `WhisperRecognitionReceipt` (the **seven-column** replay boundary
+  with the fingerprint stored separately, no Site FK — cascading a receipt away
+  would re-admit a consumed nonce), and append-only `WhisperAuditLog`.
+- **Generic Incident source seam** (B11-13): `hypothesis_id` and
+  `incident_candidate_id` become nullable, `source_kind`/`source_ref` are added
+  with `(organisation_id, source_kind, source_ref)` uniqueness, and every
+  existing row is backfilled as `FUSION_HYPOTHESIS` + its hypothesis id behind
+  fail-loud preflights. Whisper uses `WHISPER_RECOGNITION` + the recognition
+  fingerprint. **No synthetic Fusion identifiers are ever fabricated**, and
+  `createFromCandidate`'s caller-facing shape is unchanged.
+- **Authority** (B11-02): the four capabilities wired mechanically —
+  commander read/manage/approve, operative invoke, nobody else, and no
+  existing action implies Whisper authority.
+- **Studio** (B11-03/04/05): seven authenticated Command-side routes, one
+  action each, no delete. The generic transitions endpoint refuses
+  `to: ACTIVE` so activation cannot be reached around the two-person control.
+  Activation binds the current persisted fingerprint, requires a distinct
+  approver, and atomically rotates any predecessor so one family can never
+  have two ACTIVE versions.
+- **Runtime** (B11-08..B11-12): `recognise()` is internal — **no HTTP route
+  exists**. Signature is verified first, so an invalid one never consumes a
+  replay identity; the key comes only from a fail-closed server-owned
+  resolver, never from the result. An unresolved or foreign signal is routed
+  *through* the same gate via a placeholder that cannot pass, so a refusal
+  cannot be assembled into an existence oracle. `on_duty` is derived from
+  authoritative Field state, where absent means unknown and fails closed and
+  `COMPROMISED` counts as on-duty while device trust gates independently.
+- **SILENT integration** (B11-14/15): SEV2 / threat state 2 / SILENT, entering
+  the **existing** `runProofA` machinery. Recognition creates zero
+  `ResponseTaskSilentApproval` rows and hands off nothing; the existing two
+  distinct commander approvals remain the only route to dispatch.
+
 ## Gate state
 
 ```text
-WP-20 implementation              FROZEN
-Wave 9                            CLOSED
-
-WP-21A directive/contracts        DELIVERED — awaiting lead review
-WP-21 Prisma                      HOLD
-WP-21 roles.ts                    HOLD
-WP-21 services/controllers        HOLD
-WP-21 SILENT integration code     HOLD
+WP-21A contracts                  FROZEN / COMPLETE (df479f4)
+WP-21B implementation             DELIVERED — merge HOLD
+public device invoke HTTP         PROHIBITED (no authenticated-device facility)
+new Whisper modality              HOLD
+Constitution changes              NONE (untouched)
 WP-22                             HOLD
+original repository               FROZEN at bd6076e
 ```
+
+**Proof C accounting.** WP-21B gives the server-side Whisper foundation and a
+strong pre-Proof-C integration harness. Proof C is not claimed until a real
+authenticated device or Field client originates the signed device action
+through the production device-identity boundary and receives the resulting
+acknowledgement.

@@ -21,6 +21,7 @@ import { FieldModule } from './modules/field/field.module';
 import { FieldMessagingModule } from './modules/field-messaging/field-messaging.module';
 import { FieldOfflineModule } from './modules/field-offline/field-offline.module';
 import { PatrolModule } from './modules/patrol/patrol.module';
+import { WhisperModule } from './modules/whisper/whisper.module';
 
 @Module({
   imports: [
@@ -60,6 +61,11 @@ import { PatrolModule } from './modules/patrol/patrol.module';
     // declares no controller, so this adds no HTTP surface (C10-02).
     FieldOfflineModule,
     PatrolModule,
+    // WP-21B. The controller it registers is STUDIO ONLY (signal lifecycle);
+    // the recognition runtime is an exported service with no HTTP surface,
+    // because an authenticated device context cannot come from a JSON body
+    // (W21-05, the C10-02 boundary applied to a silent duress channel).
+    WhisperModule,
   ],
 })
 export class AppModule {}

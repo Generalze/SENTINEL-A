@@ -103,9 +103,13 @@ describe('WP-18 realtime delivery evidence (live stack, C8-01)', () => {
         data: { id, organisationId: fx.org, email: `${id}@example.invalid`, displayName: id, clearance: 5, roles: { create: [{ role, siteId: fx.site }] } },
       });
     }
+    // B11-13: an incident now states its ORIGIN. This fixture is Fusion-shaped,
+    // so source_ref IS the hypothesis id, exactly as the WP-21B migration
+    // backfills every pre-existing row.
+    const fixtureHypothesisId = randomUUID();
     await prisma.incident.create({
       data: {
-        id: fx.incident, hypothesisId: randomUUID(), incidentCandidateId: randomUUID(),
+        id: fx.incident, hypothesisId: fixtureHypothesisId, incidentCandidateId: randomUUID(), sourceKind: 'FUSION_HYPOTHESIS', sourceRef: fixtureHypothesisId,
         organisationId: fx.org, siteId: fx.site, incidentType: 'wp18.rt', severity: 'SEV3',
         threatState: 2, confidence: 0.9, responseMode: 'STANDARD',
       },
