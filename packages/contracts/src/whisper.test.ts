@@ -27,6 +27,7 @@ import {
   evaluateWhisperContextRequirements,
   evaluateWhisperRuntimeEligibility,
   isAllowlistedWhisperResponseProtocol,
+  isCanonicalJsonRecord,
   isTerminalWhisperSignalStatus,
   isWhisperConfigurationEditable,
   whisperActivationApproverIsDistinct,
@@ -127,7 +128,7 @@ const SIGNAL_CONFIG: WhisperSemanticConfiguration = {
   response_protocol_id: 'SILENT_INCIDENT_RESPONSE' as const,
 };
 
-const SIGNAL_SCOPE = { organisation_id: 'org-1', site_id: 'site-1' as string | null };
+const SIGNAL_SCOPE = { whisper_signal_id: 'whisper-1', organisation_id: 'org-1', site_id: 'site-1' as string | null };
 
 const DEVICE_CONTEXT: AuthenticatedWhisperDeviceContext = {
   organisationId: 'org-1',
@@ -139,6 +140,7 @@ const DEVICE_CONTEXT: AuthenticatedWhisperDeviceContext = {
 };
 
 const SIGNED_IDENTITY = {
+  whisper_signal_id: 'whisper-1',
   organisation_id: 'org-1',
   site_id: 'site-1',
   actor_user_id: 'user-1',
@@ -560,12 +562,12 @@ describe('C11-02 the signed identity and the resolved signal are bound to the tr
   });
 
   it('a signal from another organisation cannot be fired even by a perfectly authenticated device', () => {
-    const foreignSignal = { organisation_id: 'org-2', site_id: 'site-1' as string | null, status: 'ACTIVE' as const, signal_version: 3, ...SIGNAL_CONFIG };
+    const foreignSignal = { whisper_signal_id: 'whisper-1', organisation_id: 'org-2', site_id: 'site-1' as string | null, status: 'ACTIVE' as const, signal_version: 3, ...SIGNAL_CONFIG };
     expect(evaluateWhisperRuntimeEligibility(eligibilityInput({ signal: foreignSignal }))).toEqual({ eligible: false, conflictCode: 'SIGNAL_SCOPE_MISMATCH' });
   });
 
   it('a site-scoped signal cannot be fired at a different site of the same organisation', () => {
-    const otherSite = { organisation_id: 'org-1', site_id: 'site-9' as string | null, status: 'ACTIVE' as const, signal_version: 3, ...SIGNAL_CONFIG };
+    const otherSite = { whisper_signal_id: 'whisper-1', organisation_id: 'org-1', site_id: 'site-9' as string | null, status: 'ACTIVE' as const, signal_version: 3, ...SIGNAL_CONFIG };
     const context = { ...DEVICE_CONTEXT, authorisedSiteIds: ['site-1', 'site-9'] };
     // The device is entitled to both sites, so only the signal's own scope refuses it.
     expect(evaluateWhisperRuntimeEligibility(eligibilityInput({ signal: otherSite, context }))).toEqual({
@@ -575,7 +577,7 @@ describe('C11-02 the signed identity and the resolved signal are bound to the tr
   });
 
   it('an organisation-wide signal (null site) fires only at a site the device is entitled to', () => {
-    const orgWide = { organisation_id: 'org-1', site_id: null, status: 'ACTIVE' as const, signal_version: 3, ...SIGNAL_CONFIG };
+    const orgWide = { whisper_signal_id: 'whisper-1', organisation_id: 'org-1', site_id: null, status: 'ACTIVE' as const, signal_version: 3, ...SIGNAL_CONFIG };
     expect(evaluateWhisperRuntimeEligibility(eligibilityInput({ signal: orgWide }))).toEqual({ eligible: true, responseProtocolId: 'SILENT_INCIDENT_RESPONSE' });
     // Organisation-wide is NOT a bypass of the device's own site entitlement.
     expect(
@@ -636,5 +638,129 @@ describe('C11-01 fingerprints are pinned to their exact hex shape', () => {
     for (const bad of ['A'.repeat(64), 'g'.repeat(64), '0'.repeat(63), '0'.repeat(65)]) {
       expect(() => WhisperActivationApprovalSchema.parse({ ...approval, configuration_fingerprint: bad })).toThrow();
     }
+  });
+});
+
+describe('C11-05 the gate binds the exact signal family, not merely the version', () => {
+  it('a recognition signed for one family is refused against another at the same version', () => {
+    // Signal A "medical-duress" v3 and Signal B "covert-assistance" v3 share a
+    // version number and a device action. Everything else about them may
+    // differ — roster, threshold, context, and one day the protocol. A lookup
+    // bug that hands the gate the wrong family must not go undetected.
+    const signalB = { ...SIGNAL_SCOPE, whisper_signal_id: 'covert-assistance', status: 'ACTIVE' as const, signal_version: 3, ...SIGNAL_CONFIG };
+    const signedForA = { ...SIGNED_IDENTITY, whisper_signal_id: 'medical-duress' };
+    expect(evaluateWhisperRuntimeEligibility(eligibilityInput({ signal: signalB, result: signedForA }))).toEqual({
+      eligible: false,
+      conflictCode: 'SIGNAL_IDENTITY_MISMATCH',
+    });
+  });
+
+  it('refuses the substitution even when every other dimension matches exactly', () => {
+    // Same organisation, same site, same actor and device, same version, same
+    // device action, byte-identical configuration — only the family differs.
+    const signalB = { ...SIGNAL_SCOPE, whisper_signal_id: 'whisper-2', status: 'ACTIVE' as const, signal_version: 3, ...SIGNAL_CONFIG };
+    const outcome = evaluateWhisperRuntimeEligibility(eligibilityInput({ signal: signalB }));
+    expect(outcome).toEqual({ eligible: false, conflictCode: 'SIGNAL_IDENTITY_MISMATCH' });
+    // And the matching family still resolves, so the check is not vacuous.
+    expect(evaluateWhisperRuntimeEligibility(eligibilityInput())).toEqual({ eligible: true, responseProtocolId: 'SILENT_INCIDENT_RESPONSE' });
+  });
+
+  it('family identity is checked before status, version, action and protocol', () => {
+    // A wrong family that is ALSO retired, at a different version, with a
+    // different action and no protocol still reports the identity failure —
+    // the gate never evaluates a configuration it has not proven is the right one.
+    const wrongEverything = {
+      ...SIGNAL_SCOPE,
+      whisper_signal_id: 'whisper-2',
+      status: 'RETIRED' as const,
+      signal_version: 9,
+      ...SIGNAL_CONFIG,
+      device_action_id: 'button-triple-press',
+      response_protocol_id: null,
+    };
+    expect(evaluateWhisperRuntimeEligibility(eligibilityInput({ signal: wrongEverything }))).toEqual({
+      eligible: false,
+      conflictCode: 'SIGNAL_IDENTITY_MISMATCH',
+    });
+  });
+});
+
+describe('C11-06 canonicalisation admits only genuine JSON records', () => {
+  const exotic: Array<[string, unknown]> = [
+    ['Date', new Date('2026-08-19T10:00:00.000Z')],
+    ['Map', new Map([['on_duty', true]])],
+    ['Set', new Set([1, 2])],
+    ['RegExp', /on-duty/u],
+    ['boxed Number', new Number(1)],
+    ['boxed String', new String('true')],
+    ['typed array', new Uint8Array([1, 2, 3])],
+    ['class instance', new (class Shift { public on_duty = true; })()],
+  ];
+
+  it('none of them count as a canonical JSON record', () => {
+    for (const [label, value] of exotic) {
+      expect(isCanonicalJsonRecord({ on_duty: value }), label).toBe(false);
+    }
+    // The plain equivalents still do.
+    expect(isCanonicalJsonRecord({ on_duty: true, nested: { a: [1, 'x', null] } })).toBe(true);
+    // A null-prototype record is a genuine record.
+    expect(isCanonicalJsonRecord(Object.assign(Object.create(null), { on_duty: true }))).toBe(true);
+  });
+
+  it('a cyclic graph is named as such rather than exhausting the stack', () => {
+    const cyclic: Record<string, unknown> = { on_duty: true };
+    cyclic.self = cyclic;
+    expect(isCanonicalJsonRecord(cyclic)).toBe(false);
+    expect(() => whisperConfigurationFingerprint({ ...SIGNAL_CONFIG, context_requirements: cyclic as never })).toThrow(/cyclic/);
+    // Sharing one object twice is ordinary structure, not a cycle.
+    const shared = { a: 1 };
+    expect(isCanonicalJsonRecord({ first: shared, second: shared })).toBe(true);
+  });
+
+  it('exotic server facts cannot satisfy a requirement — they fail closed', () => {
+    for (const [label, value] of exotic) {
+      expect(evaluateWhisperContextRequirements({ on_duty: true }, { on_duty: value }), label).toEqual({
+        satisfied: false,
+        unsatisfiedKeys: ['on_duty'],
+      });
+    }
+    // A Date must not quietly become {} and match an empty-object requirement.
+    expect(evaluateWhisperContextRequirements({ shift: {} }, { shift: new Date('2026-08-19T10:00:00.000Z') })).toEqual({
+      satisfied: false,
+      unsatisfiedKeys: ['shift'],
+    });
+  });
+
+  it('force-passing an exotic value into fingerprinting throws instead of converging', () => {
+    for (const [label, value] of exotic) {
+      expect(() => whisperConfigurationFingerprint({ ...SIGNAL_CONFIG, context_requirements: { on_duty: value } as never }), label).toThrow(
+        /canonically representable/,
+      );
+    }
+  });
+
+  it('the wire schema refuses them too, rather than parsing them into an empty object', () => {
+    const signal = {
+      schema_version: 1 as const, whisper_signal_id: 'whisper-1', organisation_id: 'org-1', site_id: 'site-1', name: 'Assistance',
+      signal_version: 1, status: 'DRAFT' as const, ...SIGNAL_CONFIG, created_at: at, updated_at: at, created_by_user_id: 'admin-1', trace_id: 'trace-1',
+    };
+    for (const [label, value] of exotic) {
+      expect(() => WhisperSignalSchema.parse({ ...signal, context_requirements: { on_duty: value } }), label).toThrow();
+    }
+    // Proof the hole is closed rather than merely unreachable: a RegExp once
+    // parsed to {} because zod saw an ordinary object with no enumerable keys.
+    expect(() => WhisperSignalSchema.parse({ ...signal, context_requirements: { on_duty: /x/u } })).toThrow();
+  });
+
+  it('symbol-keyed, non-enumerable and accessor state cannot hide inside a record', () => {
+    const symbolKeyed: Record<string, unknown> = { on_duty: true };
+    (symbolKeyed as Record<symbol, unknown>)[Symbol('hidden')] = 'value';
+    expect(isCanonicalJsonRecord(symbolKeyed)).toBe(false);
+
+    const nonEnumerable = Object.defineProperty({ on_duty: true }, 'hidden', { value: 'x', enumerable: false });
+    expect(isCanonicalJsonRecord(nonEnumerable)).toBe(false);
+
+    const accessor = Object.defineProperty({ on_duty: true }, 'derived', { get: () => 'x', enumerable: true });
+    expect(isCanonicalJsonRecord(accessor)).toBe(false);
   });
 });

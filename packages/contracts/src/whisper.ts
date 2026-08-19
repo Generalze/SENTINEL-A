@@ -26,11 +26,40 @@ export const WhisperJsonValueSchema: z.ZodType<WhisperJsonValue> = z.lazy(() =>
 );
 
 /**
- * C11-03: the canonicaliser REFUSES what it cannot represent losslessly rather
- * than quietly normalising it. A value that reaches a fingerprint must be the
- * value that was approved.
+ * C11-06: a JSON RECORD, not merely "an object".
+ *
+ * `Object.entries()` is not proof of anything — it happily enumerates a `Date`
+ * (no own enumerable keys, so it reads as `{}`), a `Map`, a `RegExp` or any
+ * class instance. Only a plain record, with `Object.prototype` or a null
+ * prototype, carries its whole meaning in its enumerable string keys.
  */
-function assertJsonSafe(value: unknown, path: string): void {
+function isPlainJsonRecord(value: object): boolean {
+  const prototype: unknown = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function describeUnsupported(value: object): string {
+  const name: unknown = (value as { constructor?: { name?: unknown } }).constructor?.name;
+  return typeof name === 'string' && name.length > 0 ? name : 'non-plain object';
+}
+
+/**
+ * C11-03/C11-06: the canonicaliser REFUSES what it cannot represent losslessly
+ * rather than quietly normalising it. A value that reaches a fingerprint must
+ * be the value that was approved.
+ *
+ * Everything JSON would silently discard is a refusal, not a normalisation: a
+ * `Date` collapsing to `{}`, a `Map`'s entries vanishing, a getter's result
+ * disappearing, a symbol-keyed member evaporating. Each of those would let two
+ * materially different configurations share one digest — and an activation
+ * approval attests to a digest. Cycles are named explicitly rather than left
+ * to blow the stack.
+ *
+ * `seen` tracks the current PATH, not every value ever visited: the same object
+ * appearing twice in a structure is ordinary sharing, while an object
+ * containing itself is the cycle JSON cannot express.
+ */
+function assertJsonSafe(value: unknown, path: string, seen: Set<object> = new Set()): void {
   if (value === null) return;
   switch (typeof value) {
     case 'string':
@@ -40,17 +69,42 @@ function assertJsonSafe(value: unknown, path: string): void {
       if (!Number.isFinite(value)) throw new TypeError(`${path} is not canonically representable: non-finite number`);
       return;
     case 'object': {
-      if (Array.isArray(value)) {
-        value.forEach((entry, index) => assertJsonSafe(entry, `${path}[${index}]`));
+      const object = value as object;
+      if (seen.has(object)) throw new TypeError(`${path} is not canonically representable: cyclic reference`);
+      seen.add(object);
+      if (Array.isArray(object)) {
+        object.forEach((entry, index) => assertJsonSafe(entry, `${path}[${index}]`, seen));
+        seen.delete(object);
         return;
       }
-      for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-        assertJsonSafe(entry, `${path}.${key}`);
+      if (!isPlainJsonRecord(object)) throw new TypeError(`${path} is not canonically representable: ${describeUnsupported(object)}`);
+      if (Object.getOwnPropertySymbols(object).length > 0) {
+        throw new TypeError(`${path} is not canonically representable: symbol-keyed property`);
       }
+      for (const key of Object.getOwnPropertyNames(object)) {
+        const descriptor = Object.getOwnPropertyDescriptor(object, key);
+        if (descriptor === undefined) continue;
+        if (!descriptor.enumerable || typeof descriptor.get === 'function' || typeof descriptor.set === 'function') {
+          throw new TypeError(`${path}.${key} is not canonically representable: non-enumerable or accessor property`);
+        }
+        assertJsonSafe(descriptor.value, `${path}.${key}`, seen);
+      }
+      seen.delete(object);
       return;
     }
     default:
       throw new TypeError(`${path} is not canonically representable: ${typeof value}`);
+  }
+}
+
+/** True when `value` is a record this module can canonicalise without loss. */
+export function isCanonicalJsonRecord(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  try {
+    assertJsonSafe(value, 'value');
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -62,10 +116,25 @@ function contextByteLength(value: unknown): number {
   }
 }
 
-const contextSchema = z.record(WhisperJsonValueSchema).refine(
-  (value) => contextByteLength(value) <= MAX_CONTEXT_BYTES,
-  { message: `context must serialize to at most ${MAX_CONTEXT_BYTES} bytes` },
-);
+/**
+ * C11-06: the guard runs on the RAW input, before zod rebuilds the record.
+ *
+ * `z.record(WhisperJsonValueSchema)` alone was not enough. Zod classifies a
+ * `RegExp` or a class instance as an ordinary object, finds no enumerable
+ * keys, and parses it into `{}` — the value is gone before any refinement can
+ * see it, and the fingerprint then attests to an empty object nobody wrote.
+ * Validating the raw value first means an unrepresentable member is REFUSED
+ * rather than quietly emptied.
+ */
+const contextSchema = z
+  .custom<Record<string, WhisperJsonValue>>(isCanonicalJsonRecord, {
+    message: 'context must be a plain record of canonically representable JSON values',
+  })
+  .pipe(
+    z.record(WhisperJsonValueSchema).refine((value) => contextByteLength(value) <= MAX_CONTEXT_BYTES, {
+      message: `context must serialize to at most ${MAX_CONTEXT_BYTES} bytes`,
+    }),
+  );
 
 export const WhisperSignalStatusSchema = z.enum([
   'DRAFT',
@@ -534,6 +603,8 @@ export const WhisperRecognitionConflictCodeSchema = z.enum([
   'SITE_SCOPE_MISMATCH',
   /** C11-02: the resolved signal does not belong to the trusted scope. */
   'SIGNAL_SCOPE_MISMATCH',
+  /** C11-05: the resolved signal is not the family the recognition was signed for. */
+  'SIGNAL_IDENTITY_MISMATCH',
   'SIGNAL_NOT_ACTIVE',
   'SIGNAL_VERSION_MISMATCH',
   'ACTOR_NOT_ELIGIBLE',
@@ -602,6 +673,7 @@ export interface WhisperRuntimeEligibilityInput {
    */
   signal: Pick<
     WhisperSignal,
+    | 'whisper_signal_id'
     | 'organisation_id'
     | 'site_id'
     | 'status'
@@ -620,7 +692,14 @@ export interface WhisperRuntimeEligibilityInput {
    */
   result: Pick<
     DeviceActionWhisperResult,
-    'organisation_id' | 'site_id' | 'actor_user_id' | 'device_id' | 'whisper_signal_version' | 'device_action_id' | 'confidence'
+    | 'organisation_id'
+    | 'site_id'
+    | 'actor_user_id'
+    | 'device_id'
+    | 'whisper_signal_id'
+    | 'whisper_signal_version'
+    | 'device_action_id'
+    | 'confidence'
   >;
   /**
    * W21-04: the allowlist is NOT a grant. This is the CURRENT answer to "may
@@ -662,6 +741,16 @@ export function evaluateWhisperRuntimeEligibility(input: WhisperRuntimeEligibili
   // check above already established.
   if (input.signal.organisation_id !== input.context.organisationId) return { eligible: false, conflictCode: 'SIGNAL_SCOPE_MISMATCH' };
   if (input.signal.site_id !== null && input.signal.site_id !== input.result.site_id) return { eligible: false, conflictCode: 'SIGNAL_SCOPE_MISMATCH' };
+
+  // C11-05: and it must be the SIGNAL FAMILY this recognition was signed for.
+  // W21-02 makes `whisper_signal_id + signal_version` the exact configuration
+  // identity, so a version number alone proves nothing — two families can both
+  // be at version 3 with the same device action while differing in roster,
+  // threshold, context requirements or (later) protocol. A lookup that handed
+  // this gate the wrong family would otherwise go undetected, and the whole
+  // point of C11-02 was to stop trusting the lookup that produced the signal.
+  // Service-layer correctness is not a substitute for this binding.
+  if (input.signal.whisper_signal_id !== input.result.whisper_signal_id) return { eligible: false, conflictCode: 'SIGNAL_IDENTITY_MISMATCH' };
 
   if (!deviceTrustPermitsWhisperInvocation(input.context.deviceTrust)) return { eligible: false, conflictCode: 'DEVICE_TRUST_INSUFFICIENT' };
   if (input.signal.status !== 'ACTIVE') return { eligible: false, conflictCode: 'SIGNAL_NOT_ACTIVE' };

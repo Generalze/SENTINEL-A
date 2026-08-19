@@ -287,6 +287,35 @@ reduce what is permitted. `signature_algorithm` is pinned to **Ed25519** so a
 client-named algorithm can never select the verifier; the server's key registry
 remains the algorithm authority.
 
+**C11-05 — The gate bound the version but not the signal family.** The signed
+statement and the replay identity both carry `whisper_signal_id`, but the
+runtime gate received neither the stored signal's family nor the signed one, so
+it could prove organisation, site, actor, device, version and device action —
+and still not prove that the recognition belonged to *this* signal. W21-02
+makes `whisper_signal_id + signal_version` the exact configuration identity, so
+a version number alone proves nothing: `medical-duress` v3 and
+`covert-assistance` v3 can share a device action while differing in roster,
+threshold, context requirements and eventually protocol. A lookup that handed
+the gate the wrong family would have gone undetected — and refusing to trust
+that lookup was the entire point of C11-02. Both identities are now inputs, and
+they must be equal before status, version, action or protocol is evaluated
+(`SIGNAL_IDENTITY_MISMATCH`). **Service-layer lookup correctness is not a
+substitute for this binding**; later surfaces must collapse discovery-sensitive
+mismatches so this never becomes an existence oracle.
+
+**C11-06 — Canonicalisation still accepted objects that are not JSON.**
+`assertJsonSafe` used `Object.entries`, which happily enumerates a `Date`
+(no own enumerable keys, so it reads as `{}`), a `Map`, a `RegExp` or any class
+instance — and zod classified those same values as ordinary objects and parsed
+them into `{}` before any refinement could see them. Either way a server fact
+or a requirement could be silently emptied, and the fingerprint would then
+attest to something nobody wrote. Only a plain record (`Object.prototype` or
+null prototype) is now admitted, with symbol-keyed, non-enumerable and accessor
+state refused because JSON would discard them, and cycles named explicitly
+rather than left to exhaust the stack. The context schema validates the **raw**
+input before zod rebuilds it, so an unrepresentable member is refused rather
+than quietly normalised.
+
 ## WP-21A deliverables (this checkpoint)
 
 - `packages/contracts/src/whisper.ts` — extended: JSON-safe context values and
