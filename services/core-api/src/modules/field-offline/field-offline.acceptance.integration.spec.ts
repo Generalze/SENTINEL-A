@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { BadRequestException, type INestApplication } from '@nestjs/common';
-import { NestFactory } from '@nestjs/core';
+import { Test } from '@nestjs/testing';
 import {
   deriveOfflineDownstreamIdempotencyKey,
   MAX_OFFLINE_DEVICE_SEQUENCE,
@@ -18,6 +18,8 @@ import { TIMELINE_MESSAGE_ACKNOWLEDGED } from '../field-messaging/field-messagin
 import { FieldMessagingService } from '../field-messaging/field-messaging.service';
 import { FieldService } from '../field/field.service';
 import { intersectSiteScope } from '../identity/list-pagination';
+import { PATROL_SWEEP_SCHEDULER } from '../patrol/patrol-sweep.scheduler';
+import { NoopPatrolSweepScheduler } from '../patrol/patrol-sweep.scheduler.test-support';
 import {
   ACTION_MESSAGE_SEND,
   AUDIT_OFFLINE_OPERATION_FINALIZED,
@@ -322,7 +324,14 @@ describe('WP-20 offline replay acceptance (live stack)', () => {
 
   beforeAll(async () => {
     for (const [key, value] of Object.entries(STACK_ENV)) process.env[key] = value;
-    app = await NestFactory.create(AppModule, { logger: false });
+    // C13-01: production's sweep cadence is hard-wired and cannot be switched
+    // off by configuration. A spec silences only the REPEATING timer, through
+    // the DI seam, so the sweeps in flight are exactly the ones it drives.
+    const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
+      .overrideProvider(PATROL_SWEEP_SCHEDULER)
+      .useClass(NoopPatrolSweepScheduler)
+      .compile();
+    app = moduleRef.createNestApplication({ logger: false });
     await app.listen(0, '127.0.0.1');
     prisma = app.get(PrismaService);
     service = app.get(FieldOfflineReplayService);

@@ -1,11 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { canTransition } from '@sentinel/contracts';
 import type { INestApplication } from '@nestjs/common';
-import { NestFactory } from '@nestjs/core';
+import { Test } from '@nestjs/testing';
 import { io, type Socket as ClientSocket } from 'socket.io-client';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { AppModule } from '../../app.module';
 import { PrismaService } from '../../prisma/prisma.service';
+import { PATROL_SWEEP_SCHEDULER } from '../patrol/patrol-sweep.scheduler';
+import { NoopPatrolSweepScheduler } from '../patrol/patrol-sweep.scheduler.test-support';
 import { WS_EVENT_FIELD_MESSAGE_UPDATED, WS_PATH } from '../realtime/realtime.constants';
 import { FieldMessagingOutboxPublisher } from './field-messaging-outbox.publisher';
 import { FieldMessagingRepository } from './field-messaging.repository';
@@ -88,7 +90,14 @@ describe('WP-18 realtime delivery evidence (live stack, C8-01)', () => {
 
   beforeAll(async () => {
     for (const [k, v] of Object.entries(STACK_ENV)) process.env[k] = v;
-    app = await NestFactory.create(AppModule, { logger: false });
+    // C13-01: production's sweep cadence is hard-wired and cannot be switched
+    // off by configuration. A spec silences only the REPEATING timer, through
+    // the DI seam, so the sweeps in flight are exactly the ones it drives.
+    const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
+      .overrideProvider(PATROL_SWEEP_SCHEDULER)
+      .useClass(NoopPatrolSweepScheduler)
+      .compile();
+    app = moduleRef.createNestApplication({ logger: false });
     await app.listen(0, '127.0.0.1');
     const address = app.getHttpServer().address();
     base = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`;

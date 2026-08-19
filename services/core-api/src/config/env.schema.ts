@@ -67,6 +67,19 @@ export const envSchema = z.object({
     })
     .default('info'),
   DEV_AUTH_ENABLED: booleanFromEnvString.default(false),
+  /**
+   * C13-01: there is deliberately NO patrol sweep interval key here.
+   *
+   * MISSED is a server-owned verdict (WP-19 s.3), so the cadence that reaches
+   * it must not be something a deployment can set — a configurable interval
+   * whose `0` means "stop detecting missed checkpoints" is a production
+   * kill-switch over a safety-critical judgement, however well-intentioned the
+   * default. The interval is hard-wired in `patrol-missed.sweeper.ts`, and the
+   * test-determinism problem that motivated the key is solved instead by a
+   * dependency seam (`patrol-sweep.scheduler.ts`) that exists only in test
+   * wiring. `modules/patrol/patrol-sweep.scheduler.spec.ts` is the permanent
+   * guard that this key stays absent and that the interval stays hard-wired.
+   */
 });
 
 export type AppConfig = z.infer<typeof envSchema>;

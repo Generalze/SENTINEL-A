@@ -16,6 +16,8 @@ import { buildPrincipal, type Principal } from '../../common/security/principal'
 import { PrismaService } from '../../prisma/prisma.service';
 import { IncidentsRepository } from '../incidents/incidents.repository';
 import { IncidentsService } from '../incidents/incidents.service';
+import { PATROL_SWEEP_SCHEDULER } from '../patrol/patrol-sweep.scheduler';
+import { NoopPatrolSweepScheduler } from '../patrol/patrol-sweep.scheduler.test-support';
 import { WHISPER_DEVICE_KEY_RESOLVER, type WhisperDeviceKeyResolver } from './whisper-key.resolver';
 import { WhisperSignatureVerifier } from './whisper-signature.verifier';
 import { ACTION_WHISPER_DEVICE_ACTION_INVOKE } from './whisper.constants';
@@ -335,6 +337,11 @@ describe('WP-21B C12 audit regressions (live stack)', () => {
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
       .overrideProvider(WHISPER_DEVICE_KEY_RESOLVER)
       .useValue(keyRegistry)
+      // C13-01: production's sweep cadence is hard-wired and cannot be switched
+      // off by configuration. This silences only the REPEATING timer, through
+      // the DI seam, so no ambient sweep races what this suite drives.
+      .overrideProvider(PATROL_SWEEP_SCHEDULER)
+      .useClass(NoopPatrolSweepScheduler)
       .compile();
     app = moduleRef.createNestApplication({ logger: false });
     await app.init();

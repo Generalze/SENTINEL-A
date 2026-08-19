@@ -4,13 +4,14 @@
 **Depends:** WP-15 Field Contracts, WP-16 Field Domain, WP-18 Incident Field Messaging, WP-20 Offline Operation Contracts
 **Review chain:** Adversarial review -> Lead merge gate
 **Accepted base:** `3b1d7fe` (WP-20 closure boundary)
-**Status:** **WP-21A COMPLETE** — contract + authority lock merged (`df479f4`,
-post-main CI green); W21-01..W21-14 locked, C11-01..C11-07 closed. The contract
-is now a **frozen implementation dependency**. **WP-21B** server runtime
-delivered on `wp-21b-whisper-runtime` under rulings B11-01..B11-15 and the
-execution amendments; **MERGE HOLD** pending the whole-effective-diff audit and
-hosted CI. Public device-facing invocation remains **PROHIBITED** until a
-genuine authenticated-device facility exists.
+**Status:** **COMPLETE.** WP-21A contract + authority lock merged `df479f4`;
+WP-21B server runtime merged `e779a454` with post-main CI green — 20 migrations
+from zero, 1,071 workspace tests, 75 Whisper tests, Proof A 1/1. W21-01..W21-14
+are locked, C11-01..C11-07 and C12-01..C12-04 are closed. The contract remains
+a frozen implementation dependency. Public device-facing invocation stays
+PROHIBITED until a genuine authenticated-device facility exists, and **Proof C
+is UNCLAIMED**: the runtime is exercised through a server-constructed device
+context, which is not a real device.
 
 ## Objective
 
