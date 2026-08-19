@@ -97,25 +97,31 @@ the whole log.
 | WP-17A | Done — Field `site_id` referential integrity, closing Wave-7 finding C7-07 | merged `5f01b15` |
 | WP-18 | Done — incident field messaging: named-recipient entitlement, commander oversight as its own action, immutable recipients, tuple-bound persistence, transport-evidence delivery | merged `5868bf7` |
 | WP-19 | Done — versioned patrol standards, materialised run expectations, server-owned timing (C9-01..C9-09), whole-system audit correction batch (complete evidence tuple, request-bound idempotency, locked mutable dependencies, fail-closed START, boundary-bounded JSON), 34 patrol tests | merged `e4092e2` |
-| WP-20 | Checkpoint A contracts merged (`eb5e0cf`, 141 contract tests); Checkpoint B replay harness delivered — cursor/receipt persistence, effectively-once executor over the six-kind allowlist, authenticated device-context seam, WP-18 aggregate-size correction, 17 acceptance tests. **MERGE HOLD** pending lead audit + hosted CI; HTTP/mobile API HOLD | branch `wp-20-offline-replay-harness` |
-| WP-21 .. WP-22 | Not started | — |
+| WP-20 | Done — offline operation contracts and server replay foundation: V2 discriminated envelope, contiguous per-device sequencing, request-bound fingerprints, cursor/receipt persistence, effectively-once executor with claim fencing and domain-evidence recovery, authenticated device-context seam (C10-01..C10-11, B10-01..B10-03), 25 acceptance tests | merged `3b1d7fe` |
+| WP-21 | WP-21A **Contract + Authority Lock delivered** — DEVICE_ACTION-only modality, configuration freeze/versioning, exact lifecycle, trusted device seam, canonical signed statement with `device_action_id`, authoritative freshness, actor-bound replay identity, server-owned protocol registry, proposed four-action authority matrix (W21-01..W21-14). **Implementation HOLD** pending lead review | branch `docs/wp-21-directive` |
+| WP-22 | Not started | — |
 
 **Wave 7 is closed.** WP-17 and WP-17A are both on `main`; C7-07 is closed.
 
-**Wave 8 is complete.** WP-18 (`5868bf7`) and WP-19 (`e4092e2`) are both on
-accepted mirror `main`; C9-01..C9-09 are closed and the whole-system audit
-passed.
+**Waves 8 and 9 are complete.** WP-18 (`5868bf7`), WP-19 (`e4092e2`) and WP-20
+(`3b1d7fe`) are on accepted mirror `main`; C9-01..C9-09, C10-01..C10-11 and the
+B10 correction batch are closed, each through its own whole-system audit.
 
-**Wave 9 is open. WP-20 is the current gate.** See
-[`directives/WP-20-offline-operation-contracts.md`](directives/WP-20-offline-operation-contracts.md):
-a V2 discriminated offline-operation contract, contiguous per-device
-sequencing, request-bound fingerprints, an authenticated device-context seam,
-and a deliberately narrow replay allowlist — reconnection may delay an
-authorised operation but never duplicate, reorder, de-authorize or backdate
-it. Checkpoint A (contracts only) is authorised once the directive is
-accepted; persistence, the replay executor and any HTTP surface stay HOLD.
-WP-20 proves the ordering/idempotency/recovery foundation; it does not by
-itself complete architecture Proof D.
+**Wave 10 is open. WP-21 is the current gate.** See
+[`directives/WP-21-whisper-foundation.md`](directives/WP-21-whisper-foundation.md):
+Whisper is organisation-configured discreet signalling, not a hidden command
+channel. Recognition initiates the approved silent protocol and never
+constitutes either human approval; the signal references a server-owned
+protocol registry rather than carrying executable content; device identity,
+trust, context and freshness are all server-established. WP-21A locks the
+contract and the proposed authority matrix; persistence, `roles.ts`, services,
+controllers and the SILENT adapter stay HOLD.
+
+**Proof D remains outstanding by design.** WP-20 supplied the server-side
+ordering, idempotency and recovery foundation; the architecture's degraded-
+operations proof is the later integrated demonstration in which WAN fails, Edge
+maintains critical local functions, real Field clients queue, and central
+synchronisation recovers without duplicate incident actions.
 
 ### CI contract
 
