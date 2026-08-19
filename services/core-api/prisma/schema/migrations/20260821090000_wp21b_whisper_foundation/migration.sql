@@ -165,6 +165,35 @@ CREATE UNIQUE INDEX "whisper_signal_version_id_org_key"
 CREATE INDEX "whisper_signal_family_status_idx"
   ON "whisper_signal_versions" ("organisation_id", "whisper_signal_id", "status");
 
+-- ---------------------------------------------------------------------------
+-- C12-03: at most ONE ACTIVE version per (organisation, signal family).
+--
+-- Service-level family locking makes the ordinary path sound, but B11-06
+-- requires this guarantee BELOW the service layer: a service-bypassing writer
+-- or a later regression must not be able to leave a tenant with two ACTIVE
+-- versions of one signal, which would make "the exact active configuration"
+-- ambiguous at the moment a duress signal fires. Prisma cannot express a
+-- partial unique index, so it is created here directly and deliberately.
+-- ---------------------------------------------------------------------------
+CREATE UNIQUE INDEX "whisper_signal_one_active_family_key"
+  ON "whisper_signal_versions" ("organisation_id", "whisper_signal_id")
+  WHERE "status" = 'ACTIVE';
+
+-- ---------------------------------------------------------------------------
+-- C12-04: a DIRECT tenant foreign key.
+--
+-- The composite (site_id, organisation_id) -> sites FK below is MATCH SIMPLE,
+-- so a NULL site_id — an organisation-wide signal — skips it entirely and the
+-- row would carry no database proof that its organisation exists at all. This
+-- FK covers both scoped and organisation-wide configurations; the composite
+-- Site FK still proves that a non-null site belongs to this same organisation.
+-- ---------------------------------------------------------------------------
+ALTER TABLE "whisper_signal_versions"
+  ADD CONSTRAINT "whisper_signal_versions_organisation_fkey"
+  FOREIGN KEY ("organisation_id")
+  REFERENCES "organisations" ("id")
+  ON DELETE RESTRICT ON UPDATE CASCADE;
+
 -- WP-17A live-state precedent: the pair must match, not just the site id.
 -- RESTRICT — a site's lifecycle must never silently delete a configuration
 -- that can raise a silent dispatch. MATCH SIMPLE leaves the constraint
@@ -228,11 +257,16 @@ CREATE TABLE "whisper_recognition_receipts" (
     "whisper_signal_id" TEXT NOT NULL,
     "whisper_signal_version" INTEGER NOT NULL,
     "anti_replay_nonce" TEXT NOT NULL,
-    -- NULLABLE on purpose: a refusal that never got as far as resolving a
-    -- signal must STILL be recorded, because the replay boundary also has to
-    -- retire the nonce of an attempt that failed. Requiring the reference here
-    -- would mean the failures most worth recording were the ones that could
-    -- not be written.
+    -- NULLABLE on purpose: a SIGNATURE-VERIFIED recognition can still be
+    -- refused before a signal is resolved — an out-of-scope or unknown family
+    -- collapses into a generic scope refusal — and that attempt must still be
+    -- recorded. Requiring the reference here would mean the failures most
+    -- worth recording were the ones that could not be written.
+    --
+    -- To be exact about what does NOT reach this table: an INVALID SIGNATURE
+    -- consumes no replay identity at all. Verification happens before any
+    -- receipt is written, so unsigned garbage can never reserve — or retire —
+    -- a nonce a legitimate operative may still need.
     "signal_version_id" UUID,
     -- SHA-256 of the canonical signed statement. Stored SEPARATELY; it never
     -- replaces the composite identity above. The fingerprint answers "is this

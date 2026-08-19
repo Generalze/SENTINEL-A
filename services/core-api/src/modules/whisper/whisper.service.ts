@@ -588,6 +588,36 @@ export class WhisperService {
     const result = parsed.data;
     const recognitionFingerprint = whisperRecognitionFingerprint(result);
 
+    // ---- C12-01: the PRINCIPAL must be the trusted context's actor. -------
+    //
+    // Two independent identities arrive here: the trusted device context, and
+    // the Principal whose live role assignments decide `whisper.device-action.
+    // invoke`. Binding the signed result to the context is not enough — if the
+    // Principal is somebody else, the capability answer is BORROWED. An actor
+    // holding no invoke authority could then fire a signal because an
+    // unrelated principal in the same tenant does hold it.
+    //
+    // This runs before signature verification and before any signal lookup, so
+    // a mismatch is refused with no receipt, no protocol and nothing that
+    // could disclose whether the signal exists. It reuses the existing generic
+    // device-context refusal rather than introducing a new code, so the caller
+    // still learns only that the binding failed.
+    if (principal.organisation_id !== deviceContext.organisationId || principal.user.id !== deviceContext.actorUserId) {
+      await this.repository.recordAudit(
+        this.recognitionAudit({
+          context: deviceContext,
+          result,
+          recognitionFingerprint,
+          configurationFingerprint: null,
+          outcome: 'REFUSED',
+          conflictCode: 'DEVICE_CONTEXT_MISMATCH',
+          responseProtocolId: null,
+          incidentId: null,
+        }),
+      );
+      return { kind: 'refused', conflict_code: 'DEVICE_CONTEXT_MISMATCH', recognition_fingerprint: recognitionFingerprint, replayed: false };
+    }
+
     // ---- 2. Signature FIRST. Still no receipt. ---------------------------
     // B11-12: AN INVALID SIGNATURE MUST NOT CONSUME A REPLAY IDENTITY. The
     // seven-column identity is a one-shot resource, and every field of it is
@@ -860,6 +890,11 @@ export class WhisperService {
   }): Promise<WhisperRecognitionOutcome> {
     const { deviceContext, result, recognitionFingerprint, receipt, claimGeneration } = input;
 
+    // C12-02: this probe decides only WHETHER a retry should still accept —
+    // never whether the domain work is finished. A gate that has since gone
+    // stale must not turn an effect that already committed into a REFUSED
+    // (the WP-20/B10-02 lesson), but the presence of an incident row proves
+    // only that ONE transaction committed, not that the SILENT entry ran.
     const recovered =
       claimGeneration > 1
         ? await this.incidents.findWhisperSilentIncident(deviceContext.organisationId, recognitionFingerprint)
@@ -898,10 +933,26 @@ export class WhisperService {
       ? input.eligibility.responseProtocolId
       : null;
 
+    // ---- C12-02: converge the WHOLE domain entry, every time. ------------
+    //
+    // The previous form short-circuited to the recovered incident id, which
+    // treated "an Incident row exists" as proof the protocol had been entered.
+    // It is not. `createFromWhisperRecognition` commits the incident, its
+    // opening timeline entry and the outbox in one transaction, and the
+    // Proof-A/SILENT machinery runs AFTER it. A crash in that window leaves an
+    // incident with no response tasks and no SILENT entry — and the old
+    // recovery would have finalized the receipt ACCEPTED over that hole, after
+    // which every exact duplicate replayed the terminal receipt instead of
+    // repairing it. For a silent duress protocol that is a permanent,
+    // invisible failure to respond.
+    //
+    // `openWhisperSilentIncident` is idempotent end to end: the incident
+    // converges on the (organisation, source_kind, source_ref) uniqueness
+    // boundary, task establishment uses skipDuplicates, and the SILENT
+    // constitution/dispatch steps are each guarded by their own current state.
+    // So the honest recovery is to re-enter it rather than to assume.
     let incidentId: string;
-    if (recovered !== null) {
-      incidentId = recovered.incidentId;
-    } else {
+    {
       try {
         const opened = await this.incidents.openWhisperSilentIncident({
           organisationId: deviceContext.organisationId,

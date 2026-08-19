@@ -14,6 +14,10 @@ model Organisation {
 
   sites Site[]
   users User[]
+  /// C12-04: organisation-wide Whisper signals (site_id NULL) skip the
+  /// composite Site relation entirely under MATCH SIMPLE, so they carry a
+  /// direct tenant FK instead.
+  whisperSignalVersions WhisperSignalVersion[]
 
   @@map("organisations")
 }
