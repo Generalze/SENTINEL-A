@@ -19,6 +19,7 @@ import { PrismaModule } from './prisma/prisma.module';
 import { IncidentsModule } from './modules/incidents/incidents.module';
 import { FieldModule } from './modules/field/field.module';
 import { FieldMessagingModule } from './modules/field-messaging/field-messaging.module';
+import { FieldOfflineModule } from './modules/field-offline/field-offline.module';
 import { PatrolModule } from './modules/patrol/patrol.module';
 
 @Module({
@@ -55,6 +56,9 @@ import { PatrolModule } from './modules/patrol/patrol.module';
     IncidentsModule,
     FieldModule,
     FieldMessagingModule,
+    // WP-20 Checkpoint B. Registered for dependency wiring only: the module
+    // declares no controller, so this adds no HTTP surface (C10-02).
+    FieldOfflineModule,
     PatrolModule,
   ],
 })

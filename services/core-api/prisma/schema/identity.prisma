@@ -47,6 +47,7 @@ model Site {
   incidentFieldMessages IncidentFieldMessage[]
   patrolRoutes PatrolRoute[]
   patrolRuns PatrolRun[]
+  fieldOfflineCursors FieldOfflineDeviceCursor[]
 
   @@unique([id, organisationId], map: "sites_id_organisation_key")
   @@index([organisationId])

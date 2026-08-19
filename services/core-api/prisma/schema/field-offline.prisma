@@ -1,0 +1,169 @@
+// SENTINEL Field offline replay (WP-20, architecture sections 13, 61, 62.1).
+// Owned exclusively by services/core-api/src/modules/field. Every read and
+// write is scoped to the authenticated principal AND the authenticated device
+// context (C10-02); the envelope's own namespace claims are never trusted.
+//
+// THE INVARIANT THIS SCHEMA EXISTS TO HOLD
+// ----------------------------------------
+// A reconnect may DELAY an authorised operation. It must never duplicate it,
+// reorder it, weaken its authorization, backdate server authority, or let a
+// changed request hide behind an old idempotency identity. The cursor makes
+// ordering enforceable; the receipt makes an outcome durable and replayable.
+//
+// THE LIVE / RELIABILITY SPLIT (the WP-17A rule applied to WP-20)
+// ---------------------------------------------------------------
+//
+//   LIVE SYNC STATE (FieldOfflineDeviceCursor)
+//     carries a composite (site_id, organisation_id) relation to Site with
+//     onDelete: Restrict, exactly as FieldAssignment and
+//     FieldOperativeCurrentState do. A cursor row asserts something true
+//     *right now* — "this device's queue stands here" — so the site it names
+//     must exist and must belong to the same organisation. The reference is
+//     composite rather than a plain Site.id FK so the database itself rejects
+//     a row pairing one tenant's organisation with another tenant's site
+//     (§62.1 defence in depth). Restrict, never Cascade: a site's lifecycle
+//     must not silently reset a device's queue position, because a reset
+//     cursor would re-admit sequence positions that were already consumed.
+//
+//   RELIABILITY / HISTORY ARTEFACT (FieldOfflineOperationReceipt)
+//     deliberately carries NO Site foreign key, per the historical-artefact
+//     rule stated in the doctrine header of field.prisma (WP-17A) and applied
+//     there to FieldOperativeStateHistory, FieldStateUpdateIdempotency,
+//     FieldAuditLog and FieldOutbox. Its `site_id` is the site identifier as
+//     recorded when the operation was received, and it must stay that way.
+//     `Cascade` would let a site's lifecycle erase the record of what a device
+//     was told happened to its queued work (forbidden by §61); `Restrict`
+//     would mean a site could never be removed once a single device had ever
+//     synced, silently inventing a Site retirement policy this work package
+//     has no mandate to decide. Integrity comes from the write-time check
+//     instead: the service proves the site exists in the organisation, and
+//     that the principal is authorised for it, BEFORE the transaction that
+//     claims the receipt, calls the domain and advances the cursor.
+//
+// NOTHING IN THIS FILE EVER CASCADES. The receipt is not a replay guard that
+// may be discarded with its parent (contrast the WP-16/WP-18/WP-19 action
+// idempotency tables): it is the only durable answer to "did my queued
+// operation actually happen?", and it is what a REPLAY returns instead of
+// re-executing a domain effect. Losing one converts an applied operation back
+// into an unapplied one — the precise duplication this work package forbids.
+//
+// See docs/execution/directives/WP-17A-field-site-integrity.md for the locked
+// site-integrity ruling, and packages/contracts/src/field-offline.ts for the
+// wire contract (sequence classification, receipt lifecycle, canonical request
+// fingerprint, safe conflict codes).
+
+/// Live per-device queue position: one row per authenticated replay namespace
+/// (organisation, site, user, device). This is the only thing the C10-03
+/// sequence classifier is allowed to know about ordering.
+model FieldOfflineDeviceCursor {
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  siteId String @map("site_id") @db.Text
+  userId String @map("user_id") @db.Text
+  deviceId String @map("device_id") @db.Text
+
+  /// C10-07: tracks the last FINALIZED sequence, not the last APPLIED one — a
+  /// deterministic rejection consumes a queue position exactly as an
+  /// application does, otherwise a rejected entry would wedge the queue behind
+  /// a position nothing could ever fill. NULL means a fresh namespace: the
+  /// contract's OFFLINE_SEQUENCE_START (0) has not been consumed yet, so the
+  /// next admissible sequence is 0 rather than last + 1. An UNKNOWN outcome
+  /// never advances this value (C10-08); it is retried into convergence.
+  lastFinalizedSequence BigInt? @map("last_finalized_sequence")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  /// WP-17A live-state precedent: composite so the pair must match, not just
+  /// the site id. Restrict — a site deletion must never reset a live queue.
+  site Site @relation(fields: [siteId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([organisationId, siteId, userId, deviceId], map: "field_offline_cursor_namespace_key")
+  @@map("field_offline_device_cursors")
+}
+
+/// The durable record of one queued offline operation and what became of it.
+/// Append-mostly: a row is inserted on first receipt and then advanced through
+/// the C10-08 lifecycle in place; no write path deletes one.
+///
+/// RELIABILITY ARTEFACT — no Site relation, deliberately. See this file's
+/// header and the WP-17A doctrine header in field.prisma: `site_id` here is
+/// the site as recorded at receipt time, and its integrity is enforced by the
+/// write-time check the service performs before the claiming transaction, not
+/// by a foreign key whose Cascade would erase reliability history and whose
+/// Restrict would invent a Site retirement policy.
+model FieldOfflineOperationReceipt {
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  siteId String @map("site_id") @db.Text
+  userId String @map("user_id") @db.Text
+  deviceId String @map("device_id") @db.Text
+
+  /// The queue position this operation claims within the namespace above.
+  deviceSequence BigInt @map("device_sequence")
+  offlineOperationId String @map("offline_operation_id") @db.Uuid
+  operationKind String @map("operation_kind") @db.Text
+
+  /// C10-04: SHA-256 hex of the canonical semantic request. Same sequence with
+  /// a different fingerprint is SEQUENCE_REUSED even when a downstream domain
+  /// service would have called the client's idempotency key a duplicate — a
+  /// changed request may never hide behind an old identity.
+  requestFingerprint String @map("request_fingerprint") @db.Text
+
+  /// C10-09: server-derived, never the client's key. Stored so a crash between
+  /// the domain call and the receipt update converges on the same domain
+  /// identity when the operation is retried.
+  downstreamIdempotencyKey String @map("downstream_idempotency_key") @db.Text
+
+  /// C10-06: telemetry only. When the client CLAIMS it queued the operation.
+  /// It is part of the semantic request identity and is never server
+  /// authority — it cannot backdate a transition or become a message's sent_at.
+  clientCreatedAt DateTime @map("client_created_at") @db.Timestamptz(3)
+  /// Server clock: when this queue entry first reached us.
+  firstReceivedAt DateTime @map("first_received_at") @db.Timestamptz(3)
+
+  /// C10-08 lifecycle: RECEIVED | APPLYING | APPLIED | REJECTED | UNKNOWN.
+  /// APPLIED and deterministic REJECTED are finalized and advance the cursor;
+  /// UNKNOWN never does.
+  status String @default("RECEIVED") @db.Text
+  /// APPLIED | REJECTED once finalized; NULL while the operation is in flight.
+  outcome String? @db.Text
+  /// A safe machine-readable code (e.g. DOMAIN_REJECTED) — never domain
+  /// detail. A foreign-tenant or non-entitled 404/403 must not leak out as
+  /// "exists but belongs to someone else" (C10-11).
+  conflictCode String? @map("conflict_code") @db.Text
+
+  resultRef String? @map("result_ref") @db.Text
+  /// Bounded, allowlist-populated safe metadata only. NEVER a message body,
+  /// recipient list, or any need-to-know content: a receipt is read back on
+  /// reconnect, so it must carry nothing the §62.1 access guard would have to
+  /// re-evaluate at read time.
+  resultSnapshot Json? @map("result_snapshot")
+
+  /// CAS/lease claim marker: set when a worker transitions RECEIVED ->
+  /// APPLYING, so a crashed attempt is recoverable rather than invisible.
+  processingClaimedAt DateTime? @map("processing_claimed_at") @db.Timestamptz(3)
+  attemptCount Int @default(0) @map("attempt_count")
+  finalizedAt DateTime? @map("finalized_at") @db.Timestamptz(3)
+
+  /// The trace of the FIRST receipt. C10-04: trace_id is non-semantic, so a
+  /// legitimate retry may carry a fresh trace without changing the request —
+  /// which is exactly why the first one is the one worth retaining.
+  firstTraceId String @map("first_trace_id") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  /// One receipt per queue position per namespace: the durable proof that
+  /// makes REPLAY / SEQUENCE_REUSED / SEQUENCE_STALE distinguishable (C10-03).
+  @@unique([organisationId, siteId, userId, deviceId, deviceSequence], map: "field_offline_receipt_sequence_key")
+  /// OPERATION_ID_REUSED enforced BELOW the service layer: one offline
+  /// operation id may occupy exactly one queue position in its namespace, so a
+  /// service-bypassing writer cannot smuggle the same operation in twice.
+  @@unique([organisationId, siteId, userId, deviceId, offlineOperationId], map: "field_offline_receipt_operation_key")
+  /// Recovery sweep: find operations left in a non-finalized status.
+  @@index([status, updatedAt], map: "field_offline_receipt_recovery_idx")
+  @@map("field_offline_operation_receipts")
+}

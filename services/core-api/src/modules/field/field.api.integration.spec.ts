@@ -396,8 +396,17 @@ describe('Field REST surface (live stack, WP-16 AC7 / WP-17 AC6-AC8)', () => {
     );
     const names = constrained.map((row) => row.table_name).sort();
 
-    expect(names).toEqual(['field_assignments', 'field_operative_current_states']);
-    for (const historical of ['field_operative_state_history', 'field_state_update_idempotency', 'field_audit_log', 'field_outbox']) {
+    // WP-20: the offline device cursor is LIVE synchronisation state and so
+    // joins the constrained set; its receipt table is a reliability artefact
+    // and must stay unconstrained, exactly like the four WP-16 history tables.
+    expect(names).toEqual(['field_assignments', 'field_offline_device_cursors', 'field_operative_current_states']);
+    for (const historical of [
+      'field_operative_state_history',
+      'field_state_update_idempotency',
+      'field_audit_log',
+      'field_outbox',
+      'field_offline_operation_receipts',
+    ]) {
       expect(names).not.toContain(historical);
     }
   });

@@ -41,6 +41,13 @@ function siteAllowed(siteScope: SiteScope, siteId: string): boolean {
   return siteScope.orgWide || siteScope.siteIds.includes(siteId);
 }
 
+/**
+ * WP-20 Checkpoint B integration correction: a stand-in for the message id
+ * while the aggregate size is measured BEFORE the row exists. It is exactly
+ * uuid-length, so the measurement matches what the real id will serialize to.
+ */
+const AGGREGATE_SIZE_PROBE_ID = '00000000-0000-0000-0000-000000000000';
+
 @Injectable()
 export class FieldMessagingService {
   private readonly logger = new Logger(FieldMessagingService.name);
@@ -125,6 +132,41 @@ export class FieldMessagingService {
     const sentAt = new Date();
     if (expiresAt !== null && expiresAt < sentAt) throw new BadRequestException('expires_at must be >= sent_at');
 
+    // WP-20 Checkpoint B integration correction: aggregate size must fail
+    // BEFORE the durable transaction. Every individual bound is already
+    // checked above — recipient count and uniqueness, media-ref count, body
+    // bytes — so the only remaining way for `assertContract` to fail is the
+    // CANONICAL AGGREGATE size, and it used to fail AFTER repository.send()
+    // had already committed the message, its recipient rows, the incident
+    // timeline entry and the outbox row. A refused aggregate must leave ZERO
+    // rows behind. Re-using IncidentFieldMessageSchema itself, rather than a
+    // local byte count, is what stops this gate drifting from the contract it
+    // enforces: the size rule lives in exactly one place.
+    const candidate = IncidentFieldMessageSchema.safeParse({
+      schema_version: 1,
+      incident_field_message_id: AGGREGATE_SIZE_PROBE_ID,
+      organisation_id: principal.organisation_id,
+      site_id: siteId,
+      incident_id: incidentId,
+      sender_user_id: principal.user.id,
+      recipient_user_ids: recipientUserIds,
+      body,
+      media_refs: mediaRefs,
+      delivery_state: 'REQUESTED',
+      retention_class: input.retention_class,
+      sent_at: sentAt.toISOString(),
+      expires_at: expiresAt?.toISOString() ?? null,
+      trace_id: input.trace_id,
+    });
+    if (!candidate.success) {
+      // The aggregate-size rule is the only issue the contract raises at the
+      // ROOT path; every other superRefine issue names a field. The fallback
+      // branch keeps this fail-closed rather than letting an unexpected
+      // contract failure fall through to the write it was meant to precede.
+      const oversized = candidate.error.issues.some((issue) => issue.path.length === 0 && issue.code === z.ZodIssueCode.custom);
+      throw new BadRequestException(oversized ? 'message exceeds the canonical serialized size limit' : 'message failed canonical contract validation');
+    }
+
     const result = await this.repository.send({
       organisationId: principal.organisation_id,
       siteId,
@@ -189,6 +231,42 @@ export class FieldMessagingService {
     if (result.kind === 'not_recipient') throw new NotFoundException('Message not found');
     if (result.kind === 'conflict') throw new ConflictException(`Delivery state is ${result.currentState}`);
     return mapMessage(result.message);
+  }
+
+  /**
+   * WP-20/B10-02 idempotency recovery probe — pure evidence lookup, no mutable
+   * eligibility re-evaluation, actor-scoped per the C8-05 lesson.
+   *
+   * The offline replay executor asks THIS domain whether the send identity it
+   * derived has already committed. It cannot learn that by calling `send`
+   * again: `send` re-runs sender eligibility, incident scope resolution and
+   * the aggregate bound BEFORE the repository's idempotency layer, so an
+   * eligibility that drifted since the first attempt would turn an effect that
+   * already committed into a REJECTED receipt — false history the device would
+   * then treat as final.
+   *
+   * The sender is `principal.user.id` and the tenant `principal.organisation_id`,
+   * matching the send-idempotency identity exactly (C8-05).
+   */
+  async probeSendEvidence(
+    principal: Principal,
+    incidentId: string,
+    idempotencyKey: string,
+  ): Promise<{ id: string; incidentId: string; recipientCount: number } | null> {
+    return this.repository.findSendEvidence(principal.organisation_id, incidentId, principal.user.id, idempotencyKey);
+  }
+
+  /**
+   * WP-20/B10-02 idempotency recovery probe — pure evidence lookup, no mutable
+   * eligibility re-evaluation, actor-scoped per the C8-05 lesson.
+   *
+   * Same argument as `probeSendEvidence`: `acknowledge` re-checks recipiency
+   * and the C8-01 DELIVERED precondition before reaching its idempotency row,
+   * so a re-run cannot distinguish "never happened" from "already happened and
+   * the state moved on". The evidence row can.
+   */
+  async probeAcknowledgeEvidence(principal: Principal, messageId: string, idempotencyKey: string): Promise<boolean> {
+    return this.repository.findAcknowledgeEvidence(principal.organisation_id, messageId, principal.user.id, idempotencyKey);
   }
 
   private isEntitled(message: MessageWithRecipients, userId: string): boolean {

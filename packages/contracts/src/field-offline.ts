@@ -190,6 +190,29 @@ export interface OfflineSequenceObservation {
 }
 
 /**
+ * The sequence a device should submit next, as reported back to clients.
+ *
+ * SEQUENCE EXHAUSTION (B10-03). `null` means the namespace is EXHAUSTED: the
+ * device has finalized MAX_OFFLINE_DEVICE_SEQUENCE, so `last + 1` would leave
+ * the safe-integer range and NO position remains that could be admitted. The
+ * honest answer is "there is no next sequence", not a silently wrapped or
+ * rounded number — the whole point of the BigInt boundary assertion is that a
+ * sequence must never quietly become a DIFFERENT queue position.
+ *
+ * THERE IS DELIBERATELY NO RESET. C10-03 forbids rewinding a device queue: a
+ * cursor that can go backwards can re-admit a consumed position and duplicate
+ * the effect already recorded there. Reprovisioning an exhausted device
+ * therefore requires a NEW authenticated device identity — which is a new
+ * `(organisation, site, user, device)` namespace with its own cursor and its
+ * own receipts — never a reset of this one.
+ */
+export function nextExpectedOfflineSequence(lastFinalizedSequence: number | null): number | null {
+  if (lastFinalizedSequence === null) return OFFLINE_SEQUENCE_START;
+  if (lastFinalizedSequence >= MAX_OFFLINE_DEVICE_SEQUENCE) return null;
+  return lastFinalizedSequence + 1;
+}
+
+/**
  * C10-03: contiguous, not merely increasing. The next admissible sequence is
  * exactly `last_finalized + 1` (or OFFLINE_SEQUENCE_START on a fresh
  * namespace). Anything beyond it is a GAP — a queue entry at N+1 must never
@@ -197,18 +220,25 @@ export interface OfflineSequenceObservation {
  * same request replays the recorded outcome, a different request under the
  * same position is reuse, and a consumed position with no receipt is stale.
  * None of the non-FRESH classifications may produce a domain effect.
+ *
+ * B10-03 EXHAUSTED NAMESPACE. When `nextExpectedOfflineSequence` reports null
+ * every position up to MAX is consumed, so neither FRESH nor SEQUENCE_GAP can
+ * apply — there is no unconsumed position left to be fresh at, and nothing
+ * above MAX can even be expressed (the contract bounds `device_sequence` at
+ * MAX). Both branches are skipped and the receipt decides: the finalized MAX
+ * position still REPLAYS its stored outcome, a CHANGED request at MAX is
+ * SEQUENCE_REUSED, and anything else is SEQUENCE_STALE. An exhausted device
+ * can therefore still read back what it already did; it simply cannot enqueue
+ * anything new.
  */
 export function classifyOfflineSequence(observation: OfflineSequenceObservation): OfflineSequenceClassification {
-  const nextExpected = observation.last_finalized_sequence === null ? OFFLINE_SEQUENCE_START : observation.last_finalized_sequence + 1;
-  if (observation.incoming_sequence === nextExpected) return 'FRESH';
-  if (observation.incoming_sequence > nextExpected) return 'SEQUENCE_GAP';
+  const nextExpected = nextExpectedOfflineSequence(observation.last_finalized_sequence);
+  if (nextExpected !== null) {
+    if (observation.incoming_sequence === nextExpected) return 'FRESH';
+    if (observation.incoming_sequence > nextExpected) return 'SEQUENCE_GAP';
+  }
   if (observation.receipt.exists) return observation.receipt.same_semantic_request ? 'REPLAY' : 'SEQUENCE_REUSED';
   return 'SEQUENCE_STALE';
-}
-
-/** The sequence a device should submit next, as reported back to clients. */
-export function nextExpectedOfflineSequence(lastFinalizedSequence: number | null): number {
-  return lastFinalizedSequence === null ? OFFLINE_SEQUENCE_START : lastFinalizedSequence + 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -380,7 +410,11 @@ export const OfflineOperationResultSchema = z
     outcome: OfflineOperationOutcomeSchema,
     replayed: z.boolean(),
     finalized_at: timestamp,
-    next_expected_sequence: deviceSequence,
+    /** B10-03: null = the device's sequence namespace is EXHAUSTED (MAX
+     *  finalized). The operation still has a real outcome to report; there is
+     *  simply no next position, and no reset — reprovisioning needs a new
+     *  authenticated device identity (see nextExpectedOfflineSequence). */
+    next_expected_sequence: deviceSequence.nullable(),
     result_ref: scopedId.nullable(),
     result_snapshot: z
       .record(z.unknown())
