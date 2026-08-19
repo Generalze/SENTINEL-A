@@ -98,8 +98,8 @@ the whole log.
 | WP-18 | Done — incident field messaging: named-recipient entitlement, commander oversight as its own action, immutable recipients, tuple-bound persistence, transport-evidence delivery | merged `5868bf7` |
 | WP-19 | Done — versioned patrol standards, materialised run expectations, server-owned timing (C9-01..C9-09), whole-system audit correction batch (complete evidence tuple, request-bound idempotency, locked mutable dependencies, fail-closed START, boundary-bounded JSON), 34 patrol tests | merged `e4092e2` |
 | WP-20 | Done — offline operation contracts and server replay foundation: V2 discriminated envelope, contiguous per-device sequencing, request-bound fingerprints, cursor/receipt persistence, effectively-once executor with claim fencing and domain-evidence recovery, authenticated device-context seam (C10-01..C10-11, B10-01..B10-03), 25 acceptance tests | merged `3b1d7fe` |
-| WP-21 | WP-21A **COMPLETE** — contract + authority lock (W21-01..W21-14, C11-01..C11-07), 202 contract tests, merged `df479f4`. WP-21B server runtime delivered — Whisper Studio persistence and lifecycle, Ed25519 verification, durable seven-column anti-replay, generic Incident source seam, entry into the existing SILENT path, 65 acceptance tests. **MERGE HOLD** pending audit + hosted CI | branch `wp-21b-whisper-runtime` |
-| WP-22 | Not started | — |
+| WP-21 | Done — Whisper foundation. WP-21A contract + authority lock (W21-01..W21-14, C11-01..C11-07) merged `df479f4`; WP-21B server runtime (B11-01..B11-15, C12-01..C12-04) merged `e779a454` — Studio persistence and lifecycle, Ed25519 verification, seven-column anti-replay, generic Incident source seam, entry into the existing SILENT path, 75 Whisper tests | merged `e779a454` |
+| WP-22 | Milestone-2 live regression and sign-off — patrol scheduler determinism, integrated M2 Field loop, isolation matrix, effectively-once and Whisper Crucibles, evidence record. **MERGE HOLD** pending audit + hosted CI | branch `wp-22-m2-live-regression-signoff` |
 
 **Wave 7 is closed.** WP-17 and WP-17A are both on `main`; C7-07 is closed.
 
@@ -107,21 +107,25 @@ the whole log.
 (`3b1d7fe`) are on accepted mirror `main`; C9-01..C9-09, C10-01..C10-11 and the
 B10 correction batch are closed, each through its own whole-system audit.
 
-**Wave 10 is open. WP-21 is the current gate.** See
-[`directives/WP-21-whisper-foundation.md`](directives/WP-21-whisper-foundation.md):
-Whisper is organisation-configured discreet signalling, not a hidden command
-channel. Recognition initiates the approved silent protocol and never
-constitutes either human approval; the signal references a server-owned
-protocol registry rather than carrying executable content; device identity,
-trust, context and freshness are all server-established. WP-21A locks the
-contract and the proposed authority matrix; persistence, `roles.ts`, services,
-controllers and the SILENT adapter stay HOLD.
+**Wave 10 is complete.** WP-21A (`df479f4`) and WP-21B (`e779a454`) are on
+accepted mirror `main`; the contract is frozen and the server runtime is
+closed, each through its own whole-system audit.
 
-**Proof D remains outstanding by design.** WP-20 supplied the server-side
-ordering, idempotency and recovery foundation; the architecture's degraded-
-operations proof is the later integrated demonstration in which WAN fails, Edge
-maintains critical local functions, real Field clients queue, and central
-synchronisation recovers without duplicate incident actions.
+**Wave 11 is open. WP-22 is the final engineering gate before Milestone-2
+sign-off.** See
+[`directives/WP-22-milestone-2-regression-hardening.md`](directives/WP-22-milestone-2-regression-hardening.md)
+and the capability-to-evidence map in
+[`MILESTONE-2-EVIDENCE.md`](MILESTONE-2-EVIDENCE.md). WP-22 adds no feature: it
+proves the WP-15..WP-21 capabilities remain correct together, removes the
+ambient-scheduler nondeterminism from the patrol suite, and records what is
+proven versus what is not.
+
+**Proof C and Proof D remain UNCLAIMED**, deliberately. WP-21B proved the
+server-side Whisper authority, recognition, replay and SILENT-entry semantics
+but not that a production-authenticated device originated the signed action;
+WP-20 supplied the ordering, idempotency and recovery foundation but not the
+WAN-loss/Edge-continuity demonstration. The milestone tag
+`milestone-2-field-workflow` makes neither claim.
 
 ### CI contract
 

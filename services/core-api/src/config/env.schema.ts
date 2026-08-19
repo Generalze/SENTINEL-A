@@ -67,6 +67,24 @@ export const envSchema = z.object({
     })
     .default('info'),
   DEV_AUTH_ENABLED: booleanFromEnvString.default(false),
+  /**
+   * WP-22/W22-02: the patrol missed-sweep cadence, in milliseconds.
+   *
+   * The sweep decides MISSED by the clock alone, so it must keep running in
+   * production — but a BACKGROUND timer firing on its own schedule made the
+   * WP-19 integration suite's correctness depend on lucky timing: a sweep
+   * landing between a test's own actions changed counts the test was about to
+   * assert. That is a scheduler problem, not a patrol-semantics problem.
+   *
+   * `0` disables the background cadence entirely, leaving `sweep()` callable
+   * explicitly. Tests set it to 0 and drive the sweep themselves, so what they
+   * assert is what they caused. The sweep logic itself is untouched.
+   */
+  PATROL_SWEEP_INTERVAL_MS: z.coerce
+    .number()
+    .int('PATROL_SWEEP_INTERVAL_MS must be an integer')
+    .nonnegative('PATROL_SWEEP_INTERVAL_MS must not be negative')
+    .default(5000),
 });
 
 export type AppConfig = z.infer<typeof envSchema>;

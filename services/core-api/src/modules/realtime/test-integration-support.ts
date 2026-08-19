@@ -54,6 +54,8 @@ export const LIVE_STACK_ENV: Readonly<Record<string, string>> = {
   PORT: '3000',
   LOG_LEVEL: 'error',
   DEV_AUTH_ENABLED: 'true',
+  // W22-02: no ambient sweep cadence — this suite drives sweep() itself.
+  PATROL_SWEEP_INTERVAL_MS: '0',
 };
 
 @Module({ imports: [ConfigModule, PrismaModule, InfraModule, RealtimeModule] })

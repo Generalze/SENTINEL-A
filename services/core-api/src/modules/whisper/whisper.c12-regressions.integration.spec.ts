@@ -67,6 +67,8 @@ const STACK_ENV: Record<string, string> = {
   S3_BUCKET: 'sentinel-dev',
   LOG_LEVEL: 'error',
   DEV_AUTH_ENABLED: 'true',
+  // W22-02: no ambient sweep cadence — this suite drives sweep() itself.
+  PATROL_SWEEP_INTERVAL_MS: '0',
 };
 
 const tag = `wp21bc12_${Date.now()}_${Math.trunc(Math.random() * 100000)}`;

@@ -25,7 +25,7 @@ export function makeAppConfig(overrides: Partial<AppConfig> = {}): AppConfigServ
     S3_EVIDENCE_BUCKET: 'sentinel-evidence',
     PORT: 3000,
     LOG_LEVEL: 'info',
-    DEV_AUTH_ENABLED: false,
+    DEV_AUTH_ENABLED: false, PATROL_SWEEP_INTERVAL_MS: 0,
     ...overrides,
   };
   return { values } as AppConfigService;
