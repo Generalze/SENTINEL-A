@@ -1,0 +1,384 @@
+// SENTINEL Whisper domain (WP-21B, architecture sections 14.5, 61, 62, 62.1).
+// Owned exclusively by services/core-api/src/modules/whisper. Every read and
+// write is scoped to the authenticated principal AND the authenticated device
+// context (W21-05); nothing a submitted recognition claims about itself is
+// ever authority.
+//
+// This file is PERSISTENCE ONLY. The behaviour it serves is fixed by the
+// frozen contract in packages/contracts/src/whisper.ts — the nine-status
+// lifecycle, the six semantic configuration fields, the canonical signed
+// statement, the seven-column replay identity, the conflict-code vocabulary
+// and the strict audit payload. Nothing here re-states a rule the contract
+// already owns; these tables exist to make those rules DURABLE.
+//
+// THE INVARIANTS THESE TABLES EXIST TO HOLD
+// -----------------------------------------
+//  1. A configuration that was TESTED is the configuration that was APPROVED
+//     is the configuration that FIRES. W21-02 freezes a version the moment it
+//     leaves DRAFT, so a semantic change is a NEW version — never an edit
+//     underneath accumulated evidence. Persistence expresses that as one
+//     immutable row per (family, version).
+//  2. A recognition may be RETRIED. It may never be REPLAYED. W21-09/B11-12
+//     make that a durable seven-column uniqueness boundary, not a cache.
+//  3. History is never erased to make an administrative action possible
+//     (section 61).
+//
+// THE LIVE / HISTORY SPLIT (the WP-17A rule applied to WP-21B)
+// -------------------------------------------------------------
+// The doctrine header of prisma/schema/field.prisma states the locked ruling
+// and docs/execution/directives/WP-17A-field-site-integrity.md records it.
+// It divides tables by what they ASSERT, and Whisper divides the same way:
+//
+//   LIVE DOMAIN STATE (WhisperSignalVersion)
+//     carries a composite (site_id, organisation_id) relation to Site with
+//     onDelete: Restrict, exactly as FieldAssignment,
+//     FieldOperativeCurrentState and FieldOfflineDeviceCursor do. A signal
+//     version asserts something true *right now* — "this configuration may be
+//     recognised at this site" — so the site it names must exist and must
+//     belong to the same organisation. The reference is composite rather than
+//     a plain Site.id FK so the database itself rejects a row pairing one
+//     tenant's organisation with another tenant's site (section 62.1 defence
+//     in depth), which for this modality is the difference between a silent
+//     duress trigger scoped to its own tenant and one that is not.
+//
+//     The relation is OPTIONAL only because a NULL site_id is a real and
+//     meaningful configuration: W21-03/C11-02 admit an organisation-wide
+//     signal. NULL means "every site in this organisation", never "unknown
+//     site" — and Postgres MATCH SIMPLE gives exactly that reading, since a
+//     NULL member leaves the composite constraint unenforced rather than
+//     dangling. C11-02's runtime gate still requires the firing device to be
+//     entitled to the specific site it fires at, so org-wide scope widens
+//     WHERE a signal may exist, never WHO may fire it.
+//
+//   HISTORICAL / RELIABILITY ARTEFACTS (WhisperRecognitionReceipt,
+//   WhisperAuditLog)
+//     deliberately carry NO Site foreign key, per the historical-artefact rule
+//     the WP-17A header states and applies to FieldOperativeStateHistory,
+//     FieldStateUpdateIdempotency, FieldAuditLog, FieldOutbox and
+//     FieldOfflineOperationReceipt. Their site_id is the site identifier AS
+//     RECORDED at the moment of the event, and it must stay that way.
+//     `Cascade` would let a site's lifecycle erase the record of a silent
+//     duress signal and of the anti-replay identity that was consumed —
+//     forbidden by section 61, and for a receipt it is worse than data loss:
+//     deleting a consumed replay identity RE-ADMITS the nonce it retired.
+//     `Restrict` would mean a site could never be removed once a single
+//     recognition had ever been received, silently inventing a Site retirement
+//     policy this work package has no mandate to decide. Integrity comes from
+//     the write-time check instead: the service proves the site exists in the
+//     organisation, and that the authenticated device context is entitled to
+//     it, BEFORE the transaction that claims the receipt and writes the audit
+//     row.
+//
+//   IMMUTABLE ATTESTATION (WhisperActivationApproval)
+//     names no site at all, so the question does not arise for it. It binds to
+//     the version's (id, organisation_id) candidate key with Restrict: the
+//     approval must not outlive, and must not be separated from, the exact
+//     version it attests to.
+//
+// NOTHING IN THIS FILE EVER CASCADES. Contrast the WP-16/WP-18/WP-19 action
+// idempotency tables, which legitimately cascade because they only dedupe
+// requests against a live parent. None of these four rows is that: an
+// approval is evidence, a receipt is a consumed one-shot identity, an audit
+// row is the record of a silent channel being used.
+
+/// One IMMUTABLE-AFTER-DRAFT configuration version (W21-02).
+///
+/// `whisper_signal_id` is the FAMILY identifier — server-generated and stable
+/// across every version of one logical signal — while `signal_version` counts
+/// within that family. Together they are the exact configuration identity the
+/// contract's C11-05 gate binds a recognition to, which is why a version
+/// number alone is never sufficient: two families can both sit at version 3
+/// with the same device action while differing in roster, threshold, context
+/// requirements or protocol.
+///
+/// LIVE STATE — carries the composite Site relation. See this file's header.
+model WhisperSignalVersion {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// The family id. Stable across versions; server-generated, never client-chosen.
+  whisperSignalId String @map("whisper_signal_id") @db.Text
+  signalVersion Int @map("signal_version")
+
+  organisationId String @map("organisation_id") @db.Text
+  /// W21-03/C11-02: NULL = organisation-wide. See the header — NULL means
+  /// "every site in this organisation", not "unknown site".
+  siteId String? @map("site_id") @db.Text
+
+  /// Deliberately NOT part of the configuration fingerprint: renaming a signal
+  /// in Studio changes no authority and must not force a version bump.
+  name String @db.Text
+
+  /// The nine-status section 14.5 lifecycle, owned by
+  /// WhisperSignalStatusSchema in the frozen contract. Stored as text for the
+  /// same reason every other status column in this schema is: the transition
+  /// table is versioned in reviewable code, not in a database type whose
+  /// change would be a migration.
+  status String @default("DRAFT") @db.Text
+
+  // ---- the six SEMANTIC configuration fields ----
+  // WHISPER_SEMANTIC_CONFIGURATION_FIELDS in the frozen contract. These, and
+  // only these, are what `configuration_fingerprint` digests. A change to any
+  // of them past DRAFT means a NEW version, because an approval attests to a
+  // tested configuration and must never survive one it never saw.
+  modality String @default("DEVICE_ACTION") @db.Text
+  deviceActionId String @map("device_action_id") @db.Text
+  /// B11-07: stored SORTED, because order is not authority. This is an
+  /// allowlist SET — reordering the roster is not a configuration change, and
+  /// the contract's fingerprint sorts before digesting for exactly that
+  /// reason. Membership here is necessary but never sufficient: W21-04 also
+  /// requires the actor to hold current authority at invocation time, so
+  /// revoking someone stops them even while an older active version still
+  /// lists their id.
+  authorisedUserIds String[] @map("authorised_user_ids")
+  contextRequirements Json @default("{}") @map("context_requirements")
+  minimumConfidence Float @map("minimum_confidence")
+  /// W21-10: a REFERENCE into the server-owned response-protocol allowlist,
+  /// never executable content. Nullable because a DRAFT may not have chosen
+  /// one yet; the contract refuses ACTIVE without it.
+  responseProtocolId String? @map("response_protocol_id") @db.Text
+
+  /// SHA-256 hex of the six fields above, canonically digested. Stored so an
+  /// activation approval can be bound to the exact configuration it attests
+  /// to, and so a claimed no-op edit can be proven to be one.
+  configurationFingerprint String @map("configuration_fingerprint") @db.Text
+
+  createdByUserId String @map("created_by_user_id") @db.Text
+  traceId String @map("trace_id") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  /// Lifecycle timestamps for the three consequential transitions. Separate
+  /// columns rather than one "status_changed_at" because ROTATED and RETIRED
+  /// are distinct outcomes and an audit must be able to tell how long a
+  /// version was actually live.
+  activatedAt DateTime? @map("activated_at") @db.Timestamptz(3)
+  rotatedAt DateTime? @map("rotated_at") @db.Timestamptz(3)
+  retiredAt DateTime? @map("retired_at") @db.Timestamptz(3)
+
+  /// WP-17A live-state precedent: composite so the pair must match, not just
+  /// the site id. Restrict — a site's lifecycle must never silently delete a
+  /// configuration that can raise a silent dispatch. Optional because a NULL
+  /// site_id is org-wide scope (W21-03/C11-02), not a missing site.
+  /// C12-04: a DIRECT organisation relation, because the composite Site
+  /// relation below is MATCH SIMPLE — a NULL site_id skips it entirely, so an
+  /// organisation-wide signal would otherwise carry NO database proof that its
+  /// tenant exists at all. This FK covers both scoped and organisation-wide
+  /// rows; the composite Site FK still proves a non-null site belongs to this
+  /// same organisation. RESTRICT: a tenant with live Whisper configuration is
+  /// not silently removable.
+  organisation Organisation @relation(fields: [organisationId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  site Site? @relation(fields: [siteId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
+  approvals WhisperActivationApproval[]
+  receipts WhisperRecognitionReceipt[]
+
+  /// One row per (tenant, family, version). This is the W21-02 freeze made
+  /// durable: a second write of the same version cannot exist to be edited.
+  @@unique([organisationId, whisperSignalId, signalVersion], map: "whisper_signal_version_key")
+  /// Candidate key, deliberately redundant with the primary key — it makes
+  /// (id, organisation_id) referenceable so a child row binds to THIS version
+  /// UNDER THIS TENANT rather than to an id that merely exists. Same
+  /// technique, same reason, as incidents_id_org_site_key and
+  /// sites_id_organisation_key.
+  @@unique([id, organisationId], map: "whisper_signal_version_id_org_key")
+  /// Resolve the active version of a family, and list a family's history.
+  @@index([organisationId, whisperSignalId, status], map: "whisper_signal_family_status_idx")
+  /// C12-03: at most ONE ACTIVE version per (organisation, family) is a
+  /// PERSISTENCE invariant, not merely a service one. Service locking makes
+  /// the normal path sound, but B11-06 requires the guarantee below the
+  /// service layer, and Prisma cannot express a partial index — so the
+  /// migration creates it directly:
+  ///
+  ///   CREATE UNIQUE INDEX whisper_signal_one_active_family_key
+  ///     ON whisper_signal_versions (organisation_id, whisper_signal_id)
+  ///     WHERE status = 'ACTIVE';
+  ///
+  /// Do not remove it from the migration believing this schema covers it.
+  @@map("whisper_signal_versions")
+}
+
+/// W21-13: the record that a TESTED CONFIGURATION IS SAFE TO RECOGNISE.
+///
+/// IMMUTABLE. No write path updates or deletes one; a withdrawn approval is
+/// expressed by rotating or retiring the version, never by rewriting history.
+///
+/// THIS IS NOT, AND CAN NEVER BE REPLAYED AS, AN APPROVAL OF ANY OPERATIONAL
+/// RESPONSE. The shape carries no incident, no task and no dispatch column —
+/// structurally, not by convention — so no query and no future code path can
+/// mistake one for a ResponseTaskSilentApproval. When an active signal later
+/// fires, the existing SILENT response still requires its own
+/// Constitution-governed approvals from distinct commanders.
+///
+/// W21-12 additionally requires the approver to be a person distinct from the
+/// version's creator; both ids are stored so that check is auditable after the
+/// fact and not merely enforced in flight.
+model WhisperActivationApproval {
+  id String @id @default(uuid()) @db.Uuid
+
+  signalVersionId String @map("signal_version_id") @db.Uuid
+  organisationId String @map("organisation_id") @db.Text
+
+  /// Bound through the version's (id, organisation_id) candidate key, so an
+  /// approval cannot be attached to another tenant's version. Restrict: the
+  /// attestation must never be separated from what it attests to.
+  signalVersion WhisperSignalVersion @relation(fields: [signalVersionId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
+  /// Bound to the EXACT tested configuration. An approval that no longer
+  /// matches its version's fingerprint is an approval of something that no
+  /// longer exists, and the service must refuse to activate on it.
+  configurationFingerprint String @map("configuration_fingerprint") @db.Text
+
+  approvedByUserId String @map("approved_by_user_id") @db.Text
+  createdByUserId String @map("created_by_user_id") @db.Text
+  approvedAt DateTime @map("approved_at") @db.Timestamptz(3)
+  traceId String @map("trace_id") @db.Text
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  /// EXACTLY ONE activation per version, enforced below the service layer. A
+  /// second approval row would let an activation be re-attested after the
+  /// fact, or let two partial approvals be mistaken for the one the lifecycle
+  /// requires.
+  @@unique([signalVersionId], map: "whisper_activation_approval_version_key")
+  @@map("whisper_activation_approvals")
+}
+
+/// B11-12/W21-09: the DURABLE anti-replay record, and the record of what
+/// became of one recognition.
+///
+/// A recognition may be RETRIED — the same canonical statement converges on
+/// this same row and returns the stored outcome. It may never be REPLAYED: a
+/// reused replay identity carrying a different statement is a conflict that
+/// invokes nothing.
+///
+/// RELIABILITY / HISTORY ARTEFACT — no Site relation, deliberately. See this
+/// file's header and the WP-17A doctrine header in field.prisma. site_id here
+/// is the site as recorded at receipt time; its integrity comes from the
+/// write-time check the service performs before the claiming transaction.
+/// Cascading it away would not merely lose history, it would RE-ADMIT a nonce
+/// that had already been consumed.
+model WhisperRecognitionReceipt {
+  id String @id @default(uuid()) @db.Uuid
+
+  // ---- THE SEVEN IDENTITY COLUMNS ----
+  // deviceActionWhisperReplayIdentity in the frozen contract. C11-01: the
+  // anti-replay identity is a REAL COMPOSITE KEY over these seven columns, not
+  // a concatenation and not a hash. A digest would still refuse the duplicate,
+  // but it would throw away the ability to query, audit and reason about the
+  // parts — and a delimiter-joined string would let two different tuples
+  // collide, which is one tenant's nonce consuming another's replay slot. The
+  // ACTOR is part of the identity (W21-09) because two people may legitimately
+  // be authorised on one version and may share a device between shifts: a
+  // nonce consumed by one must not silently consume the other's one-shot
+  // identities.
+  organisationId String @map("organisation_id") @db.Text
+  siteId String @map("site_id") @db.Text
+  actorUserId String @map("actor_user_id") @db.Text
+  deviceId String @map("device_id") @db.Text
+  whisperSignalId String @map("whisper_signal_id") @db.Text
+  whisperSignalVersion Int @map("whisper_signal_version")
+  antiReplayNonce String @map("anti_replay_nonce") @db.Text
+
+  /// The resolved version, when one was resolved. NULLABLE on purpose: a
+  /// refusal that never got as far as resolving a signal — a scope mismatch,
+  /// an invalid signature, an unknown family — must STILL be recorded, because
+  /// the whole point of a durable replay boundary is that it also retires the
+  /// nonce of an attempt that failed. Requiring the FK here would mean the
+  /// failures most worth recording were the ones that could not be written.
+  ///
+  /// Postgres MATCH SIMPLE leaves the composite constraint unenforced when
+  /// signal_version_id is NULL, which is exactly the intended reading; when it
+  /// is present, the (id, organisation_id) binding proves the version belongs
+  /// to this same tenant.
+  signalVersionId String? @map("signal_version_id") @db.Uuid
+  signalVersion WhisperSignalVersion? @relation(fields: [signalVersionId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
+  /// SHA-256 hex of the canonical signed statement. Stored SEPARATELY and it
+  /// NEVER replaces the composite identity above: the fingerprint answers "is
+  /// this the same request?", the seven columns answer "has this one-shot
+  /// identity already been spent?". Collapsing the second question into the
+  /// first is how a replay guard becomes a cache.
+  recognitionFingerprint String @map("recognition_fingerprint") @db.Text
+
+  /// RECEIVED | APPLYING | APPLIED | REFUSED | UNKNOWN. UNKNOWN is not a
+  /// failure state, it is an unresolved one: it is retried into convergence
+  /// and never silently finalized (the WP-20/C10-08 precedent).
+  status String @default("RECEIVED") @db.Text
+  /// ACCEPTED | REFUSED once finalized; NULL while in flight.
+  outcome String? @db.Text
+  /// A WhisperRecognitionConflictCode. Safe and machine-readable by
+  /// construction — the contract's vocabulary deliberately cannot say whether
+  /// a signal exists, only that the attempt did not qualify.
+  conflictCode String? @map("conflict_code") @db.Text
+
+  /// Where an ACCEPTED recognition entered the existing SILENT response path.
+  /// A SCALAR LINK WITH NO FOREIGN KEY, on purpose: this is a history artefact
+  /// and must never be cascade-erased by an incident's lifecycle, nor may it
+  /// pin an incident open under Restrict. The chain stays reconstructable by
+  /// id, exactly as the contract's audit payload does it.
+  incidentId String? @map("incident_id") @db.Uuid
+
+  /// Fencing generation for crash recovery (the WP-20/B10-01 precedent): an
+  /// attempt that claimed this row and died is recoverable rather than
+  /// invisible, and a stale worker's write can be refused by generation.
+  attemptCount Int @default(0) @map("attempt_count")
+  /// CAS/lease claim marker, set on RECEIVED -> APPLYING.
+  processingClaimedAt DateTime? @map("processing_claimed_at") @db.Timestamptz(3)
+
+  /// AUTHORITATIVE server receipt time — the server clock read when the result
+  /// arrived. W21-08 judges freshness against THIS, never against the device's
+  /// self-reported freshness_ms: a device that under-reports its own age must
+  /// not thereby extend its acceptance window.
+  recordedAt DateTime @map("recorded_at") @db.Timestamptz(3)
+  finalizedAt DateTime? @map("finalized_at") @db.Timestamptz(3)
+
+  traceId String @map("trace_id") @db.Text
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  /// THE seven-column anti-replay boundary (C11-01). Enforced BELOW the
+  /// service layer so a service-bypassing writer cannot spend one identity
+  /// twice.
+  @@unique([organisationId, siteId, actorUserId, deviceId, whisperSignalId, whisperSignalVersion, antiReplayNonce], map: "whisper_recognition_replay_key")
+  /// Recovery sweep: find recognitions left in a non-finalized status.
+  @@index([status, updatedAt], map: "whisper_recognition_recovery_idx")
+  @@map("whisper_recognition_receipts")
+}
+
+/// W21-14: APPEND-ONLY audit of the Whisper channel. No write path updates or
+/// deletes a row; corrections are subsequent entries.
+///
+/// `payload` is constrained by WhisperAuditPayloadSchema in the frozen
+/// contract, whose `.strict()` is the actual enforcement: the discreet action
+/// definition, signature material, public keys, the authorised-user roster and
+/// the context VALUES have no field there, so a well-meaning future edit
+/// cannot quietly widen an audit row into a disclosure of the very secret this
+/// modality depends on. What remains is enough to reconstruct WHO did WHAT,
+/// WHEN, under WHICH version, with WHICH outcome, and where it went.
+///
+/// HISTORY ARTEFACT — no Site relation, deliberately. See this file's header:
+/// security history must never be cascade-erased by a site's lifecycle
+/// (section 61), and Restrict would invent a Site retirement policy this work
+/// package has no mandate to decide.
+///
+/// `signal_version` is nullable because family-level events, and events logged
+/// before a version could be resolved, are real and must be recordable.
+model WhisperAuditLog {
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  siteId String? @map("site_id") @db.Text
+  whisperSignalId String @map("whisper_signal_id") @db.Text
+  signalVersion Int? @map("signal_version")
+
+  kind String @db.Text
+  /// Nullable: system-owned transitions have no human actor, and refusing to
+  /// log one for want of an actor id would be the wrong trade.
+  actorUserId String? @map("actor_user_id") @db.Text
+  payload Json @default("{}")
+  at DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([organisationId, whisperSignalId, at], map: "whisper_audit_family_idx")
+  @@map("whisper_audit_log")
+}

@@ -9,8 +9,39 @@ model Incident {
 
   /// Exactly one incident may be created for a Fusion hypothesis.  This is the
   /// durable idempotency boundary for JetStream redelivery.
-  hypothesisId String @unique @map("hypothesis_id") @db.Uuid
-  incidentCandidateId String @map("incident_candidate_id") @db.Uuid
+  ///
+  /// B11-13 — THE GENERIC SOURCE SEAM.
+  ///
+  /// These two columns used to be NOT NULL, which made "an incident comes from
+  /// Fusion" a structural assumption rather than a fact about one source. A
+  /// recognised Whisper device-action duress signal (WP-21B) enters the SAME
+  /// already-proven silent response path, and under the old shape the only way
+  /// it could have opened an incident was by FABRICATING a hypothesis id and a
+  /// candidate id — inventing Fusion evidence no Fusion pipeline ever produced,
+  /// and destroying the one guarantee these columns exist to give: that a
+  /// hypothesis_id names a real assessment this incident actually came from.
+  ///
+  /// The seam below is deliberately GENERIC and NOT a `whisper_*` column. A
+  /// whisper-specific column would make Incident know about Whisper, and the
+  /// source after Whisper would add a third column, and that one a fourth —
+  /// each nullable, each another way of expressing the same single fact.
+  /// `source_kind` + `source_ref` state it once for every source there will
+  /// ever be, and keep Incident independent of the domains that feed it, which
+  /// is this file's opening rule about scalar cross-domain identifiers.
+  ///
+  /// hypothesis_id KEEPS its @unique. Postgres treats NULLs as distinct in a
+  /// unique index, so Fusion's exactly-one-incident-per-hypothesis redelivery
+  /// boundary is completely unaffected while non-Fusion rows carry NULL.
+  hypothesisId String? @unique @map("hypothesis_id") @db.Uuid
+  incidentCandidateId String? @map("incident_candidate_id") @db.Uuid
+
+  /// WHAT opened this incident, stated as data: e.g. 'FUSION_HYPOTHESIS' with
+  /// the hypothesis id as the reference. Both are REQUIRED — an incident whose
+  /// origin is unstated is an incident nobody can audit back to a cause, and
+  /// leaving them nullable would recreate the very ambiguity the nullable
+  /// hypothesis columns above now have.
+  sourceKind String @map("source_kind") @db.Text
+  sourceRef String @map("source_ref") @db.Text
 
   organisationId String @map("organisation_id") @db.Text
   siteId String @map("site_id") @db.Text
@@ -49,6 +80,12 @@ model Incident {
   /// bound to THIS incident under THIS tenant and site rather than to an id
   /// that merely exists. Incident's own scalar site semantics are unchanged.
   @@unique([id, organisationId, siteId], map: "incidents_id_org_site_key")
+  /// B11-13: one incident per (tenant, source) — the GENERAL form of the
+  /// redelivery boundary that hypothesis_id's @unique gave Fusion alone, now
+  /// available to every source without any of them inventing a hypothesis to
+  /// get it. Organisation-scoped because a source reference is only meaningful
+  /// inside the tenant that produced it.
+  @@unique([organisationId, sourceKind, sourceRef], map: "incidents_source_identity_key")
   @@index([organisationId, status])
   @@index([organisationId, severity])
   @@index([organisationId, openedAt])

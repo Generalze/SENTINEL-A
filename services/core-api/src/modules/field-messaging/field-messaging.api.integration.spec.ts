@@ -84,11 +84,17 @@ async function seed(prisma: PrismaService): Promise<void> {
     });
   }
 
-  const incident = (id: string, org: string, site: string) => ({
-    id, hypothesisId: randomUUID(), incidentCandidateId: randomUUID(),
-    organisationId: org, siteId: site, incidentType: 'wp18.test', severity: 'SEV3',
-    threatState: 2, confidence: 0.9, responseMode: 'STANDARD',
-  });
+  // B11-13: an incident now states its ORIGIN. These fixtures are
+  // Fusion-shaped, so source_ref IS the hypothesis id, exactly as the WP-21B
+  // migration backfills every pre-existing row.
+  const incident = (id: string, org: string, site: string) => {
+    const hypothesisId = randomUUID();
+    return {
+      id, hypothesisId, incidentCandidateId: randomUUID(), sourceKind: 'FUSION_HYPOTHESIS', sourceRef: hypothesisId,
+      organisationId: org, siteId: site, incidentType: 'wp18.test', severity: 'SEV3',
+      threatState: 2, confidence: 0.9, responseMode: 'STANDARD',
+    };
+  };
   await prisma.incident.createMany({
     data: [
       incident(fx.incidentA1, fx.orgA, fx.siteA1),

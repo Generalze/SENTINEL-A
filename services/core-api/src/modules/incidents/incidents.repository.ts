@@ -1,9 +1,18 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { Prisma, type Incident, type ResponseTask } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
-import type { CreateIncidentInput, IncidentListFilter } from './incidents.types';
+import type { CreateIncidentInput, IncidentListFilter, OpenWhisperSilentIncidentInput } from './incidents.types';
 import type { SiteScope } from '../identity/list-pagination';
-import { PLAYBOOK_PROOF_A_V1, TASK_DISPATCH_FIELD, TASK_NOTIFY_COMMANDER, TASK_PRESERVE_EVIDENCE } from './incidents.constants';
+import {
+  INCIDENT_SOURCE_KIND_WHISPER_RECOGNITION,
+  PLAYBOOK_PROOF_A_V1,
+  TASK_DISPATCH_FIELD,
+  TASK_NOTIFY_COMMANDER,
+  TASK_PRESERVE_EVIDENCE,
+  WHISPER_INCIDENT_SEVERITY,
+  WHISPER_INCIDENT_THREAT_STATE,
+  WHISPER_INCIDENT_TYPE,
+} from './incidents.constants';
 
 export function isUniqueViolation(error: unknown): boolean {
   return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002';
@@ -24,6 +33,13 @@ export class IncidentsRepository {
           data: {
             hypothesisId: input.hypothesisId,
             incidentCandidateId: input.incidentCandidateId,
+            // B11-13: this method IS the Fusion source path (the only
+            // production writer of an incident row), so its source identity
+            // is fixed HERE rather than accepted from the caller — nothing
+            // upstream can claim a different origin for a Fusion incident.
+            // The literal matches the WP-21B migration backfill exactly.
+            sourceKind: 'FUSION_HYPOTHESIS',
+            sourceRef: input.hypothesisId,
             organisationId: input.organisationId,
             siteId: input.siteId,
             incidentType: input.incidentType,
@@ -56,6 +72,130 @@ export class IncidentsRepository {
       if (!incident) throw error;
       return { incident, created: false };
     }
+  }
+
+  /**
+   * B11-13/B11-14: opens — or REUSES — the incident a recognised Whisper
+   * device-action signal enters the SILENT response path through.
+   *
+   * IDENTICAL IN SHAPE TO `createFromCandidate`, DELIBERATELY. Both are source
+   * paths, so both fix their own source identity here rather than accepting it
+   * from a caller, and both express redelivery idempotence as a P2002 on a
+   * unique index rather than a read-then-create a crash could interleave with.
+   * The Fusion path above is untouched.
+   *
+   * WHAT THIS METHOD REFUSES TO INVENT. `hypothesis_id` and
+   * `incident_candidate_id` are NULL, because a duress recognition is not a
+   * Fusion assessment: fabricating either would mean inventing evidence no
+   * Fusion pipeline ever produced, and would destroy the one guarantee those
+   * columns exist to give. The related/supporting/contradicting event arrays
+   * are empty for the same reason — a recognition cites no events, and an
+   * empty array says exactly that while a populated one would be a lie.
+   *
+   * IDEMPOTENCE IS CRASH-SAFE, and it has to be. The recognition receipt is
+   * claimed before this call and finalized after it, so a process that dies in
+   * between leaves a receipt reclaimable under its lease; the retry re-enters
+   * on the SAME recognition fingerprint, collides on
+   * `incidents_source_identity_key`, and converges on the incident the first
+   * attempt already opened. Without that, a crash between the two would open a
+   * second incident for one duress signal.
+   *
+   * The timeline entry names NO ACTOR, deliberately. `incident.view` is held by
+   * six roles, so recording who signalled here would broadcast the identity of
+   * the person under duress far beyond the four Whisper capabilities. W21-14
+   * puts WHO in the Whisper audit log, which carries `incident_id`, so the
+   * chain stays reconstructable by anyone entitled to walk it — and by nobody
+   * else.
+   */
+  async createFromWhisperRecognition(input: OpenWhisperSilentIncidentInput): Promise<{ incident: Incident; created: boolean }> {
+    const sourceRef = input.recognitionFingerprint;
+    try {
+      const incident = await this.prisma.$transaction(async (tx) => {
+        const row = await tx.incident.create({
+          data: {
+            hypothesisId: null,
+            incidentCandidateId: null,
+            sourceKind: INCIDENT_SOURCE_KIND_WHISPER_RECOGNITION,
+            sourceRef,
+            organisationId: input.organisationId,
+            siteId: input.siteId,
+            incidentType: WHISPER_INCIDENT_TYPE,
+            severity: WHISPER_INCIDENT_SEVERITY,
+            threatState: WHISPER_INCIDENT_THREAT_STATE,
+            // C11-04: the SIGNED confidence, so an intercepted recognition
+            // could not have had this figure raised in flight.
+            confidence: input.confidence,
+            responseMode: 'SILENT',
+            relatedEventIds: [],
+            supportingEventIds: [],
+            contradictingEventIds: [],
+            playbookVersion: PLAYBOOK_PROOF_A_V1,
+            proofAStartedAt: new Date(),
+          },
+        });
+        await tx.incidentTimelineEntry.create({
+          data: {
+            incidentId: row.id,
+            kind: 'INCIDENT_OPENED',
+            payload: {
+              source_kind: INCIDENT_SOURCE_KIND_WHISPER_RECOGNITION,
+              source_ref: sourceRef,
+              incident_type: WHISPER_INCIDENT_TYPE,
+              severity: WHISPER_INCIDENT_SEVERITY,
+              response_mode: 'SILENT',
+              trace_id: input.traceId,
+            },
+          },
+        });
+        await tx.incidentUpdateOutbox.create({
+          data: {
+            incidentId: row.id,
+            organisationId: input.organisationId,
+            payload: { id: row.id, organisation_id: input.organisationId, kind: 'INCIDENT_OPENED' },
+          },
+        });
+        return row;
+      });
+      return { incident, created: true };
+    } catch (error) {
+      if (!isUniqueViolation(error)) throw error;
+      const incident = await this.prisma.incident.findUnique({
+        where: {
+          organisationId_sourceKind_sourceRef: {
+            organisationId: input.organisationId,
+            sourceKind: INCIDENT_SOURCE_KIND_WHISPER_RECOGNITION,
+            sourceRef,
+          },
+        },
+      });
+      // A P2002 on some OTHER constraint would leave this read empty. Rethrow
+      // the original rather than reinterpret an unrelated violation as a
+      // successful convergence.
+      if (!incident) throw error;
+      return { incident, created: false };
+    }
+  }
+
+  /**
+   * B11-13: the EVIDENCE probe for Whisper crash recovery.
+   *
+   * A pure lookup of the row `createFromWhisperRecognition` writes inside the
+   * SAME transaction as the incident it records. That atomicity is the whole
+   * argument: presence proves the effect committed, absence proves it did not.
+   * It consults no mutable state — not the incident's status, not its tasks —
+   * because all of those may legitimately have moved on since the attempt
+   * being recovered.
+   */
+  async findByWhisperRecognition(organisationId: string, recognitionFingerprint: string): Promise<Incident | null> {
+    return this.prisma.incident.findUnique({
+      where: {
+        organisationId_sourceKind_sourceRef: {
+          organisationId,
+          sourceKind: INCIDENT_SOURCE_KIND_WHISPER_RECOGNITION,
+          sourceRef: recognitionFingerprint,
+        },
+      },
+    });
   }
 
   async ensureProofATasks(incidentId: string): Promise<ResponseTask[]> {

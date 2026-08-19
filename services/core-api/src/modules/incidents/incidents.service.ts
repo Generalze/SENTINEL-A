@@ -16,7 +16,12 @@ import {
 import { toIncidentView, toTaskView, toTimelineView } from './incidents.mapper';
 import { IncidentsPublisher } from './incidents.publisher';
 import { IncidentsRepository } from './incidents.repository';
-import type { IncidentDetailView, IncidentListFilter, IncidentTransitionInput } from './incidents.types';
+import type {
+  IncidentDetailView,
+  IncidentListFilter,
+  IncidentTransitionInput,
+  OpenWhisperSilentIncidentInput,
+} from './incidents.types';
 import type { SiteScope } from '../identity/list-pagination';
 
 const CRITICAL_PLAYBOOK_SEVERITIES = new Set(['SEV1', 'SEV2']);
@@ -100,6 +105,71 @@ export class IncidentsService {
     // committed incident because a transient realtime path is unavailable.
     await this.publisher.publishUpdated(detail);
     return detail;
+  }
+
+  /**
+   * B11-13/B11-14/B11-15: the internal entry a recognised Whisper
+   * device-action signal uses to open — or converge on — its SILENT incident.
+   *
+   * INTERNAL ONLY. No controller reaches this: an HTTP body cannot be
+   * authenticated device identity, so the whisper module's runtime is a
+   * service seam, and this is the seam it hands off to (the WP-20/C10-02
+   * precedent, applied to a channel whose whole purpose is silent duress
+   * signalling).
+   *
+   * WHAT IT REUSES, AND WHY THAT MATTERS MORE THAN WHAT IT ADDS. Everything
+   * after the incident row is `runProofA` — the SAME method the Fusion path
+   * runs, called rather than copied. So the evidence snapshot, the Constitution
+   * evaluation of `response.dispatch.silent`, `recordConstitutionDecision`, and
+   * a hand-off that happens ONLY on ALLOW are byte-identical between the two
+   * sources. W21-10 is explicit that recognition INITIATES the already-proven
+   * silent protocol; a second implementation of that protocol, however
+   * faithful on the day it was written, would be a second thing to keep
+   * faithful.
+   *
+   * WHAT IT DELIBERATELY DOES NOT DO: it records NO
+   * `ResponseTaskSilentApproval`. Activating a Whisper signal attested that a
+   * TESTED CONFIGURATION IS SAFE TO RECOGNISE (W21-13) — it is not, and can
+   * never be replayed as, an approval of any operational response. With no
+   * approvals recorded, the Constitution evaluation inside `runProofA` sees
+   * none, so the silent dispatch stays REQUESTED until two DISTINCT site
+   * commanders approve it through the existing endpoint. A recognised duress
+   * signal opens an incident and starts the playbook; it dispatches nobody by
+   * itself.
+   *
+   * IDEMPOTENT END TO END. The incident converges on
+   * `(organisation_id, source_kind, source_ref)`, `ensureProofATasks` uses
+   * `skipDuplicates`, the evidence step is guarded by `completedAt` and the
+   * dispatch step by `deliveryState === 'REQUESTED'` — so a retry after a
+   * crash re-runs this whole method and changes nothing that already happened.
+   */
+  async openWhisperSilentIncident(input: OpenWhisperSilentIncidentInput): Promise<{ incidentId: string; created: boolean }> {
+    const { incident, created } = await this.repository.createFromWhisperRecognition(input);
+    await this.runProofA(incident.id, incident.organisationId, incident.siteId, 'SILENT', [], []);
+    const detail = await this.getDetail(incident.organisationId, incident.id, SYSTEM_SITE_SCOPE);
+    // Best-effort, exactly as on the Fusion path: nothing may roll back a
+    // committed incident because a transient realtime path is unavailable.
+    await this.publisher.publishUpdated(detail);
+    return { incidentId: incident.id, created };
+  }
+
+  /**
+   * B11-13: has a recognition ALREADY entered the silent path?
+   *
+   * The whisper runtime asks this before re-deciding a recognition whose first
+   * attempt claimed the receipt and died. Without it, a retry arriving after
+   * the crash-recovery lease would re-evaluate a recognition that is by then
+   * older than its freshness window, conclude RECOGNITION_STALE, and write
+   * that refusal onto a receipt whose incident is already open — false history
+   * on the one record that says whether anyone was sent.
+   *
+   * Returns identifiers only. This is a recovery probe, not a read of the
+   * incident, so it deliberately exposes no detail that would bypass the
+   * site-scoped `getDetail` path every entitled reader goes through.
+   */
+  async findWhisperSilentIncident(organisationId: string, recognitionFingerprint: string): Promise<{ incidentId: string } | null> {
+    const incident = await this.repository.findByWhisperRecognition(organisationId, recognitionFingerprint);
+    return incident === null ? null : { incidentId: incident.id };
   }
 
   /** The only incident status transition point: open -> contained -> closed. */
