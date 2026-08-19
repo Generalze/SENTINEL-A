@@ -25,6 +25,8 @@ import { FieldOutboxPublisher } from '../field/field-outbox.publisher';
 import { FieldOfflineReplayService } from '../field-offline/field-offline.service';
 import type { OfflineSubmissionOutcome } from '../field-offline/field-offline.types';
 import { PatrolMissedSweeper } from '../patrol/patrol-missed.sweeper';
+import { PATROL_SWEEP_SCHEDULER } from '../patrol/patrol-sweep.scheduler';
+import { NoopPatrolSweepScheduler } from '../patrol/patrol-sweep.scheduler.test-support';
 import { WS_EVENT_FIELD_UPDATED, WS_PATH } from '../realtime/realtime.constants';
 import { WHISPER_DEVICE_KEY_RESOLVER, type WhisperDeviceKeyResolver } from '../whisper/whisper-key.resolver';
 import { WhisperSignatureVerifier } from '../whisper/whisper-signature.verifier';
@@ -63,10 +65,12 @@ import { WhisperService } from '../whisper/whisper.service';
  * honoured (or refused) in another, or a boundary that would only fail once
  * the modules share a tenant, an incident and an operative.
  *
- * W22-02 NOTE. `PATROL_SWEEP_INTERVAL_MS` is '0', so no background sweep timer
- * exists and `PatrolMissedSweeper.sweep()` is driven explicitly. The Field
- * outbox publisher is likewise driven explicitly where a socket assertion
- * depends on it, rather than waited on.
+ * C13-01 NOTE. The sweep cadence is HARD-WIRED in production and cannot be
+ * configured off; this suite silences only the repeating timer by overriding
+ * PATROL_SWEEP_SCHEDULER with a no-op double, so `PatrolMissedSweeper.sweep()`
+ * is driven explicitly and nothing ambient races it. The Field outbox
+ * publisher is likewise driven explicitly where a socket assertion depends on
+ * it, rather than waited on.
  */
 
 const STACK_ENV: Record<string, string> = {
@@ -82,8 +86,6 @@ const STACK_ENV: Record<string, string> = {
   S3_BUCKET: 'sentinel-dev',
   LOG_LEVEL: 'error',
   DEV_AUTH_ENABLED: 'true',
-  // W22-02: no ambient sweep cadence — this suite drives sweep() itself.
-  PATROL_SWEEP_INTERVAL_MS: '0',
 };
 
 const tag = `m2_${Date.now()}_${Math.trunc(Math.random() * 100000)}`;
@@ -575,6 +577,11 @@ describe('WP-22 Milestone 2 integrated Field loop (live stack)', () => {
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
       .overrideProvider(WHISPER_DEVICE_KEY_RESOLVER)
       .useValue(keyRegistry)
+      // C13-01: production's sweep cadence is hard-wired and cannot be switched
+      // off by configuration. This silences only the REPEATING timer, through
+      // the DI seam, so no ambient sweep races what this suite drives.
+      .overrideProvider(PATROL_SWEEP_SCHEDULER)
+      .useClass(NoopPatrolSweepScheduler)
       .compile();
     app = moduleRef.createNestApplication({ logger: false });
     await app.listen(0, '127.0.0.1');
@@ -806,7 +813,8 @@ describe('WP-22 Milestone 2 integrated Field loop (live stack)', () => {
     expect(await prisma.patrolCheckpointVerification.count({ where: { patrolRunId: narrativeRunId } })).toBe(1);
 
     // MISSED is the sweep's judgement alone, and the sweep is DRIVEN here — no
-    // timer exists to race it (PATROL_SWEEP_INTERVAL_MS=0).
+    // timer exists to race it (C13-01: the scheduler is a no-op double here,
+    // while production's cadence stays hard-wired and unswitchable).
     await Promise.all([sweeper.sweep(), sweeper.sweep()]);
     await sweeper.sweep();
 
@@ -1366,20 +1374,105 @@ describe('WP-22 Milestone 2 integrated Field loop (live stack)', () => {
     expect(stillActive[0]?.id).toBe(active.id);
   }, 180_000);
 
-  it('W22-06/16: there is no public Whisper recognition HTTP route', async () => {
-    // W21-05: the runtime's whole safety argument rests on
-    // AuthenticatedWhisperDeviceContext being SERVER-established. An invoke
-    // endpoint would mean accepting that context from a JSON body — the exact
-    // C10-02 trust hole, on the one channel whose consequence is a silent
-    // duress dispatch. These are the paths a future convenience commit would
-    // most plausibly add.
-    const plausible = ['/api/v1/whisper/recognitions', '/api/v1/whisper/invoke', '/api/v1/whisper/signals/recognise'];
+  // ------------------------------- C13-02: the permanent route-table guard
+
+  interface RegisteredRoute {
+    readonly method: string;
+    readonly path: string;
+  }
+
+  /**
+   * Every route the running app ACTUALLY serves, read out of the live Express
+   * router — not a list of paths this test thought to imagine.
+   *
+   * Express 5 (this build) exposes the root router as `router`; Express 4
+   * exposed it as `_router`. Both are read so an upgrade or downgrade cannot
+   * quietly turn this guard into a no-op, and an unreadable stack is a hard
+   * failure rather than an empty list that satisfies every assertion below.
+   */
+  function registeredRoutes(): RegisteredRoute[] {
+    const instance = app.getHttpAdapter().getInstance() as {
+      router?: { stack?: unknown[] };
+      _router?: { stack?: unknown[] };
+    };
+    const stack = instance.router?.stack ?? instance._router?.stack;
+    expect(Array.isArray(stack), 'router stack unreadable — this guard would verify nothing').toBe(true);
+
+    const routes: RegisteredRoute[] = [];
+    for (const layer of (stack ?? []) as Array<{ route?: { path?: unknown; methods?: Record<string, boolean> } }>) {
+      const route = layer.route;
+      if (!route || typeof route.path !== 'string') continue;
+      for (const [method, enabled] of Object.entries(route.methods ?? {})) {
+        if (enabled) routes.push({ method: method.toUpperCase(), path: route.path });
+      }
+    }
+    return routes;
+  }
+
+  /**
+   * The seven Studio routes, literally. This list is the whole public Whisper
+   * HTTP surface; anything else registered under `whisper` is a defect.
+   */
+  const WHISPER_STUDIO_ROUTES = [
+    'GET /api/v1/whisper/signals',
+    'GET /api/v1/whisper/signals/:id',
+    'PATCH /api/v1/whisper/signals/:id/versions/:version',
+    'POST /api/v1/whisper/signals',
+    'POST /api/v1/whisper/signals/:id/versions',
+    'POST /api/v1/whisper/signals/:id/versions/:version/activate',
+    'POST /api/v1/whisper/signals/:id/versions/:version/transitions',
+  ];
+
+  it('W22-06/16 (B11-08/W22-06): the registered route table is exactly the seven Whisper Studio routes — recognition has no HTTP surface at all', async () => {
+    /**
+     * THE PERMANENT B11-08 / W22-06 BOUNDARY GUARD.
+     *
+     * The property is not "these three guessed paths return 404" — that proves
+     * nothing about a fourth path someone adds next quarter. The property is
+     * that WHISPER RECOGNITION HAS NO HTTP SURFACE AT ALL.
+     *
+     * W21-05's entire safety argument rests on
+     * `AuthenticatedWhisperDeviceContext` being SERVER-established. An invoke
+     * endpoint would mean accepting that context from a JSON body — the exact
+     * C10-02 trust hole, on the one channel whose consequence is a silent
+     * duress dispatch. Recognition is reachable only in-process, from the
+     * signed device path, and must stay that way.
+     *
+     * So this asserts against the ROUTER TABLE THE APP ACTUALLY SERVES. Any
+     * whisper route registered later — whatever it is named, whichever
+     * controller it hangs off, whoever adds it — shows up in that table and
+     * fails this test the moment it appears.
+     */
+    const routes = registeredRoutes();
+
+    // Sanity FIRST: prove the table was genuinely read. Without this, an
+    // enumeration that silently returned [] would pass everything below
+    // forever, and the guard would rot without anyone noticing.
+    expect(routes.length).toBeGreaterThan(50);
+    expect(routes).toContainEqual({ method: 'GET', path: '/health' });
+    expect(routes.some((r) => r.path.startsWith('/api/v1/patrol/'))).toBe(true);
+    expect(routes.some((r) => r.path.startsWith('/api/v1/whisper/'))).toBe(true);
+
+    // 1. PRIMARY GUARD: the whisper surface is EXACTLY the Studio seven.
+    const whisperRoutes = [
+      ...new Set(routes.filter((r) => /whisper/i.test(r.path)).map((r) => `${r.method} ${r.path}`)),
+    ].sort();
+    expect(whisperRoutes).toEqual(WHISPER_STUDIO_ROUTES);
+    expect(whisperRoutes).toHaveLength(7);
+
+    // 2. And nowhere in the ENTIRE table — not merely under /whisper — does a
+    //    recognition-shaped path exist. A future `POST /api/v1/device-actions`
+    //    hung off some unrelated controller is caught by this line.
+    const forbidden = [...new Set(routes.filter((r) => /recogni|invoke|device-action/i.test(r.path)).map((r) => `${r.method} ${r.path}`))];
+    expect(forbidden, `recognition-shaped routes are registered: ${JSON.stringify(forbidden)}`).toEqual([]);
+
+    // 3. Belt and braces: the two most plausible convenience paths, probed
+    //    over real HTTP by an operative who genuinely HOLDS
+    //    whisper.device-action.invoke, carrying a perfectly valid signed
+    //    statement. The route must still not exist.
     const signal = await activeSignalViaStudio();
     const body = signResult(unsignedResult(signal), keyAlpha.privateKey);
-
-    for (const path of plausible) {
-      // Posted by an operative who genuinely HOLDS whisper.device-action.invoke
-      // and a perfectly valid signed statement: the route must still not exist.
+    for (const path of ['/api/v1/whisper/recognitions', '/api/v1/whisper/invoke']) {
       const res = await post(path, fx.opAlpha, body);
       expect(res.status, `${path} must not be routable`).toBe(404);
       expect([200, 201], `${path} must never succeed`).not.toContain(res.status);

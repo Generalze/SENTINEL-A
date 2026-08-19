@@ -30,18 +30,18 @@ fixture is not proof that a real device did anything.
 | Materialised checkpoint windows; TOO_EARLY / VERIFIED / LATE / EXPIRED | WP-19 | `patrol.api.integration.spec.ts` | Tested |
 | MISSED as the server sweep's judgement alone; abandonment cannot launder | WP-19 | `patrol.api.integration.spec.ts`; `m2-field-loop` step 4 | Tested |
 | Patrol evidence tuple enforced below the service layer | WP-19A | `patrol.audit-regressions.integration.spec.ts` | Tested |
-| Offline V2 contract, contiguous sequencing, request-bound fingerprints | WP-20 | `field-offline.test.ts`; `field-offline.acceptance.integration.spec.ts` | Tested |
+| Offline V2 contract, contiguous sequencing, request-bound fingerprints | WP-20 | `field-offline.test.ts` — 24 contract tests; `field-offline.acceptance.integration.spec.ts` — 25 live tests | Tested |
 | Offline effectively-once: claim fencing, domain-evidence recovery, exhaustion | WP-20/B10 | `field-offline.acceptance.integration.spec.ts`; `m2-field-loop` steps 10–11 | Tested |
 | Offline allowlist is closed at six kinds | WP-20 | `m2-field-loop` step 5 (inadmissible kinds refused; the set is pinned) | Tested |
-| Whisper contract: modality, lifecycle, canonicalisation, signed statement | WP-21A | `whisper.test.ts` (202 contract tests) | Tested |
+| Whisper contract: modality, lifecycle, canonicalisation, signed statement | WP-21A | `whisper.test.ts` — 69 contract tests (the contracts package totals 202 across all domains) | Tested |
 | Whisper Studio: authority matrix, configuration freeze, distinct activation approver, one ACTIVE version | WP-21B | `whisper.studio.integration.spec.ts`; `m2-field-loop` step 15 | Tested |
 | Ed25519 verification with a server-selected key; no client-chosen verifier | WP-21B | `whisper.runtime.integration.spec.ts` | Tested |
 | Whisper anti-replay: seven-column identity; invalid signature consumes no nonce | WP-21B | `whisper.runtime.integration.spec.ts`; `m2-field-loop` step 13 | Tested |
 | Principal cannot borrow another actor's invoke authority | WP-21B/C12-01 | `whisper.c12-regressions.integration.spec.ts`; `m2-field-loop` step 14 | Tested |
 | Crash between incident commit and SILENT entry converges before ACCEPTED | WP-21B/C12-02 | `whisper.c12-regressions.integration.spec.ts` | Tested |
 | Recognition initiates but never approves; two distinct commanders still required | WP-21B | `m2-field-loop` step 6 | Tested |
-| No public Whisper recognition endpoint | WP-21B | `m2-field-loop` step 16 (three plausible paths 404) | Tested |
-| Cross-tenant / wrong-site / unassigned isolation, refusals indistinguishable from absence | WP-16..WP-21 | `m2-field-loop` steps 7–8 | Tested |
+| No public Whisper recognition endpoint | WP-21B | `m2-field-loop` step 16: a **live route-table guard** — registered whisper routes must equal exactly the seven Studio routes, and no path in the whole table may match `/recogni|invoke|device-action/i` | Tested |
+| Cross-tenant / wrong-site / unassigned isolation | WP-16..WP-21 | `m2-field-loop` steps 7–8: each refusal is asserted **byte-identical** (status *and* response body) to the same request for a nonexistent id, across the assignment, message, patrol run, Whisper signal and the Whisper-raised incident, with no narrative identifier present in the body | Tested |
 | Proof A regression (Milestone 1 protected workflow) | WP-13 | `tests/integration/proof-a.test.ts` | Tested |
 
 ## Deliberately not yet proven
@@ -57,10 +57,13 @@ fixture is not proof that a real device did anything.
 ## Known debt carried forward
 
 - **Patrol sweeper timing (closed in WP-22).** The WP-19 suite raced an
-  ambient five-second sweep. Fixed at the scheduler boundary by
-  `PATROL_SWEEP_INTERVAL_MS`; the sweep logic is unchanged. Recorded here
-  because the failure mode — a background scheduler making correctness look
-  conditional — is worth remembering when the next background job is added.
+  ambient five-second sweep. Fixed at the scheduler boundary via a **test-only
+  DI seam** (`PATROL_SWEEP_SCHEDULER`), with the interval hard-wired at 5000 ms
+  and the boot sweep unconditional; the sweep logic is unchanged. The first
+  attempt exposed the setting through the env schema, which would have been a
+  production kill-switch for missed-checkpoint detection — recorded here
+  because it is the sharper lesson: making a safety-critical job configurable
+  is not the same as making it testable.
 - **Incident/Event scalar site semantics.** Unchanged since WP-18; the
   divergence remains an explicit sign-off note rather than a silent
   assumption.
@@ -69,7 +72,7 @@ fixture is not proof that a real device did anything.
 
 ```text
 migrations from zero        20
-workspace tests             see the WP-22 PR packet
+patrol stress               50 consecutive runs, 0 failures
 Proof A                     1/1
 Proof C                     UNCLAIMED
 Proof D                     UNCLAIMED

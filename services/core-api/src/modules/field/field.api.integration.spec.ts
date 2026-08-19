@@ -1,9 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import type { INestApplication } from '@nestjs/common';
-import { NestFactory } from '@nestjs/core';
+import { Test } from '@nestjs/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { AppModule } from '../../app.module';
 import { PrismaService } from '../../prisma/prisma.service';
+import { PATROL_SWEEP_SCHEDULER } from '../patrol/patrol-sweep.scheduler';
+import { NoopPatrolSweepScheduler } from '../patrol/patrol-sweep.scheduler.test-support';
 
 /**
  * Field REST surface end to end, through the real global guard chain
@@ -27,8 +29,6 @@ const STACK_ENV: Record<string, string> = {
   S3_BUCKET: 'sentinel-dev',
   LOG_LEVEL: 'error',
   DEV_AUTH_ENABLED: 'true',
-  // W22-02: no ambient sweep cadence — this suite drives sweep() itself.
-  PATROL_SWEEP_INTERVAL_MS: '0',
 };
 
 interface Fixture {
@@ -141,7 +141,14 @@ describe('Field REST surface (live stack, WP-16 AC7 / WP-17 AC6-AC8)', () => {
 
   beforeAll(async () => {
     for (const [key, value] of Object.entries(STACK_ENV)) process.env[key] = value;
-    app = await NestFactory.create(AppModule, { logger: false });
+    // C13-01: production's sweep cadence is hard-wired and cannot be switched
+    // off by configuration. A spec silences only the REPEATING timer, through
+    // the DI seam, so the sweeps in flight are exactly the ones it drives.
+    const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
+      .overrideProvider(PATROL_SWEEP_SCHEDULER)
+      .useClass(NoopPatrolSweepScheduler)
+      .compile();
+    app = moduleRef.createNestApplication({ logger: false });
     await app.listen(0, '127.0.0.1');
     const address = app.getHttpServer().address();
     base = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`;

@@ -1,6 +1,17 @@
 import { Inject, Injectable, Logger, type OnApplicationBootstrap, type OnModuleDestroy } from '@nestjs/common';
-import { AppConfigService } from '../../config/config.service';
+import { PATROL_SWEEP_SCHEDULER, type PatrolSweepScheduler } from './patrol-sweep.scheduler';
 import { PatrolRepository } from './patrol.repository';
+
+/**
+ * C13-01: the sweep cadence, HARD-WIRED.
+ *
+ * This is a constant and not a configuration key on purpose. MISSED is a
+ * server-owned verdict, so no environment file may decide how often — or
+ * whether — the server reaches it. See `patrol-sweep.scheduler.ts` for the
+ * full argument and for the test-only seam that replaces the *scheduler*
+ * without ever touching this number.
+ */
+export const PATROL_SWEEP_INTERVAL_MS = 5_000;
 
 /**
  * WP-19 missed sweep (directive s.3): MISSED is the server's judgement alone.
@@ -15,44 +26,31 @@ import { PatrolRepository } from './patrol.repository';
 @Injectable()
 export class PatrolMissedSweeper implements OnApplicationBootstrap, OnModuleDestroy {
   private readonly logger = new Logger(PatrolMissedSweeper.name);
-  private timer: ReturnType<typeof globalThis.setInterval> | undefined;
   private sweeping = false;
 
   constructor(
     @Inject(PatrolRepository) private readonly repository: PatrolRepository,
-    @Inject(AppConfigService) private readonly config: AppConfigService,
+    @Inject(PATROL_SWEEP_SCHEDULER) private readonly scheduler: PatrolSweepScheduler,
   ) {}
 
   /**
-   * W22-02: the background cadence is CONFIGURED, not hard-wired.
-   *
-   * A zero interval disables the timer and the boot sweep together, which is
-   * the whole point: a suite that drives `sweep()` explicitly must not also be
-   * raced by a timer it did not ask for. Correctness never depended on the
-   * cadence — MISSED is decided per checkpoint under the run lock against the
-   * database clock — so removing the ambient scheduler from tests removes a
-   * source of false failures without touching a single patrol rule.
+   * The boot sweep is UNCONDITIONAL — a server that has just come back up owes
+   * an immediate verdict on everything whose deadline passed while it was
+   * down, and no injected scheduler can decline that. Only the repeating
+   * cadence goes through the seam, which is exactly the part a test needs
+   * silenced so its explicit `sweep()` calls are the only ones in flight.
    */
   async onApplicationBootstrap(): Promise<void> {
-    const intervalMs = this.config.values.PATROL_SWEEP_INTERVAL_MS;
-    if (intervalMs === 0) {
-      this.logger.log('patrol missed sweep cadence disabled (PATROL_SWEEP_INTERVAL_MS=0); sweep() must be invoked explicitly');
-      return;
-    }
     await this.sweep();
-    this.timer = globalThis.setInterval(() => {
+    this.scheduler.start(() => {
       void this.sweep().catch((error: unknown) => {
         this.logger.error(`Patrol missed sweep failed: ${error instanceof Error ? error.message : String(error)}`);
       });
-    }, intervalMs);
-    this.timer.unref?.();
+    }, PATROL_SWEEP_INTERVAL_MS);
   }
 
   onModuleDestroy(): void {
-    if (this.timer) {
-      globalThis.clearInterval(this.timer);
-      this.timer = undefined;
-    }
+    this.scheduler.stop();
   }
 
   async sweep(limit = 100): Promise<number> {

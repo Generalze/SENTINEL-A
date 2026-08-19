@@ -41,11 +41,24 @@ checkpoint under the run lock against the database clock — but the ambient
 timer could fire *between* a test's own actions and change the counts that test
 was about to assert. That is a harness problem wearing a correctness costume.
 
-The cadence is now configuration: `PATROL_SWEEP_INTERVAL_MS` (default `5000`,
-`0` disables the timer and the boot sweep together). Every live-stack spec sets
-it to `0` and drives `sweep()` explicitly, so what a test asserts is what that
-test caused. No sleeps were lengthened, no retry-until-green was added, no
-timeout was enlarged and no assertion was weakened — the sweep logic itself is
+The cadence moves behind a **test-only dependency-injection seam**
+(`PATROL_SWEEP_SCHEDULER`), and the interval stays hard-wired at 5000 ms.
+
+**C13-01 correction.** The first attempt made the cadence an env-validated
+setting where `0` disabled the sweep. That was a production kill-switch for a
+safety-critical, server-owned judgement: an operator could silently stop
+missed-checkpoint detection through configuration, which is exactly what WP-19
+exists to prevent. Worse, the disable branch returned *before* the boot sweep,
+so a `0` deployment also skipped catch-up on restart — precisely when a server
+has the most overdue checkpoints to judge. The setting is removed from the env
+schema entirely; there is now no env var, no config field and no runtime API
+that can stop the sweep in production. Only a test may substitute a scheduler
+that never fires, through Nest provider override, and the boot sweep sits
+outside the seam so no double can skip it either.
+
+Specs drive `sweep()` explicitly, so what a test asserts is what that test
+caused. No sleeps were lengthened, no retry-until-green was added, no timeout
+was enlarged and no assertion was weakened — the sweep logic itself is
 byte-identical.
 
 **Evidence required:** 50 consecutive executions of the previously flaky file.
@@ -91,8 +104,15 @@ Invalid signature consumes no nonce; a substituted principal is refused before
 the verifier or the signal lookup is reached (proved by spies, using an actor
 who genuinely lacks the capability so it proves authority cannot be
 *borrowed*); one ACTIVE family version is refused by the database itself; and
-there is **no public Whisper recognition HTTP endpoint** — three plausible
-paths are asserted to 404.
+there is **no public Whisper recognition HTTP endpoint**.
+
+**C13-02 correction.** Probing three guessed paths for 404 proved nothing about
+a fourth path added later. The guard now enumerates the application's **live
+route table** and asserts the registered whisper routes equal exactly the seven
+Studio routes, that no path anywhere in the table matches
+`/recogni|invoke|device-action/i`, and — so an empty enumeration cannot pass
+forever — that the table was genuinely read. A real recognition route added to
+the controller fails this guard; it did not fail the old probe.
 
 ### W22-07 — Schema and migration integrity
 
