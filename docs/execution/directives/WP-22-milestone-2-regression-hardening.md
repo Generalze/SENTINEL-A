@@ -82,13 +82,32 @@ handoff**, then that two distinct commanders produce exactly one handoff.
 
 ### W22-04 — Isolation and need-to-know matrix
 
-Foreign organisation, wrong site, unassigned operative and non-recipient
-adversaries are all exercised against the assignment, the message, the patrol
-run, the Whisper signal and the Whisper-raised incident. Each refusal is
-**byte-identical** to the same request for a nonexistent id — status parity and
-body parity — so a refusal cannot be read as confirmation. The shared Field
-realtime channel keeps the C7-08 rule: `kind` + `organisation_id` + `site_id`
-and nothing else.
+The integrated suite exercises a specific matrix, and this directive states it
+exactly rather than implying every adversary was tried against every resource:
+
+- **Foreign tenant** — probed against all five narrative objects: the
+  assignment, the message, the patrol run, the Whisper signal and the
+  Whisper-raised SILENT incident.
+- **Wrong-site operative and unassigned same-site peer** — probed against the
+  patrol run and the message.
+- Remaining per-adversary coverage stays where it already lives, in the
+  focused module suites (`field`, `field-messaging`, `patrol`, `whisper`),
+  which WP-22 does not duplicate.
+
+Every refusal above is asserted **byte-identical** to the same request for a
+nonexistent id — status parity *and* body parity — so a refusal cannot be read
+as confirmation, and no narrative identifier appears in the body. The shared
+Field realtime channel keeps the C7-08 rule: `kind` + `organisation_id` +
+`site_id` and nothing else.
+
+**C13-02b correction.** The route-table guard answers "what is registered?" but
+not "what may a controller call?". A neutral-named endpoint such as
+`POST /api/v1/field/help` wired to `WhisperService.recognise()` would pass both
+the `/whisper/**` whitelist and the path regex while exposing the very seam
+B11-08 forbids. A second, independent source-architecture guard therefore scans
+every `*.controller.ts` and fails if any invokes the recognition seam, in call,
+optional-call or `call/apply/bind` form. The Studio controller may keep
+depending on `WhisperService`; the prohibition is the invocation.
 
 ### W22-05 — Effectively-once, integrated
 

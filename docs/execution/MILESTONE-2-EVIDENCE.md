@@ -29,7 +29,7 @@ fixture is not proof that a real device did anything.
 | Patrol route versioning, immutable published standards | WP-19 | `patrol.api.integration.spec.ts` | Tested |
 | Materialised checkpoint windows; TOO_EARLY / VERIFIED / LATE / EXPIRED | WP-19 | `patrol.api.integration.spec.ts` | Tested |
 | MISSED as the server sweep's judgement alone; abandonment cannot launder | WP-19 | `patrol.api.integration.spec.ts`; `m2-field-loop` step 4 | Tested |
-| Patrol evidence tuple enforced below the service layer | WP-19A | `patrol.audit-regressions.integration.spec.ts` | Tested |
+| Patrol evidence tuple enforced below the service layer | WP-19 audit correction / `wp19a` migration (not a separately approved work package) | `patrol.audit-regressions.integration.spec.ts` | Tested |
 | Offline V2 contract, contiguous sequencing, request-bound fingerprints | WP-20 | `field-offline.test.ts` — 24 contract tests; `field-offline.acceptance.integration.spec.ts` — 25 live tests | Tested |
 | Offline effectively-once: claim fencing, domain-evidence recovery, exhaustion | WP-20/B10 | `field-offline.acceptance.integration.spec.ts`; `m2-field-loop` steps 10–11 | Tested |
 | Offline allowlist is closed at six kinds | WP-20 | `m2-field-loop` step 5 (inadmissible kinds refused; the set is pinned) | Tested |
@@ -40,8 +40,9 @@ fixture is not proof that a real device did anything.
 | Principal cannot borrow another actor's invoke authority | WP-21B/C12-01 | `whisper.c12-regressions.integration.spec.ts`; `m2-field-loop` step 14 | Tested |
 | Crash between incident commit and SILENT entry converges before ACCEPTED | WP-21B/C12-02 | `whisper.c12-regressions.integration.spec.ts` | Tested |
 | Recognition initiates but never approves; two distinct commanders still required | WP-21B | `m2-field-loop` step 6 | Tested |
-| No public Whisper recognition endpoint | WP-21B | `m2-field-loop` step 16: a **live route-table guard** — registered whisper routes must equal exactly the seven Studio routes, and no path in the whole table may match `/recogni|invoke|device-action/i` | Tested |
-| Cross-tenant / wrong-site / unassigned isolation | WP-16..WP-21 | `m2-field-loop` steps 7–8: each refusal is asserted **byte-identical** (status *and* response body) to the same request for a nonexistent id, across the assignment, message, patrol run, Whisper signal and the Whisper-raised incident, with no narrative identifier present in the body | Tested |
+| No public Whisper recognition endpoint (two independent guards) | WP-21B | `m2-field-loop` step 16: a **live route-table guard** — registered whisper routes must equal exactly the seven Studio routes, and no path in the whole table may match `/recogni|invoke|device-action/i`. Plus `whisper-boundary.architecture.spec.ts`: a **source guard** failing if any controller invokes the `recognise()` seam — which catches a neutrally named route the path scan cannot see | Tested |
+| Cross-tenant isolation (**foreign tenant** vs all five narrative objects: assignment, message, patrol run, Whisper signal, Whisper-raised incident) | WP-16..WP-21 | `m2-field-loop` step 7 — each refusal asserted **byte-identical** (status *and* body) to the same request for a nonexistent id, with no narrative identifier in the body | Tested |
+| Wrong-site operative and unassigned same-site peer (**patrol run and message only**; remaining per-adversary coverage lives in the focused module suites, which WP-22 does not duplicate) | WP-16..WP-21 | `m2-field-loop` step 8 | Tested |
 | Proof A regression (Milestone 1 protected workflow) | WP-13 | `tests/integration/proof-a.test.ts` | Tested |
 
 ## Deliberately not yet proven
