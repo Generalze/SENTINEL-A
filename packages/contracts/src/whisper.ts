@@ -6,6 +6,54 @@ const MAX_CONTEXT_BYTES = 16 * 1024;
 const scopedId = z.string().min(1).max(256);
 const timestamp = z.string().datetime();
 
+/** C11-01/C11-03: a SHA-256 digest, pinned to its exact lowercase hex shape. */
+const sha256HexSchema = z.string().regex(/^[0-9a-f]{64}$/, 'must be lowercase 64-character SHA-256 hex');
+
+/**
+ * C11-03: the only values a Whisper context may contain.
+ *
+ * `z.record(z.unknown())` was too generous for something that gets FINGERPRINTED.
+ * `JSON.stringify` drops `undefined` members and renders `NaN`/`Infinity` as
+ * `null`, so materially different requirement objects could collapse onto one
+ * digest — and an activation approval is supposed to attest to an exact
+ * configuration. Only JSON-representable values are admitted, at every depth:
+ * string, finite number, boolean, null, array, object. No `undefined`, bigint,
+ * function, symbol, `NaN` or infinity.
+ */
+export type WhisperJsonValue = string | number | boolean | null | WhisperJsonValue[] | { [key: string]: WhisperJsonValue };
+export const WhisperJsonValueSchema: z.ZodType<WhisperJsonValue> = z.lazy(() =>
+  z.union([z.string(), z.number().finite(), z.boolean(), z.null(), z.array(WhisperJsonValueSchema), z.record(WhisperJsonValueSchema)]),
+);
+
+/**
+ * C11-03: the canonicaliser REFUSES what it cannot represent losslessly rather
+ * than quietly normalising it. A value that reaches a fingerprint must be the
+ * value that was approved.
+ */
+function assertJsonSafe(value: unknown, path: string): void {
+  if (value === null) return;
+  switch (typeof value) {
+    case 'string':
+    case 'boolean':
+      return;
+    case 'number':
+      if (!Number.isFinite(value)) throw new TypeError(`${path} is not canonically representable: non-finite number`);
+      return;
+    case 'object': {
+      if (Array.isArray(value)) {
+        value.forEach((entry, index) => assertJsonSafe(entry, `${path}[${index}]`));
+        return;
+      }
+      for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+        assertJsonSafe(entry, `${path}.${key}`);
+      }
+      return;
+    }
+    default:
+      throw new TypeError(`${path} is not canonically representable: ${typeof value}`);
+  }
+}
+
 function contextByteLength(value: unknown): number {
   try {
     return Buffer.byteLength(JSON.stringify(value), 'utf8');
@@ -14,7 +62,7 @@ function contextByteLength(value: unknown): number {
   }
 }
 
-const contextSchema = z.record(z.unknown()).refine(
+const contextSchema = z.record(WhisperJsonValueSchema).refine(
   (value) => contextByteLength(value) <= MAX_CONTEXT_BYTES,
   { message: `context must serialize to at most ${MAX_CONTEXT_BYTES} bytes` },
 );
@@ -138,40 +186,76 @@ export const DeviceActionWhisperResultSchema = z.object({
    */
   freshness_ms: z.number().int().nonnegative(),
   anti_replay_nonce: z.string().min(16).max(512),
-  signature_algorithm: z.string().min(1).max(128),
+  /**
+   * C11-04: pinned for Milestone 2. A client-supplied algorithm name must
+   * never select the verifier — that is how a signature check gets downgraded
+   * to something the attacker can forge. The server's key registry chooses the
+   * verification algorithm for the registered key; this field may only ever
+   * restate the one algorithm M2 supports, so a mismatch is refused at the
+   * contract boundary before any verification code runs.
+   */
+  signature_algorithm: z.literal('Ed25519'),
   signature: z.string().min(16).max(16 * 1024),
   trace_id: scopedId,
 }).strict();
 export type DeviceActionWhisperResult = z.infer<typeof DeviceActionWhisperResultSchema>;
 
+export type WhisperReplayIdentityInput = Pick<
+  DeviceActionWhisperResult,
+  'organisation_id' | 'site_id' | 'actor_user_id' | 'device_id' | 'whisper_signal_id' | 'whisper_signal_version' | 'anti_replay_nonce'
+>;
+
+export interface WhisperReplayIdentity {
+  readonly organisation_id: string;
+  readonly site_id: string;
+  readonly actor_user_id: string;
+  readonly device_id: string;
+  readonly whisper_signal_id: string;
+  readonly whisper_signal_version: number;
+  readonly anti_replay_nonce: string;
+}
+
 /**
- * W21-09: the persistence-backed anti-replay identity.
+ * W21-09: the persistence-backed anti-replay identity, as STRUCTURE.
  *
  * Tenant, site, ACTOR, device, signal and version bound. The actor belongs in
- * the key because two people may legitimately be authorised on one signal
+ * the identity because two people may legitimately be authorised on one signal
  * version and may share a device between shifts; a nonce consumed by one must
- * not silently consume the other's queue of one-shot identities, and a nonce
- * replayed across actors must not look like the same request.
+ * not silently consume the other's one-shot identities, and a nonce replayed
+ * across actors must not look like the same request.
  *
- * This is an IDENTITY, not a duplicate-detector on its own: the runtime must
- * store it, and a reuse whose canonical signed statement differs is a generic
- * conflict that invokes no protocol (see `whisperRecognitionFingerprint`).
+ * C11-01: WP-21B persistence MUST enforce uniqueness with a real composite key
+ * over these seven columns. The string form below exists for comparison,
+ * logging and test assertions — a concatenation or a hash is not an identity,
+ * and building the durable constraint out of one would throw away the ability
+ * to query, audit and reason about the parts.
  */
-export function deviceActionWhisperReplayKey(
-  result: Pick<
-    DeviceActionWhisperResult,
-    'organisation_id' | 'site_id' | 'actor_user_id' | 'device_id' | 'whisper_signal_id' | 'whisper_signal_version' | 'anti_replay_nonce'
-  >,
-): string {
-  return [
-    result.organisation_id,
-    result.site_id,
-    result.actor_user_id,
-    result.device_id,
-    result.whisper_signal_id,
-    result.whisper_signal_version,
-    result.anti_replay_nonce,
-  ].join(':');
+export function deviceActionWhisperReplayIdentity(result: WhisperReplayIdentityInput): WhisperReplayIdentity {
+  return {
+    organisation_id: result.organisation_id,
+    site_id: result.site_id,
+    actor_user_id: result.actor_user_id,
+    device_id: result.device_id,
+    whisper_signal_id: result.whisper_signal_id,
+    whisper_signal_version: result.whisper_signal_version,
+    anti_replay_nonce: result.anti_replay_nonce,
+  };
+}
+
+/**
+ * C11-01: the identity as one unambiguous string.
+ *
+ * Delimiter joining was wrong and is gone. Every one of these values is a
+ * caller-supplied string that may itself contain the delimiter, so
+ * `[org, site, ...].join(':')` let two DIFFERENT tuples collide — organisation
+ * `"a:b"` with site `"c"` produced the same key as organisation `"a"` with
+ * site `"b:c"`. A collision here is not cosmetic: it is one tenant's nonce
+ * consuming another's replay slot. Canonical JSON escapes the separator inside
+ * each value and records the field names, so no two distinct tuples can share
+ * a representation.
+ */
+export function deviceActionWhisperReplayKey(result: WhisperReplayIdentityInput): string {
+  return canonicalJson({ domain: WHISPER_REPLAY_IDENTITY_DOMAIN, ...deviceActionWhisperReplayIdentity(result) });
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +309,9 @@ function sortKeysDeep(value: unknown): unknown {
 }
 
 function canonicalJson(value: unknown): string {
+  // C11-03: refuse rather than normalise. A digest taken over a silently
+  // altered value attests to something nobody approved.
+  assertJsonSafe(value, 'value');
   return JSON.stringify(sortKeysDeep(value)) ?? 'null';
 }
 
@@ -327,6 +414,12 @@ export function deviceTrustPermitsWhisperInvocation(trust: DeviceTrust): boolean
 /** Domain separator: a signature for this purpose can serve no other. */
 export const WHISPER_SIGNED_STATEMENT_DOMAIN = 'sentinel.whisper.device-action.v1';
 
+/** C11-01: the replay identity carries its own domain for the same reason. */
+export const WHISPER_REPLAY_IDENTITY_DOMAIN = 'sentinel.whisper.replay-identity.v1';
+
+/** C11-04: the one algorithm Milestone 2 verifies. */
+export const WHISPER_SIGNATURE_ALGORITHM = 'Ed25519';
+
 export type WhisperSignedStatementInput = Pick<
   DeviceActionWhisperResult,
   | 'schema_version'
@@ -338,39 +431,55 @@ export type WhisperSignedStatementInput = Pick<
   | 'whisper_signal_version'
   | 'device_action_id'
   | 'recognised_at'
+  | 'confidence'
   | 'anti_replay_nonce'
 >;
 
 /**
- * W21-06: EXACTLY what the device signs.
+ * W21-06/C11-01: EXACTLY what the device signs, canonically.
  *
- * Newline-separated with a leading domain tag, so no two different field
- * splits can concatenate to the same preimage and no signature minted for
- * another Sentinel purpose can be replayed here.
+ * A domain-tagged canonical JSON object, NOT a delimiter-joined string. The
+ * earlier newline form was ambiguous: every field is a caller-supplied value
+ * that may contain a newline, so organisation `"a\nb"` with site `"c"` and
+ * organisation `"a"` with site `"b\nc"` produced identical bytes — one
+ * signature would then verify for two different identities. JSON escapes the
+ * separator inside each value and names every field, so distinct tuples cannot
+ * share a preimage. The domain tag keeps a signature minted for another
+ * Sentinel purpose from being replayed here.
  *
- * What is deliberately ABSENT is as load-bearing as what is present:
+ * C11-04: `confidence` IS signed. It was called telemetry, but the runtime
+ * compares it against `minimum_confidence`, so an intercepted recognition
+ * whose unsigned confidence was raised could cross the threshold and turn a
+ * REFUSED into an ELIGIBLE. Any field that can flip that decision is
+ * security-relevant regardless of its label. It remains EVIDENCE — it never
+ * authorises on its own, and it can only ever reduce what is permitted — but
+ * its value is now fixed by the trusted device that produced it.
+ *
+ * What stays deliberately ABSENT:
  *
  *  - `response_protocol_id` — the server resolves the protocol from the exact
  *    active signal version (W21-10). A device that could sign the protocol
  *    could choose its own consequence.
- *  - `confidence`, `freshness_ms`, `context` — telemetry (W21-07). Signing
- *    them would dress client claims as authority.
+ *  - `freshness_ms` — the device's opinion of its own age, judged instead
+ *    against the server clock (W21-08).
+ *  - `context` — satisfied from server-established facts, never claimed (W21-07).
  *  - `device_trust` — the platform's judgement, never the device's (W21-05).
  */
 export function canonicalWhisperSignedStatement(input: WhisperSignedStatementInput): string {
-  return [
-    WHISPER_SIGNED_STATEMENT_DOMAIN,
-    String(input.schema_version),
-    input.organisation_id,
-    input.site_id,
-    input.actor_user_id,
-    input.device_id,
-    input.whisper_signal_id,
-    String(input.whisper_signal_version),
-    input.device_action_id,
-    input.recognised_at,
-    input.anti_replay_nonce,
-  ].join('\n');
+  return canonicalJson({
+    domain: WHISPER_SIGNED_STATEMENT_DOMAIN,
+    schema_version: input.schema_version,
+    organisation_id: input.organisation_id,
+    site_id: input.site_id,
+    actor_user_id: input.actor_user_id,
+    device_id: input.device_id,
+    whisper_signal_id: input.whisper_signal_id,
+    whisper_signal_version: input.whisper_signal_version,
+    device_action_id: input.device_action_id,
+    recognised_at: input.recognised_at,
+    confidence: input.confidence,
+    anti_replay_nonce: input.anti_replay_nonce,
+  });
 }
 
 /**
@@ -423,6 +532,8 @@ export function classifyWhisperRecognitionFreshness(recognisedAt: Date, received
 export const WhisperRecognitionConflictCodeSchema = z.enum([
   'DEVICE_CONTEXT_MISMATCH',
   'SITE_SCOPE_MISMATCH',
+  /** C11-02: the resolved signal does not belong to the trusted scope. */
+  'SIGNAL_SCOPE_MISMATCH',
   'SIGNAL_NOT_ACTIVE',
   'SIGNAL_VERSION_MISMATCH',
   'ACTOR_NOT_ELIGIBLE',
@@ -462,7 +573,13 @@ export function evaluateWhisperContextRequirements(
   const unsatisfiedKeys = Object.keys(requirements).filter((key) => {
     const fact = serverFacts[key];
     if (fact === undefined || fact === null) return true;
-    return canonicalJson(fact) !== canonicalJson(requirements[key]);
+    // C11-03: comparison is canonical, and a fact the server cannot represent
+    // canonically is not a fact this gate will act on.
+    try {
+      return canonicalJson(fact) !== canonicalJson(requirements[key]);
+    } catch {
+      return true;
+    }
   });
   return unsatisfiedKeys.length === 0 ? { satisfied: true } : { satisfied: false, unsatisfiedKeys };
 }
@@ -477,15 +594,34 @@ export function evaluateWhisperContextRequirements(
  * and confidence can only ever REDUCE what is permitted.
  */
 export interface WhisperRuntimeEligibilityInput {
+  /**
+   * C11-02: the STORED signal, including its own tenant scope. Without
+   * `organisation_id`/`site_id` here the gate could not prove that the signal
+   * it resolved belongs to the trusted organisation and to a site this device
+   * is entitled to — it would be trusting the lookup that produced it.
+   */
   signal: Pick<
     WhisperSignal,
-    'status' | 'signal_version' | 'device_action_id' | 'authorised_user_ids' | 'context_requirements' | 'minimum_confidence' | 'response_protocol_id'
+    | 'organisation_id'
+    | 'site_id'
+    | 'status'
+    | 'signal_version'
+    | 'device_action_id'
+    | 'authorised_user_ids'
+    | 'context_requirements'
+    | 'minimum_confidence'
+    | 'response_protocol_id'
   >;
   context: AuthenticatedWhisperDeviceContext;
-  claimedSignalVersion: number;
-  claimedSiteId: string;
-  claimedDeviceActionId: string;
-  reportedConfidence: number;
+  /**
+   * C11-02/C11-04: the SIGNED identity, taken from the verified result. These
+   * are claims — which is exactly why each one is bound against the trusted
+   * context below before anything is revealed or invoked.
+   */
+  result: Pick<
+    DeviceActionWhisperResult,
+    'organisation_id' | 'site_id' | 'actor_user_id' | 'device_id' | 'whisper_signal_version' | 'device_action_id' | 'confidence'
+  >;
   /**
    * W21-04: the allowlist is NOT a grant. This is the CURRENT answer to "may
    * this authenticated person do this here, now" — recomputed per invocation,
@@ -512,17 +648,33 @@ export type WhisperRuntimeEligibility =
  * a caller to believe a `true` here meant a verified signature.
  */
 export function evaluateWhisperRuntimeEligibility(input: WhisperRuntimeEligibilityInput): WhisperRuntimeEligibility {
-  if (!input.context.authorisedSiteIds.includes(input.claimedSiteId)) return { eligible: false, conflictCode: 'SITE_SCOPE_MISMATCH' };
+  // C11-02, FIRST: the signed identity must be the authenticated one. A single
+  // code covers all three so the caller learns that the binding failed and
+  // nothing about which side disagreed.
+  if (input.result.organisation_id !== input.context.organisationId) return { eligible: false, conflictCode: 'DEVICE_CONTEXT_MISMATCH' };
+  if (input.result.actor_user_id !== input.context.actorUserId) return { eligible: false, conflictCode: 'DEVICE_CONTEXT_MISMATCH' };
+  if (input.result.device_id !== input.context.deviceId) return { eligible: false, conflictCode: 'DEVICE_CONTEXT_MISMATCH' };
+  if (!input.context.authorisedSiteIds.includes(input.result.site_id)) return { eligible: false, conflictCode: 'SITE_SCOPE_MISMATCH' };
+
+  // C11-02: and the RESOLVED SIGNAL must belong to that same trusted scope.
+  // A signal is organisation-wide when its site is null — but even then the
+  // device may only fire it at a site it is actually entitled to, which the
+  // check above already established.
+  if (input.signal.organisation_id !== input.context.organisationId) return { eligible: false, conflictCode: 'SIGNAL_SCOPE_MISMATCH' };
+  if (input.signal.site_id !== null && input.signal.site_id !== input.result.site_id) return { eligible: false, conflictCode: 'SIGNAL_SCOPE_MISMATCH' };
+
   if (!deviceTrustPermitsWhisperInvocation(input.context.deviceTrust)) return { eligible: false, conflictCode: 'DEVICE_TRUST_INSUFFICIENT' };
   if (input.signal.status !== 'ACTIVE') return { eligible: false, conflictCode: 'SIGNAL_NOT_ACTIVE' };
-  if (input.signal.signal_version !== input.claimedSignalVersion) return { eligible: false, conflictCode: 'SIGNAL_VERSION_MISMATCH' };
-  if (input.signal.device_action_id !== input.claimedDeviceActionId) return { eligible: false, conflictCode: 'DEVICE_ACTION_MISMATCH' };
+  if (input.signal.signal_version !== input.result.whisper_signal_version) return { eligible: false, conflictCode: 'SIGNAL_VERSION_MISMATCH' };
+  if (input.signal.device_action_id !== input.result.device_action_id) return { eligible: false, conflictCode: 'DEVICE_ACTION_MISMATCH' };
   // Both halves of W21-04, in order: named on this version AND currently authorised.
   if (!input.signal.authorised_user_ids.includes(input.context.actorUserId)) return { eligible: false, conflictCode: 'ACTOR_NOT_ELIGIBLE' };
   if (!input.actorHoldsCurrentAuthority) return { eligible: false, conflictCode: 'ACTOR_NOT_ELIGIBLE' };
   if (input.freshness === 'FUTURE_SKEW') return { eligible: false, conflictCode: 'RECOGNITION_FUTURE_SKEW' };
   if (input.freshness === 'STALE') return { eligible: false, conflictCode: 'RECOGNITION_STALE' };
-  if (input.reportedConfidence < input.signal.minimum_confidence) return { eligible: false, conflictCode: 'CONFIDENCE_BELOW_THRESHOLD' };
+  // C11-04: this figure is signed evidence, so it cannot have been raised in
+  // flight to cross the threshold.
+  if (input.result.confidence < input.signal.minimum_confidence) return { eligible: false, conflictCode: 'CONFIDENCE_BELOW_THRESHOLD' };
   if (!evaluateWhisperContextRequirements(input.signal.context_requirements, input.serverFacts).satisfied) {
     return { eligible: false, conflictCode: 'CONTEXT_NOT_SATISFIED' };
   }
@@ -596,7 +748,7 @@ export const WhisperActivationApprovalSchema = z
     schema_version: z.literal(1),
     whisper_signal_id: scopedId,
     signal_version: z.number().int().positive(),
-    configuration_fingerprint: z.string().length(64),
+    configuration_fingerprint: sha256HexSchema,
     approved_by_user_id: scopedId,
     created_by_user_id: scopedId,
     approved_at: timestamp,
@@ -633,7 +785,7 @@ export const WhisperAuditPayloadSchema = z
     whisper_signal_id: scopedId,
     signal_version: z.number().int().positive(),
     /** Digest, never the configuration itself. */
-    configuration_fingerprint: z.string().length(64).nullable(),
+    configuration_fingerprint: sha256HexSchema.nullable(),
     actor_user_id: scopedId.nullable(),
     device_id: scopedId.nullable(),
     from_status: WhisperSignalStatusSchema.nullable(),
@@ -641,7 +793,7 @@ export const WhisperAuditPayloadSchema = z
     outcome: z.enum(['ACCEPTED', 'REFUSED']).nullable(),
     conflict_code: WhisperRecognitionConflictCodeSchema.nullable(),
     /** Digest of the signed statement — never the signature or the key. */
-    recognition_fingerprint: z.string().length(64).nullable(),
+    recognition_fingerprint: sha256HexSchema.nullable(),
     response_protocol_id: WhisperResponseProtocolSchema.nullable(),
     /** Link into the existing SILENT path, so the chain stays reconstructable. */
     incident_id: scopedId.nullable(),

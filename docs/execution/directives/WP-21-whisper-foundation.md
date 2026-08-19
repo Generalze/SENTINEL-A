@@ -115,25 +115,20 @@ device for some version — so a captured signature could be re-presented for a
 different configured action of the same family.
 
 ```text
-sentinel.whisper.device-action.v1
-<schema_version>
-<organisation_id>
-<site_id>
-<actor_user_id>
-<device_id>
-<whisper_signal_id>
-<signal_version>
-<device_action_id>
-<recognised_at>
-<anti_replay_nonce>          (newline-joined)
+canonical JSON object, keys sorted, over:
+  domain = sentinel.whisper.device-action.v1
+  schema_version, organisation_id, site_id, actor_user_id, device_id,
+  whisper_signal_id, whisper_signal_version, device_action_id,
+  recognised_at, confidence, anti_replay_nonce
 ```
 
-The domain tag prevents a signature minted for another Sentinel purpose being
-replayed here; newline separation prevents two different field splits sharing a
-preimage. **Absent by design:** `response_protocol_id` (the server resolves it —
-a device that could sign the protocol could choose its own consequence),
-`confidence` / `freshness_ms` / `context` (telemetry), and `device_trust` (the
-platform's judgement).
+See C11-01 below: the statement is domain-tagged **canonical JSON**, not a
+delimiter-joined string. The domain tag prevents a signature minted for another
+Sentinel purpose being replayed here. **Absent by design:**
+`response_protocol_id` (the server resolves it — a device that could sign the
+protocol could choose its own consequence), `freshness_ms` and `context`
+(telemetry), and `device_trust` (the platform's judgement). `confidence` IS
+signed — see C11-04.
 
 ### W21-07 — Client confidence and context cannot authorize
 
@@ -164,7 +159,10 @@ future to extend its own window. The submitted `freshness_ms` plays no part.
 ### W21-09 — Anti-replay is persistence-backed
 
 The replay identity binds tenant, site, **actor**, device, signal and version
-plus the nonce. The actor belongs in the key because two people may be
+plus the nonce, and is exposed as a STRUCTURE
+(`deviceActionWhisperReplayIdentity`) because WP-21B must key its uniqueness on
+a real composite constraint over those seven columns — never on a concatenated
+string or a hash (C11-01). The actor belongs in the key because two people may be
 authorised on one version and may share a device between shifts. The same
 canonical signed statement must converge to the stored result; a reused replay
 identity whose statement differs is a **generic conflict** that invokes no
@@ -245,9 +243,54 @@ signature material, public keys, the authorised-user roster, the nonce and the
 context values have **no field at all**, so a future edit cannot quietly widen
 an audit row into a disclosure of the secret the modality depends on.
 
+## C11 correction batch (applied at the WP-21A audit)
+
+The lead's contract-lock audit accepted the direction of W21-01..W21-14 and
+returned four corrections, all applied here:
+
+**C11-01 — Canonical serialization was ambiguous.** Both the signed statement
+and the replay key joined raw caller-supplied values with a delimiter, so two
+different tuples could produce identical bytes: organisation `"a:b"` with site
+`"c"` collided with organisation `"a"` with site `"b:c"`. For a signature that
+means one verification covering two identities; for the replay key it means one
+tenant consuming another's nonce slot. Both now use domain-tagged **canonical
+JSON**, which escapes separators inside values and names every field. The
+replay identity is additionally exposed as a structure so persistence keys on a
+real composite constraint.
+
+**C11-02 — The runtime gate could not prove tenancy.** It received only claimed
+site/version/action. It now takes the SIGNED result identity and the STORED
+signal's own scope, and binds — before anything is revealed or invoked —
+`result.organisation_id/actor_user_id/device_id` against the trusted context,
+`result.site_id` against the device's authorised sites, and the signal's
+organisation against the same trusted organisation. A signal with
+`site_id: null` is **explicitly organisation-wide**, and that is not a bypass:
+the device must still be entitled to the site it fires at. Mismatches fail
+closed; the service layer must collapse these codes so they cannot become an
+existence oracle.
+
+**C11-03 — Fingerprints could be lossy.** `context_requirements` accepted
+arbitrary `unknown`, and `JSON.stringify` drops `undefined` members and renders
+`NaN`/`Infinity` as `null` — so materially different requirement objects could
+collapse onto one digest that an activation approval then attested to. Context
+values are now a recursive **JSON-safe** union (string, finite number, boolean,
+null, array, object) at every depth, and the canonicaliser **throws** on
+anything it cannot represent rather than normalising it.
+
+**C11-04 — Unsigned confidence affected authorization.** `confidence` was
+excluded from the signed statement as telemetry, yet the gate compared it to
+`minimum_confidence` — so an intercepted recognition whose confidence was raised
+in flight could turn REFUSED into ELIGIBLE. Any field that can flip that
+decision is security-relevant whatever it is called. `confidence` is now part
+of the signed evidence; it still never authorises on its own and can only
+reduce what is permitted. `signature_algorithm` is pinned to **Ed25519** so a
+client-named algorithm can never select the verifier; the server's key registry
+remains the algorithm authority.
+
 ## WP-21A deliverables (this checkpoint)
 
-- `packages/contracts/src/whisper.ts` — extended: response-protocol registry;
+- `packages/contracts/src/whisper.ts` — extended: JSON-safe context values and
+  a refusing canonicaliser; response-protocol registry;
   `device_action_id` on the result; actor-bound replay key; configuration
   freeze/fingerprint helpers; terminal-status helper; the authenticated device
   context and trust gate; the canonical signed statement and recognition

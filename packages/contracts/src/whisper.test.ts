@@ -10,6 +10,8 @@ import {
   WHISPER_INVOCATION_TRUST_STATES,
   WHISPER_RESPONSE_PROTOCOLS,
   WHISPER_SEMANTIC_CONFIGURATION_FIELDS,
+  WHISPER_REPLAY_IDENTITY_DOMAIN,
+  WHISPER_SIGNATURE_ALGORITHM,
   WHISPER_SIGNED_STATEMENT_DOMAIN,
   WhisperActivationApprovalSchema,
   WhisperAuditPayloadSchema,
@@ -19,6 +21,7 @@ import {
   canonicalWhisperSignedStatement,
   classifyWhisperConfigurationEdit,
   classifyWhisperRecognitionFreshness,
+  deviceActionWhisperReplayIdentity,
   deviceActionWhisperReplayKey,
   deviceTrustPermitsWhisperInvocation,
   evaluateWhisperContextRequirements,
@@ -119,10 +122,12 @@ const SIGNAL_CONFIG: WhisperSemanticConfiguration = {
   modality: 'DEVICE_ACTION' as const,
   device_action_id: 'button-double-press',
   authorised_user_ids: ['user-1', 'user-2'],
-  context_requirements: { on_duty: true } as Record<string, unknown>,
+  context_requirements: { on_duty: true },
   minimum_confidence: 0.9,
   response_protocol_id: 'SILENT_INCIDENT_RESPONSE' as const,
 };
+
+const SIGNAL_SCOPE = { organisation_id: 'org-1', site_id: 'site-1' as string | null };
 
 const DEVICE_CONTEXT: AuthenticatedWhisperDeviceContext = {
   organisationId: 'org-1',
@@ -133,14 +138,21 @@ const DEVICE_CONTEXT: AuthenticatedWhisperDeviceContext = {
   verificationKeyId: 'key-1',
 };
 
+const SIGNED_IDENTITY = {
+  organisation_id: 'org-1',
+  site_id: 'site-1',
+  actor_user_id: 'user-1',
+  device_id: 'device-1',
+  whisper_signal_version: 3,
+  device_action_id: 'button-double-press',
+  confidence: 0.95,
+};
+
 function eligibilityInput(overrides: Partial<WhisperRuntimeEligibilityInput> = {}): WhisperRuntimeEligibilityInput {
   return {
-    signal: { status: 'ACTIVE', signal_version: 3, ...SIGNAL_CONFIG },
+    signal: { ...SIGNAL_SCOPE, status: 'ACTIVE', signal_version: 3, ...SIGNAL_CONFIG },
     context: DEVICE_CONTEXT,
-    claimedSignalVersion: 3,
-    claimedSiteId: 'site-1',
-    claimedDeviceActionId: 'button-double-press',
-    reportedConfidence: 0.95,
+    result: SIGNED_IDENTITY,
     actorHoldsCurrentAuthority: true,
     serverFacts: { on_duty: true },
     freshness: 'FRESH',
@@ -158,6 +170,7 @@ const STATEMENT_INPUT = {
   whisper_signal_version: 3,
   device_action_id: 'button-double-press',
   recognised_at: '2026-08-19T10:00:00.000Z',
+  confidence: 0.95,
   anti_replay_nonce: '0123456789abcdef',
 };
 
@@ -249,17 +262,38 @@ describe('W21-03 the lifecycle admits no shortcut and no resurrection', () => {
   });
 });
 
-describe('W21-06 the canonical signed statement', () => {
-  it('binds exactly the ten documented identity fields, domain-separated', () => {
-    expect(canonicalWhisperSignedStatement(STATEMENT_INPUT)).toBe(
-      [
-        WHISPER_SIGNED_STATEMENT_DOMAIN, '1', 'org-1', 'site-1', 'user-1', 'device-1', 'whisper-1', '3', 'button-double-press',
-        '2026-08-19T10:00:00.000Z', '0123456789abcdef',
-      ].join('\n'),
-    );
-    expect(whisperRecognitionFingerprint(STATEMENT_INPUT)).toBe(
-      createHash('sha256').update(canonicalWhisperSignedStatement(STATEMENT_INPUT), 'utf8').digest('hex'),
-    );
+describe('W21-06/C11-01 the canonical signed statement', () => {
+  it('is domain-tagged canonical JSON over the eleven signed fields', () => {
+    const statement = canonicalWhisperSignedStatement(STATEMENT_INPUT);
+    expect(JSON.parse(statement)).toEqual({
+      domain: WHISPER_SIGNED_STATEMENT_DOMAIN,
+      schema_version: 1,
+      organisation_id: 'org-1',
+      site_id: 'site-1',
+      actor_user_id: 'user-1',
+      device_id: 'device-1',
+      whisper_signal_id: 'whisper-1',
+      whisper_signal_version: 3,
+      device_action_id: 'button-double-press',
+      recognised_at: '2026-08-19T10:00:00.000Z',
+      confidence: 0.95,
+      anti_replay_nonce: '0123456789abcdef',
+    });
+    expect(whisperRecognitionFingerprint(STATEMENT_INPUT)).toBe(createHash('sha256').update(statement, 'utf8').digest('hex'));
+    expect(whisperRecognitionFingerprint(STATEMENT_INPUT)).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('C11-01: a field value containing the old delimiter cannot forge another identity', () => {
+    // The delimiter-joined form collided here: org "a\nb" + site "c" and
+    // org "a" + site "b\nc" produced identical bytes, so one signature
+    // verified for two different tenants.
+    const split = { ...STATEMENT_INPUT, organisation_id: 'a\nb', site_id: 'c' };
+    const shifted = { ...STATEMENT_INPUT, organisation_id: 'a', site_id: 'b\nc' };
+    expect(canonicalWhisperSignedStatement(split)).not.toBe(canonicalWhisperSignedStatement(shifted));
+    expect(whisperRecognitionFingerprint(split)).not.toBe(whisperRecognitionFingerprint(shifted));
+    // The same attack through a quote or a brace is equally refused.
+    const quoted = { ...STATEMENT_INPUT, organisation_id: 'a","site_id":"z' };
+    expect(whisperRecognitionFingerprint(quoted)).not.toBe(whisperRecognitionFingerprint(STATEMENT_INPUT));
   });
 
   it('the observed device_action_id is part of the statement, so a signature cannot be re-presented for another action', () => {
@@ -268,33 +302,74 @@ describe('W21-06 the canonical signed statement', () => {
     );
   });
 
+  it('C11-04: confidence is signed, so it cannot be raised in flight to cross the threshold', () => {
+    const raised = { ...STATEMENT_INPUT, confidence: 0.99 };
+    expect(whisperRecognitionFingerprint(raised)).not.toBe(whisperRecognitionFingerprint(STATEMENT_INPUT));
+    // A recognition below the bar is refused, and lifting the figure changes
+    // the signed statement — so the altered claim no longer verifies.
+    const belowBar = { ...SIGNED_IDENTITY, confidence: 0.5 };
+    expect(evaluateWhisperRuntimeEligibility(eligibilityInput({ result: belowBar }))).toEqual({
+      eligible: false,
+      conflictCode: 'CONFIDENCE_BELOW_THRESHOLD',
+    });
+    expect(whisperRecognitionFingerprint({ ...STATEMENT_INPUT, confidence: 0.5 })).not.toBe(whisperRecognitionFingerprint(STATEMENT_INPUT));
+  });
+
   it('every identity field changes the statement', () => {
     const variants = [
       { organisation_id: 'org-2' }, { site_id: 'site-2' }, { actor_user_id: 'user-2' }, { device_id: 'device-2' },
       { whisper_signal_id: 'whisper-2' }, { whisper_signal_version: 4 }, { recognised_at: '2026-08-19T10:00:01.000Z' },
-      { anti_replay_nonce: 'fedcba9876543210' },
+      { anti_replay_nonce: 'fedcba9876543210' }, { confidence: 0.96 },
     ];
     for (const variant of variants) {
       expect(canonicalWhisperSignedStatement({ ...STATEMENT_INPUT, ...variant })).not.toBe(canonicalWhisperSignedStatement(STATEMENT_INPUT));
     }
   });
+
+  it('C11-04: only the server-selected Ed25519 algorithm is admitted', () => {
+    expect(WHISPER_SIGNATURE_ALGORITHM).toBe('Ed25519');
+    const base = {
+      schema_version: 1 as const, whisper_result_id: 'result-2', whisper_signal_id: 'whisper-1', whisper_signal_version: 3,
+      organisation_id: 'org-1', site_id: 'site-1', actor_user_id: 'user-1', device_id: 'device-1', device_action_id: 'button-double-press',
+      recognised_at: at, confidence: 0.95, device_trust: 'TRUSTED' as const, context: { on_duty: true }, freshness_ms: 0,
+      anti_replay_nonce: '0123456789abcdef', signature_algorithm: 'Ed25519', signature: '0123456789abcdef', trace_id: 'trace-1',
+    };
+    expect(DeviceActionWhisperResultSchema.parse(base).signature_algorithm).toBe('Ed25519');
+    // A client must never be able to name the verifier — least of all a
+    // downgrade the platform could be talked into accepting.
+    for (const algorithm of ['none', 'HS256', 'RS256', 'MD5', 'Ed448']) {
+      expect(() => DeviceActionWhisperResultSchema.parse({ ...base, signature_algorithm: algorithm })).toThrow();
+    }
+  });
 });
 
-describe('W21-09 the replay identity is actor-bound', () => {
+describe('W21-09/C11-01 the replay identity is actor-bound and unambiguous', () => {
+  it('exposes the real composite identity that persistence must key on', () => {
+    expect(deviceActionWhisperReplayIdentity(STATEMENT_INPUT)).toEqual({
+      organisation_id: 'org-1', site_id: 'site-1', actor_user_id: 'user-1', device_id: 'device-1',
+      whisper_signal_id: 'whisper-1', whisper_signal_version: 3, anti_replay_nonce: '0123456789abcdef',
+    });
+    expect(JSON.parse(deviceActionWhisperReplayKey(STATEMENT_INPUT)).domain).toBe(WHISPER_REPLAY_IDENTITY_DOMAIN);
+  });
+
   it('distinguishes actors sharing one device, and every other scope dimension', () => {
-    const base = { ...STATEMENT_INPUT };
-    const key = deviceActionWhisperReplayKey(base);
-    expect(deviceActionWhisperReplayKey({ ...base, actor_user_id: 'user-2' })).not.toBe(key);
-    expect(deviceActionWhisperReplayKey({ ...base, organisation_id: 'org-2' })).not.toBe(key);
-    expect(deviceActionWhisperReplayKey({ ...base, site_id: 'site-2' })).not.toBe(key);
-    expect(deviceActionWhisperReplayKey({ ...base, device_id: 'device-2' })).not.toBe(key);
-    expect(deviceActionWhisperReplayKey({ ...base, whisper_signal_version: 4 })).not.toBe(key);
-    expect(deviceActionWhisperReplayKey({ ...base, anti_replay_nonce: 'fedcba9876543210' })).not.toBe(key);
+    const key = deviceActionWhisperReplayKey(STATEMENT_INPUT);
+    const variants = [
+      { actor_user_id: 'user-2' }, { organisation_id: 'org-2' }, { site_id: 'site-2' }, { device_id: 'device-2' },
+      { whisper_signal_id: 'whisper-2' }, { whisper_signal_version: 4 }, { anti_replay_nonce: 'fedcba9876543210' },
+    ];
+    for (const variant of variants) {
+      expect(deviceActionWhisperReplayKey({ ...STATEMENT_INPUT, ...variant })).not.toBe(key);
+    }
+  });
+
+  it('C11-01: a colon inside a value cannot make one tenant consume another tenant replay slot', () => {
+    const split = { ...STATEMENT_INPUT, organisation_id: 'a:b', site_id: 'c' };
+    const shifted = { ...STATEMENT_INPUT, organisation_id: 'a', site_id: 'b:c' };
+    expect(deviceActionWhisperReplayKey(split)).not.toBe(deviceActionWhisperReplayKey(shifted));
   });
 
   it('a reused identity carrying different immutable semantics is a different request', () => {
-    // Same replay identity (nonce and scope unchanged), different signed
-    // statement: the runtime must treat this as a conflict, never converge it.
     const drifted = { ...STATEMENT_INPUT, device_action_id: 'button-triple-press' };
     expect(deviceActionWhisperReplayKey(drifted)).toBe(deviceActionWhisperReplayKey(STATEMENT_INPUT));
     expect(whisperRecognitionFingerprint(drifted)).not.toBe(whisperRecognitionFingerprint(STATEMENT_INPUT));
@@ -338,9 +413,9 @@ describe('W21-07 client confidence and context cannot authorize', () => {
     expect(evaluateWhisperRuntimeEligibility(eligibilityInput({ serverFacts: {} }))).toEqual({ eligible: false, conflictCode: 'CONTEXT_NOT_SATISFIED' });
   });
 
-  it('reported confidence can only reduce what is permitted', () => {
-    expect(evaluateWhisperRuntimeEligibility(eligibilityInput({ reportedConfidence: 0.9 })).eligible).toBe(true);
-    expect(evaluateWhisperRuntimeEligibility(eligibilityInput({ reportedConfidence: 0.89 }))).toEqual({
+  it('signed confidence can only reduce what is permitted', () => {
+    expect(evaluateWhisperRuntimeEligibility(eligibilityInput({ result: { ...SIGNED_IDENTITY, confidence: 0.9 } })).eligible).toBe(true);
+    expect(evaluateWhisperRuntimeEligibility(eligibilityInput({ result: { ...SIGNED_IDENTITY, confidence: 0.89 } }))).toEqual({
       eligible: false,
       conflictCode: 'CONFIDENCE_BELOW_THRESHOLD',
     });
@@ -369,19 +444,27 @@ describe('W21-04 configuration eligibility is not runtime authority', () => {
   });
 
   it('an unnamed user cannot invoke even while currently authorised elsewhere', () => {
+    // Identity is consistent — the signed result and the trusted context name
+    // the same person — so the ONLY thing refusing this is the allowlist.
     const context = { ...DEVICE_CONTEXT, actorUserId: 'user-9' };
-    expect(evaluateWhisperRuntimeEligibility(eligibilityInput({ context }))).toEqual({ eligible: false, conflictCode: 'ACTOR_NOT_ELIGIBLE' });
+    const result = { ...SIGNED_IDENTITY, actor_user_id: 'user-9' };
+    expect(evaluateWhisperRuntimeEligibility(eligibilityInput({ context, result }))).toEqual({ eligible: false, conflictCode: 'ACTOR_NOT_ELIGIBLE' });
+    // And an identity that does NOT agree is refused earlier still, by C11-02.
+    expect(evaluateWhisperRuntimeEligibility(eligibilityInput({ context }))).toEqual({ eligible: false, conflictCode: 'DEVICE_CONTEXT_MISMATCH' });
   });
 
   it('only the exact ACTIVE version resolves, and the resolved protocol comes from the stored signal', () => {
     for (const status of ['DRAFT', 'SIMULATION', 'APPROVAL', 'ROTATED', 'RETIRED'] as const) {
-      expect(evaluateWhisperRuntimeEligibility(eligibilityInput({ signal: { status, signal_version: 3, ...SIGNAL_CONFIG } }))).toEqual({
+      expect(evaluateWhisperRuntimeEligibility(eligibilityInput({ signal: { ...SIGNAL_SCOPE, status, signal_version: 3, ...SIGNAL_CONFIG } }))).toEqual({
         eligible: false,
         conflictCode: 'SIGNAL_NOT_ACTIVE',
       });
     }
-    expect(evaluateWhisperRuntimeEligibility(eligibilityInput({ claimedSignalVersion: 2 }))).toEqual({ eligible: false, conflictCode: 'SIGNAL_VERSION_MISMATCH' });
-    expect(evaluateWhisperRuntimeEligibility(eligibilityInput({ claimedDeviceActionId: 'button-triple-press' }))).toEqual({
+    expect(evaluateWhisperRuntimeEligibility(eligibilityInput({ result: { ...SIGNED_IDENTITY, whisper_signal_version: 2 } }))).toEqual({
+      eligible: false,
+      conflictCode: 'SIGNAL_VERSION_MISMATCH',
+    });
+    expect(evaluateWhisperRuntimeEligibility(eligibilityInput({ result: { ...SIGNED_IDENTITY, device_action_id: 'button-triple-press' } }))).toEqual({
       eligible: false,
       conflictCode: 'DEVICE_ACTION_MISMATCH',
     });
@@ -389,7 +472,10 @@ describe('W21-04 configuration eligibility is not runtime authority', () => {
   });
 
   it('a site outside the authenticated device scope is refused before anything reveals the signal', () => {
-    expect(evaluateWhisperRuntimeEligibility(eligibilityInput({ claimedSiteId: 'site-2' }))).toEqual({ eligible: false, conflictCode: 'SITE_SCOPE_MISMATCH' });
+    expect(evaluateWhisperRuntimeEligibility(eligibilityInput({ result: { ...SIGNED_IDENTITY, site_id: 'site-2' } }))).toEqual({
+      eligible: false,
+      conflictCode: 'SITE_SCOPE_MISMATCH',
+    });
   });
 });
 
@@ -459,6 +545,96 @@ describe('W21-14 audit records identity and disposition, never the secret', () =
       { anti_replay_nonce: '0123456789abcdef' },
     ]) {
       expect(() => WhisperAuditPayloadSchema.parse({ ...payload, ...leak })).toThrow();
+    }
+  });
+});
+
+describe('C11-02 the signed identity and the resolved signal are bound to the trusted scope', () => {
+  it('a signed result naming another organisation, actor or device is refused before anything is revealed', () => {
+    for (const forged of [{ organisation_id: 'org-2' }, { actor_user_id: 'user-2' }, { device_id: 'device-2' }]) {
+      expect(evaluateWhisperRuntimeEligibility(eligibilityInput({ result: { ...SIGNED_IDENTITY, ...forged } }))).toEqual({
+        eligible: false,
+        conflictCode: 'DEVICE_CONTEXT_MISMATCH',
+      });
+    }
+  });
+
+  it('a signal from another organisation cannot be fired even by a perfectly authenticated device', () => {
+    const foreignSignal = { organisation_id: 'org-2', site_id: 'site-1' as string | null, status: 'ACTIVE' as const, signal_version: 3, ...SIGNAL_CONFIG };
+    expect(evaluateWhisperRuntimeEligibility(eligibilityInput({ signal: foreignSignal }))).toEqual({ eligible: false, conflictCode: 'SIGNAL_SCOPE_MISMATCH' });
+  });
+
+  it('a site-scoped signal cannot be fired at a different site of the same organisation', () => {
+    const otherSite = { organisation_id: 'org-1', site_id: 'site-9' as string | null, status: 'ACTIVE' as const, signal_version: 3, ...SIGNAL_CONFIG };
+    const context = { ...DEVICE_CONTEXT, authorisedSiteIds: ['site-1', 'site-9'] };
+    // The device is entitled to both sites, so only the signal's own scope refuses it.
+    expect(evaluateWhisperRuntimeEligibility(eligibilityInput({ signal: otherSite, context }))).toEqual({
+      eligible: false,
+      conflictCode: 'SIGNAL_SCOPE_MISMATCH',
+    });
+  });
+
+  it('an organisation-wide signal (null site) fires only at a site the device is entitled to', () => {
+    const orgWide = { organisation_id: 'org-1', site_id: null, status: 'ACTIVE' as const, signal_version: 3, ...SIGNAL_CONFIG };
+    expect(evaluateWhisperRuntimeEligibility(eligibilityInput({ signal: orgWide }))).toEqual({ eligible: true, responseProtocolId: 'SILENT_INCIDENT_RESPONSE' });
+    // Organisation-wide is NOT a bypass of the device's own site entitlement.
+    expect(
+      evaluateWhisperRuntimeEligibility(eligibilityInput({ signal: orgWide, result: { ...SIGNED_IDENTITY, site_id: 'site-2' } })),
+    ).toEqual({ eligible: false, conflictCode: 'SITE_SCOPE_MISMATCH' });
+  });
+});
+
+describe('C11-03 context values must be losslessly canonical', () => {
+  it('rejects values JSON cannot represent, at any nesting depth', () => {
+    const signal = {
+      schema_version: 1 as const, whisper_signal_id: 'whisper-1', organisation_id: 'org-1', site_id: 'site-1', name: 'Assistance',
+      signal_version: 1, status: 'DRAFT' as const, ...SIGNAL_CONFIG, created_at: at, updated_at: at, created_by_user_id: 'admin-1', trace_id: 'trace-1',
+    };
+    for (const requirements of [
+      { on_duty: undefined },
+      { on_duty: Number.NaN },
+      { on_duty: Number.POSITIVE_INFINITY },
+      { nested: { deep: Number.NaN } },
+      { nested: [1, Number.NEGATIVE_INFINITY] },
+    ]) {
+      expect(() => WhisperSignalSchema.parse({ ...signal, context_requirements: requirements })).toThrow();
+    }
+    // Ordinary JSON shapes remain admissible, including nested ones.
+    expect(
+      WhisperSignalSchema.parse({ ...signal, context_requirements: { on_duty: true, zone: { name: 'north', level: 2 }, tags: ['a', 'b'] } }).status,
+    ).toBe('DRAFT');
+  });
+
+  it('the fingerprint refuses unrepresentable input rather than silently normalising it', () => {
+    expect(() => whisperConfigurationFingerprint({ ...SIGNAL_CONFIG, context_requirements: { on_duty: Number.NaN } as never })).toThrow(/canonically/);
+    expect(() => whisperConfigurationFingerprint({ ...SIGNAL_CONFIG, context_requirements: { on_duty: undefined } as never })).toThrow(/canonically/);
+  });
+
+  it('values that JSON.stringify would have collapsed stay distinguishable', () => {
+    // Both of these once serialised to {"a":null}: a dropped member and an
+    // explicit null are materially different requirements, and an activation
+    // approval attests to the exact one that was tested.
+    const explicitNull = whisperConfigurationFingerprint({ ...SIGNAL_CONFIG, context_requirements: { a: null } });
+    const empty = whisperConfigurationFingerprint({ ...SIGNAL_CONFIG, context_requirements: {} });
+    expect(explicitNull).not.toBe(empty);
+    expect(explicitNull).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('a server fact that cannot be represented canonically does not satisfy a requirement', () => {
+    expect(evaluateWhisperContextRequirements({ on_duty: true }, { on_duty: Number.NaN })).toEqual({ satisfied: false, unsatisfiedKeys: ['on_duty'] });
+  });
+});
+
+describe('C11-01 fingerprints are pinned to their exact hex shape', () => {
+  it('refuses a digest that is the right length but not lowercase hex', () => {
+    const approval = {
+      schema_version: 1 as const, whisper_signal_id: 'whisper-1', signal_version: 3,
+      configuration_fingerprint: whisperConfigurationFingerprint(SIGNAL_CONFIG),
+      approved_by_user_id: 'commander-2', created_by_user_id: 'commander-1', approved_at: at, trace_id: 'trace-1',
+    };
+    expect(WhisperActivationApprovalSchema.parse(approval).configuration_fingerprint).toMatch(/^[0-9a-f]{64}$/);
+    for (const bad of ['A'.repeat(64), 'g'.repeat(64), '0'.repeat(63), '0'.repeat(65)]) {
+      expect(() => WhisperActivationApprovalSchema.parse({ ...approval, configuration_fingerprint: bad })).toThrow();
     }
   });
 });
