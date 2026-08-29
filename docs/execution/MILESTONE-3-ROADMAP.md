@@ -76,9 +76,14 @@ M2's boundaries are frozen and carry forward as constraints, not suggestions:
   approvals remain the only route to SILENT dispatch, through the existing
   Constitution path. A real device changes who signs the action — it changes
   nothing about who authorises the response.
-- **The Whisper contract is frozen** (`packages/contracts/src/whisper.ts`).
-  M3 supplies a genuine `AuthenticatedWhisperDeviceContext`; it does not
-  redefine what one means.
+- **Whisper v1 semantics are frozen. M3 may add a lead-approved versioned
+  physical-device signature profile without altering or weakening v1**
+  (C14-01). The earlier phrasing — "the Whisper contract is frozen" — was too
+  broad, and taken literally it made Proof C unreachable: v1 pins Ed25519,
+  while the hardware-backed keystores a TRUSTED device must use guarantee
+  P-256. M3 supplies a genuine `AuthenticatedWhisperDeviceContext` and, under
+  a new version, a hardware-compatible signature profile. It does not
+  reinterpret v1.
 - **A re-provisioned device is a new identity.** WP-20/C10-03 already ruled
   that a device needing a fresh sequence namespace requires a new
   authenticated device identity, never a reset. M3's enrollment must honour

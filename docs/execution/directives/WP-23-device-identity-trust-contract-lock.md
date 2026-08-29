@@ -94,6 +94,38 @@ Enrollment is a **challenge-response proving possession** of the private key,
 never an upload. A public key arriving without a fresh server-issued challenge
 signed by the matching private key is not an enrollment; it is a claim.
 
+**C14-01 correction — the hardware requirement and Ed25519 were in direct
+conflict.** Whisper v1 pins `signature_algorithm` to Ed25519 and calls it the
+one algorithm M2 verifies. But Secure Enclave signing is P-256, and StrongBox
+guarantees ECDSA/ECDH P-256 among its hardware-backed algorithms; neither
+offers an equivalent hardware-backed Ed25519 path. Chaining the requirements as
+originally written — hardware-backed key for TRUSTED, TRUSTED for Whisper,
+Ed25519 for Whisper — made **Proof C unreachable on the mainstream mobile
+target**. That is exactly the contradiction this gate exists to surface before
+a gateway is built on top of it.
+
+**Ruling: v1 remains frozen; M3 versions forward.**
+
+```text
+Whisper device-action v1     Ed25519, M2 historical contract,
+                             supported and unchanged, never reinterpreted
+
+Whisper physical-device v2   hardware-backed signature profile
+                             (P-256 ECDSA / SHA-256), new M3 version
+```
+
+Two constraints ride with it. The verification profile is **selected from the
+server key registry** by key id and version — never negotiated, named or
+influenced by client input, carrying forward C11-04's rule that a client must
+not choose its own verifier. And the signature encoding is pinned to exactly
+one canonical representation, rejected before any cryptographic work if it
+does not round-trip, rather than left to whatever a parser happens to accept.
+
+A device platform that cannot produce a hardware-backed key in an approved
+profile does not get a TRUSTED credential. It may enrol at a lower trust
+state, and the contract must say so rather than quietly widening the profile
+list to accommodate it.
+
 ### D23-04 — The enrollment bootstrap is the hardest problem, and it is not a shared secret
 
 Every device-trust system is only as strong as how the *first* credential is
@@ -111,6 +143,43 @@ Consuming a bootstrap token binds one device public key, exactly once, and
 burns the token — a second use is a conflict and an audit event, never a
 second device. If a token is used from an unexpected context, the enrollment
 must fail closed and the token must die rather than degrade.
+
+**C14-02 correction — single-use stops replay, not preemption.** As originally
+written the construction still lost this race:
+
+```text
+steal an unused bootstrap token
+  + generate an attacker keypair
+  + prove possession of the ATTACKER's private key
+  = attacker wins the enrollment
+```
+
+Proof-of-possession proves possession of *the key being enrolled*. It says
+nothing about whether that is the hardware the issuer intended to enrol. A
+bootstrap grant alone must therefore never be sufficient. Enrollment requires a
+**two-sided binding**, where a human approves the exact request rather than
+handing out a credential in advance:
+
+```text
+device generates a hardware-backed key
+  -> device produces an enrollment REQUEST
+     (public-key thumbprint + attestation evidence)
+  -> a Command principal approves THAT EXACT REQUEST
+     for the intended organisation / site / device class
+  -> the intended user authenticates
+  -> fresh server challenge
+  -> device proves possession of the APPROVED key
+  -> enrollment commits, once
+```
+
+**Custody is not identity.** The contract must separate the device's
+ownership/custody from the *current authenticated user*, because M2's replay
+design already assumes more than one actor may legitimately use one device
+across shifts — the actor is part of the replay identity precisely for that
+reason. WP-23 must therefore state explicitly whether Proof C is limited to
+personally assigned devices, and if not, define personal versus
+controlled-shared enrollment. What it must not do is let `intended_user_id`
+harden into permanent hardware identity by accident.
 
 ### D23-05 — Trust is server-owned state, not a device self-report
 
@@ -144,6 +213,30 @@ plainly that this is a deliberate trade: we would rather a duress signal fall
 back to a loud channel than accept a silent dispatch from hardware we can no
 longer vouch for.
 
+**C14-05 correction — a provider outage is not device evidence.** The original
+wording let "attestation failure or staleness" cover both cases, which treats a
+third-party service being unreachable as though the device had failed
+verification. Those are different facts and must be ruled separately:
+
+```text
+NEGATIVE / INVALID / REVOKED attestation
+  -> device evidence. May immediately lower trust or quarantine.
+
+ATTESTATION SERVICE UNAVAILABLE
+  -> no NEW positive evidence, and no negative evidence either.
+  -> retain last-known-good attestation for a BOUNDED GRACE PERIOD
+  -> once the grace expires, degrade
+  -> DEGRADED cannot invoke Whisper (W21-05 already requires TRUSTED)
+
+NO PRIOR VERIFIED ATTESTATION
+  -> cannot become TRUSTED while verification is unavailable
+```
+
+The grace period is a **numeric contract constant**, named the way W21-08 named
+its freshness bounds — not implementation policy discovered later. This keeps
+the fail-closed end state while stopping a provider outage from instantly
+disabling every already-known-good duress device.
+
 ### D23-07 — The device context is a short-lived, server-issued, revocation-checked assertion
 
 `AuthenticatedWhisperDeviceContext` and its Field equivalent become
@@ -160,7 +253,34 @@ W21-08 named its freshness bounds instead of hiding them in a service.
 
 A context must never be transferable between users, devices, sites or
 organisations, and must carry the key version it was issued against so a
-rotation invalidates it.
+rotation invalidates it. (Invalidating a context is not the same as changing a
+device's identity — see the D23-09 rotation clarification.)
+
+**C14-03 correction — a short TTL still leaves a bearer credential.** TTL plus
+a registry check does not stop replay of a *stolen* context. Lifted from memory
+or transport, inside its lifetime, against a registry record that still says
+TRUSTED, it passes — because nothing in that path required the thief to hold
+the hardware key.
+
+**Locked invariant:**
+
+> **Possession of a device-context token without possession of the registered
+> hardware private key must be useless.**
+
+The context must therefore be **sender-constrained**, not merely server-signed.
+Every security-relevant use proves possession of the current registered device
+key, with the request proof cryptographically binding at least:
+
+```text
+context / session identity      nonce
+request purpose                 freshness
+body / payload digest           device key id + version
+```
+
+The transport mechanism — request signing, mTLS-style binding, DPoP-style
+proof — is settled during contract design; the invariant above is not
+negotiable. The reconnect handshake (D23-13) obeys the same rule: it
+authenticates by proof of possession, never by presenting a token.
 
 ### D23-08 — Revocation must be evaluated at reconciliation, and a revoked device's queue is refused
 
@@ -182,6 +302,32 @@ purpose of revocation is to stop trusting anything that credential says. The
 contract must state the consequence honestly — a genuinely lost queue is
 recoverable only through human-attested re-entry, not by trusting the device.
 
+**C14-06 correction — keep fail-closed, but sharpen two distinctions.** The
+core decision stands and must not be softened into "accept it if the payload
+looks plausible": independent corroboration can suggest something happened, but
+it cannot restore authority to a compromised credential.
+
+First, the three responses D23-15 already requires are not one flag:
+
+```text
+LOST             quarantine / suspend; recoverable under controlled
+                 trust restoration
+STOLEN           assume hostile possession; revoke; no queued domain execution
+COMPROMISED KEY  assume the credential is cloned; revoke;
+                 no queued domain execution
+```
+
+Second, an **already-committed effect** is not a queued request. If Sentinel's
+own authoritative domain evidence proves operation `X` was committed before
+revocation, recovery may resolve `X` as historical fact without executing it
+again. That is trusting Sentinel's own prior evidence, not the device.
+
+> **A revoked or compromised credential can never cause a NEW domain mutation.
+> Server-owned evidence may resolve an already-committed effect; it may never
+> be used as a loophole to admit a previously unapplied queued request.**
+
+Genuinely unapplied work still goes through human-attested re-entry.
+
 ### D23-09 — Re-enrollment produces a new device identity, never a reset
 
 WP-20/C10-03 already locked that a device needing a fresh sequence namespace
@@ -192,6 +338,23 @@ device id**, a new key identity, and a fresh offline sequence namespace.
 The old identity is retired, not reused. Reusing it would let a re-enrolled
 device inherit a replay namespace whose consumed positions it no longer knows,
 which is precisely how a duplicate operational effect gets in.
+
+**Clarification (C14 batch) — routine rotation is not reincarnation.** Normal
+key hygiene must not mint a new device. The contract must distinguish:
+
+```text
+routine AUTHENTICATED key rotation
+  -> same device_id, same offline sequence namespace, new key version
+  -> outstanding device contexts bound to the old version become invalid
+
+wipe / re-provision / irrecoverable continuity loss /
+compromise recovery / actual re-enrollment
+  -> NEW device_id, new key identity, fresh sequence namespace
+```
+
+The dividing line is continuity of the enrolled hardware credential, not the
+key material alone: a device that can still prove possession of its current
+registered key is rotating; one that cannot is re-enrolling.
 
 ### D23-10 — Edge is a buffer and a transport, never an authority
 
@@ -206,6 +369,28 @@ to *delay, drop or corrupt* traffic without being able to *forge a Field
 action*. If Edge compromise could manufacture a signed device action, the
 whole device-trust model collapses to trusting the box in the wiring closet.
 
+**C14-04 correction, first half — Edge may witness; Edge may not authorize.**
+Keeping Edge out of the authority path is right, but it left Proof D without a
+trustworthy clock (see D23-11/D23-12). Edge may therefore append a **signed
+receipt / provenance fact**:
+
+```text
+"I, trusted Edge E17, received device-signed operation X
+ at my trusted time / monotonic position Y."
+```
+
+which asserts *when Edge saw it*, and explicitly not:
+
+```text
+"I authorize operation X."
+```
+
+Origin still comes from the device signature; local admissibility still comes
+from the cached policy lease; Edge contributes independent time and provenance
+evidence and nothing else. If Edge itself has lost trust, or no trustworthy
+time anchor is available, operations requiring time-bounded authority **fail
+closed**.
+
 ### D23-11 — Offline authority is bounded by a policy cache that expires
 
 A disconnected client may act only within a cached policy, and that cache must
@@ -218,6 +403,35 @@ allowing everything has not survived an outage, it has stopped enforcing.
 Operations whose authority cannot be established offline must be refusable
 locally with a clear reason the operative can act on, not silently queued to
 fail hours later.
+
+**C14-04 correction, second half — the missing time witness and the missing
+envelope.** D23-11 expires cached authority while D23-12 refuses to trust the
+client clock. Both are individually right and together they left a hole: after
+six hours offline, how does central prove an operation happened *before* the
+lease expired, if the only timestamp is one a compromised client could
+backdate?
+
+Two things must be locked. First, the canonical **device-signed offline
+operation envelope**, which D23-10 assumed but never defined:
+
+```text
+schema / version                  sequence
+organisation / site               idempotency identity
+actor                             canonical payload digest
+device id + key version           policy / authority lease identity
+operation kind                    nonce
+                                  signature
+```
+
+Binding the **lease identity** into the signature is what makes the question
+answerable: the operation names the authority it was acting under, so a lease
+that has since expired or been revoked can be judged on its own terms rather
+than on the device's word about when it acted.
+
+Second, the degraded-time mechanism: the Edge receipt of D23-10 supplies the
+independent time witness. Where no such witness exists — no Edge, or an Edge
+that has lost trust — time-bounded authority cannot be established and the
+operation is refused. A device's own timestamp never closes that gap.
 
 ### D23-12 — Freshness, nonce and clock skew are server-judged, at device scale
 
@@ -265,6 +479,25 @@ migration. If implementation appears to prove a contract impossible or
 internally inconsistent, **STOP and report** rather than silently adjusting
 the model — the WP-21A precedent.
 
+## C14 correction batch (applied to this directive)
+
+The lead's adversarial review accepted the M3A/M3B sequencing, D23-01/02,
+D23-05, D23-10's authority separation, D23-13/14 and the implementation HOLD,
+and returned six corrections — three of them blockers. All are applied in place
+above:
+
+| | Finding | Resolution |
+|---|---|---|
+| **C14-01** | Hardware-backed TRUSTED keys and frozen Ed25519 Whisper were incompatible, making Proof C unreachable on mainstream mobile | v1 stays frozen; M3 adds a versioned hardware-backed P-256 profile, registry-selected, canonically encoded |
+| **C14-02** | Single-use bootstrap stopped replay but not preemption | Two-sided enrollment-request binding; a grant alone is never sufficient; custody separated from current user |
+| **C14-03** | A short-lived context was still a bearer credential | Contexts are sender-constrained; a token without the hardware key is useless |
+| **C14-04** | Expiring offline authority had no trustworthy time witness, and the signed offline envelope was undefined | Canonical envelope incl. lease identity; Edge witnesses time but never authorizes; no witness means fail closed |
+| **C14-05** | Attestation outage was treated as device evidence | NEGATIVE and UNAVAILABLE ruled separately, with a bounded last-known-good grace |
+| **C14-06** | Revocation was right but imprecise | LOST/STOLEN/COMPROMISED separated; server evidence may resolve an already-committed effect but never admit an unapplied request |
+
+Three of these would have been expensive, and two structural, if found after
+the mobile gateway existed. That is the argument for the gate.
+
 ## WP-23 deliverables (when contract authoring is authorised)
 
 - A device-identity contract module under `packages/contracts/src/` covering
@@ -294,6 +527,21 @@ an expired policy cache refuses rather than assumes
 Edge cannot forge, re-sign or re-authorise a device operation
 stale offline operations are judged against the server clock
 audit payloads carry no key, token, attestation blob, nonce or context
+
+C14-01  a hardware-backed profile is admitted and Whisper v1 is unchanged
+C14-01  the verifier is chosen by registry key id/version, never by the client
+C14-01  a non-canonical signature encoding is refused before verification
+C14-02  a stolen bootstrap grant plus an attacker key cannot complete enrollment
+C14-02  approval binds the exact request thumbprint, not a device class alone
+C14-03  a stolen, unexpired context without the hardware key proves nothing
+C14-03  the reconnect handshake refuses a presented token without possession
+C14-04  an offline operation missing its lease identity is refused
+C14-04  a backdated client timestamp cannot revive an expired lease
+C14-04  an Edge receipt witnesses time and never confers authority
+C14-05  provider-unavailable retains last-known-good only within the grace
+C14-05  no first TRUSTED enrollment while attestation cannot be verified
+C14-06  a revoked credential causes no new domain mutation
+C14-06  server evidence resolves an already-committed effect only
 ```
 
 ## Out of scope
