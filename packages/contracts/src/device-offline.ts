@@ -1,6 +1,13 @@
 import { z } from 'zod';
 import { DeviceTrustSchema, type DeviceTrust } from './device.js';
-import { DeviceSignatureProfileSchema, DeviceSignatureSchema } from './device-signature.js';
+import {
+  bindClaimedSignatureProfile,
+  DeviceP256PublicKeySchema,
+  DeviceSignatureProfileSchema,
+  DeviceSignatureSchema,
+  deviceKeyThumbprintMatches,
+  type DeviceSignatureProfile,
+} from './device-signature.js';
 import { FieldOfflineOperationKindSchema, MAX_OFFLINE_DEVICE_SEQUENCE, type FieldOfflineOperationKind } from './field-offline.js';
 import {
   canonicalDeviceJson,
@@ -9,10 +16,18 @@ import {
   DeviceAttestationStandingSchema,
   DeviceDigestSchema,
   DeviceEnrollmentStateSchema,
+  DeviceKeyLifecycleStateSchema,
+  deviceKeyStatePermitsHistoricalVerification,
   DeviceKeyVersionSchema,
   DeviceNonceSchema,
   DeviceTraceIdSchema,
   DEVICE_OFFLINE_LEASE_MAX_LIFETIME_MS,
+  DEVICE_TIME_NOT_AUTHORITATIVE,
+  isExpiredAt,
+  parseAuthoritativeInstants,
+  refineDeviceInstantWindow,
+  type DeviceNonceConsumption,
+  type DeviceRevocationDisposition,
 } from './device-identity.js';
 
 /**
@@ -43,10 +58,6 @@ const scopedId = z.string().min(1).max(256);
 const timestamp = z.string().datetime();
 const deviceSequence = z.number().int().nonnegative().max(MAX_OFFLINE_DEVICE_SEQUENCE);
 
-function epochMs(value: string): number {
-  return Date.parse(value);
-}
-
 // ---------------------------------------------------------------------------
 // The policy / authority lease (D23-11)
 // ---------------------------------------------------------------------------
@@ -68,30 +79,38 @@ export const DevicePolicyLeaseSchema = z
     site_id: scopedId,
     /** The lease is issued TO one device identity; it is not a site-wide permit. */
     device_id: scopedId,
+    /**
+     * C15-06: THE LEASE NAMES THE ACTOR WHOSE AUTHORITY JUSTIFIED IT.
+     *
+     * A lease bound only to a device is a device-wide permit, and on a
+     * CONTROLLED_SHARED device that is a hole: operative A, who holds the
+     * capability, causes a lease to be issued; the device passes to operative B
+     * at shift change; B — who holds nothing — signs envelopes that ride A's
+     * lease. Both envelopes name the same device and the same lease, and
+     * nothing in WP-23 distinguished them. Binding the actor here, and refusing
+     * a mismatch in `evaluateOfflineOperationAdmissibility`, closes it.
+     *
+     * This is CACHED authority, not live authority: central still revalidates
+     * the actor's CURRENT entitlement at reconnect (C15-04). The lease answers
+     * "whose authority was cached", never "who is allowed now".
+     */
+    actor_user_id: scopedId,
+    /** The specific capability/authority grant the issuance rested on, for audit and revalidation. */
+    authority_basis_id: scopedId,
     scope: z.array(FieldOfflineOperationKindSchema).min(1).max(64),
     issued_at: timestamp,
     expires_at: timestamp,
   })
   .strict()
   .superRefine((value, context) => {
-    const issued = epochMs(value.issued_at);
-    const expires = epochMs(value.expires_at);
-    if (!(expires > issued)) {
-      context.addIssue({ code: z.ZodIssueCode.custom, path: ['expires_at'], message: 'expires_at must be after issued_at' });
-    } else if (expires - issued > DEVICE_OFFLINE_LEASE_MAX_LIFETIME_MS) {
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['expires_at'],
-        message: `policy lease lifetime must not exceed ${DEVICE_OFFLINE_LEASE_MAX_LIFETIME_MS} ms`,
-      });
-    }
+    refineDeviceInstantWindow(value, context, DEVICE_OFFLINE_LEASE_MAX_LIFETIME_MS, 'policy lease');
     if (new Set(value.scope).size !== value.scope.length) {
       context.addIssue({ code: z.ZodIssueCode.custom, path: ['scope'], message: 'scope must be unique' });
     }
   });
 export type DevicePolicyLease = z.infer<typeof DevicePolicyLeaseSchema>;
 
-export const DevicePolicyLeaseStandingSchema = z.enum(['VALID', 'NOT_YET_VALID', 'EXPIRED']);
+export const DevicePolicyLeaseStandingSchema = z.enum(['VALID', 'NOT_YET_VALID', 'EXPIRED', DEVICE_TIME_NOT_AUTHORITATIVE]);
 export type DevicePolicyLeaseStanding = z.infer<typeof DevicePolicyLeaseStandingSchema>;
 
 /**
@@ -100,11 +119,16 @@ export type DevicePolicyLeaseStanding = z.infer<typeof DevicePolicyLeaseStanding
  * an envelope. That is not a convention: `evaluateOfflineOperationAdmissibility`
  * below is the only place this is called from in the contract, and it never
  * passes a device-supplied value.
+ *
+ * C15-07: expiry is EXCLUSIVE (`at >= expires_at` is expired), and an
+ * unreadable instant answers `TIME_NOT_AUTHORITATIVE` — which is not `VALID`,
+ * so every caller's `!== 'VALID'` test fails closed on it.
  */
 export function classifyDevicePolicyLease(lease: DevicePolicyLease, at: string): DevicePolicyLeaseStanding {
-  const atMs = epochMs(at);
-  if (atMs < epochMs(lease.issued_at)) return 'NOT_YET_VALID';
-  if (atMs > epochMs(lease.expires_at)) return 'EXPIRED';
+  const instants = parseAuthoritativeInstants({ at, issued: lease.issued_at, expires: lease.expires_at });
+  if (instants === null) return DEVICE_TIME_NOT_AUTHORITATIVE;
+  if (instants.at < instants.issued) return 'NOT_YET_VALID';
+  if (isExpiredAt(instants.at, instants.expires)) return 'EXPIRED';
   return 'VALID';
 }
 
@@ -160,13 +184,51 @@ export const DeviceOfflineOperationEnvelopeSchema = z
     nonce: DeviceNonceSchema,
     /** Client telemetry only. Never server authority. */
     created_at: timestamp,
-    signature_profile: DeviceSignatureProfileSchema,
+    /** C15-01: a non-authoritative claim, equality-bound to the registry's profile. */
+    claimed_signature_profile: DeviceSignatureProfileSchema,
+    /** C15-01: branded; the schema runs the full canonical decode, so a malformed or high-S value cannot reach a parsed envelope. */
     signature: DeviceSignatureSchema,
   })
   .strict();
 export type DeviceOfflineOperationEnvelope = z.infer<typeof DeviceOfflineOperationEnvelopeSchema>;
 
-export type DeviceOfflineOperationStatementInput = Omit<DeviceOfflineOperationEnvelope, 'signature'>;
+/**
+ * C15-01: the signed bytes carry the SERVER-selected profile in place of the
+ * device's claim, and the type forbids passing an envelope straight through.
+ */
+export type DeviceOfflineOperationStatementInput = Omit<DeviceOfflineOperationEnvelope, 'signature' | 'claimed_signature_profile'> & {
+  /** SERVER-selected, from the registry key record. Never `claimed_signature_profile`. */
+  readonly signature_profile: DeviceSignatureProfile;
+};
+
+/**
+ * Build the statement input by REPLACING the client's claim with the server's
+ * answer. Every field is listed rather than spread-minus-two, so what the
+ * device signs is legible in one place.
+ */
+export function deviceOfflineOperationStatementInput(
+  envelope: DeviceOfflineOperationEnvelope,
+  serverResolvedProfile: DeviceSignatureProfile,
+): DeviceOfflineOperationStatementInput {
+  return {
+    schema_version: envelope.schema_version,
+    offline_operation_id: envelope.offline_operation_id,
+    organisation_id: envelope.organisation_id,
+    site_id: envelope.site_id,
+    actor_user_id: envelope.actor_user_id,
+    device_id: envelope.device_id,
+    key_id: envelope.key_id,
+    key_version: envelope.key_version,
+    operation_kind: envelope.operation_kind,
+    device_sequence: envelope.device_sequence,
+    idempotency_key: envelope.idempotency_key,
+    payload_digest: envelope.payload_digest,
+    policy_lease_id: envelope.policy_lease_id,
+    nonce: envelope.nonce,
+    created_at: envelope.created_at,
+    signature_profile: serverResolvedProfile,
+  };
+}
 
 function deviceOfflineOperationStatementObject(input: DeviceOfflineOperationStatementInput): Record<string, unknown> {
   return {
@@ -205,6 +267,60 @@ export function canonicalDeviceOfflineOperationStatement(input: DeviceOfflineOpe
  */
 export function deviceOfflineOperationFingerprint(input: DeviceOfflineOperationStatementInput): string {
   return deviceCanonicalDigest(deviceOfflineOperationStatementObject(input));
+}
+
+// ---------------------------------------------------------------------------
+// Offline replay identity (C15-05)
+// ---------------------------------------------------------------------------
+
+/** Domain separator for the offline-envelope replay identity. */
+export const DEVICE_OFFLINE_OPERATION_REPLAY_IDENTITY_DOMAIN = 'sentinel.device.offline-operation.replay-identity.v1';
+
+export interface DeviceOfflineOperationReplayIdentity {
+  readonly organisation_id: string;
+  readonly site_id: string;
+  readonly actor_user_id: string;
+  readonly device_id: string;
+  readonly key_version: number;
+  readonly nonce: string;
+}
+
+/**
+ * C15-05, the same six columns as the request-proof identity and WP-20's
+ * Whisper identity before it, for the same reasons — and separate from
+ * `deviceOfflineOperationFingerprint`, which answers "same bytes?" rather than
+ * "same one-shot slot?".
+ *
+ * The distinction earns its keep on the offline path more than anywhere else: a
+ * queue that reconnects and re-sends is the NORMAL case, so an exact retry must
+ * converge on what already happened rather than committing a second effect,
+ * while the same slot carrying different bytes is a device rewriting history
+ * and must conflict.
+ */
+export function deviceOfflineOperationReplayIdentity(envelope: {
+  readonly organisation_id: string;
+  readonly site_id: string;
+  readonly actor_user_id: string;
+  readonly device_id: string;
+  readonly key_version: number;
+  readonly nonce: string;
+}): DeviceOfflineOperationReplayIdentity {
+  return {
+    organisation_id: envelope.organisation_id,
+    site_id: envelope.site_id,
+    actor_user_id: envelope.actor_user_id,
+    device_id: envelope.device_id,
+    key_version: envelope.key_version,
+    nonce: envelope.nonce,
+  };
+}
+
+/** C11-01: canonical JSON, never a delimiter join. */
+export function deviceOfflineOperationReplayKey(envelope: Parameters<typeof deviceOfflineOperationReplayIdentity>[0]): string {
+  return canonicalDeviceJson({
+    domain: DEVICE_OFFLINE_OPERATION_REPLAY_IDENTITY_DOMAIN,
+    ...deviceOfflineOperationReplayIdentity(envelope),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -249,7 +365,13 @@ export const DeviceEdgeReceiptSchema = z
     edge_trusted_time: timestamp.nullable(),
     /** Edge's monotonic counter position, which survives a clock that does not. */
     edge_monotonic_position: z.number().int().nonnegative().max(MAX_OFFLINE_DEVICE_SEQUENCE).nullable(),
-    edge_signature_profile: DeviceSignatureProfileSchema,
+    /**
+     * C15-01: Edge does not choose its profile either. The claim is
+     * equality-bound to the profile on the EDGE registry key record before the
+     * receipt's signature is verified.
+     */
+    claimed_edge_signature_profile: DeviceSignatureProfileSchema,
+    /** C15-01: branded; a malformed or high-S Edge signature cannot reach a parsed receipt. */
     edge_signature: DeviceSignatureSchema,
   })
   .strict()
@@ -284,15 +406,37 @@ export const DEVICE_EDGE_RECEIPT_FORBIDDEN_FIELDS = [
   'operation_permitted',
 ] as const;
 
-export type DeviceEdgeReceiptStatementInput = Omit<DeviceEdgeReceipt, 'edge_signature'>;
+/** C15-01: the Edge statement binds the EDGE REGISTRY's profile, not the receipt's claim. */
+export type DeviceEdgeReceiptStatementInput = Omit<DeviceEdgeReceipt, 'edge_signature' | 'claimed_edge_signature_profile'> & {
+  readonly edge_signature_profile: DeviceSignatureProfile;
+};
+
+export function deviceEdgeReceiptStatementInput(
+  receipt: DeviceEdgeReceipt,
+  serverResolvedProfile: DeviceSignatureProfile,
+): DeviceEdgeReceiptStatementInput {
+  return {
+    schema_version: receipt.schema_version,
+    edge_id: receipt.edge_id,
+    edge_key_id: receipt.edge_key_id,
+    edge_key_version: receipt.edge_key_version,
+    witnessed_operation_fingerprint: receipt.witnessed_operation_fingerprint,
+    edge_trusted_time: receipt.edge_trusted_time,
+    edge_monotonic_position: receipt.edge_monotonic_position,
+    edge_signature_profile: serverResolvedProfile,
+  };
+}
 
 /**
  * What Edge signs. Note what is absent: there is no operation payload, no
  * verdict, and nothing about the device beyond the fingerprint of what Edge
  * saw. The statement can only ever mean "this passed through me, then".
+ *
+ * Both this and the fingerprint below read from ONE object literal, so the
+ * signed bytes and the fingerprinted bytes cannot drift apart in a future edit.
  */
-export function canonicalDeviceEdgeReceiptStatement(input: DeviceEdgeReceiptStatementInput): string {
-  return canonicalDeviceJson({
+function deviceEdgeReceiptStatementObject(input: DeviceEdgeReceiptStatementInput): Record<string, unknown> {
+  return {
     domain: DEVICE_EDGE_RECEIPT_DOMAIN,
     schema_version: input.schema_version,
     edge_id: input.edge_id,
@@ -302,22 +446,73 @@ export function canonicalDeviceEdgeReceiptStatement(input: DeviceEdgeReceiptStat
     edge_trusted_time: input.edge_trusted_time,
     edge_monotonic_position: input.edge_monotonic_position,
     edge_signature_profile: input.edge_signature_profile,
-  });
+  };
+}
+
+export function canonicalDeviceEdgeReceiptStatement(input: DeviceEdgeReceiptStatementInput): string {
+  return canonicalDeviceJson(deviceEdgeReceiptStatementObject(input));
 }
 
 export function deviceEdgeReceiptFingerprint(input: DeviceEdgeReceiptStatementInput): string {
-  return deviceCanonicalDigest({
-    domain: DEVICE_EDGE_RECEIPT_DOMAIN,
-    schema_version: input.schema_version,
-    edge_id: input.edge_id,
-    edge_key_id: input.edge_key_id,
-    edge_key_version: input.edge_key_version,
-    witnessed_operation_fingerprint: input.witnessed_operation_fingerprint,
-    edge_trusted_time: input.edge_trusted_time,
-    edge_monotonic_position: input.edge_monotonic_position,
-    edge_signature_profile: input.edge_signature_profile,
-  });
+  return deviceCanonicalDigest(deviceEdgeReceiptStatementObject(input));
 }
+
+// ---------------------------------------------------------------------------
+// The Edge registry seam (C15-02)
+// ---------------------------------------------------------------------------
+
+/**
+ * C15-02: AN EDGE RECEIPT NOBODY CAN VERIFY IS NOT EVIDENCE.
+ *
+ * `DeviceOfflineWitness` asks for `edgeSignatureVerified` — a boolean the server
+ * is supposed to have computed. Against what? WP-23 named `edge_key_id` and
+ * `edge_key_version` and stored no Edge key anywhere, so the verification the
+ * whole time-witness argument rests on had nothing to run against. This is the
+ * device registry key record's exact counterpart for Edge.
+ *
+ * `edge_trust` is Edge's OWN trust state — Edge is a principal in its own right
+ * (D23-10) — and is deliberately separate from the key's lifecycle `status`: a
+ * perfectly valid key belonging to an Edge we have suspended must not witness
+ * anything, and a suspended Edge whose key was also rotated is two facts, not
+ * one.
+ */
+export const DeviceEdgeTrustStatusSchema = z.enum(['TRUSTED', 'SUSPENDED', 'REVOKED']);
+export type DeviceEdgeTrustStatus = z.infer<typeof DeviceEdgeTrustStatusSchema>;
+
+export const EdgeRegistryKeyRecordSchema = z
+  .object({
+    schema_version: z.literal(1),
+    organisation_id: scopedId,
+    edge_id: scopedId,
+    edge_key_id: scopedId,
+    edge_key_version: DeviceKeyVersionSchema,
+    /** The actual Edge public key, in the one canonical representation. */
+    public_key: DeviceP256PublicKeySchema,
+    /** Must EQUAL the digest derived from `public_key`. Never trusted alone. */
+    public_key_thumbprint: DeviceDigestSchema,
+    /** SERVER-selected. A receipt's claimed profile is bound to this. */
+    signature_profile: DeviceSignatureProfileSchema,
+    /** The key's own lifecycle, using the same four states as a device key. */
+    status: DeviceKeyLifecycleStateSchema,
+    /** The Edge principal's trust, which is a different question from the key's. */
+    edge_trust: DeviceEdgeTrustStatusSchema,
+    registered_at: timestamp,
+    revoked_at: timestamp.nullable(),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (!deviceKeyThumbprintMatches(value.public_key, value.public_key_thumbprint)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['public_key_thumbprint'],
+        message: 'public_key_thumbprint must equal the digest derived from public_key',
+      });
+    }
+    if ((value.status === 'REVOKED' || value.status === 'COMPROMISED') && value.revoked_at === null) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ['revoked_at'], message: 'a REVOKED or COMPROMISED Edge key must record when it was withdrawn' });
+    }
+  });
+export type EdgeRegistryKeyRecord = z.infer<typeof EdgeRegistryKeyRecordSchema>;
 
 /**
  * The witness available at reconciliation.
@@ -331,8 +526,14 @@ export type DeviceOfflineWitness =
   | {
       readonly kind: 'EDGE';
       readonly receipt: DeviceEdgeReceipt;
-      /** Edge's OWN trust state. Edge is a principal in its own right (D23-10). */
-      readonly edgeTrust: DeviceTrust;
+      /**
+       * C15-02: the SERVER's Edge registry record for this receipt's
+       * `edge_key_id + edge_key_version`. It carries the key the signature was
+       * checked against, the SERVER-selected Edge profile, the key's lifecycle
+       * and Edge's own trust state (D23-10) — the facts that make
+       * `edgeSignatureVerified` mean anything.
+       */
+      readonly registeredEdgeKey: EdgeRegistryKeyRecord;
       /** Server's verdict on the Edge signature. Never Edge's claim about itself. */
       readonly edgeSignatureVerified: boolean;
     };
@@ -380,6 +581,20 @@ export const DeviceOfflineAdmissibilityRefusalSchema = z.enum([
   'EDGE_NOT_TRUSTED',
   'EDGE_SIGNATURE_NOT_VERIFIED',
   'WITNESS_FINGERPRINT_MISMATCH',
+  /** C15-06: the envelope's actor is not the actor whose authority the lease cached. */
+  'LEASE_ACTOR_MISMATCH',
+  /** C15-01: the envelope's claimed profile is not the server-resolved one. */
+  'SIGNATURE_PROFILE_CLAIM_MISMATCH',
+  /** C15-01: the receipt's claimed Edge profile is not the Edge registry's. */
+  'EDGE_SIGNATURE_PROFILE_CLAIM_MISMATCH',
+  /** C15-02: the Edge key record is about a different key, or is no longer usable. */
+  'EDGE_KEY_NOT_USABLE',
+  /** C15-05: this one-shot identity was already spent on different bytes. */
+  'NONCE_REUSED_WITH_CHANGED_SEMANTICS',
+  /** C15-05: the consumption fact handed in is about some other operation. */
+  'NONCE_CONSUMPTION_MISBOUND',
+  /** C15-07: an instant this decision depends on is unreadable. */
+  DEVICE_TIME_NOT_AUTHORITATIVE,
 ]);
 export type DeviceOfflineAdmissibilityRefusal = z.infer<typeof DeviceOfflineAdmissibilityRefusalSchema>;
 
@@ -399,15 +614,36 @@ export interface DeviceOfflineAdmissibilityInput {
   readonly deviceRevokedAt: string | null;
   /** The server's verdict on the device signature over the canonical statement. */
   readonly signatureVerified: boolean;
+  /**
+   * C15-01: the profile the registry key record names for this device's
+   * `key_id + key_version`. `envelope.claimed_signature_profile` is bound to it.
+   */
+  readonly registeredSignatureProfile: DeviceSignatureProfile;
+  /**
+   * C15-05: the store's report on this envelope's one-shot identity. REQUIRED,
+   * with no default — a reconnecting queue re-sends by design, so an evaluator
+   * that cannot tell a retry from a rewrite commits duplicate effects.
+   */
+  readonly consumption: DeviceNonceConsumption;
 }
 
 export type DeviceOfflineAdmissibility =
   | {
       readonly admitted: true;
+      readonly effect: 'PROCEED';
       /** Which clock established the authority window. */
       readonly time_basis: 'EDGE_WITNESS' | 'SERVER_RECEIPT';
       readonly established_at: string;
       readonly operation_fingerprint: string;
+    }
+  /** C15-05: a byte-identical retry of one queued operation. No second effect. */
+  | {
+      readonly admitted: true;
+      readonly effect: 'CONVERGE_ON_STORED_OUTCOME';
+      readonly time_basis: 'EDGE_WITNESS' | 'SERVER_RECEIPT';
+      readonly established_at: string;
+      readonly operation_fingerprint: string;
+      readonly stored_outcome_ref: string;
     }
   | { readonly admitted: false; readonly refusal: DeviceOfflineAdmissibilityRefusal };
 
@@ -439,6 +675,11 @@ export type DeviceOfflineAdmissibility =
 export function evaluateOfflineOperationAdmissibility(input: DeviceOfflineAdmissibilityInput): DeviceOfflineAdmissibility {
   const { envelope, lease, witness } = input;
 
+  // C15-01: bind the claimed profile to the registry's BEFORE anything else, so
+  // the fingerprint below is computed over the server's profile.
+  const profileBinding = bindClaimedSignatureProfile(envelope.claimed_signature_profile, input.registeredSignatureProfile);
+  if (!profileBinding.bound) return { admitted: false, refusal: 'SIGNATURE_PROFILE_CLAIM_MISMATCH' };
+
   if (!input.signatureVerified) return { admitted: false, refusal: 'SIGNATURE_NOT_VERIFIED' };
   if (input.deviceRevokedAt !== null) return { admitted: false, refusal: 'CREDENTIAL_REVOKED' };
   if (envelope.payload_digest !== input.expectedPayloadDigest) return { admitted: false, refusal: 'PAYLOAD_DIGEST_MISMATCH' };
@@ -452,13 +693,43 @@ export function evaluateOfflineOperationAdmissibility(input: DeviceOfflineAdmiss
   ) {
     return { admitted: false, refusal: 'LEASE_IDENTITY_MISMATCH' };
   }
+  // C15-06: the lease belongs to the ACTOR whose authority justified it. On a
+  // CONTROLLED_SHARED device this is the whole defence: operative B cannot ride
+  // the lease operative A's capability produced.
+  if (lease.actor_user_id !== envelope.actor_user_id) return { admitted: false, refusal: 'LEASE_ACTOR_MISMATCH' };
   if (!lease.scope.includes(envelope.operation_kind)) return { admitted: false, refusal: 'LEASE_SCOPE_MISMATCH' };
 
-  const fingerprint = deviceOfflineOperationFingerprint(envelope);
+  const fingerprint = deviceOfflineOperationFingerprint(deviceOfflineOperationStatementInput(envelope, profileBinding.profile));
+
+  // C15-05: the one-shot identity, and the fact must be about THIS operation.
+  const replayKey = deviceOfflineOperationReplayKey(envelope);
+  if (input.consumption.replay_key !== replayKey || input.consumption.statement_fingerprint !== fingerprint) {
+    return { admitted: false, refusal: 'NONCE_CONSUMPTION_MISBOUND' };
+  }
+  if (input.consumption.outcome === 'REUSED_WITH_CHANGED_SEMANTICS') {
+    return { admitted: false, refusal: 'NONCE_REUSED_WITH_CHANGED_SEMANTICS' };
+  }
+  const storedOutcomeRef = input.consumption.outcome === 'EXACT_DUPLICATE' ? input.consumption.stored_outcome_ref : null;
 
   if (deviceOfflineOperationRequiresTimeWitness(envelope.operation_kind)) {
     if (witness.kind === 'NONE') return { admitted: false, refusal: 'NO_TRUSTWORTHY_TIME_WITNESS' };
-    if (witness.edgeTrust !== 'TRUSTED') return { admitted: false, refusal: 'EDGE_NOT_TRUSTED' };
+    // C15-02: the Edge key record must be ABOUT this receipt's key and must
+    // still be able to verify. A key we revoked cannot witness anything, and a
+    // record for another key is not evidence about this signature.
+    if (
+      witness.registeredEdgeKey.edge_id !== witness.receipt.edge_id ||
+      witness.registeredEdgeKey.edge_key_id !== witness.receipt.edge_key_id ||
+      witness.registeredEdgeKey.edge_key_version !== witness.receipt.edge_key_version ||
+      !deviceKeyStatePermitsHistoricalVerification(witness.registeredEdgeKey.status)
+    ) {
+      return { admitted: false, refusal: 'EDGE_KEY_NOT_USABLE' };
+    }
+    if (witness.registeredEdgeKey.edge_trust !== 'TRUSTED') return { admitted: false, refusal: 'EDGE_NOT_TRUSTED' };
+    const edgeProfileBinding = bindClaimedSignatureProfile(
+      witness.receipt.claimed_edge_signature_profile,
+      witness.registeredEdgeKey.signature_profile,
+    );
+    if (!edgeProfileBinding.bound) return { admitted: false, refusal: 'EDGE_SIGNATURE_PROFILE_CLAIM_MISMATCH' };
     if (!witness.edgeSignatureVerified) return { admitted: false, refusal: 'EDGE_SIGNATURE_NOT_VERIFIED' };
     if (witness.receipt.witnessed_operation_fingerprint !== fingerprint) {
       return { admitted: false, refusal: 'WITNESS_FINGERPRINT_MISMATCH' };
@@ -466,20 +737,45 @@ export function evaluateOfflineOperationAdmissibility(input: DeviceOfflineAdmiss
     // A monotonic position proves ordering, not wall-clock time. Placing an
     // operation inside a lease window needs a clock, so a receipt carrying only
     // a counter is not a time witness for this purpose.
-    if (witness.receipt.edge_trusted_time === null) return { admitted: false, refusal: 'NO_TRUSTWORTHY_TIME_WITNESS' };
-    if (classifyDevicePolicyLease(lease, witness.receipt.edge_trusted_time) !== 'VALID') {
-      return { admitted: false, refusal: 'LEASE_NOT_IN_FORCE' };
+    const edgeTime = witness.receipt.edge_trusted_time;
+    if (edgeTime === null) return { admitted: false, refusal: 'NO_TRUSTWORTHY_TIME_WITNESS' };
+    const standing = classifyDevicePolicyLease(lease, edgeTime);
+    // C15-07: an unreadable witnessed instant is not a witness at all.
+    if (standing === DEVICE_TIME_NOT_AUTHORITATIVE) return { admitted: false, refusal: DEVICE_TIME_NOT_AUTHORITATIVE };
+    if (standing !== 'VALID') return { admitted: false, refusal: 'LEASE_NOT_IN_FORCE' };
+    if (storedOutcomeRef !== null) {
+      return {
+        admitted: true,
+        effect: 'CONVERGE_ON_STORED_OUTCOME',
+        time_basis: 'EDGE_WITNESS',
+        established_at: edgeTime,
+        operation_fingerprint: fingerprint,
+        stored_outcome_ref: storedOutcomeRef,
+      };
     }
     return {
       admitted: true,
+      effect: 'PROCEED',
       time_basis: 'EDGE_WITNESS',
-      established_at: witness.receipt.edge_trusted_time,
+      established_at: edgeTime,
       operation_fingerprint: fingerprint,
     };
   }
 
-  if (classifyDevicePolicyLease(lease, input.now) !== 'VALID') return { admitted: false, refusal: 'LEASE_NOT_IN_FORCE' };
-  return { admitted: true, time_basis: 'SERVER_RECEIPT', established_at: input.now, operation_fingerprint: fingerprint };
+  const standing = classifyDevicePolicyLease(lease, input.now);
+  if (standing === DEVICE_TIME_NOT_AUTHORITATIVE) return { admitted: false, refusal: DEVICE_TIME_NOT_AUTHORITATIVE };
+  if (standing !== 'VALID') return { admitted: false, refusal: 'LEASE_NOT_IN_FORCE' };
+  if (storedOutcomeRef !== null) {
+    return {
+      admitted: true,
+      effect: 'CONVERGE_ON_STORED_OUTCOME',
+      time_basis: 'SERVER_RECEIPT',
+      established_at: input.now,
+      operation_fingerprint: fingerprint,
+      stored_outcome_ref: storedOutcomeRef,
+    };
+  }
+  return { admitted: true, effect: 'PROCEED', time_basis: 'SERVER_RECEIPT', established_at: input.now, operation_fingerprint: fingerprint };
 }
 
 // ---------------------------------------------------------------------------
@@ -487,15 +783,11 @@ export function evaluateOfflineOperationAdmissibility(input: DeviceOfflineAdmiss
 // ---------------------------------------------------------------------------
 
 /**
- * D23-15: three threats, three responses, never one flag.
- *
- * LOST            the device may come back and may still be in honest hands.
- * STOLEN          assume adversarial possession.
- * COMPROMISED_KEY assume the credential itself has been copied.
+ * D23-15's three dispositions are defined in `device-identity.ts` (C15-04 needs
+ * them on `DeviceRegistryFacts` too) and re-stated here only in the response
+ * table below. `DeviceRevocationDispositionSchema` is imported, not redeclared:
+ * two enums with one name is how they drift apart.
  */
-export const DeviceRevocationDispositionSchema = z.enum(['LOST', 'STOLEN', 'COMPROMISED_KEY']);
-export type DeviceRevocationDisposition = z.infer<typeof DeviceRevocationDispositionSchema>;
-
 export interface DeviceRevocationResponse {
   /** What the device's trust state becomes. */
   readonly trust: DeviceTrust;
@@ -561,6 +853,22 @@ export const DeviceCommittedEffectEvidenceSchema = z
     /** A literal, so the only admissible provenance is Sentinel's own record. */
     source: z.literal('SENTINEL_DOMAIN_RECORD'),
     offline_operation_id: z.string().uuid(),
+    /**
+     * C15-06: THE EXACT OPERATION, NOT MERELY ITS ID.
+     *
+     * Evidence keyed on `offline_operation_id` alone says "something with this
+     * id committed". An id is a value a device chooses, so a revoked device
+     * could re-present a DIFFERENT operation under an id Sentinel had already
+     * recorded as committed and have it resolved as historical fact — turning
+     * C14-06's narrow "recognise what already happened" into a general
+     * write path for a credential we no longer trust. Binding the operation
+     * FINGERPRINT means the evidence is about specific bytes, which is WP-20's
+     * request-bound idempotency rule, unchanged.
+     */
+    operation_fingerprint: DeviceDigestSchema,
+    /** C15-06: and the tenant scope, so evidence cannot cross an organisation or site. */
+    organisation_id: scopedId,
+    site_id: scopedId,
     /** SERVER time at which Sentinel's own record shows the effect committed. */
     committed_at: timestamp,
     /** Pointer into the authoritative domain record. */
@@ -580,12 +888,28 @@ export const DEVICE_COMMITTED_EVIDENCE_FORBIDDEN_FIELDS = [
   'client_created_at',
 ] as const;
 
-export const DeviceRevokedOperationResolutionSchema = z.enum(['RESOLVE_AS_COMMITTED', 'REFUSE_NEW_EFFECT', 'REQUIRES_HUMAN_REENTRY']);
+export const DeviceRevokedOperationResolutionSchema = z.enum([
+  'RESOLVE_AS_COMMITTED',
+  'REFUSE_NEW_EFFECT',
+  'REQUIRES_HUMAN_REENTRY',
+  /**
+   * C15-06: an operation id Sentinel has committed evidence for, presented with
+   * DIFFERENT bytes or in a different tenant scope. It is neither the thing
+   * that committed nor a fresh piece of work — it is a collision, and the only
+   * safe answer is to resolve nothing and cause nothing.
+   */
+  'CONFLICT',
+]);
 export type DeviceRevokedOperationResolution = z.infer<typeof DeviceRevokedOperationResolutionSchema>;
 
 export interface DeviceRevokedOperationInput {
   readonly disposition: DeviceRevocationDisposition;
   readonly offline_operation_id: string;
+  /** C15-06: the fingerprint of the operation actually being resolved. */
+  readonly operation_fingerprint: string;
+  /** C15-06: the tenant scope it is being resolved in. */
+  readonly organisation_id: string;
+  readonly site_id: string;
   /**
    * Sentinel's own record, or null. Deliberately a SEPARATE server-owned input
    * rather than a field on the envelope: an evidence field the device could
@@ -627,6 +951,20 @@ export interface DeviceRevokedOperationDecision {
 export function resolveRevokedDeviceOperation(input: DeviceRevokedOperationInput): DeviceRevokedOperationDecision {
   const evidence = input.priorCommittedEvidence;
   if (evidence !== null && evidence.source === 'SENTINEL_DOMAIN_RECORD' && evidence.offline_operation_id === input.offline_operation_id) {
+    // C15-06: the id matching is NOT enough. The evidence must be about these
+    // exact bytes in this exact tenant scope, or the "already committed" answer
+    // is being given about a different operation.
+    const sameOperation =
+      evidence.operation_fingerprint === input.operation_fingerprint &&
+      evidence.organisation_id === input.organisation_id &&
+      evidence.site_id === input.site_id;
+    if (!sameOperation) {
+      return {
+        resolution: 'CONFLICT',
+        reason:
+          "Sentinel's record for this operation id is about different bytes or a different tenant scope; a reused id is a collision, never a resolution",
+      };
+    }
     return {
       resolution: 'RESOLVE_AS_COMMITTED',
       reason: "Sentinel's own authoritative record shows this effect committed; it is recorded as historical fact and never re-executed",

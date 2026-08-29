@@ -1,3 +1,4 @@
+import { generateKeyPairSync } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import {
   canonicalDeviceEdgeReceiptStatement,
@@ -15,19 +16,32 @@ import {
   DeviceEdgeReceiptSchema,
   DeviceOfflineOperationEnvelopeSchema,
   DevicePolicyLeaseSchema,
-  DeviceRevocationDispositionSchema,
+  DeviceEdgeTrustStatusSchema,
+  EdgeRegistryKeyRecordSchema,
   deviceEdgeReceiptFingerprint,
+  deviceEdgeReceiptStatementInput,
   deviceOfflineOperationFingerprint,
+  deviceOfflineOperationReplayIdentity,
+  deviceOfflineOperationReplayKey,
   deviceOfflineOperationRequiresTimeWitness,
+  deviceOfflineOperationStatementInput,
   evaluateOfflineOperationAdmissibility,
   resolveRevokedDeviceOperation,
   type DeviceEdgeReceipt,
   type DeviceOfflineAdmissibilityInput,
   type DeviceOfflineOperationEnvelope,
   type DeviceOfflineOperationStatementInput,
+  type DeviceOfflineWitness,
   type DevicePolicyLease,
+  type EdgeRegistryKeyRecord,
 } from './device-offline.js';
-import { DEVICE_OFFLINE_LEASE_MAX_LIFETIME_MS } from './device-identity.js';
+import {
+  DEVICE_OFFLINE_LEASE_MAX_LIFETIME_MS,
+  DEVICE_TIME_NOT_AUTHORITATIVE,
+  DeviceRevocationDispositionSchema,
+  type DeviceNonceConsumption,
+} from './device-identity.js';
+import { deriveP256PublicKeyThumbprint } from './device-signature.js';
 import { DEVICE_REQUEST_PROOF_DOMAIN } from './device-context.js';
 
 /** WP-23 Crucible — offline envelope, Edge provenance, revocation and audit. */
@@ -41,8 +55,28 @@ const SIGNATURE = Buffer.from(new Uint8Array(64).fill(11)).toString('base64url')
 const EDGE_SIGNATURE = Buffer.from(new Uint8Array(64).fill(12)).toString('base64url');
 const NONCE = 'nonce-0123456789abcdef';
 
+/** C15-02: a real canonical P-256 point, because the Edge key schema decodes it. */
+const EDGE_PUBLIC_KEY = Buffer.from(
+  generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).publicKey.export({ type: 'spki', format: 'der' }),
+)
+  .subarray(-65)
+  .toString('base64url');
+const EDGE_THUMBPRINT = deriveP256PublicKeyThumbprint(EDGE_PUBLIC_KEY);
+
 function iso(deltaMs: number): string {
   return new Date(Date.parse(NOW) + deltaMs).toISOString();
+}
+
+/**
+ * C15-01: the signed bytes carry the SERVER's profile. A test cannot hand an
+ * envelope straight to the statement builder any more, which is the point.
+ */
+function offlineStatement(target: DeviceOfflineOperationEnvelope): DeviceOfflineOperationStatementInput {
+  return deviceOfflineOperationStatementInput(target, 'P256_ECDSA_SHA256');
+}
+
+function edgeStatement(receipt: DeviceEdgeReceipt): ReturnType<typeof deviceEdgeReceiptStatementInput> {
+  return deviceEdgeReceiptStatementInput(receipt, 'P256_ECDSA_SHA256');
 }
 
 function lease(overrides: Record<string, unknown> = {}): DevicePolicyLease {
@@ -52,6 +86,8 @@ function lease(overrides: Record<string, unknown> = {}): DevicePolicyLease {
     organisation_id: 'org-1',
     site_id: 'site-1',
     device_id: 'device-1',
+    actor_user_id: 'user-1',
+    authority_basis_id: 'authority-basis-1',
     scope: ['FIELD_ASSIGNMENT_ACCEPT', 'INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE'],
     issued_at: iso(-HOUR),
     expires_at: iso(HOUR),
@@ -81,7 +117,7 @@ function envelope(overrides: Record<string, unknown> = {}): DeviceOfflineOperati
     policy_lease_id: 'lease-1',
     nonce: NONCE,
     created_at: iso(-2 * HOUR),
-    signature_profile: 'P256_ECDSA_SHA256',
+    claimed_signature_profile: 'P256_ECDSA_SHA256',
     signature: SIGNATURE,
     ...overrides,
   });
@@ -93,13 +129,60 @@ function receiptFor(target: DeviceOfflineOperationEnvelope, overrides: Record<st
     edge_id: 'edge-17',
     edge_key_id: 'edge-key-1',
     edge_key_version: 1,
-    witnessed_operation_fingerprint: deviceOfflineOperationFingerprint(target),
+    witnessed_operation_fingerprint: deviceOfflineOperationFingerprint(offlineStatement(target)),
     edge_trusted_time: iso(-2 * HOUR),
     edge_monotonic_position: 4_211,
-    edge_signature_profile: 'P256_ECDSA_SHA256',
+    claimed_edge_signature_profile: 'P256_ECDSA_SHA256',
     edge_signature: EDGE_SIGNATURE,
     ...overrides,
   });
+}
+
+/** C15-02: the Edge registry record that makes `edgeSignatureVerified` mean something. */
+function edgeKeyRecord(overrides: Record<string, unknown> = {}): EdgeRegistryKeyRecord {
+  return EdgeRegistryKeyRecordSchema.parse({
+    schema_version: 1,
+    organisation_id: 'org-1',
+    edge_id: 'edge-17',
+    edge_key_id: 'edge-key-1',
+    edge_key_version: 1,
+    public_key: EDGE_PUBLIC_KEY,
+    public_key_thumbprint: EDGE_THUMBPRINT,
+    signature_profile: 'P256_ECDSA_SHA256',
+    status: 'CURRENT',
+    edge_trust: 'TRUSTED',
+    registered_at: iso(-100 * HOUR),
+    revoked_at: null,
+    ...overrides,
+  });
+}
+
+/** An Edge witness with its registry record, the shape C15-02 requires. */
+function edgeWitness(
+  target: DeviceOfflineOperationEnvelope,
+  overrides: { receipt?: DeviceEdgeReceipt; registeredEdgeKey?: EdgeRegistryKeyRecord; edgeSignatureVerified?: boolean } = {},
+): DeviceOfflineWitness {
+  return {
+    kind: 'EDGE',
+    receipt: overrides.receipt ?? receiptFor(target),
+    registeredEdgeKey: overrides.registeredEdgeKey ?? edgeKeyRecord(),
+    edgeSignatureVerified: overrides.edgeSignatureVerified ?? true,
+  };
+}
+
+/** C15-05: a store report shaped for the envelope actually being presented. */
+function consumptionFor(
+  target: DeviceOfflineOperationEnvelope,
+  overrides: Partial<DeviceNonceConsumption> = {},
+): DeviceNonceConsumption {
+  return {
+    source: 'SENTINEL_NONCE_STORE',
+    outcome: 'FIRST_SEEN',
+    replay_key: deviceOfflineOperationReplayKey(target),
+    statement_fingerprint: deviceOfflineOperationFingerprint(offlineStatement(target)),
+    stored_outcome_ref: null,
+    ...overrides,
+  };
 }
 
 function admissibility(overrides: Partial<DeviceOfflineAdmissibilityInput> = {}): DeviceOfflineAdmissibilityInput {
@@ -107,11 +190,13 @@ function admissibility(overrides: Partial<DeviceOfflineAdmissibilityInput> = {})
   return {
     envelope: target,
     lease: lease(),
-    witness: { kind: 'EDGE', receipt: receiptFor(target), edgeTrust: 'TRUSTED', edgeSignatureVerified: true },
+    witness: edgeWitness(target),
     now: NOW,
     expectedPayloadDigest: PAYLOAD_DIGEST,
     deviceRevokedAt: null,
     signatureVerified: true,
+    registeredSignatureProfile: 'P256_ECDSA_SHA256',
+    consumption: consumptionFor(target),
     ...overrides,
   };
 }
@@ -148,16 +233,16 @@ describe('the canonical device-signed offline envelope (C14-04)', () => {
   it('uses domain tags distinct from the request-proof and Whisper statements', () => {
     expect(DEVICE_OFFLINE_OPERATION_DOMAIN).toBe('sentinel.device.offline-operation.v1');
     expect(DEVICE_OFFLINE_OPERATION_DOMAIN).not.toBe(DEVICE_REQUEST_PROOF_DOMAIN);
-    expect(canonicalDeviceOfflineOperationStatement(envelope())).toContain(DEVICE_OFFLINE_OPERATION_DOMAIN);
+    expect(canonicalDeviceOfflineOperationStatement(offlineStatement(envelope()))).toContain(DEVICE_OFFLINE_OPERATION_DOMAIN);
   });
 
   it('excludes the signature from the bytes it signs', () => {
-    expect(canonicalDeviceOfflineOperationStatement(envelope())).not.toContain(SIGNATURE);
+    expect(canonicalDeviceOfflineOperationStatement(offlineStatement(envelope()))).not.toContain(SIGNATURE);
   });
 
   it('changes the fingerprint for every individually mutated bound component, and never converges on the original', () => {
-    const baseline = deviceOfflineOperationFingerprint(envelope());
-    const mutations: Array<[string, DeviceOfflineOperationStatementInput]> = [
+    const baseline = deviceOfflineOperationFingerprint(offlineStatement(envelope()));
+    const mutations: Array<[string, DeviceOfflineOperationEnvelope]> = [
       ['offline_operation_id', envelope({ offline_operation_id: 'b4cc2b21-3d4e-4f60-9aab-1d2e3f4a5b6c' })],
       ['organisation_id', envelope({ organisation_id: 'org-2' })],
       ['site_id', envelope({ site_id: 'site-2' })],
@@ -175,7 +260,7 @@ describe('the canonical device-signed offline envelope (C14-04)', () => {
     ];
     const digests = new Set<string>([baseline]);
     for (const [label, mutated] of mutations) {
-      const digest = deviceOfflineOperationFingerprint(mutated);
+      const digest = deviceOfflineOperationFingerprint(offlineStatement(mutated));
       expect(digest, `${label} must move the fingerprint`).not.toBe(baseline);
       digests.add(digest);
     }
@@ -203,7 +288,7 @@ describe('the Edge receipt witnesses time and never confers authority (D23-10 / 
   });
 
   it('says only what it saw and when, never what it permits', () => {
-    const statement = canonicalDeviceEdgeReceiptStatement(receiptFor(envelope()));
+    const statement = canonicalDeviceEdgeReceiptStatement(edgeStatement(receiptFor(envelope())));
     expect(statement).toContain(DEVICE_EDGE_RECEIPT_DOMAIN);
     for (const authorityWord of ['authoris', 'authoriz', 'approv', 'permit', 'decision', 'device_trust']) {
       expect(statement).not.toContain(authorityWord);
@@ -214,7 +299,7 @@ describe('the Edge receipt witnesses time and never confers authority (D23-10 / 
     const a = receiptFor(envelope());
     const b = receiptFor(envelope({ device_sequence: 8 }));
     expect(a.witnessed_operation_fingerprint).not.toBe(b.witnessed_operation_fingerprint);
-    expect(deviceEdgeReceiptFingerprint(a)).not.toBe(deviceEdgeReceiptFingerprint(b));
+    expect(deviceEdgeReceiptFingerprint(edgeStatement(a))).not.toBe(deviceEdgeReceiptFingerprint(edgeStatement(b)));
   });
 });
 
@@ -223,9 +308,10 @@ describe('offline admissibility (C14-04 / D23-11 / D23-12)', () => {
     const decision = evaluateOfflineOperationAdmissibility(admissibility({ lease: expiredLease() }));
     expect(decision).toEqual({
       admitted: true,
+      effect: 'PROCEED',
       time_basis: 'EDGE_WITNESS',
       established_at: iso(-2 * HOUR),
-      operation_fingerprint: deviceOfflineOperationFingerprint(envelope()),
+      operation_fingerprint: deviceOfflineOperationFingerprint(offlineStatement(envelope())),
     });
   });
 
@@ -238,10 +324,10 @@ describe('offline admissibility (C14-04 / D23-11 / D23-12)', () => {
 
   it('refuses when the Edge itself has lost trust', () => {
     const target = envelope();
-    for (const edgeTrust of ['DEGRADED', 'SUSPICIOUS', 'QUARANTINED', 'COMPROMISED', 'OFFLINE'] as const) {
+    for (const edgeTrust of ['SUSPENDED', 'REVOKED'] as const) {
       expect(
         evaluateOfflineOperationAdmissibility(
-          admissibility({ witness: { kind: 'EDGE', receipt: receiptFor(target), edgeTrust, edgeSignatureVerified: true } }),
+          admissibility({ witness: edgeWitness(target, { registeredEdgeKey: edgeKeyRecord({ edge_trust: edgeTrust, revoked_at: edgeTrust === 'REVOKED' ? NOW : null }) }) }),
         ),
       ).toEqual({ admitted: false, refusal: 'EDGE_NOT_TRUSTED' });
     }
@@ -251,16 +337,17 @@ describe('offline admissibility (C14-04 / D23-11 / D23-12)', () => {
     const target = envelope();
     expect(
       evaluateOfflineOperationAdmissibility(
-        admissibility({ witness: { kind: 'EDGE', receipt: receiptFor(target), edgeTrust: 'TRUSTED', edgeSignatureVerified: false } }),
+        admissibility({ witness: edgeWitness(target, { edgeSignatureVerified: false }) }),
       ),
     ).toEqual({ admitted: false, refusal: 'EDGE_SIGNATURE_NOT_VERIFIED' });
   });
 
   it('refuses a receipt that witnessed a different operation', () => {
+    const target = envelope();
     const other = receiptFor(envelope({ device_sequence: 99 }));
     expect(
       evaluateOfflineOperationAdmissibility(
-        admissibility({ witness: { kind: 'EDGE', receipt: other, edgeTrust: 'TRUSTED', edgeSignatureVerified: true } }),
+        admissibility({ witness: edgeWitness(target, { receipt: other }) }),
       ),
     ).toEqual({ admitted: false, refusal: 'WITNESS_FINGERPRINT_MISMATCH' });
   });
@@ -270,12 +357,7 @@ describe('offline admissibility (C14-04 / D23-11 / D23-12)', () => {
     expect(
       evaluateOfflineOperationAdmissibility(
         admissibility({
-          witness: {
-            kind: 'EDGE',
-            receipt: receiptFor(target, { edge_trusted_time: null }),
-            edgeTrust: 'TRUSTED',
-            edgeSignatureVerified: true,
-          },
+          witness: edgeWitness(target, { receipt: receiptFor(target, { edge_trusted_time: null }) }),
         }),
       ),
     ).toEqual({ admitted: false, refusal: 'NO_TRUSTWORTHY_TIME_WITNESS' });
@@ -297,12 +379,7 @@ describe('offline admissibility (C14-04 / D23-11 / D23-12)', () => {
     const witnessedLate = admissibility({
       envelope: target,
       lease: expiredLease(),
-      witness: {
-        kind: 'EDGE',
-        receipt: receiptFor(target, { edge_trusted_time: iso(-1_800_000) }),
-        edgeTrust: 'TRUSTED',
-        edgeSignatureVerified: true,
-      },
+      witness: edgeWitness(target, { receipt: receiptFor(target, { edge_trusted_time: iso(-1_800_000) }) }),
     });
     expect(evaluateOfflineOperationAdmissibility(witnessedLate)).toEqual({ admitted: false, refusal: 'LEASE_NOT_IN_FORCE' });
   });
@@ -349,9 +426,10 @@ describe('offline admissibility (C14-04 / D23-11 / D23-12)', () => {
     const decision = evaluateOfflineOperationAdmissibility(admissibility({ envelope: ack, witness: { kind: 'NONE' } }));
     expect(decision).toEqual({
       admitted: true,
+      effect: 'PROCEED',
       time_basis: 'SERVER_RECEIPT',
       established_at: NOW,
-      operation_fingerprint: deviceOfflineOperationFingerprint(ack),
+      operation_fingerprint: deviceOfflineOperationFingerprint(offlineStatement(ack)),
     });
   });
 
@@ -405,33 +483,45 @@ describe('lost, stolen and compromised are three responses (D23-15 / C14-06)', (
 });
 
 describe('recovery resolves committed effects and never admits unapplied work (C14-06)', () => {
+  const OPERATION_FINGERPRINT = deviceOfflineOperationFingerprint(offlineStatement(envelope()));
+
+  /** C15-06: evidence now names the exact bytes and the tenant scope. */
   const evidence = DeviceCommittedEffectEvidenceSchema.parse({
     source: 'SENTINEL_DOMAIN_RECORD',
     offline_operation_id: OP_ID,
+    operation_fingerprint: OPERATION_FINGERPRINT,
+    organisation_id: 'org-1',
+    site_id: 'site-1',
     committed_at: iso(-4 * HOUR),
     domain_record_ref: 'assignment-42',
   });
 
+  function resolution(overrides: Record<string, unknown> = {}) {
+    return resolveRevokedDeviceOperation({
+      disposition: 'STOLEN',
+      offline_operation_id: OP_ID,
+      operation_fingerprint: OPERATION_FINGERPRINT,
+      organisation_id: 'org-1',
+      site_id: 'site-1',
+      priorCommittedEvidence: evidence,
+      ...overrides,
+    });
+  }
+
   it('resolves an already-committed effect from the platform authoritative domain record, under every disposition', () => {
     for (const disposition of DeviceRevocationDispositionSchema.options) {
-      expect(
-        resolveRevokedDeviceOperation({ disposition, offline_operation_id: OP_ID, priorCommittedEvidence: evidence }).resolution,
-      ).toBe('RESOLVE_AS_COMMITTED');
+      expect(resolution({ disposition }).resolution).toBe('RESOLVE_AS_COMMITTED');
     }
   });
 
   it('refuses a new effect for a stolen device or a copied key when the work was never applied', () => {
     for (const disposition of ['STOLEN', 'COMPROMISED_KEY'] as const) {
-      expect(resolveRevokedDeviceOperation({ disposition, offline_operation_id: OP_ID, priorCommittedEvidence: null }).resolution).toBe(
-        'REFUSE_NEW_EFFECT',
-      );
+      expect(resolution({ disposition, priorCommittedEvidence: null }).resolution).toBe('REFUSE_NEW_EFFECT');
     }
   });
 
   it('routes unapplied work from a merely lost device to human-attested re-entry', () => {
-    expect(resolveRevokedDeviceOperation({ disposition: 'LOST', offline_operation_id: OP_ID, priorCommittedEvidence: null }).resolution).toBe(
-      'REQUIRES_HUMAN_REENTRY',
-    );
+    expect(resolution({ disposition: 'LOST', priorCommittedEvidence: null }).resolution).toBe('REQUIRES_HUMAN_REENTRY');
   });
 
   it('does not let evidence about a different operation resolve this one', () => {
@@ -439,9 +529,7 @@ describe('recovery resolves committed effects and never admits unapplied work (C
       ...evidence,
       offline_operation_id: 'b4cc2b21-3d4e-4f60-9aab-1d2e3f4a5b6c',
     });
-    expect(
-      resolveRevokedDeviceOperation({ disposition: 'STOLEN', offline_operation_id: OP_ID, priorCommittedEvidence: otherEvidence }).resolution,
-    ).toBe('REFUSE_NEW_EFFECT');
+    expect(resolution({ priorCommittedEvidence: otherEvidence }).resolution).toBe('REFUSE_NEW_EFFECT');
   });
 
   it('LOCKED: the committed-effect evidence has no device-supplied field at all', () => {
@@ -499,5 +587,316 @@ describe('audit records the decision, never the secret (D23-14)', () => {
     expect(parsed.enrollment_request_fingerprint).toMatch(/^[0-9a-f]{64}$/u);
     expect(parsed.attestation_outcome).toBe('VERIFIED');
     expect(Object.keys(parsed)).not.toContain('attestation_blob');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C15 corrections
+// ---------------------------------------------------------------------------
+
+describe('C15-01 the offline envelope and Edge receipt do not choose their profile', () => {
+  it('names both profile fields as CLAIMS, and refuses the old authoritative names', () => {
+    expect(envelope().claimed_signature_profile).toBe('P256_ECDSA_SHA256');
+    expect(() => envelope({ signature_profile: 'P256_ECDSA_SHA256' })).toThrow();
+    expect(receiptFor(envelope()).claimed_edge_signature_profile).toBe('P256_ECDSA_SHA256');
+    expect(() => receiptFor(envelope(), { edge_signature_profile: 'P256_ECDSA_SHA256' })).toThrow();
+  });
+
+  it('LOCKED: an envelope claiming a profile the registry did not select refuses', () => {
+    expect(evaluateOfflineOperationAdmissibility(admissibility({ registeredSignatureProfile: 'Ed25519' as never }))).toEqual({
+      admitted: false,
+      refusal: 'SIGNATURE_PROFILE_CLAIM_MISMATCH',
+    });
+  });
+
+  it('LOCKED: a receipt claiming a profile the Edge registry did not select refuses', () => {
+    const target = envelope();
+    expect(
+      evaluateOfflineOperationAdmissibility(
+        admissibility({
+          envelope: target,
+          // Built by hand: the Edge REGISTRY schema will not itself store an
+          // unapproved profile, so the mismatch has to be staged past it.
+          witness: edgeWitness(target, {
+            registeredEdgeKey: { ...edgeKeyRecord(), signature_profile: 'Ed25519' as never },
+          }),
+        }),
+      ),
+    ).toEqual({ admitted: false, refusal: 'EDGE_SIGNATURE_PROFILE_CLAIM_MISMATCH' });
+  });
+
+  it('COMPOUND: a whole envelope or receipt carrying a non-canonical signature fails to PARSE', () => {
+    const highS = Buffer.concat([Buffer.alloc(32, 1), Buffer.alloc(32, 0xff)]).toString('base64url');
+    const zeroS = Buffer.concat([Buffer.alloc(32, 1), Buffer.alloc(32)]).toString('base64url');
+    const shortSig = Buffer.alloc(48).toString('base64url');
+    const shapeOnly = 'A'.repeat(86);
+    for (const [label, signature] of [
+      ['high s', highS],
+      ['zero s', zeroS],
+      ['wrong length', shortSig],
+      ['non-canonical 86 chars', shapeOnly],
+    ] as Array<[string, string]>) {
+      expect(DeviceOfflineOperationEnvelopeSchema.safeParse({ ...envelope(), signature }).success, label).toBe(false);
+      expect(
+        DeviceEdgeReceiptSchema.safeParse({ ...receiptFor(envelope()), edge_signature: signature }).success,
+        `receipt ${label}`,
+      ).toBe(false);
+    }
+  });
+
+  it('the canonical statements bind the SERVER profile, never the claim', () => {
+    const built = offlineStatement(envelope());
+    expect(built).not.toHaveProperty('claimed_signature_profile');
+    expect(built.signature_profile).toBe('P256_ECDSA_SHA256');
+    const edgeBuilt = edgeStatement(receiptFor(envelope()));
+    expect(edgeBuilt).not.toHaveProperty('claimed_edge_signature_profile');
+    expect(edgeBuilt.edge_signature_profile).toBe('P256_ECDSA_SHA256');
+  });
+});
+
+describe('C15-02 the Edge registry seam makes an Edge signature verifiable', () => {
+  it('carries the actual Edge key, and refuses an undelivered thumbprint', () => {
+    expect(edgeKeyRecord().public_key).toBe(EDGE_PUBLIC_KEY);
+    expect(() => edgeKeyRecord({ public_key_thumbprint: 'a'.repeat(64) })).toThrow();
+    expect(() => edgeKeyRecord({ public_key: 'not-a-point' })).toThrow();
+    expect(() => edgeKeyRecord({ status: 'REVOKED' })).toThrow();
+    expect(() => edgeKeyRecord({ status: 'REVOKED', revoked_at: NOW })).not.toThrow();
+  });
+
+  it('separates the KEY lifecycle from the EDGE principal trust', () => {
+    expect([...DeviceEdgeTrustStatusSchema.options]).toEqual(['TRUSTED', 'SUSPENDED', 'REVOKED']);
+    // A perfectly valid key belonging to a suspended Edge witnesses nothing.
+    const target = envelope();
+    expect(
+      evaluateOfflineOperationAdmissibility(
+        admissibility({ envelope: target, witness: edgeWitness(target, { registeredEdgeKey: edgeKeyRecord({ edge_trust: 'SUSPENDED' }) }) }),
+      ),
+    ).toEqual({ admitted: false, refusal: 'EDGE_NOT_TRUSTED' });
+  });
+
+  it('LOCKED: an Edge key record for a DIFFERENT key, or one that can no longer verify, refuses', () => {
+    const target = envelope();
+    const cases: Array<[string, EdgeRegistryKeyRecord]> = [
+      ['another edge', edgeKeyRecord({ edge_id: 'edge-99' })],
+      ['another key id', edgeKeyRecord({ edge_key_id: 'edge-key-9' })],
+      ['another key version', edgeKeyRecord({ edge_key_version: 2 })],
+      ['revoked key', edgeKeyRecord({ status: 'REVOKED', revoked_at: NOW })],
+      ['compromised key', edgeKeyRecord({ status: 'COMPROMISED', revoked_at: NOW })],
+    ];
+    for (const [label, registeredEdgeKey] of cases) {
+      expect(
+        evaluateOfflineOperationAdmissibility(admissibility({ envelope: target, witness: edgeWitness(target, { registeredEdgeKey }) })),
+        label,
+      ).toEqual({ admitted: false, refusal: 'EDGE_KEY_NOT_USABLE' });
+    }
+    // A ROTATED Edge key may still verify what it legitimately signed. (The
+    // lease is the expired one, because the witnessed instant is two hours old.)
+    expect(
+      evaluateOfflineOperationAdmissibility(
+        admissibility({
+          envelope: target,
+          lease: expiredLease(),
+          witness: edgeWitness(target, { registeredEdgeKey: edgeKeyRecord({ status: 'ROTATED' }) }),
+        }),
+      ).admitted,
+    ).toBe(true);
+  });
+});
+
+describe('C15-06 the lease binds the actor whose authority justified it', () => {
+  it('records the actor and the authority basis', () => {
+    expect(lease().actor_user_id).toBe('user-1');
+    expect(lease().authority_basis_id).toBe('authority-basis-1');
+  });
+
+  it('LOCKED: on a CONTROLLED_SHARED device, actor B cannot ride actor A lease', () => {
+    // Operative A holds the capability and caused the lease to be issued.
+    // The device passes to operative B at shift change. B signs a perfectly
+    // valid envelope naming the same device and the same lease.
+    const shiftTwo = envelope({ actor_user_id: 'user-2' });
+    const decision = evaluateOfflineOperationAdmissibility(
+      admissibility({ envelope: shiftTwo, lease: lease({ actor_user_id: 'user-1' }) }),
+    );
+    expect(decision).toEqual({ admitted: false, refusal: 'LEASE_ACTOR_MISMATCH' });
+
+    // B's own lease, for B, is admitted — the device is legitimately shared.
+    expect(
+      evaluateOfflineOperationAdmissibility(
+        admissibility({ envelope: shiftTwo, lease: expiredLease({ actor_user_id: 'user-2' }) }),
+      ).admitted,
+    ).toBe(true);
+  });
+});
+
+describe('C15-06 committed-effect evidence binds the operation and its tenant', () => {
+  const OPERATION_FINGERPRINT = deviceOfflineOperationFingerprint(offlineStatement(envelope()));
+
+  function evidenceRecord(overrides: Record<string, unknown> = {}) {
+    return DeviceCommittedEffectEvidenceSchema.parse({
+      source: 'SENTINEL_DOMAIN_RECORD',
+      offline_operation_id: OP_ID,
+      operation_fingerprint: OPERATION_FINGERPRINT,
+      organisation_id: 'org-1',
+      site_id: 'site-1',
+      committed_at: iso(-4 * HOUR),
+      domain_record_ref: 'assignment-42',
+      ...overrides,
+    });
+  }
+
+  function resolve(overrides: Record<string, unknown> = {}) {
+    return resolveRevokedDeviceOperation({
+      disposition: 'STOLEN',
+      offline_operation_id: OP_ID,
+      operation_fingerprint: OPERATION_FINGERPRINT,
+      organisation_id: 'org-1',
+      site_id: 'site-1',
+      priorCommittedEvidence: evidenceRecord(),
+      ...overrides,
+    });
+  }
+
+  it('resolves as committed only when the fingerprint AND tenant scope both match', () => {
+    expect(resolve().resolution).toBe('RESOLVE_AS_COMMITTED');
+  });
+
+  it('LOCKED: a reused operation id carrying DIFFERENT bytes is a CONFLICT, never resolved as committed', () => {
+    // The WP-20 request-bound idempotency rule. An id is a value the device
+    // chooses; without the fingerprint, "already committed" could be claimed
+    // about an operation Sentinel never saw.
+    const rewritten = deviceOfflineOperationFingerprint(offlineStatement(envelope({ payload_digest: OTHER_DIGEST })));
+    expect(rewritten).not.toBe(OPERATION_FINGERPRINT);
+    expect(resolve({ operation_fingerprint: rewritten })).toMatchObject({ resolution: 'CONFLICT' });
+    // And the mirror image: evidence about other bytes under this id.
+    expect(resolve({ priorCommittedEvidence: evidenceRecord({ operation_fingerprint: rewritten }) })).toMatchObject({
+      resolution: 'CONFLICT',
+    });
+  });
+
+  it('LOCKED: evidence from another organisation or site cannot resolve this operation', () => {
+    expect(resolve({ priorCommittedEvidence: evidenceRecord({ organisation_id: 'org-9' }) })).toMatchObject({ resolution: 'CONFLICT' });
+    expect(resolve({ priorCommittedEvidence: evidenceRecord({ site_id: 'site-9' }) })).toMatchObject({ resolution: 'CONFLICT' });
+  });
+
+  it('a CONFLICT causes no effect at all, under every disposition', () => {
+    const rewritten = 'a'.repeat(64);
+    for (const disposition of DeviceRevocationDispositionSchema.options) {
+      expect(resolve({ disposition, operation_fingerprint: rewritten }).resolution, disposition).toBe('CONFLICT');
+    }
+  });
+});
+
+describe('C15-05 the offline envelope nonce is one-shot through a contract seam', () => {
+  it('scopes the replay identity to org, site, actor, device, key version and nonce', () => {
+    expect(deviceOfflineOperationReplayIdentity(envelope())).toEqual({
+      organisation_id: 'org-1',
+      site_id: 'site-1',
+      actor_user_id: 'user-1',
+      device_id: 'device-1',
+      key_version: 4,
+      nonce: NONCE,
+    });
+    expect(deviceOfflineOperationReplayKey(envelope())).not.toBe(deviceOfflineOperationReplayKey(envelope({ actor_user_id: 'user-2' })));
+    // C11-01: canonical JSON, so a delimiter inside a value cannot forge a tuple.
+    expect(deviceOfflineOperationReplayKey(envelope({ organisation_id: 'a:b', site_id: 'c' }))).not.toBe(
+      deviceOfflineOperationReplayKey(envelope({ organisation_id: 'a', site_id: 'b:c' })),
+    );
+  });
+
+  it('is DISTINCT from the operation fingerprint, which is what separates a retry from a rewrite', () => {
+    const target = envelope();
+    const rewritten = envelope({ payload_digest: OTHER_DIGEST });
+    expect(deviceOfflineOperationReplayKey(rewritten)).toBe(deviceOfflineOperationReplayKey(target));
+    expect(deviceOfflineOperationFingerprint(offlineStatement(rewritten))).not.toBe(
+      deviceOfflineOperationFingerprint(offlineStatement(target)),
+    );
+  });
+
+  it('a reconnecting queue that re-sends CONVERGES rather than committing twice', () => {
+    const target = envelope();
+    const decision = evaluateOfflineOperationAdmissibility(
+      admissibility({
+        envelope: target,
+        lease: expiredLease(),
+        consumption: consumptionFor(target, { outcome: 'EXACT_DUPLICATE', stored_outcome_ref: 'assignment-42' }),
+      }),
+    );
+    expect(decision).toEqual({
+      admitted: true,
+      effect: 'CONVERGE_ON_STORED_OUTCOME',
+      time_basis: 'EDGE_WITNESS',
+      established_at: iso(-2 * HOUR),
+      operation_fingerprint: deviceOfflineOperationFingerprint(offlineStatement(target)),
+      stored_outcome_ref: 'assignment-42',
+    });
+  });
+
+  it('LOCKED: the same slot carrying CHANGED semantics conflicts and causes nothing', () => {
+    const target = envelope();
+    expect(
+      evaluateOfflineOperationAdmissibility(
+        admissibility({ envelope: target, consumption: consumptionFor(target, { outcome: 'REUSED_WITH_CHANGED_SEMANTICS' }) }),
+      ),
+    ).toEqual({ admitted: false, refusal: 'NONCE_REUSED_WITH_CHANGED_SEMANTICS' });
+  });
+
+  it('LOCKED: a consumption fact about ANOTHER operation cannot stand in for this one', () => {
+    const target = envelope();
+    expect(
+      evaluateOfflineOperationAdmissibility(
+        admissibility({ envelope: target, consumption: consumptionFor(envelope({ nonce: 'nonce-fedcba9876543210' })) }),
+      ),
+    ).toEqual({ admitted: false, refusal: 'NONCE_CONSUMPTION_MISBOUND' });
+    expect(
+      evaluateOfflineOperationAdmissibility(
+        admissibility({ envelope: target, consumption: consumptionFor(target, { statement_fingerprint: 'b'.repeat(64) }) }),
+      ),
+    ).toEqual({ admitted: false, refusal: 'NONCE_CONSUMPTION_MISBOUND' });
+  });
+
+  it('the consumption fact cannot be defaulted away: it is a required input', () => {
+    const { consumption, ...withoutFact } = admissibility();
+    expect(consumption).toBeDefined();
+    expect(Object.keys(withoutFact)).not.toContain('consumption');
+    expect(() => evaluateOfflineOperationAdmissibility(withoutFact as unknown as DeviceOfflineAdmissibilityInput)).toThrow();
+  });
+});
+
+describe('C15-07 the offline evaluator fails closed on time', () => {
+  it('treats the lease expiry as an EXCLUSIVE boundary, asserted exactly at the instant', () => {
+    const l = lease({ issued_at: iso(-HOUR), expires_at: NOW });
+    expect(classifyDevicePolicyLease(l, iso(-1))).toBe('VALID');
+    expect(classifyDevicePolicyLease(l, NOW)).toBe('EXPIRED');
+    // And it is valid at exactly the issuance instant.
+    expect(classifyDevicePolicyLease(l, iso(-HOUR))).toBe('VALID');
+    expect(classifyDevicePolicyLease(l, iso(-HOUR - 1))).toBe('NOT_YET_VALID');
+  });
+
+  it('answers TIME_NOT_AUTHORITATIVE rather than VALID for an unreadable instant', () => {
+    expect(classifyDevicePolicyLease(lease(), 'not-a-time')).toBe(DEVICE_TIME_NOT_AUTHORITATIVE);
+  });
+
+  it('LOCKED: an unreadable server receipt clock refuses a stale-tolerant operation', () => {
+    const ack = envelope({ operation_kind: 'INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE' });
+    expect(
+      evaluateOfflineOperationAdmissibility(admissibility({ envelope: ack, witness: { kind: 'NONE' }, now: 'not-a-time' })),
+    ).toEqual({ admitted: false, refusal: DEVICE_TIME_NOT_AUTHORITATIVE });
+  });
+
+  it('LOCKED: an unreadable Edge-witnessed instant is not a witness at all', () => {
+    const target = envelope();
+    // Defence in depth: the receipt SCHEMA already refuses a non-datetime, so
+    // this is staged past the parse to prove the evaluator would not admit on a
+    // NaN comparison if the value ever reached it by another route.
+    expect(() => receiptFor(target, { edge_trusted_time: 'whenever' })).toThrow();
+    const staged = { ...receiptFor(target), edge_trusted_time: 'whenever' } as DeviceEdgeReceipt;
+    expect(
+      evaluateOfflineOperationAdmissibility(admissibility({ envelope: target, witness: edgeWitness(target, { receipt: staged }) })),
+    ).toEqual({ admitted: false, refusal: DEVICE_TIME_NOT_AUTHORITATIVE });
+  });
+
+  it('refuses an impossible lease window through the one shared refinement', () => {
+    expect(() => lease({ issued_at: NOW, expires_at: NOW })).toThrow(/after issued_at/u);
+    expect(() => lease({ issued_at: NOW, expires_at: iso(-1) })).toThrow(/after issued_at/u);
   });
 });

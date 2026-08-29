@@ -1,5 +1,30 @@
+import { generateKeyPairSync } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import * as deviceIdentityModule from './device-identity.js';
+import { deriveP256PublicKeyThumbprint } from './device-signature.js';
+import {
+  ALLOWED_DEVICE_KEY_LIFECYCLE_TRANSITIONS,
+  canTransitionDeviceKeyLifecycle,
+  classifyDeviceNonceConsumption,
+  DEVICE_KEY_LIFECYCLE_STATES,
+  DEVICE_NONCE_CONSUMPTION_OUTCOMES,
+  DEVICE_TIME_NOT_AUTHORITATIVE,
+  DeviceCustodyAssociationSchema,
+  DevicePossessionVerificationResultSchema,
+  DeviceRegistryKeyRecordSchema,
+  deviceBootstrapGrantReplayKey,
+  deviceCustodyAssociationBindsSite,
+  deviceKeyStatePermitsHistoricalVerification,
+  deviceKeyStatePermitsNewOperations,
+  devicePossessionChallengeReplayKey,
+  isExpiredAt,
+  isTerminalDeviceKeyLifecycleState,
+  parseAuthoritativeInstant,
+  parseAuthoritativeInstants,
+  refineDeviceInstantWindow,
+  type DeviceNonceConsumption,
+  type DevicePossessionVerificationResult,
+} from './device-identity.js';
 import {
   ALLOWED_DEVICE_ENROLLMENT_TRANSITIONS,
   ALLOWED_DEVICE_TRUST_TRANSITIONS,
@@ -61,13 +86,34 @@ import { DeviceTrustSchema, type DeviceTrust } from './device.js';
 /** WP-23 Crucible — device identity, enrollment, keys, attestation and trust. */
 
 const NOW = '2026-08-29T12:00:00.000Z';
-const THUMBPRINT = 'a'.repeat(64);
-const ATTACKER_THUMBPRINT = 'b'.repeat(64);
 const SIGNATURE = Buffer.from(new Uint8Array(64).fill(7)).toString('base64url');
 const NONCE = 'nonce-0123456789abcdef';
 
+/** C15-02: fixtures use REAL canonical P-256 points, because the schema now decodes them. */
+function canonicalPublicKey(): string {
+  const { publicKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  return Buffer.from(publicKey.export({ type: 'spki', format: 'der' })).subarray(-65).toString('base64url');
+}
+
+const PUBLIC_KEY = canonicalPublicKey();
+const ATTACKER_PUBLIC_KEY = canonicalPublicKey();
+const THUMBPRINT = deriveP256PublicKeyThumbprint(PUBLIC_KEY);
+const ATTACKER_THUMBPRINT = deriveP256PublicKeyThumbprint(ATTACKER_PUBLIC_KEY);
+
 function iso(base: string, deltaMs: number): string {
   return new Date(Date.parse(base) + deltaMs).toISOString();
+}
+
+/** C15-05: a store report shaped for the thing actually being presented. */
+function consumption(replayKey: string, statementFingerprint: string, overrides: Partial<DeviceNonceConsumption> = {}): DeviceNonceConsumption {
+  return {
+    source: 'SENTINEL_NONCE_STORE',
+    outcome: 'FIRST_SEEN',
+    replay_key: replayKey,
+    statement_fingerprint: statementFingerprint,
+    stored_outcome_ref: null,
+    ...overrides,
+  };
 }
 
 function grant(overrides: Record<string, unknown> = {}): DeviceEnrollmentBootstrapGrant {
@@ -96,13 +142,19 @@ function request(overrides: Record<string, unknown> = {}): DeviceEnrollmentReque
     intended_user_id: 'user-1',
     bootstrap_grant_id: 'grant-1',
     custody: 'PERSONAL',
-    signature_profile: 'P256_ECDSA_SHA256',
+    claimed_signature_profile: 'P256_ECDSA_SHA256',
     key_storage: 'HARDWARE_BACKED',
+    public_key: PUBLIC_KEY,
     public_key_thumbprint: THUMBPRINT,
     attestation: { outcome: 'VERIFIED', evaluated_at: NOW, attestation_reference: 'att-1' },
     requested_at: iso(NOW, -30_000),
     ...overrides,
   });
+}
+
+/** The attacker's request: a different keypair, correctly self-consistent. */
+function attackerRequest(overrides: Record<string, unknown> = {}): DeviceEnrollmentRequest {
+  return request({ public_key: ATTACKER_PUBLIC_KEY, public_key_thumbprint: ATTACKER_THUMBPRINT, ...overrides });
 }
 
 function approvalFor(target: DeviceEnrollmentRequest, overrides: Record<string, unknown> = {}): DeviceEnrollmentApproval {
@@ -132,19 +184,86 @@ function challenge(overrides: Record<string, unknown> = {}): DevicePossessionCha
   });
 }
 
+/**
+ * C15-03: the SERVER's verdict, correctly bound to one ceremony. Every field an
+ * attack would have to forge is here, which is the point.
+ */
+function verificationFor(
+  target: DeviceEnrollmentRequest,
+  theChallenge: DevicePossessionChallenge,
+  overrides: Record<string, unknown> = {},
+): DevicePossessionVerificationResult {
+  const fingerprint = deviceEnrollmentRequestFingerprint(target);
+  return DevicePossessionVerificationResultSchema.parse({
+    schema_version: 1,
+    source: 'SENTINEL_SERVER_VERIFICATION',
+    verified: true,
+    challenge_id: theChallenge.challenge_id,
+    enrollment_request_id: target.enrollment_request_id,
+    enrollment_request_fingerprint: fingerprint,
+    public_key_thumbprint: target.public_key_thumbprint,
+    possession_statement_fingerprint: devicePossessionStatementFingerprint({
+      challenge_id: theChallenge.challenge_id,
+      enrollment_request_id: target.enrollment_request_id,
+      enrollment_request_fingerprint: fingerprint,
+      nonce: theChallenge.nonce,
+      public_key_thumbprint: target.public_key_thumbprint,
+      signature_profile: 'P256_ECDSA_SHA256',
+    }),
+    signature_profile: 'P256_ECDSA_SHA256',
+    verified_at: iso(NOW, -5_000),
+    ...overrides,
+  });
+}
+
+function grantConsumptionFor(theGrant: DeviceEnrollmentBootstrapGrant, fingerprint: string): DeviceNonceConsumption {
+  return consumption(
+    deviceBootstrapGrantReplayKey({
+      organisation_id: theGrant.organisation_id,
+      site_id: theGrant.site_id,
+      intended_user_id: theGrant.intended_user_id,
+      grant_id: theGrant.grant_id,
+    }),
+    fingerprint,
+  );
+}
+
+function challengeConsumptionFor(
+  target: DeviceEnrollmentRequest,
+  theChallenge: DevicePossessionChallenge,
+  fingerprint: string,
+): DeviceNonceConsumption {
+  return consumption(
+    devicePossessionChallengeReplayKey({
+      organisation_id: target.organisation_id,
+      site_id: target.site_id,
+      intended_user_id: target.intended_user_id,
+      enrollment_request_id: target.enrollment_request_id,
+      challenge_id: theChallenge.challenge_id,
+      nonce: theChallenge.nonce,
+    }),
+    fingerprint,
+  );
+}
+
 function commitInput(overrides: Partial<DeviceEnrollmentCommitInput> = {}): DeviceEnrollmentCommitInput {
   const enrollmentRequest = overrides.request ?? request();
-  return {
+  const theGrant = overrides.grant !== undefined ? overrides.grant : grant();
+  const theChallenge = overrides.challenge !== undefined ? overrides.challenge : challenge();
+  const fingerprint = deviceEnrollmentRequestFingerprint(enrollmentRequest);
+  const base: DeviceEnrollmentCommitInput = {
     request: enrollmentRequest,
-    grant: grant(),
+    grant: theGrant,
     approval: approvalFor(enrollmentRequest),
-    challenge: challenge(),
-    possessionVerified: true,
-    possessionAnsweredAt: iso(NOW, -5_000),
+    challenge: theChallenge,
+    serverSelectedSignatureProfile: 'P256_ECDSA_SHA256',
+    possessionVerification: theChallenge === null ? null : verificationFor(enrollmentRequest, theChallenge),
+    grantConsumption: grantConsumptionFor(theGrant ?? grant(), fingerprint),
+    challengeConsumption: challengeConsumptionFor(enrollmentRequest, theChallenge ?? challenge(), fingerprint),
     authenticatedUserId: 'user-1',
     now: NOW,
-    ...overrides,
   };
+  return { ...base, ...overrides };
 }
 
 const RESTORATION_BASIS: DeviceTrustTransitionBasis = {
@@ -338,8 +457,12 @@ describe('the enrollment request fingerprint (C14-02)', () => {
       ['bootstrap_grant_id', request({ bootstrap_grant_id: 'grant-2' })],
       ['custody', request({ custody: 'CONTROLLED_SHARED' })],
       ['key_storage', request({ key_storage: 'SOFTWARE' })],
-      ['public_key_thumbprint', request({ public_key_thumbprint: ATTACKER_THUMBPRINT })],
+      ['public key', attackerRequest()],
       ['attestation.outcome', request({ attestation: { outcome: 'UNAVAILABLE', evaluated_at: NOW, attestation_reference: 'att-1' } })],
+      // C15-03: the WHOLE evidence record is bound, not just its outcome.
+      ['attestation.evaluated_at', request({ attestation: { outcome: 'VERIFIED', evaluated_at: iso(NOW, -3_600_000), attestation_reference: 'att-1' } })],
+      ['attestation.attestation_reference', request({ attestation: { outcome: 'VERIFIED', evaluated_at: NOW, attestation_reference: 'att-2' } })],
+      ['attestation.attestation_reference null', request({ attestation: { outcome: 'VERIFIED', evaluated_at: NOW, attestation_reference: null } })],
       ['requested_at', request({ requested_at: iso(NOW, -31_000) })],
     ];
     const digests = new Set<string>([baseline]);
@@ -370,14 +493,14 @@ describe('C14-02 approval binds the exact request, not a device class', () => {
 
   it('refuses when the attacker substitutes their own public key into an otherwise identical request', () => {
     const intended = request();
-    const attacker = request({ public_key_thumbprint: ATTACKER_THUMBPRINT });
+    const attacker = attackerRequest();
     const approval = approvalFor(intended);
     expect(approvalMatchesEnrollmentRequest(approval, attacker)).toBe(false);
   });
 
   it('refuses an approval that names only the device class, site and custody but a different request', () => {
     const intended = request();
-    const other = request({ enrollment_request_id: 'enrol-2', public_key_thumbprint: ATTACKER_THUMBPRINT });
+    const other = attackerRequest({ enrollment_request_id: 'enrol-2' });
     const classApproval = approvalFor(intended, { enrollment_request_id: other.enrollment_request_id });
     expect(approvalMatchesEnrollmentRequest(classApproval, other)).toBe(false);
   });
@@ -385,17 +508,13 @@ describe('C14-02 approval binds the exact request, not a device class', () => {
   it('LOCKED: a stolen bootstrap grant plus an attacker keypair cannot complete enrollment (C14-02)', () => {
     // The attacker holds a real, unused, in-scope grant and genuinely proves
     // possession — of THEIR OWN key. No human approved that request.
-    const attackerRequest = request({ public_key_thumbprint: ATTACKER_THUMBPRINT });
-    const stolen = evaluateDeviceEnrollmentCommit({
-      request: attackerRequest,
-      grant: grant(),
-      approval: approvalFor(request()), // the approval a Command principal issued for the REAL device
-      challenge: challenge(),
-      possessionVerified: true,
-      possessionAnsweredAt: iso(NOW, -5_000),
-      authenticatedUserId: 'user-1',
-      now: NOW,
-    });
+    const attackers = attackerRequest();
+    const stolen = evaluateDeviceEnrollmentCommit(
+      commitInput({
+        request: attackers,
+        approval: approvalFor(request()), // the approval a Command principal issued for the REAL device
+      }),
+    );
     expect(stolen).toEqual({ decision: 'REFUSE', refusal: 'APPROVAL_FINGERPRINT_MISMATCH' });
   });
 });
@@ -421,13 +540,16 @@ describe('the enrollment commit gate (C14-02)', () => {
   });
 
   it('refuses an enrollment without proof of possession even when everything else is perfect (D23-03)', () => {
-    expect(evaluateDeviceEnrollmentCommit(commitInput({ possessionVerified: false }))).toEqual({
+    const negative = verificationFor(request(), challenge(), { verified: false });
+    expect(evaluateDeviceEnrollmentCommit(commitInput({ possessionVerification: negative }))).toEqual({
       decision: 'REFUSE',
       refusal: 'POSSESSION_NOT_PROVEN',
     });
-    expect(evaluateDeviceEnrollmentCommit(commitInput({ possessionAnsweredAt: null }))).toEqual({
+    // C15-03: a MISSING verdict is not a passing one, and is named separately
+    // so an absent check can never read as a successful check.
+    expect(evaluateDeviceEnrollmentCommit(commitInput({ possessionVerification: null }))).toEqual({
       decision: 'REFUSE',
-      refusal: 'POSSESSION_NOT_PROVEN',
+      refusal: 'POSSESSION_VERIFICATION_MISSING',
     });
   });
 
@@ -456,11 +578,17 @@ describe('the enrollment commit gate (C14-02)', () => {
     });
   });
 
-  it('refuses a challenge answered after it expired, and one bound to another request', () => {
-    expect(evaluateDeviceEnrollmentCommit(commitInput({ possessionAnsweredAt: iso(NOW, 60_001) }))).toEqual({
+  it('refuses a challenge verified after it expired, and one bound to another request', () => {
+    // C15-03/C15-07: judged on the SERVER's verification instant, and the
+    // expiry boundary is exclusive — exactly at expires_at is already expired.
+    const expired = verificationFor(request(), challenge(), { verified_at: iso(NOW, 60_000) });
+    expect(evaluateDeviceEnrollmentCommit(commitInput({ possessionVerification: expired }))).toEqual({
       decision: 'REFUSE',
       refusal: 'CHALLENGE_EXPIRED',
     });
+    const justInside = verificationFor(request(), challenge(), { verified_at: iso(NOW, 59_999) });
+    expect(evaluateDeviceEnrollmentCommit(commitInput({ possessionVerification: justInside })).decision).toBe('COMMIT');
+
     expect(evaluateDeviceEnrollmentCommit(commitInput({ challenge: challenge({ enrollment_request_id: 'enrol-other' }) }))).toEqual({
       decision: 'REFUSE',
       refusal: 'CHALLENGE_MISBOUND',
@@ -477,8 +605,9 @@ describe('the possession statement (D23-03)', () => {
       enrollment_request_fingerprint: deviceEnrollmentRequestFingerprint(intended),
       nonce: NONCE,
       public_key_thumbprint: THUMBPRINT,
-    };
-    const attacker = { ...base, enrollment_request_fingerprint: deviceEnrollmentRequestFingerprint(request({ public_key_thumbprint: ATTACKER_THUMBPRINT })) };
+      signature_profile: 'P256_ECDSA_SHA256',
+    } as const;
+    const attacker = { ...base, enrollment_request_fingerprint: deviceEnrollmentRequestFingerprint(attackerRequest()) };
     expect(devicePossessionStatementFingerprint(attacker)).not.toBe(devicePossessionStatementFingerprint(base));
   });
 
@@ -489,6 +618,7 @@ describe('the possession statement (D23-03)', () => {
       enrollment_request_fingerprint: THUMBPRINT,
       nonce: NONCE,
       public_key_thumbprint: THUMBPRINT,
+      signature_profile: 'P256_ECDSA_SHA256',
     })).toContain('sentinel.device.possession-challenge.v1');
   });
 
@@ -497,13 +627,30 @@ describe('the possession statement (D23-03)', () => {
       schema_version: 1,
       challenge_id: 'challenge-1',
       enrollment_request_id: 'enrol-1',
-      signature_profile: 'P256_ECDSA_SHA256',
+      claimed_signature_profile: 'P256_ECDSA_SHA256',
       signature: SIGNATURE,
       answered_at: NOW,
     };
     expect(() => DevicePossessionResponseSchema.parse(valid)).not.toThrow();
     expect(() => DevicePossessionResponseSchema.parse({ ...valid, signature: `${SIGNATURE}==` })).toThrow();
-    expect(() => DevicePossessionResponseSchema.parse({ ...valid, signature_profile: 'Ed25519' })).toThrow();
+    expect(() => DevicePossessionResponseSchema.parse({ ...valid, claimed_signature_profile: 'Ed25519' })).toThrow();
+    // C15-01: the profile field is a CLAIM and is named as one. The old
+    // authoritative-sounding name must no longer parse.
+    expect(() => DevicePossessionResponseSchema.parse({ ...valid, signature_profile: 'P256_ECDSA_SHA256' })).toThrow();
+  });
+
+  it('C15-01: a high-S signature cannot exist inside a parsed possession response', () => {
+    const highS = Buffer.concat([Buffer.alloc(32, 1), Buffer.alloc(32, 0xff)]).toString('base64url');
+    expect(() =>
+      DevicePossessionResponseSchema.parse({
+        schema_version: 1,
+        challenge_id: 'challenge-1',
+        enrollment_request_id: 'enrol-1',
+        claimed_signature_profile: 'P256_ECDSA_SHA256',
+        signature: highS,
+        answered_at: NOW,
+      }),
+    ).toThrow();
   });
 });
 
@@ -862,5 +1009,434 @@ describe('canonical JSON refuses what it cannot represent (C11-03/C11-06/C11-07)
     expect(isCanonicalDeviceJsonRecord({ a: [1, 'x', null] })).toBe(true);
     expect(isCanonicalDeviceJsonRecord(new Date())).toBe(false);
     expect(isCanonicalDeviceJsonRecord([1, 2])).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C15 corrections
+// ---------------------------------------------------------------------------
+
+describe('C15-02 the registry key record can actually verify', () => {
+  function keyRecord(overrides: Record<string, unknown> = {}): unknown {
+    return {
+      schema_version: 1,
+      organisation_id: 'org-1',
+      device_id: 'device-1',
+      key_id: 'key-1',
+      key_version: 3,
+      public_key: PUBLIC_KEY,
+      public_key_thumbprint: THUMBPRINT,
+      signature_profile: 'P256_ECDSA_SHA256',
+      key_storage: 'HARDWARE_BACKED',
+      status: 'CURRENT',
+      registered_at: NOW,
+      rotated_at: null,
+      revoked_at: null,
+      revocation_disposition: null,
+      ...overrides,
+    };
+  }
+
+  it('carries the actual public key, not merely a digest of one', () => {
+    const record = DeviceRegistryKeyRecordSchema.parse(keyRecord());
+    expect(record.public_key).toBe(PUBLIC_KEY);
+    expect(record.signature_profile).toBe('P256_ECDSA_SHA256');
+  });
+
+  it('C15-02: refuses a thumbprint that was not DERIVED from the key it sits beside', () => {
+    // The whole defect: a digest supplied alongside a key is a second claim,
+    // not corroboration of the first.
+    expect(() => DeviceRegistryKeyRecordSchema.parse(keyRecord({ public_key_thumbprint: ATTACKER_THUMBPRINT }))).toThrow();
+    expect(() => DeviceRegistryKeyRecordSchema.parse(keyRecord({ public_key_thumbprint: 'a'.repeat(64) }))).toThrow();
+    // A non-canonical key is a parse failure, not a thrown deriver.
+    expect(() => DeviceRegistryKeyRecordSchema.parse(keyRecord({ public_key: 'not-a-point' }))).toThrow();
+  });
+
+  it('refuses a record whose status and timestamps tell different stories', () => {
+    expect(() => DeviceRegistryKeyRecordSchema.parse(keyRecord({ status: 'ROTATED' }))).toThrow();
+    expect(() => DeviceRegistryKeyRecordSchema.parse(keyRecord({ status: 'REVOKED' }))).toThrow();
+    expect(() => DeviceRegistryKeyRecordSchema.parse(keyRecord({ rotated_at: NOW }))).toThrow();
+    expect(() =>
+      DeviceRegistryKeyRecordSchema.parse(keyRecord({ status: 'ROTATED', rotated_at: NOW, revocation_disposition: 'LOST' })),
+    ).toThrow();
+    expect(() => DeviceRegistryKeyRecordSchema.parse(keyRecord({ status: 'ROTATED', rotated_at: NOW }))).not.toThrow();
+    expect(() =>
+      DeviceRegistryKeyRecordSchema.parse(keyRecord({ status: 'COMPROMISED', revoked_at: NOW, revocation_disposition: 'COMPROMISED_KEY' })),
+    ).not.toThrow();
+  });
+
+  it('C15-02: ROTATED and REVOKED/COMPROMISED are DIFFERENT semantic states', () => {
+    expect([...DEVICE_KEY_LIFECYCLE_STATES]).toEqual(['CURRENT', 'ROTATED', 'REVOKED', 'COMPROMISED']);
+    // Routine rotation retires a key's AUTHORITY but not its history: the
+    // evidence it signed while current was legitimate when it was made.
+    expect(deviceKeyStatePermitsNewOperations('ROTATED')).toBe(false);
+    expect(deviceKeyStatePermitsHistoricalVerification('ROTATED')).toBe(true);
+    // Revocation and compromise withdraw BOTH.
+    for (const state of ['REVOKED', 'COMPROMISED'] as const) {
+      expect(deviceKeyStatePermitsNewOperations(state), state).toBe(false);
+      expect(deviceKeyStatePermitsHistoricalVerification(state), state).toBe(false);
+    }
+    expect(deviceKeyStatePermitsNewOperations('CURRENT')).toBe(true);
+    expect(deviceKeyStatePermitsHistoricalVerification('CURRENT')).toBe(true);
+  });
+
+  it('COMPROMISED is terminal and no edge climbs back', () => {
+    expect(ALLOWED_DEVICE_KEY_LIFECYCLE_TRANSITIONS).toEqual({
+      CURRENT: ['ROTATED', 'REVOKED', 'COMPROMISED'],
+      ROTATED: ['REVOKED', 'COMPROMISED'],
+      REVOKED: ['COMPROMISED'],
+      COMPROMISED: [],
+    });
+    expect(isTerminalDeviceKeyLifecycleState('COMPROMISED')).toBe(true);
+    expect(canTransitionDeviceKeyLifecycle('CURRENT', 'ROTATED')).toBe(true);
+    // Learning something bad about a historical key must be expressible.
+    expect(canTransitionDeviceKeyLifecycle('ROTATED', 'COMPROMISED')).toBe(true);
+    // But nothing is ever rehabilitated.
+    expect(canTransitionDeviceKeyLifecycle('ROTATED', 'CURRENT')).toBe(false);
+    expect(canTransitionDeviceKeyLifecycle('REVOKED', 'CURRENT')).toBe(false);
+    expect(canTransitionDeviceKeyLifecycle('COMPROMISED', 'REVOKED')).toBe(false);
+  });
+
+  it('C15-02: the enrollment request carries the key, and refuses a mismatched thumbprint', () => {
+    expect(request().public_key).toBe(PUBLIC_KEY);
+    expect(() => request({ public_key_thumbprint: ATTACKER_THUMBPRINT })).toThrow();
+    expect(() => request({ public_key: ATTACKER_PUBLIC_KEY })).toThrow();
+    // Consistent pairs on either side are fine.
+    expect(() => attackerRequest()).not.toThrow();
+  });
+});
+
+describe('C15-03 the possession verdict is bound, and cannot be borrowed', () => {
+  it('commits on a correctly bound verdict', () => {
+    expect(evaluateDeviceEnrollmentCommit(commitInput()).decision).toBe('COMMIT');
+  });
+
+  it('LOCKED: a genuine verified:true produced for ANOTHER challenge cannot be borrowed', () => {
+    // The attack the bare boolean allowed: run one honest ceremony, keep the
+    // `true`, present it against a different challenge. Everything else is valid.
+    const otherCeremony = verificationFor(request(), challenge({ challenge_id: 'challenge-9' }));
+    expect(otherCeremony.verified).toBe(true);
+    expect(evaluateDeviceEnrollmentCommit(commitInput({ possessionVerification: otherCeremony }))).toEqual({
+      decision: 'REFUSE',
+      refusal: 'POSSESSION_VERIFICATION_MISBOUND',
+    });
+  });
+
+  it('LOCKED: a verdict produced for ANOTHER key cannot be borrowed', () => {
+    const otherKey = verificationFor(attackerRequest(), challenge());
+    expect(evaluateDeviceEnrollmentCommit(commitInput({ possessionVerification: otherKey }))).toEqual({
+      decision: 'REFUSE',
+      refusal: 'POSSESSION_VERIFICATION_MISBOUND',
+    });
+  });
+
+  it('LOCKED: a verdict over DIFFERENT statement bytes is refused', () => {
+    const wrongStatement = verificationFor(request(), challenge(), { possession_statement_fingerprint: 'c'.repeat(64) });
+    expect(evaluateDeviceEnrollmentCommit(commitInput({ possessionVerification: wrongStatement }))).toEqual({
+      decision: 'REFUSE',
+      refusal: 'POSSESSION_STATEMENT_MISMATCH',
+    });
+    // A verdict over the statement for a DIFFERENT nonce is the same defect
+    // wearing this ceremony's challenge id.
+    const otherNonce = challenge({ nonce: 'nonce-fedcba9876543210' });
+    const borrowed = verificationFor(request(), otherNonce, { challenge_id: 'challenge-1' });
+    expect(evaluateDeviceEnrollmentCommit(commitInput({ possessionVerification: borrowed }))).toEqual({
+      decision: 'REFUSE',
+      refusal: 'POSSESSION_STATEMENT_MISMATCH',
+    });
+  });
+
+  it('C15-01: the request cannot claim a profile the server did not select', () => {
+    expect(evaluateDeviceEnrollmentCommit(commitInput({ serverSelectedSignatureProfile: 'Ed25519' as never }))).toEqual({
+      decision: 'REFUSE',
+      refusal: 'SIGNATURE_PROFILE_CLAIM_MISMATCH',
+    });
+  });
+
+  it('C15-03: freshness comes from the SERVER instant, not a device-supplied answered_at', () => {
+    // `answered_at` is not an input to the gate at all any more — the only way
+    // to move freshness is to move the SERVER's verification instant.
+    const beforeIssuance = verificationFor(request(), challenge(), { verified_at: iso(NOW, -30_000) });
+    expect(evaluateDeviceEnrollmentCommit(commitInput({ possessionVerification: beforeIssuance }))).toEqual({
+      decision: 'REFUSE',
+      refusal: 'CHALLENGE_NOT_YET_ISSUED',
+    });
+  });
+
+  it('C15-07: an unreadable verification instant refuses fail-closed', () => {
+    const broken = { ...verificationFor(request(), challenge()), verified_at: 'not-a-time' };
+    expect(evaluateDeviceEnrollmentCommit(commitInput({ possessionVerification: broken }))).toEqual({
+      decision: 'REFUSE',
+      refusal: DEVICE_TIME_NOT_AUTHORITATIVE,
+    });
+  });
+
+  it('C15-07: a request or approval claiming to come from the FUTURE refuses', () => {
+    expect(evaluateDeviceEnrollmentCommit(commitInput({ request: request({ requested_at: iso(NOW, 1_000) }) }))).toEqual({
+      decision: 'REFUSE',
+      refusal: 'REQUEST_NOT_YET_MADE',
+    });
+    expect(evaluateDeviceEnrollmentCommit(commitInput({ approval: approvalFor(request(), { approved_at: iso(NOW, 1_000) }) }))).toEqual({
+      decision: 'REFUSE',
+      refusal: 'APPROVAL_NOT_YET_MADE',
+    });
+  });
+
+  it('C15-07: an unreadable server clock refuses rather than admitting', () => {
+    expect(evaluateDeviceEnrollmentCommit(commitInput({ now: 'whenever' }))).toEqual({
+      decision: 'REFUSE',
+      refusal: DEVICE_TIME_NOT_AUTHORITATIVE,
+    });
+  });
+});
+
+describe('C15-05 one-shot consumption is a required fact', () => {
+  it('classifies the three cases, and only converges on identical bytes', () => {
+    expect([...DEVICE_NONCE_CONSUMPTION_OUTCOMES]).toEqual(['FIRST_SEEN', 'EXACT_DUPLICATE', 'REUSED_WITH_CHANGED_SEMANTICS']);
+    expect(classifyDeviceNonceConsumption({ replay_key: 'k', statement_fingerprint: 'f', stored: null }).outcome).toBe('FIRST_SEEN');
+    expect(
+      classifyDeviceNonceConsumption({
+        replay_key: 'k',
+        statement_fingerprint: 'f',
+        stored: { statement_fingerprint: 'f', stored_outcome_ref: 'outcome-1' },
+      }),
+    ).toMatchObject({ outcome: 'EXACT_DUPLICATE', stored_outcome_ref: 'outcome-1' });
+    // Same slot, different meaning: a conflict with NOTHING to converge on.
+    expect(
+      classifyDeviceNonceConsumption({
+        replay_key: 'k',
+        statement_fingerprint: 'f2',
+        stored: { statement_fingerprint: 'f', stored_outcome_ref: 'outcome-1' },
+      }),
+    ).toMatchObject({ outcome: 'REUSED_WITH_CHANGED_SEMANTICS', stored_outcome_ref: null });
+  });
+
+  it('an exact retry of one enrollment ceremony CONVERGES rather than enrolling twice', () => {
+    const fingerprint = deviceEnrollmentRequestFingerprint(request());
+    const duplicate = challengeConsumptionFor(request(), challenge(), fingerprint);
+    expect(
+      evaluateDeviceEnrollmentCommit(
+        commitInput({ challengeConsumption: { ...duplicate, outcome: 'EXACT_DUPLICATE', stored_outcome_ref: 'device-1' } }),
+      ),
+    ).toEqual({ decision: 'CONVERGE', enrollment_request_fingerprint: fingerprint, stored_outcome_ref: 'device-1' });
+  });
+
+  it('a reused challenge carrying DIFFERENT semantics conflicts', () => {
+    const fingerprint = deviceEnrollmentRequestFingerprint(request());
+    const reused = challengeConsumptionFor(request(), challenge(), fingerprint);
+    expect(
+      evaluateDeviceEnrollmentCommit(commitInput({ challengeConsumption: { ...reused, outcome: 'REUSED_WITH_CHANGED_SEMANTICS' } })),
+    ).toEqual({ decision: 'REFUSE', refusal: 'CHALLENGE_REUSED' });
+  });
+
+  it('D23-04: a reused bootstrap grant conflicts rather than producing a second device', () => {
+    const fingerprint = deviceEnrollmentRequestFingerprint(request());
+    const reused = grantConsumptionFor(grant(), fingerprint);
+    expect(
+      evaluateDeviceEnrollmentCommit(commitInput({ grantConsumption: { ...reused, outcome: 'REUSED_WITH_CHANGED_SEMANTICS' } })),
+    ).toEqual({ decision: 'REFUSE', refusal: 'BOOTSTRAP_GRANT_REUSED' });
+  });
+
+  it('LOCKED: a consumption fact for a DIFFERENT identity cannot stand in for this one', () => {
+    const fingerprint = deviceEnrollmentRequestFingerprint(request());
+    expect(evaluateDeviceEnrollmentCommit(commitInput({ grantConsumption: consumption('some-other-grant', fingerprint) }))).toEqual({
+      decision: 'REFUSE',
+      refusal: 'BOOTSTRAP_CONSUMPTION_MISBOUND',
+    });
+    expect(evaluateDeviceEnrollmentCommit(commitInput({ challengeConsumption: consumption('some-other-challenge', fingerprint) }))).toEqual({
+      decision: 'REFUSE',
+      refusal: 'CHALLENGE_CONSUMPTION_MISBOUND',
+    });
+    // A fact about the right slot but the wrong bytes is equally not evidence.
+    expect(
+      evaluateDeviceEnrollmentCommit(commitInput({ challengeConsumption: challengeConsumptionFor(request(), challenge(), 'd'.repeat(64)) })),
+    ).toEqual({ decision: 'REFUSE', refusal: 'CHALLENGE_CONSUMPTION_MISBOUND' });
+  });
+
+  it('the consumption fact cannot be defaulted away: it is a required input', () => {
+    // Enforced by the type in the contract; asserted structurally here so a
+    // future edit reintroducing an optional field fails a test rather than
+    // silently restoring the "no fact means no replay" behaviour.
+    const full = commitInput();
+    const { grantConsumption, challengeConsumption, ...withoutFacts } = full;
+    expect(grantConsumption).toBeDefined();
+    expect(challengeConsumption).toBeDefined();
+    expect(Object.keys(withoutFacts)).not.toContain('grantConsumption');
+    expect(() => evaluateDeviceEnrollmentCommit(withoutFacts as unknown as DeviceEnrollmentCommitInput)).toThrow();
+  });
+
+  it('replay identities are canonical JSON, so no two distinct tuples collide (C11-01)', () => {
+    const a = deviceBootstrapGrantReplayKey({ organisation_id: 'a:b', site_id: 'c', intended_user_id: 'u', grant_id: 'g' });
+    const b = deviceBootstrapGrantReplayKey({ organisation_id: 'a', site_id: 'b:c', intended_user_id: 'u', grant_id: 'g' });
+    expect(a).not.toBe(b);
+    expect(a).toContain('sentinel.device.bootstrap-grant.replay-identity.v1');
+    const c = devicePossessionChallengeReplayKey({
+      organisation_id: 'org-1',
+      site_id: 'site-1',
+      intended_user_id: 'user-1',
+      enrollment_request_id: 'enrol-1',
+      challenge_id: 'challenge-1',
+      nonce: NONCE,
+    });
+    expect(c).toContain('sentinel.device.possession-challenge.replay-identity.v1');
+    expect(c).not.toBe(a);
+  });
+});
+
+describe('C15-07 authoritative time fails closed', () => {
+  it('refuses an unparseable instant instead of returning NaN for comparison', () => {
+    expect(parseAuthoritativeInstant(NOW)).toBe(Date.parse(NOW));
+    for (const bad of ['', 'not-a-date', 'Invalid Date', '2026-13-45T99:99:99Z']) {
+      expect(parseAuthoritativeInstant(bad), bad).toBeNull();
+    }
+    // All-or-nothing: one bad member poisons the set rather than being skipped.
+    expect(parseAuthoritativeInstants({ a: NOW, b: NOW })).toEqual({ a: Date.parse(NOW), b: Date.parse(NOW) });
+    expect(parseAuthoritativeInstants({ a: NOW, b: 'nope' })).toBeNull();
+  });
+
+  it('expiry is an EXCLUSIVE boundary, asserted exactly at the instant', () => {
+    expect(isExpiredAt(100, 101)).toBe(false);
+    expect(isExpiredAt(100, 100)).toBe(true);
+    expect(isExpiredAt(101, 100)).toBe(true);
+    // The bootstrap grant reads the same rule.
+    const g = grant({ issued_at: iso(NOW, -60_000), expires_at: NOW });
+    expect(classifyDeviceBootstrapGrant(g, iso(NOW, -1))).toBe('USABLE');
+    expect(classifyDeviceBootstrapGrant(g, NOW)).toBe('EXPIRED');
+    expect(classifyDeviceBootstrapGrant(g, 'not-a-time')).toBe(DEVICE_TIME_NOT_AUTHORITATIVE);
+  });
+
+  it('C15-07: a lastVerifiedAt in the FUTURE is INCONSISTENT, never clamped to fresh', () => {
+    // The old behaviour clamped a negative age to zero, which read a future
+    // timestamp as "verified just now" — the freshest possible standing, from
+    // exactly the record that deserves the least confidence.
+    expect(
+      evaluateAttestationStanding({ outcome: 'UNAVAILABLE', lastVerifiedAt: iso(NOW, 60_000), now: NOW, hasPriorVerified: true }),
+    ).toEqual({ standing: 'INCONSISTENT', lastKnownGoodAgeMs: null });
+    expect(attestationStandingPermitsTrusted('INCONSISTENT')).toBe(false);
+    expect(initialDeviceTrustOnEnrollment({ keyStorage: 'HARDWARE_BACKED', attestationStanding: 'INCONSISTENT' })).toBe('DEGRADED');
+  });
+
+  it('an unreadable attestation instant is INCONSISTENT rather than fresh', () => {
+    expect(evaluateAttestationStanding({ outcome: 'UNAVAILABLE', lastVerifiedAt: 'whenever', now: NOW, hasPriorVerified: true })).toEqual({
+      standing: 'INCONSISTENT',
+      lastKnownGoodAgeMs: null,
+    });
+  });
+
+  it('a window schema refuses an impossible ordering through the one shared refinement', () => {
+    expect(() => grant({ issued_at: NOW, expires_at: NOW })).toThrow(/after issued_at/u);
+    expect(() => grant({ issued_at: NOW, expires_at: iso(NOW, -1) })).toThrow(/after issued_at/u);
+    expect(typeof refineDeviceInstantWindow).toBe('function');
+  });
+});
+
+describe('C15-08 derived and server-owned invariants are contracts', () => {
+  const HARDWARE_KEY = {
+    key_id: 'key-1',
+    key_version: 1,
+    signature_profile: 'P256_ECDSA_SHA256',
+    key_storage: 'HARDWARE_BACKED',
+    public_key_thumbprint: THUMBPRINT,
+  };
+  const SOFTWARE_KEY = { ...HARDWARE_KEY, key_storage: 'SOFTWARE' };
+
+  function identity(overrides: Record<string, unknown> = {}): unknown {
+    return {
+      schema_version: 1,
+      device_id: 'device-1',
+      organisation_id: 'org-1',
+      custody: 'PERSONAL',
+      enrolled_by_user_id: 'commander-1',
+      intended_user_id: 'user-1',
+      sequence_namespace_id: deviceSequenceNamespaceId({ organisation_id: 'org-1', device_id: 'device-1' }),
+      key: HARDWARE_KEY,
+      trust: 'TRUSTED',
+      enrolled_at: NOW,
+      revoked_at: null,
+      ...overrides,
+    };
+  }
+
+  it('LOCKED: an arbitrary sequence_namespace_id fails to PARSE (D23-09)', () => {
+    expect(() => DeviceIdentitySchema.parse(identity())).not.toThrow();
+    // A namespace reset arriving through the front door rather than through
+    // classifyDeviceKeyChange is still a namespace reset.
+    expect(() => DeviceIdentitySchema.parse(identity({ sequence_namespace_id: 'device-seq:whatever-i-like' }))).toThrow(/derived/u);
+    // Including one legitimately derived for a DIFFERENT device.
+    expect(() =>
+      DeviceIdentitySchema.parse(
+        identity({ sequence_namespace_id: deviceSequenceNamespaceId({ organisation_id: 'org-1', device_id: 'device-2' }) }),
+      ),
+    ).toThrow(/derived/u);
+  });
+
+  it('LOCKED: a TRUSTED identity on a software-backed key fails to PARSE (D23-03)', () => {
+    expect(() => DeviceIdentitySchema.parse(identity({ key: SOFTWARE_KEY }))).toThrow(/hardware-backed/u);
+    // The same software key at a lower trust state is legitimate (D23-03).
+    expect(() => DeviceIdentitySchema.parse(identity({ trust: 'DEGRADED', key: SOFTWARE_KEY }))).not.toThrow();
+  });
+
+  it('C15-08: a NEW identity cannot inherit the old identity last-known-good standing', () => {
+    // D23-09 says re-enrollment produces a NEW identity, and LAST_KNOWN_GOOD is
+    // a statement of CONTINUITY. A new identity has no "before" to ride, so the
+    // fastest route to a Whisper-capable credential must not be "wipe and
+    // re-enrol while the attestation provider happens to be down".
+    expect(initialDeviceTrustOnEnrollment({ keyStorage: 'HARDWARE_BACKED', attestationStanding: 'LAST_KNOWN_GOOD' })).toBe('DEGRADED');
+    expect(initialDeviceTrustOnEnrollment({ keyStorage: 'HARDWARE_BACKED', attestationStanding: 'CURRENT' })).toBe('TRUSTED');
+    // Continuity of an ALREADY-ESTABLISHED identity still accepts it, because
+    // there the device being vouched for is the one that earned the result.
+    expect(evaluateDeviceTrustTransition('DEGRADED', 'TRUSTED', { ...RESTORATION_BASIS, attestationStanding: 'LAST_KNOWN_GOOD' })).toEqual({
+      allowed: true,
+    });
+  });
+
+  it('locks the custody association shape WP-24 will persist', () => {
+    const personal = DeviceCustodyAssociationSchema.parse({
+      schema_version: 1,
+      organisation_id: 'org-1',
+      device_id: 'device-1',
+      custody: 'PERSONAL',
+      assigned_user_id: 'user-1',
+      custody_regime_id: null,
+      associated_site_ids: ['site-1', 'site-2'],
+      associated_at: NOW,
+      released_at: null,
+    });
+    expect(deviceCustodyAssociationBindsSite(personal, 'site-1')).toBe(true);
+    expect(deviceCustodyAssociationBindsSite(personal, 'site-9')).toBe(false);
+    // A released association binds nothing.
+    expect(deviceCustodyAssociationBindsSite({ ...personal, released_at: NOW }, 'site-1')).toBe(false);
+  });
+
+  it('C14-02: the two custody modes have mutually exclusive shapes, enforced not described', () => {
+    const base = {
+      schema_version: 1,
+      organisation_id: 'org-1',
+      device_id: 'device-1',
+      associated_site_ids: ['site-1'],
+      associated_at: NOW,
+      released_at: null,
+    };
+    // A shared device with a permanent assignee is custody fused into identity.
+    expect(() =>
+      DeviceCustodyAssociationSchema.parse({ ...base, custody: 'CONTROLLED_SHARED', assigned_user_id: 'user-1', custody_regime_id: 'regime-1' }),
+    ).toThrow();
+    // A personal device under a shared regime is an accountability gap.
+    expect(() =>
+      DeviceCustodyAssociationSchema.parse({ ...base, custody: 'PERSONAL', assigned_user_id: 'user-1', custody_regime_id: 'regime-1' }),
+    ).toThrow();
+    expect(() => DeviceCustodyAssociationSchema.parse({ ...base, custody: 'PERSONAL', assigned_user_id: null, custody_regime_id: null })).toThrow();
+    expect(() =>
+      DeviceCustodyAssociationSchema.parse({ ...base, custody: 'CONTROLLED_SHARED', assigned_user_id: null, custody_regime_id: null }),
+    ).toThrow();
+    expect(() =>
+      DeviceCustodyAssociationSchema.parse({
+        ...base,
+        custody: 'CONTROLLED_SHARED',
+        assigned_user_id: null,
+        custody_regime_id: 'regime-1',
+        associated_site_ids: ['site-1', 'site-1'],
+      }),
+    ).toThrow(/unique/u);
   });
 });

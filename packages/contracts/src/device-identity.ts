@@ -1,7 +1,15 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { DeviceTrustSchema, type DeviceTrust } from './device.js';
-import { DeviceSignatureProfileSchema, DeviceSignatureSchema } from './device-signature.js';
+import {
+  bindClaimedSignatureProfile,
+  DeviceP256PublicKeySchema,
+  DeviceSignatureProfileSchema,
+  DeviceSignatureSchema,
+  deviceKeyThumbprintMatches,
+  type DeviceSignatureProfile,
+  type DeviceSignatureProfileBinding,
+} from './device-signature.js';
 
 /**
  * WP-23 device identity, enrollment, custody, keys, attestation and trust
@@ -43,8 +51,93 @@ export const DeviceKeyVersionSchema = z.number().int().positive().max(1_000_000)
 /** A trace identifier shape shared by the whole WP-23 contract surface. */
 export const DeviceTraceIdSchema = z.string().min(1).max(256);
 
-function epochMs(value: string): number {
-  return Date.parse(value);
+// ---------------------------------------------------------------------------
+// Authoritative time (C15-07)
+// ---------------------------------------------------------------------------
+
+/**
+ * C15-07: THERE IS ONE TIME PARSER AND IT FAILS CLOSED.
+ *
+ * `Date.parse` returns `NaN` for anything it cannot read, and every comparison
+ * against `NaN` is `false`. A bare `Date.parse(a) > Date.parse(b)` therefore
+ * ADMITS an unparseable instant — the expiry check silently answers "not
+ * expired", the skew check silently answers "no skew". That is the exact
+ * opposite of fail-closed, and it was reachable in every evaluator in WP-23.
+ *
+ * So no evaluation path compares raw `Date.parse` results any more. Every
+ * instant an evaluator depends on goes through `parseAuthoritativeInstants`,
+ * which refuses the whole set if ANY member is unparseable, and the caller
+ * turns that refusal into a named `TIME_NOT_AUTHORITATIVE` outcome. A missing
+ * or malformed clock reading is a refusal, never a default.
+ *
+ * The refusal label is shared so all four modules name the same failure.
+ */
+export const DEVICE_TIME_NOT_AUTHORITATIVE = 'TIME_NOT_AUTHORITATIVE' as const;
+export type DeviceTimeNotAuthoritative = typeof DEVICE_TIME_NOT_AUTHORITATIVE;
+
+/** A single instant, or `null` when it is not a finite, parseable time. */
+export function parseAuthoritativeInstant(value: string): number | null {
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * Parses a whole bag of instants at once and returns `null` if ANY of them is
+ * unparseable. All-or-nothing on purpose: a partially parsed set invites a
+ * caller to compare the good half and quietly skip the rest.
+ */
+export function parseAuthoritativeInstants<K extends string>(values: Readonly<Record<K, string>>): Readonly<Record<K, number>> | null {
+  const parsed = {} as Record<K, number>;
+  for (const key of Object.keys(values) as K[]) {
+    const ms = parseAuthoritativeInstant(values[key]);
+    if (ms === null) return null;
+    parsed[key] = ms;
+  }
+  return parsed;
+}
+
+/**
+ * C15-07: expiry is an EXCLUSIVE boundary, everywhere.
+ *
+ * `now >= expires_at` is expired. The instant named as the expiry is the first
+ * instant the thing is no longer valid, not the last instant it is — stated
+ * once, here, so no evaluator has to re-decide it and no two evaluators can
+ * decide it differently. The boundary tests assert exactly at the instant.
+ */
+export function isExpiredAt(nowMs: number, expiresAtMs: number): boolean {
+  return nowMs >= expiresAtMs;
+}
+
+/**
+ * The one lifetime-window refinement every WP-23 window schema uses.
+ *
+ * Ordering (`expires_at > issued_at`), the named ceiling, and the fail-closed
+ * time parse in one place, so a bootstrap grant, a possession challenge, a
+ * device context and a policy lease cannot drift into four different opinions
+ * about what an impossible window is.
+ */
+export function refineDeviceInstantWindow(
+  value: { readonly issued_at: string; readonly expires_at: string },
+  context: z.RefinementCtx,
+  maxLifetimeMs: number,
+  label: string,
+): void {
+  const instants = parseAuthoritativeInstants({ issued: value.issued_at, expires: value.expires_at });
+  if (instants === null) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['expires_at'], message: `${label} instants must be authoritative` });
+    return;
+  }
+  if (!(instants.expires > instants.issued)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['expires_at'], message: 'expires_at must be after issued_at' });
+    return;
+  }
+  if (instants.expires - instants.issued > maxLifetimeMs) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['expires_at'],
+      message: `${label} lifetime must not exceed ${maxLifetimeMs} ms`,
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +389,337 @@ export function deviceKeyStoragePermitsTrusted(storage: DeviceKeyStorage): boole
   return storage === 'HARDWARE_BACKED';
 }
 
+// ---------------------------------------------------------------------------
+// Revocation disposition (D23-15 / C14-06), defined here because trust,
+// registry facts and offline resolution all need to name the same three cases.
+// ---------------------------------------------------------------------------
+
+/**
+ * D23-15: three threats, three responses, never one flag.
+ *
+ * LOST            the device may come back and may still be in honest hands.
+ * STOLEN          assume adversarial possession.
+ * COMPROMISED_KEY assume the credential itself has been copied.
+ */
+export const DeviceRevocationDispositionSchema = z.enum(['LOST', 'STOLEN', 'COMPROMISED_KEY']);
+export type DeviceRevocationDisposition = z.infer<typeof DeviceRevocationDispositionSchema>;
+
+// ---------------------------------------------------------------------------
+// The registry key record (C15-02)
+// ---------------------------------------------------------------------------
+
+/**
+ * C15-02: ROUTINE ROTATION AND COMPROMISE ARE NOT THE SAME STATE.
+ *
+ * WP-23 had a single `revoked` flag, which forced four genuinely different
+ * situations through one bit and lost the distinction that matters most: a key
+ * superseded last Tuesday by ordinary rotation is still the key that signed
+ * last Monday's evidence, while a key we believe an attacker holds signed
+ * nothing we should believe. Collapsing them either destroys the ability to
+ * verify history, or keeps a compromised key verifying. Neither is acceptable.
+ *
+ * CURRENT      the key in force. Verifies history AND authorises new work.
+ * ROTATED      superseded by routine, authenticated rotation. It may still
+ *              verify evidence produced while it was current — that evidence
+ *              was legitimate when made — but it authorises NOTHING new.
+ * REVOKED      withdrawn. Neither authorises nor verifies: we no longer stand
+ *              behind anything it says.
+ * COMPROMISED  believed to be in an attacker's hands. Neither, and TERMINAL —
+ *              a compromised key is never rehabilitated, mirroring D23-05's
+ *              terminal COMPROMISED trust state.
+ */
+export const DEVICE_KEY_LIFECYCLE_STATES = ['CURRENT', 'ROTATED', 'REVOKED', 'COMPROMISED'] as const;
+export const DeviceKeyLifecycleStateSchema = z.enum(DEVICE_KEY_LIFECYCLE_STATES);
+export type DeviceKeyLifecycleState = z.infer<typeof DeviceKeyLifecycleStateSchema>;
+
+/**
+ * The allowed transitions. Every edge runs DOWNHILL in authority and there is
+ * no edge back — a rotated key never becomes current again (that would be a
+ * rollback to a key whose replacement already exists), and COMPROMISED has no
+ * outgoing edge at all.
+ *
+ * ROTATED -> REVOKED and ROTATED -> COMPROMISED both exist because learning
+ * something bad about a historical key must be expressible: it is exactly how
+ * historical evidence signed by that key stops being believable.
+ */
+export const ALLOWED_DEVICE_KEY_LIFECYCLE_TRANSITIONS: Readonly<Record<DeviceKeyLifecycleState, readonly DeviceKeyLifecycleState[]>> = {
+  CURRENT: ['ROTATED', 'REVOKED', 'COMPROMISED'],
+  ROTATED: ['REVOKED', 'COMPROMISED'],
+  REVOKED: ['COMPROMISED'],
+  COMPROMISED: [],
+};
+
+export function canTransitionDeviceKeyLifecycle(from: DeviceKeyLifecycleState, to: DeviceKeyLifecycleState): boolean {
+  return ALLOWED_DEVICE_KEY_LIFECYCLE_TRANSITIONS[from].includes(to);
+}
+
+export function isTerminalDeviceKeyLifecycleState(state: DeviceKeyLifecycleState): boolean {
+  return ALLOWED_DEVICE_KEY_LIFECYCLE_TRANSITIONS[state].length === 0;
+}
+
+/** Only the key in force may authorise NEW operations. */
+export function deviceKeyStatePermitsNewOperations(state: DeviceKeyLifecycleState): boolean {
+  return state === 'CURRENT';
+}
+
+/** A routinely superseded key may still verify what it legitimately signed. */
+export function deviceKeyStatePermitsHistoricalVerification(state: DeviceKeyLifecycleState): boolean {
+  return state === 'CURRENT' || state === 'ROTATED';
+}
+
+/**
+ * C15-02: THE REGISTRY MUST BE ABLE TO ACTUALLY VERIFY.
+ *
+ * A record holding only `public_key_thumbprint` can recognise a key it is
+ * handed; it cannot check an ECDSA signature, which needs the point. So the
+ * registry record carries the CANONICAL PUBLIC KEY, and the thumbprint beside
+ * it is refused unless it equals the digest DERIVED from that key — an
+ * independently supplied digest is a second claim, not corroboration.
+ *
+ * `signature_profile` here is THE SERVER-SELECTED PROFILE and the only
+ * authority on the subject (C15-01). Every `claimed_signature_profile` on a
+ * submitted structure is equality-bound to this field before verification.
+ */
+export const DeviceRegistryKeyRecordSchema = z
+  .object({
+    schema_version: z.literal(1),
+    organisation_id: scopedId,
+    device_id: scopedId,
+    key_id: scopedId,
+    key_version: DeviceKeyVersionSchema,
+    /** The actual key. Without this the registry cannot verify anything. */
+    public_key: DeviceP256PublicKeySchema,
+    /** Must EQUAL the digest derived from `public_key`. Never trusted alone. */
+    public_key_thumbprint: DeviceDigestSchema,
+    /** SERVER-selected. The client's claim is checked against this, never the reverse. */
+    signature_profile: DeviceSignatureProfileSchema,
+    key_storage: DeviceKeyStorageSchema,
+    status: DeviceKeyLifecycleStateSchema,
+    registered_at: timestamp,
+    /** Set when routine rotation superseded this version. */
+    rotated_at: timestamp.nullable(),
+    /** Set when the key was revoked or declared compromised. */
+    revoked_at: timestamp.nullable(),
+    revocation_disposition: DeviceRevocationDispositionSchema.nullable(),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    // `deviceKeyThumbprintMatches` rather than `derive(...) !== ...`: a branded
+    // field's own refinement marks the parse DIRTY rather than aborting it, so
+    // this block can still see a non-canonical key. The matcher answers `false`
+    // where the deriver would throw, keeping a bad key a ZodError.
+    if (!deviceKeyThumbprintMatches(value.public_key, value.public_key_thumbprint)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['public_key_thumbprint'],
+        message: 'public_key_thumbprint must equal the digest derived from public_key',
+      });
+    }
+    // The status and the timestamps must tell the same story. A record saying
+    // CURRENT while carrying a revocation instant is two facts in conflict, and
+    // resolving it in favour of either would be guessing.
+    if (value.status === 'CURRENT' && (value.rotated_at !== null || value.revoked_at !== null)) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ['status'], message: 'a CURRENT key carries no rotation or revocation instant' });
+    }
+    if (value.status === 'ROTATED' && value.rotated_at === null) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ['rotated_at'], message: 'a ROTATED key must record when it was superseded' });
+    }
+    if ((value.status === 'REVOKED' || value.status === 'COMPROMISED') && value.revoked_at === null) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ['revoked_at'], message: 'a REVOKED or COMPROMISED key must record when it was withdrawn' });
+    }
+    if (value.status !== 'REVOKED' && value.status !== 'COMPROMISED' && value.revocation_disposition !== null) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['revocation_disposition'],
+        message: 'only a REVOKED or COMPROMISED key carries a revocation disposition',
+      });
+    }
+  });
+export type DeviceRegistryKeyRecord = z.infer<typeof DeviceRegistryKeyRecordSchema>;
+
+/**
+ * C15-01: resolve the profile from the REGISTRY, then bind the client's claim
+ * to it. The return value is what a canonical statement goes on to sign.
+ */
+export function resolveRegistrySignatureProfile(record: DeviceRegistryKeyRecord, claimed: unknown): DeviceSignatureProfileBinding {
+  return bindClaimedSignatureProfile(claimed, record.signature_profile);
+}
+
+// ---------------------------------------------------------------------------
+// One-shot consumption (C15-05)
+// ---------------------------------------------------------------------------
+
+/**
+ * C15-05: A NONCE THAT IS NOT CONSUMED IS NOT A NONCE.
+ *
+ * WP-23 called several fields "one-shot, scoped to the identity that consumes
+ * it" and then never gave any evaluator a way to know whether that had
+ * happened — so every evaluator would have admitted the same proof twice. The
+ * consumption fact is I/O, and I/O does not belong in contracts (D23-16); what
+ * belongs here is the SEAM: the identity a store must key on, the three
+ * outcomes the store can report, and an evaluator input that REQUIRES one.
+ *
+ * There is deliberately no default and no optional field. An evaluator that
+ * could be called without the consumption fact is an evaluator that admits a
+ * replay whenever a caller forgets — which is how this defect appears in the
+ * first place.
+ *
+ * FIRST_SEEN
+ *   this identity has never been presented. Proceed.
+ *
+ * EXACT_DUPLICATE
+ *   same replay identity AND same canonical-statement fingerprint. This is a
+ *   retry of one request, not a second request: converge on the outcome already
+ *   stored and cause NO second effect. That is WP-20's request-bound
+ *   idempotency rule, unchanged.
+ *
+ * REUSED_WITH_CHANGED_SEMANTICS
+ *   same replay identity, DIFFERENT statement fingerprint. Someone is reusing a
+ *   one-shot identity to mean something new. Conflict, and no effect — never a
+ *   convergence, because there is no shared outcome to converge on.
+ */
+export const DEVICE_NONCE_CONSUMPTION_OUTCOMES = ['FIRST_SEEN', 'EXACT_DUPLICATE', 'REUSED_WITH_CHANGED_SEMANTICS'] as const;
+export const DeviceNonceConsumptionOutcomeSchema = z.enum(DEVICE_NONCE_CONSUMPTION_OUTCOMES);
+export type DeviceNonceConsumptionOutcome = z.infer<typeof DeviceNonceConsumptionOutcomeSchema>;
+
+/**
+ * The server's report about a one-shot identity.
+ *
+ * `source` is a literal for the C14-06 reason: the only admissible provenance
+ * is Sentinel's own store, and a structure a device could populate would be the
+ * loophole. `replay_key` and `statement_fingerprint` are echoed back so the
+ * evaluator can prove the fact it was handed is about the request in front of
+ * it — a consumption fact for a DIFFERENT request is not evidence about this
+ * one.
+ */
+export interface DeviceNonceConsumption {
+  readonly source: 'SENTINEL_NONCE_STORE';
+  readonly outcome: DeviceNonceConsumptionOutcome;
+  /** The canonical replay-identity string this fact is about. */
+  readonly replay_key: string;
+  /** The canonical-statement fingerprint this fact is about. */
+  readonly statement_fingerprint: string;
+  /**
+   * On EXACT_DUPLICATE, a pointer to the outcome already recorded, so the
+   * caller converges on it. `null` in every other case.
+   */
+  readonly stored_outcome_ref: string | null;
+}
+
+/**
+ * The pure classifier a persistence layer wraps. Given what is being presented
+ * and what (if anything) the store already holds for that identity, it says
+ * which of the three cases this is. No I/O, no clock, no side effect — the
+ * store performs the atomic insert-or-read and calls this to name the result.
+ */
+export function classifyDeviceNonceConsumption(input: {
+  readonly replay_key: string;
+  readonly statement_fingerprint: string;
+  readonly stored: { readonly statement_fingerprint: string; readonly stored_outcome_ref: string } | null;
+}): DeviceNonceConsumption {
+  if (input.stored === null) {
+    return {
+      source: 'SENTINEL_NONCE_STORE',
+      outcome: 'FIRST_SEEN',
+      replay_key: input.replay_key,
+      statement_fingerprint: input.statement_fingerprint,
+      stored_outcome_ref: null,
+    };
+  }
+  if (input.stored.statement_fingerprint === input.statement_fingerprint) {
+    return {
+      source: 'SENTINEL_NONCE_STORE',
+      outcome: 'EXACT_DUPLICATE',
+      replay_key: input.replay_key,
+      statement_fingerprint: input.statement_fingerprint,
+      stored_outcome_ref: input.stored.stored_outcome_ref,
+    };
+  }
+  return {
+    source: 'SENTINEL_NONCE_STORE',
+    outcome: 'REUSED_WITH_CHANGED_SEMANTICS',
+    replay_key: input.replay_key,
+    statement_fingerprint: input.statement_fingerprint,
+    stored_outcome_ref: null,
+  };
+}
+
+/** Domain separator for the enrollment possession-challenge replay identity. */
+export const DEVICE_POSSESSION_CHALLENGE_REPLAY_IDENTITY_DOMAIN = 'sentinel.device.possession-challenge.replay-identity.v1';
+
+/** Domain separator for the bootstrap-grant replay identity. */
+export const DEVICE_BOOTSTRAP_GRANT_REPLAY_IDENTITY_DOMAIN = 'sentinel.device.bootstrap-grant.replay-identity.v1';
+
+export interface DevicePossessionChallengeReplayIdentity {
+  readonly organisation_id: string;
+  readonly site_id: string;
+  readonly intended_user_id: string;
+  readonly enrollment_request_id: string;
+  readonly challenge_id: string;
+  readonly nonce: string;
+}
+
+/**
+ * C15-05, mirroring `deviceActionWhisperReplayIdentity`: the identity a durable
+ * uniqueness constraint is built over, as STRUCTURE. A hash is not an identity
+ * — you cannot query it, audit it, or reason about its parts — so the columns
+ * are named and the string form below exists only for comparison and logging.
+ */
+export function devicePossessionChallengeReplayIdentity(input: {
+  readonly organisation_id: string;
+  readonly site_id: string;
+  readonly intended_user_id: string;
+  readonly enrollment_request_id: string;
+  readonly challenge_id: string;
+  readonly nonce: string;
+}): DevicePossessionChallengeReplayIdentity {
+  return {
+    organisation_id: input.organisation_id,
+    site_id: input.site_id,
+    intended_user_id: input.intended_user_id,
+    enrollment_request_id: input.enrollment_request_id,
+    challenge_id: input.challenge_id,
+    nonce: input.nonce,
+  };
+}
+
+/** C11-01: canonical JSON, never a delimiter join — a value containing the delimiter would forge another tuple. */
+export function devicePossessionChallengeReplayKey(input: Parameters<typeof devicePossessionChallengeReplayIdentity>[0]): string {
+  return canonicalDeviceJson({
+    domain: DEVICE_POSSESSION_CHALLENGE_REPLAY_IDENTITY_DOMAIN,
+    ...devicePossessionChallengeReplayIdentity(input),
+  });
+}
+
+export interface DeviceBootstrapGrantReplayIdentity {
+  readonly organisation_id: string;
+  readonly site_id: string;
+  readonly intended_user_id: string;
+  readonly grant_id: string;
+}
+
+/** D23-04's `single_use: true` given a mechanism instead of a promise. */
+export function deviceBootstrapGrantReplayIdentity(grant: {
+  readonly organisation_id: string;
+  readonly site_id: string;
+  readonly intended_user_id: string;
+  readonly grant_id: string;
+}): DeviceBootstrapGrantReplayIdentity {
+  return {
+    organisation_id: grant.organisation_id,
+    site_id: grant.site_id,
+    intended_user_id: grant.intended_user_id,
+    grant_id: grant.grant_id,
+  };
+}
+
+export function deviceBootstrapGrantReplayKey(grant: Parameters<typeof deviceBootstrapGrantReplayIdentity>[0]): string {
+  return canonicalDeviceJson({
+    domain: DEVICE_BOOTSTRAP_GRANT_REPLAY_IDENTITY_DOMAIN,
+    ...deviceBootstrapGrantReplayIdentity(grant),
+  });
+}
+
 /**
  * D23-01/D23-02: the two lists that must never be joined.
  *
@@ -402,8 +826,19 @@ export type DeviceAttestationEvidence = z.infer<typeof DeviceAttestationEvidence
  * INELIGIBLE        provider unavailable and there is NO prior verified result
  *                   to ride on. A device in this state has never been vouched
  *                   for and cannot become TRUSTED on an outage.
+ * INCONSISTENT      the recorded times do not describe a possible history —
+ *                   an unparseable instant, or a "last verified" that has not
+ *                   happened yet (C15-07). Fail-closed: it is not evidence of
+ *                   anything, so it vouches for nothing.
  */
-export const DeviceAttestationStandingSchema = z.enum(['CURRENT', 'LAST_KNOWN_GOOD', 'EXPIRED', 'NEGATIVE', 'INELIGIBLE']);
+export const DeviceAttestationStandingSchema = z.enum([
+  'CURRENT',
+  'LAST_KNOWN_GOOD',
+  'EXPIRED',
+  'NEGATIVE',
+  'INELIGIBLE',
+  'INCONSISTENT',
+]);
 export type DeviceAttestationStanding = z.infer<typeof DeviceAttestationStandingSchema>;
 
 export interface DeviceAttestationStandingInput {
@@ -441,14 +876,31 @@ export function evaluateAttestationStanding(input: DeviceAttestationStandingInpu
   if (!input.hasPriorVerified || input.lastVerifiedAt === null) {
     return { standing: 'INELIGIBLE', lastKnownGoodAgeMs: null };
   }
-  const ageMs = epochMs(input.now) - epochMs(input.lastVerifiedAt);
-  // A server-recorded verification cannot legitimately be in the future; if the
-  // clocks disagree we treat the result as fresh rather than inventing an age.
-  const effectiveAgeMs = ageMs < 0 ? 0 : ageMs;
-  if (effectiveAgeMs > DEVICE_ATTESTATION_UNAVAILABLE_GRACE_MS) {
-    return { standing: 'EXPIRED', lastKnownGoodAgeMs: effectiveAgeMs };
+
+  const instants = parseAuthoritativeInstants({ now: input.now, lastVerified: input.lastVerifiedAt });
+  if (instants === null) return { standing: 'INCONSISTENT', lastKnownGoodAgeMs: null };
+
+  const ageMs = instants.now - instants.lastVerified;
+  // C15-07: A SERVER-RECORDED VERIFICATION IN THE FUTURE IS NOT FRESH EVIDENCE.
+  //
+  // This used to clamp a negative age to zero, which read a future timestamp as
+  // "verified just now" and handed the device the freshest possible
+  // last-known-good standing. That is backwards: the one situation in which a
+  // future `lastVerifiedAt` appears is a clock nobody controls or a record
+  // somebody wrote — precisely when the value should count for LESS, not more.
+  // An impossible history is named as such and vouches for nothing.
+  if (ageMs < 0) return { standing: 'INCONSISTENT', lastKnownGoodAgeMs: null };
+
+  // C15-07's exclusive-boundary rule is about `expires_at` — an INSTANT after
+  // which a thing is dead. This is the documented exception it allows: the
+  // grace is a MAXIMUM AGE, the same kind of ceiling as the lifetime bounds
+  // above, and those are inclusive ("must not exceed"). A result exactly as old
+  // as the grace has not exceeded it. Treating one boundary as an instant and
+  // its sibling as a budget is the only way both read consistently.
+  if (ageMs > DEVICE_ATTESTATION_UNAVAILABLE_GRACE_MS) {
+    return { standing: 'EXPIRED', lastKnownGoodAgeMs: ageMs };
   }
-  return { standing: 'LAST_KNOWN_GOOD', lastKnownGoodAgeMs: effectiveAgeMs };
+  return { standing: 'LAST_KNOWN_GOOD', lastKnownGoodAgeMs: ageMs };
 }
 
 /**
@@ -457,7 +909,8 @@ export function evaluateAttestationStanding(input: DeviceAttestationStandingInpu
  * EXPIRED cannot: the grace is over and W21-05 requires TRUSTED to fire
  * Whisper, so a device we can no longer vouch for falls back to the loud
  * channels. INELIGIBLE cannot: a first enrollment during an outage has never
- * been verified at all (C14-05).
+ * been verified at all (C14-05). INCONSISTENT cannot: a record that does not
+ * describe a possible history is not evidence (C15-07).
  */
 export function attestationStandingPermitsTrusted(standing: DeviceAttestationStanding): boolean {
   return standing === 'CURRENT' || standing === 'LAST_KNOWN_GOOD';
@@ -540,32 +993,29 @@ export const DeviceEnrollmentBootstrapGrantSchema = z
   })
   .strict()
   .superRefine((value, context) => {
-    const issued = epochMs(value.issued_at);
-    const expires = epochMs(value.expires_at);
-    if (!(expires > issued)) {
-      context.addIssue({ code: z.ZodIssueCode.custom, path: ['expires_at'], message: 'expires_at must be after issued_at' });
-    } else if (expires - issued > DEVICE_ENROLLMENT_BOOTSTRAP_MAX_AGE_MS) {
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['expires_at'],
-        message: `bootstrap grant lifetime must not exceed ${DEVICE_ENROLLMENT_BOOTSTRAP_MAX_AGE_MS} ms`,
-      });
-    }
+    refineDeviceInstantWindow(value, context, DEVICE_ENROLLMENT_BOOTSTRAP_MAX_AGE_MS, 'bootstrap grant');
   });
 export type DeviceEnrollmentBootstrapGrant = z.infer<typeof DeviceEnrollmentBootstrapGrantSchema>;
 
-export const DeviceBootstrapGrantStandingSchema = z.enum(['USABLE', 'EXPIRED', 'CONSUMED', 'REVOKED']);
+export const DeviceBootstrapGrantStandingSchema = z.enum(['USABLE', 'EXPIRED', 'CONSUMED', 'REVOKED', DEVICE_TIME_NOT_AUTHORITATIVE]);
 export type DeviceBootstrapGrantStanding = z.infer<typeof DeviceBootstrapGrantStandingSchema>;
 
 /**
  * Revoked and consumed are checked BEFORE expiry so a burned grant reads as
  * burned rather than as merely old — the audit distinction matters when the
  * second use is an attacker's.
+ *
+ * C15-07: the expiry boundary is EXCLUSIVE (`now >= expires_at` is expired) and
+ * an unreadable clock is `TIME_NOT_AUTHORITATIVE`, which is not `USABLE` — so
+ * the commit gate's `!== 'USABLE'` test refuses it without needing to know
+ * about it.
  */
 export function classifyDeviceBootstrapGrant(grant: DeviceEnrollmentBootstrapGrant, now: string): DeviceBootstrapGrantStanding {
   if (grant.revoked_at !== null) return 'REVOKED';
   if (grant.consumed_at !== null) return 'CONSUMED';
-  if (epochMs(now) > epochMs(grant.expires_at)) return 'EXPIRED';
+  const instants = parseAuthoritativeInstants({ now, expires: grant.expires_at });
+  if (instants === null) return DEVICE_TIME_NOT_AUTHORITATIVE;
+  if (isExpiredAt(instants.now, instants.expires)) return 'EXPIRED';
   return 'USABLE';
 }
 
@@ -609,24 +1059,63 @@ export const DeviceEnrollmentRequestSchema = z
     intended_user_id: scopedId,
     bootstrap_grant_id: scopedId,
     custody: DeviceCustodySchema,
-    signature_profile: DeviceSignatureProfileSchema,
+    /**
+     * C15-01: A CLAIM, NOT AN AUTHORITY.
+     *
+     * The device says which profile it believes it used. The server decides
+     * which profile is in force, and the two are equality-bound before any
+     * verification. The name says so, so no future caller can mistake this for
+     * the profile that selects a verifier.
+     */
+    claimed_signature_profile: DeviceSignatureProfileSchema,
     key_storage: DeviceKeyStorageSchema,
-    /** SHA-256 over the canonical SPKI encoding of the PUBLIC key. */
+    /**
+     * C15-02: the ACTUAL key, in the one canonical representation. Without it
+     * the registry could recognise this device and never verify it.
+     */
+    public_key: DeviceP256PublicKeySchema,
+    /** Convenience name for the key. Refused unless it equals the DERIVED digest. */
     public_key_thumbprint: DeviceDigestSchema,
     attestation: DeviceAttestationEvidenceSchema,
     requested_at: timestamp,
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    if (!deviceKeyThumbprintMatches(value.public_key, value.public_key_thumbprint)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['public_key_thumbprint'],
+        message: 'public_key_thumbprint must equal the digest derived from public_key',
+      });
+    }
+  });
 export type DeviceEnrollmentRequest = z.infer<typeof DeviceEnrollmentRequestSchema>;
 
 /**
- * C14-02: the digest an approval binds to.
+ * C15-03: THE APPROVAL BINDS THE WHOLE REQUEST.
  *
- * Every field that distinguishes one enrollment from another is inside the
- * digest — including the public-key thumbprint, which is what makes an
- * attacker's substituted key visible. Approving a device CLASS, a site, or a
- * time window would leave the attacker's request satisfying the same approval;
- * approving THIS digest does not.
+ * This digest used to bind `attestation.outcome` alone, which meant two
+ * MATERIALLY DIFFERENT evidence records — a different `attestation_reference`,
+ * or the same outcome evaluated at a different time — produced the SAME
+ * fingerprint. A human approving "VERIFIED at 09:00, reference A" was
+ * therefore also approving "VERIFIED at 03:00, reference B", including a stale
+ * or borrowed evaluation the approver never saw. That is C14-02's own attack
+ * surviving inside the field C14-02 did not descend into.
+ *
+ * So the WHOLE evidence object goes in, spread rather than field-picked. The
+ * spread is load-bearing: `DeviceAttestationEvidenceSchema` is `.strict()`, so
+ * the object holds exactly its declared fields, and any field added to it in
+ * future is bound automatically instead of being silently left outside the
+ * approval. `canonicalDeviceJson` sorts keys recursively, so nesting does not
+ * make the digest order-dependent.
+ *
+ * The canonical public key is bound as well as its thumbprint (C15-02) — the
+ * key is what the enrollment is ABOUT, and binding only a digest of it would
+ * make the approval depend on a value nobody recomputed.
+ *
+ * `claimed_signature_profile` is bound as the CLAIM it is (C15-01): the
+ * approval covers what the device asserted, and the server's own selected
+ * profile is bound separately in the possession statement and the commit gate.
  */
 export function deviceEnrollmentRequestFingerprint(request: DeviceEnrollmentRequest): string {
   return deviceCanonicalDigest({
@@ -638,10 +1127,11 @@ export function deviceEnrollmentRequestFingerprint(request: DeviceEnrollmentRequ
     intended_user_id: request.intended_user_id,
     bootstrap_grant_id: request.bootstrap_grant_id,
     custody: request.custody,
-    signature_profile: request.signature_profile,
+    claimed_signature_profile: request.claimed_signature_profile,
     key_storage: request.key_storage,
+    public_key: request.public_key,
     public_key_thumbprint: request.public_key_thumbprint,
-    attestation_outcome: request.attestation.outcome,
+    attestation: { ...request.attestation },
     requested_at: request.requested_at,
   });
 }
@@ -703,17 +1193,7 @@ export const DevicePossessionChallengeSchema = z
   })
   .strict()
   .superRefine((value, context) => {
-    const issued = epochMs(value.issued_at);
-    const expires = epochMs(value.expires_at);
-    if (!(expires > issued)) {
-      context.addIssue({ code: z.ZodIssueCode.custom, path: ['expires_at'], message: 'expires_at must be after issued_at' });
-    } else if (expires - issued > DEVICE_POSSESSION_CHALLENGE_MAX_AGE_MS) {
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['expires_at'],
-        message: `possession challenge lifetime must not exceed ${DEVICE_POSSESSION_CHALLENGE_MAX_AGE_MS} ms`,
-      });
-    }
+    refineDeviceInstantWindow(value, context, DEVICE_POSSESSION_CHALLENGE_MAX_AGE_MS, 'possession challenge');
   });
 export type DevicePossessionChallenge = z.infer<typeof DevicePossessionChallengeSchema>;
 
@@ -722,9 +1202,19 @@ export const DevicePossessionResponseSchema = z
     schema_version: z.literal(1),
     challenge_id: scopedId,
     enrollment_request_id: scopedId,
-    signature_profile: DeviceSignatureProfileSchema,
-    /** Canonical P-256 form; refused before any verifier is entered (C14-01). */
+    /** C15-01: a non-authoritative claim, equality-bound to the server's profile. */
+    claimed_signature_profile: DeviceSignatureProfileSchema,
+    /**
+     * C15-01: `DeviceSignatureSchema` now runs the full canonical decode, so a
+     * high-S, zero-scalar, wrong-length or non-canonical signature cannot exist
+     * inside a parsed response at all.
+     */
     signature: DeviceSignatureSchema,
+    /**
+     * CLIENT TELEMETRY. C15-03: freshness is judged on the SERVER's verification
+     * instant (`DevicePossessionVerificationResult.verified_at`), never on this.
+     * It is retained only so a device's own claim can be recorded and compared.
+     */
     answered_at: timestamp,
   })
   .strict();
@@ -736,6 +1226,15 @@ export interface DevicePossessionStatementInput {
   readonly enrollment_request_fingerprint: string;
   readonly nonce: string;
   readonly public_key_thumbprint: string;
+  /**
+   * C15-01: THE SERVER'S SELECTED PROFILE, never the device's claim.
+   *
+   * It is bound into the signed bytes so the statement means "signed under the
+   * profile the platform chose". A statement binding the client's field would
+   * let a device sign under one profile while the server verified under
+   * another, and the signature would still be over bytes both agreed on.
+   */
+  readonly signature_profile: DeviceSignatureProfile;
 }
 
 /**
@@ -755,12 +1254,53 @@ export function canonicalDevicePossessionStatement(input: DevicePossessionStatem
     enrollment_request_fingerprint: input.enrollment_request_fingerprint,
     nonce: input.nonce,
     public_key_thumbprint: input.public_key_thumbprint,
+    signature_profile: input.signature_profile,
   });
 }
 
 export function devicePossessionStatementFingerprint(input: DevicePossessionStatementInput): string {
   return sha256Hex(canonicalDevicePossessionStatement(input));
 }
+
+/**
+ * C15-03: PROOF OF POSSESSION IS A BOUND SERVER VERDICT, NOT A BOOLEAN.
+ *
+ * The commit gate used to take `possessionVerified: boolean` plus a
+ * device-supplied `possessionAnsweredAt`. A bare `true` says nothing about
+ * WHICH challenge, WHICH key or WHICH statement it was produced for, so a
+ * genuine `true` from one ceremony could be handed to another — and the
+ * freshness it was judged on came from the device.
+ *
+ * This structure makes that borrowing impossible. Every field the verdict
+ * depended on travels WITH the verdict, and the commit gate checks each one
+ * equals the corresponding approved value. A verification result for a
+ * different challenge, a different key or different bytes is then visibly a
+ * result about something else, rather than an indistinguishable `true`.
+ *
+ * `source` is a literal and there is no device-populatable field: this is
+ * Sentinel's own verdict about Sentinel's own check.
+ */
+export const DevicePossessionVerificationResultSchema = z
+  .object({
+    schema_version: z.literal(1),
+    source: z.literal('SENTINEL_SERVER_VERIFICATION'),
+    /** The server's answer. `false` is a real, recordable verdict. */
+    verified: z.boolean(),
+    challenge_id: scopedId,
+    enrollment_request_id: scopedId,
+    /** The fingerprint of the request this verdict was produced against. */
+    enrollment_request_fingerprint: DeviceDigestSchema,
+    /** The APPROVED key's identity, so a verdict for another key cannot be borrowed. */
+    public_key_thumbprint: DeviceDigestSchema,
+    /** The exact canonical possession statement the signature was checked over. */
+    possession_statement_fingerprint: DeviceDigestSchema,
+    /** The SERVER-selected profile the check ran under (C15-01). */
+    signature_profile: DeviceSignatureProfileSchema,
+    /** THE SERVER'S verification instant. This, and not `answered_at`, is freshness. */
+    verified_at: timestamp,
+  })
+  .strict();
+export type DevicePossessionVerificationResult = z.infer<typeof DevicePossessionVerificationResultSchema>;
 
 // ---------------------------------------------------------------------------
 // The enrollment commit gate (C14-02)
@@ -782,15 +1322,41 @@ export const DeviceEnrollmentRefusalSchema = z.enum([
   'BOOTSTRAP_GRANT_MISSING',
   'BOOTSTRAP_GRANT_UNUSABLE',
   'BOOTSTRAP_SCOPE_MISMATCH',
+  /** C15-05: the grant's one-shot identity was presented again with new meaning. */
+  'BOOTSTRAP_GRANT_REUSED',
+  /** C15-05: the consumption fact handed in is about some other grant. */
+  'BOOTSTRAP_CONSUMPTION_MISBOUND',
   'REQUEST_EXPIRED',
+  /** C15-07: the request claims to have been made in the future. */
+  'REQUEST_NOT_YET_MADE',
   'APPROVAL_MISSING',
   'APPROVAL_FINGERPRINT_MISMATCH',
+  /** C15-07: the approval claims to have happened in the future. */
+  'APPROVAL_NOT_YET_MADE',
   'USER_NOT_AUTHENTICATED',
   'USER_NOT_INTENDED',
   'CHALLENGE_MISSING',
   'CHALLENGE_MISBOUND',
   'CHALLENGE_EXPIRED',
+  /** C15-07: the challenge claims to have been issued in the future. */
+  'CHALLENGE_NOT_YET_ISSUED',
+  /** C15-05: the challenge's one-shot identity was presented again with new meaning. */
+  'CHALLENGE_REUSED',
+  /** C15-05: the consumption fact handed in is about some other challenge. */
+  'CHALLENGE_CONSUMPTION_MISBOUND',
   'POSSESSION_NOT_PROVEN',
+  /** C15-03: no server verdict at all. A missing verdict is never a passing one. */
+  'POSSESSION_VERIFICATION_MISSING',
+  /** C15-03: a genuine verdict, produced for a DIFFERENT ceremony. */
+  'POSSESSION_VERIFICATION_MISBOUND',
+  /** C15-03: the verdict covered different bytes than this request's statement. */
+  'POSSESSION_STATEMENT_MISMATCH',
+  /** C15-01/C15-03: the verdict ran under a profile the server did not select. */
+  'POSSESSION_PROFILE_MISMATCH',
+  /** C15-01: the request's claimed profile is not the server-selected one. */
+  'SIGNATURE_PROFILE_CLAIM_MISMATCH',
+  /** C15-07: an instant this decision depends on is unreadable. */
+  DEVICE_TIME_NOT_AUTHORITATIVE,
 ]);
 export type DeviceEnrollmentRefusal = z.infer<typeof DeviceEnrollmentRefusalSchema>;
 
@@ -802,11 +1368,25 @@ export interface DeviceEnrollmentCommitInput {
   readonly approval: DeviceEnrollmentApproval | null;
   readonly challenge: DevicePossessionChallenge | null;
   /**
-   * The SERVER's cryptographic verdict on the challenge response, checked
-   * against the public key IN THE APPROVED REQUEST. Never a device claim.
+   * C15-03: the SERVER's verdict, carrying everything it was bound to. `null`
+   * models "the server never checked", which refuses — a missing verdict is
+   * never a passing one.
    */
-  readonly possessionVerified: boolean;
-  readonly possessionAnsweredAt: string | null;
+  readonly possessionVerification: DevicePossessionVerificationResult | null;
+  /**
+   * C15-01: the profile the SERVER selected for this enrollment. The request's
+   * `claimed_signature_profile` is equality-bound to it, and the possession
+   * statement binds it rather than the claim.
+   */
+  readonly serverSelectedSignatureProfile: DeviceSignatureProfile;
+  /**
+   * C15-05: the store's report on the bootstrap grant's one-shot identity.
+   * REQUIRED — there is no default, because an evaluator that can be called
+   * without it admits a replayed grant whenever a caller forgets.
+   */
+  readonly grantConsumption: DeviceNonceConsumption;
+  /** C15-05: the store's report on the possession challenge's one-shot identity. */
+  readonly challengeConsumption: DeviceNonceConsumption;
   /**
    * Who is authenticated RIGHT NOW, from the session — deliberately a separate
    * input from `request.intended_user_id`, because provenance is not identity.
@@ -818,6 +1398,11 @@ export interface DeviceEnrollmentCommitInput {
 
 export type DeviceEnrollmentCommitDecision =
   | { readonly decision: 'COMMIT'; readonly enrollment_request_fingerprint: string }
+  /**
+   * C15-05: a byte-identical retry of one ceremony. It causes NO second
+   * enrollment; the caller converges on the outcome already recorded.
+   */
+  | { readonly decision: 'CONVERGE'; readonly enrollment_request_fingerprint: string; readonly stored_outcome_ref: string }
   | { readonly decision: 'REFUSE'; readonly refusal: DeviceEnrollmentRefusal };
 
 /**
@@ -847,17 +1432,46 @@ export type DeviceEnrollmentCommitDecision =
  */
 export function evaluateDeviceEnrollmentCommit(input: DeviceEnrollmentCommitInput): DeviceEnrollmentCommitDecision {
   const { request } = input;
+  const fingerprint = deviceEnrollmentRequestFingerprint(request);
+
+  // 0. C15-01: the server chooses the profile. A request claiming a different
+  //    one is refused here, before anything is verified under either.
+  const profileBinding = bindClaimedSignatureProfile(request.claimed_signature_profile, input.serverSelectedSignatureProfile);
+  if (!profileBinding.bound) return { decision: 'REFUSE', refusal: 'SIGNATURE_PROFILE_CLAIM_MISMATCH' };
 
   // 1. The grant.
   if (input.grant === null) return { decision: 'REFUSE', refusal: 'BOOTSTRAP_GRANT_MISSING' };
   if (input.grant.grant_id !== request.bootstrap_grant_id) return { decision: 'REFUSE', refusal: 'BOOTSTRAP_SCOPE_MISMATCH' };
-  if (classifyDeviceBootstrapGrant(input.grant, input.now) !== 'USABLE') {
-    return { decision: 'REFUSE', refusal: 'BOOTSTRAP_GRANT_UNUSABLE' };
-  }
+  const grantStanding = classifyDeviceBootstrapGrant(input.grant, input.now);
+  // C15-07: an unreadable clock is named as such rather than being reported as
+  // a property of the grant — the grant is fine; our clock is not.
+  if (grantStanding === DEVICE_TIME_NOT_AUTHORITATIVE) return { decision: 'REFUSE', refusal: DEVICE_TIME_NOT_AUTHORITATIVE };
+  if (grantStanding !== 'USABLE') return { decision: 'REFUSE', refusal: 'BOOTSTRAP_GRANT_UNUSABLE' };
   if (!bootstrapGrantMatchesScope(input.grant, request)) return { decision: 'REFUSE', refusal: 'BOOTSTRAP_SCOPE_MISMATCH' };
 
-  // The request itself must still be live.
-  const requestAgeMs = epochMs(input.now) - epochMs(request.requested_at);
+  // C15-05: D23-04's `single_use: true` enforced rather than promised. The fact
+  //   must be ABOUT this grant, and reuse under new meaning is a conflict.
+  const grantReplayKey = deviceBootstrapGrantReplayKey({
+    organisation_id: input.grant.organisation_id,
+    site_id: input.grant.site_id,
+    intended_user_id: input.grant.intended_user_id,
+    grant_id: input.grant.grant_id,
+  });
+  if (input.grantConsumption.replay_key !== grantReplayKey || input.grantConsumption.statement_fingerprint !== fingerprint) {
+    return { decision: 'REFUSE', refusal: 'BOOTSTRAP_CONSUMPTION_MISBOUND' };
+  }
+  if (input.grantConsumption.outcome === 'REUSED_WITH_CHANGED_SEMANTICS') {
+    return { decision: 'REFUSE', refusal: 'BOOTSTRAP_GRANT_REUSED' };
+  }
+
+  // C15-07: every instant this decision turns on, parsed once, fail-closed.
+  const instants = parseAuthoritativeInstants({ now: input.now, requested: request.requested_at });
+  if (instants === null) return { decision: 'REFUSE', refusal: DEVICE_TIME_NOT_AUTHORITATIVE };
+
+  // The request itself must still be live — and must not claim to come from the
+  // future, which would otherwise buy an attacker an arbitrarily long window.
+  const requestAgeMs = instants.now - instants.requested;
+  if (requestAgeMs < 0) return { decision: 'REFUSE', refusal: 'REQUEST_NOT_YET_MADE' };
   if (requestAgeMs > DEVICE_ENROLLMENT_REQUEST_MAX_AGE_MS) return { decision: 'REFUSE', refusal: 'REQUEST_EXPIRED' };
 
   // 2. The approval, bound to the exact request fingerprint.
@@ -865,6 +1479,9 @@ export function evaluateDeviceEnrollmentCommit(input: DeviceEnrollmentCommitInpu
   if (!approvalMatchesEnrollmentRequest(input.approval, request)) {
     return { decision: 'REFUSE', refusal: 'APPROVAL_FINGERPRINT_MISMATCH' };
   }
+  const approvalInstants = parseAuthoritativeInstants({ approved: input.approval.approved_at });
+  if (approvalInstants === null) return { decision: 'REFUSE', refusal: DEVICE_TIME_NOT_AUTHORITATIVE };
+  if (approvalInstants.approved > instants.now) return { decision: 'REFUSE', refusal: 'APPROVAL_NOT_YET_MADE' };
 
   // 3. The intended user, authenticated now.
   if (input.authenticatedUserId === null) return { decision: 'REFUSE', refusal: 'USER_NOT_AUTHENTICATED' };
@@ -875,24 +1492,106 @@ export function evaluateDeviceEnrollmentCommit(input: DeviceEnrollmentCommitInpu
   if (input.challenge.enrollment_request_id !== request.enrollment_request_id) {
     return { decision: 'REFUSE', refusal: 'CHALLENGE_MISBOUND' };
   }
-  if (input.possessionAnsweredAt === null) return { decision: 'REFUSE', refusal: 'POSSESSION_NOT_PROVEN' };
-  const answeredAt = epochMs(input.possessionAnsweredAt);
-  if (answeredAt > epochMs(input.challenge.expires_at) || answeredAt < epochMs(input.challenge.issued_at)) {
-    return { decision: 'REFUSE', refusal: 'CHALLENGE_EXPIRED' };
-  }
-  if (!input.possessionVerified) return { decision: 'REFUSE', refusal: 'POSSESSION_NOT_PROVEN' };
 
-  return { decision: 'COMMIT', enrollment_request_fingerprint: deviceEnrollmentRequestFingerprint(request) };
+  // C15-05: the challenge is one-shot too.
+  const challengeReplayKey = devicePossessionChallengeReplayKey({
+    organisation_id: request.organisation_id,
+    site_id: request.site_id,
+    intended_user_id: request.intended_user_id,
+    enrollment_request_id: request.enrollment_request_id,
+    challenge_id: input.challenge.challenge_id,
+    nonce: input.challenge.nonce,
+  });
+  if (input.challengeConsumption.replay_key !== challengeReplayKey || input.challengeConsumption.statement_fingerprint !== fingerprint) {
+    return { decision: 'REFUSE', refusal: 'CHALLENGE_CONSUMPTION_MISBOUND' };
+  }
+  if (input.challengeConsumption.outcome === 'REUSED_WITH_CHANGED_SEMANTICS') {
+    return { decision: 'REFUSE', refusal: 'CHALLENGE_REUSED' };
+  }
+
+  // 5. C15-03: the server's possession verdict, bound to THIS ceremony.
+  const verification = input.possessionVerification;
+  if (verification === null) return { decision: 'REFUSE', refusal: 'POSSESSION_VERIFICATION_MISSING' };
+  // Identity first: a genuine `verified: true` produced for a different
+  // challenge, a different request or a different key is a result about
+  // something else, and must not be borrowable.
+  if (
+    verification.challenge_id !== input.challenge.challenge_id ||
+    verification.enrollment_request_id !== request.enrollment_request_id ||
+    verification.enrollment_request_fingerprint !== fingerprint ||
+    verification.public_key_thumbprint !== request.public_key_thumbprint
+  ) {
+    return { decision: 'REFUSE', refusal: 'POSSESSION_VERIFICATION_MISBOUND' };
+  }
+  // The verdict must have covered exactly the bytes this ceremony defines.
+  const expectedStatementFingerprint = devicePossessionStatementFingerprint({
+    challenge_id: input.challenge.challenge_id,
+    enrollment_request_id: request.enrollment_request_id,
+    enrollment_request_fingerprint: fingerprint,
+    nonce: input.challenge.nonce,
+    public_key_thumbprint: request.public_key_thumbprint,
+    signature_profile: profileBinding.profile,
+  });
+  if (verification.possession_statement_fingerprint !== expectedStatementFingerprint) {
+    return { decision: 'REFUSE', refusal: 'POSSESSION_STATEMENT_MISMATCH' };
+  }
+  if (verification.signature_profile !== profileBinding.profile) {
+    return { decision: 'REFUSE', refusal: 'POSSESSION_PROFILE_MISMATCH' };
+  }
+
+  // C15-03/C15-07: freshness on the SERVER's verification instant, judged
+  // against the challenge window. `answered_at` — the device's claim — is not
+  // read anywhere in this function.
+  const window = parseAuthoritativeInstants({
+    verified: verification.verified_at,
+    issued: input.challenge.issued_at,
+    expires: input.challenge.expires_at,
+  });
+  if (window === null) return { decision: 'REFUSE', refusal: DEVICE_TIME_NOT_AUTHORITATIVE };
+  if (window.issued > instants.now) return { decision: 'REFUSE', refusal: 'CHALLENGE_NOT_YET_ISSUED' };
+  // Verification cannot precede the issuance of the thing it verified.
+  if (window.verified < window.issued) return { decision: 'REFUSE', refusal: 'CHALLENGE_NOT_YET_ISSUED' };
+  if (isExpiredAt(window.verified, window.expires)) return { decision: 'REFUSE', refusal: 'CHALLENGE_EXPIRED' };
+
+  if (!verification.verified) return { decision: 'REFUSE', refusal: 'POSSESSION_NOT_PROVEN' };
+
+  // C15-05: an exact retry converges on what already happened rather than
+  // enrolling a second device off one ceremony.
+  if (input.challengeConsumption.outcome === 'EXACT_DUPLICATE' || input.grantConsumption.outcome === 'EXACT_DUPLICATE') {
+    const storedOutcomeRef = input.challengeConsumption.stored_outcome_ref ?? input.grantConsumption.stored_outcome_ref;
+    if (storedOutcomeRef !== null) {
+      return { decision: 'CONVERGE', enrollment_request_fingerprint: fingerprint, stored_outcome_ref: storedOutcomeRef };
+    }
+  }
+
+  return { decision: 'COMMIT', enrollment_request_fingerprint: fingerprint };
 }
 
 /**
- * D23-03 + C14-05: what trust a freshly committed enrollment starts at.
+ * D23-03 + C14-05 + C15-08: what trust a freshly committed enrollment starts at.
  *
- * TRUSTED requires BOTH a hardware-backed key and a currently verified
+ * TRUSTED requires BOTH a hardware-backed key and a CURRENT verified
  * attestation. A first enrollment during a provider outage has no prior
  * verified result to ride, so its standing is INELIGIBLE and it starts
  * DEGRADED — it can operate every ordinary path and simply cannot fire Whisper
  * until verification returns.
+ *
+ * C15-08: LAST_KNOWN_GOOD IS NOT AN INHERITANCE.
+ *
+ * This used to accept LAST_KNOWN_GOOD, reasoning that "a re-enrollment during
+ * an outage should behave like a live device". It should not. D23-09 is
+ * explicit that a re-enrollment produces a NEW IDENTITY — new device_id, new
+ * key, fresh sequence namespace — and last-known-good is precisely a statement
+ * of CONTINUITY: it says "this device was verified before, and the provider is
+ * merely unreachable now". A new identity has no "before". Admitting
+ * LAST_KNOWN_GOOD here let a brand-new identity, created during an outage,
+ * inherit the standing the OLD identity earned and start life TRUSTED — the
+ * fastest route to a Whisper-capable credential being a wipe and re-enrol
+ * while the attestation provider happens to be down.
+ *
+ * LAST_KNOWN_GOOD still supports the continuity of an ALREADY-ESTABLISHED
+ * identity: `evaluateDeviceTrustTransition` accepts it, because there the
+ * device being vouched for is the same device that earned the result.
  */
 export function initialDeviceTrustOnEnrollment(input: {
   readonly keyStorage: DeviceKeyStorage;
@@ -900,10 +1599,7 @@ export function initialDeviceTrustOnEnrollment(input: {
 }): DeviceTrust {
   if (input.attestationStanding === 'NEGATIVE') return 'QUARANTINED';
   if (!deviceKeyStoragePermitsTrusted(input.keyStorage)) return 'DEGRADED';
-  // LAST_KNOWN_GOOD cannot occur on a FIRST enrollment (there is no prior
-  // verified result), but it is admitted here so a re-enrollment during a
-  // provider outage behaves the same way a live device does.
-  return attestationStandingPermitsTrusted(input.attestationStanding) ? 'TRUSTED' : 'DEGRADED';
+  return input.attestationStanding === 'CURRENT' ? 'TRUSTED' : 'DEGRADED';
 }
 
 // ---------------------------------------------------------------------------
@@ -946,8 +1642,103 @@ export const DeviceIdentitySchema = z
     enrolled_at: timestamp,
     revoked_at: timestamp.nullable(),
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    // C15-08: DERIVED MEANS DERIVED.
+    //
+    // "Derived, never supplied" was a comment on a field that accepted any
+    // string, so an arbitrary namespace could be written straight into an
+    // identity — which is exactly the sequence-namespace reset D23-09 says does
+    // not exist, arriving through the front door rather than through
+    // `classifyDeviceKeyChange`. The contract now recomputes it and refuses.
+    const derived = deviceSequenceNamespaceId(value);
+    if (value.sequence_namespace_id !== derived) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['sequence_namespace_id'],
+        message: 'sequence_namespace_id must equal the value derived from organisation_id and device_id',
+      });
+    }
+    // C15-08 / D23-03: an impossible combination must fail to PARSE, not merely
+    // fail a later check. A TRUSTED credential on a software-backed key is the
+    // state D23-03 exists to forbid; if it can be constructed it will
+    // eventually be constructed.
+    if (value.trust === 'TRUSTED' && !deviceKeyStoragePermitsTrusted(value.key.key_storage)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['trust'],
+        message: 'a TRUSTED identity requires a hardware-backed key (D23-03)',
+      });
+    }
+  });
 export type DeviceIdentity = z.infer<typeof DeviceIdentitySchema>;
+
+/**
+ * C15-08: THE CUSTODY ASSOCIATION, AS A CONTRACT.
+ *
+ * WP-23 stated the custody rules in prose and left WP-24 to invent the shape it
+ * would persist. Prose does not constrain a migration. This locks it: which
+ * human a PERSONAL device is assigned to, which named régime governs a
+ * CONTROLLED_SHARED one, and which sites the device is bound to.
+ *
+ * The two custody modes have MUTUALLY EXCLUSIVE shapes, enforced rather than
+ * described. A PERSONAL device names its operative and no régime; a
+ * CONTROLLED_SHARED device names its régime and no single operative — because a
+ * shared device with a permanent assignee is the fusion of custody into
+ * identity that C14-02 forbids, and a personal device under a shared régime is
+ * an accountability gap wearing a policy's name.
+ *
+ * NONE OF THIS IS LIVE AUTHORITY. The association records who the device is FOR
+ * and where it belongs; every authorisation question is still answered from the
+ * current session and current entitlement (C14-02, C15-04).
+ */
+export const DeviceCustodyAssociationSchema = z
+  .object({
+    schema_version: z.literal(1),
+    organisation_id: scopedId,
+    device_id: scopedId,
+    custody: DeviceCustodySchema,
+    /** PERSONAL only: the operative this device is assigned to. */
+    assigned_user_id: scopedId.nullable(),
+    /** CONTROLLED_SHARED only: the named custody régime governing hand-over. */
+    custody_regime_id: scopedId.nullable(),
+    /** The sites this device is bound to. At least one; a device belongs somewhere. */
+    associated_site_ids: z.array(scopedId).min(1).max(256),
+    associated_at: timestamp,
+    /** Set when the association ends. A released device is bound to nothing. */
+    released_at: timestamp.nullable(),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.custody === 'PERSONAL') {
+      if (value.assigned_user_id === null) {
+        context.addIssue({ code: z.ZodIssueCode.custom, path: ['assigned_user_id'], message: 'a PERSONAL device names the operative it is assigned to' });
+      }
+      if (value.custody_regime_id !== null) {
+        context.addIssue({ code: z.ZodIssueCode.custom, path: ['custody_regime_id'], message: 'a PERSONAL device is not governed by a shared custody régime' });
+      }
+    } else {
+      if (value.assigned_user_id !== null) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['assigned_user_id'],
+          message: 'a CONTROLLED_SHARED device has no permanent assignee (C14-02: custody is not identity)',
+        });
+      }
+      if (value.custody_regime_id === null) {
+        context.addIssue({ code: z.ZodIssueCode.custom, path: ['custody_regime_id'], message: 'a CONTROLLED_SHARED device names the régime governing hand-over' });
+      }
+    }
+    if (new Set(value.associated_site_ids).size !== value.associated_site_ids.length) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ['associated_site_ids'], message: 'associated_site_ids must be unique' });
+    }
+  });
+export type DeviceCustodyAssociation = z.infer<typeof DeviceCustodyAssociationSchema>;
+
+/** Is this device bound to that site, and is the association still live? */
+export function deviceCustodyAssociationBindsSite(association: DeviceCustodyAssociation, site_id: string): boolean {
+  return association.released_at === null && association.associated_site_ids.includes(site_id);
+}
 
 /**
  * C10-03 / D23-09: THERE IS NO SEQUENCE RESET, AND NO CALLER CAN ASK FOR ONE.

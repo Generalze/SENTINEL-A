@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
 
 /**
@@ -16,11 +17,22 @@ import { z } from 'zod';
  *
  * WHAT THIS MODULE IS NOT
  * -----------------------
- * It performs no cryptography. It defines the exact bytes a signature is
- * allowed to be, and refuses everything else *before* any verifier is entered.
- * The actual curve arithmetic belongs to the runtime (WP-25/WP-27) against a
- * key resolved from the server registry by `key_id + key_version` — never an
- * algorithm the client named.
+ * It performs no curve arithmetic. It defines the exact bytes a signature and
+ * a public key are allowed to be, refuses everything else *before* any verifier
+ * is entered, and derives one digest (SHA-256 over canonical key bytes) so a
+ * thumbprint is COMPUTED rather than believed. The actual point arithmetic
+ * belongs to the runtime (WP-25/WP-27) against a key resolved from the server
+ * registry by `key_id + key_version` — never an algorithm the client named.
+ *
+ * C15-01: THE PARSE *IS* THE BOUNDARY
+ * -----------------------------------
+ * `DeviceSignatureSchema` used to check only "86 characters of base64url",
+ * which meant a high-S, zero-scalar, out-of-range or non-round-tripping value
+ * could sit inside a fully parsed `DeviceRequestProof`, possession response,
+ * offline envelope or Edge receipt and be refused only if some later caller
+ * remembered to run the decoder. It no longer can: the schema runs the full
+ * canonical decode and BRANDS its output, so a `CanonicalP256Signature` is a
+ * value that provably decoded. There is one parse boundary and no way past it.
  */
 
 // ---------------------------------------------------------------------------
@@ -44,6 +56,31 @@ export type DeviceSignatureProfile = z.infer<typeof DeviceSignatureProfileSchema
  */
 export function isApprovedDeviceSignatureProfile(value: unknown): value is DeviceSignatureProfile {
   return DeviceSignatureProfileSchema.safeParse(value).success;
+}
+
+/**
+ * C15-01: THE CLIENT DOES NOT CHOOSE THE PROFILE.
+ *
+ * A `signature_profile` field on anything a device submits is a CLAIM, never an
+ * authority — which is why every such field in WP-23 is now named
+ * `claimed_signature_profile`. The authority is the profile recorded on the
+ * server's registry key record for `key_id + key_version` (see
+ * `DeviceRegistryKeyRecordSchema`), and the Edge equivalent for Edge receipts.
+ *
+ * A claim is admissible only when it EQUALS the server-resolved profile. That
+ * equality is checked here, before verification, so a client cannot steer the
+ * verifier and cannot make a signature mean something the registry did not
+ * select. Canonical signed statements bind the value this function RETURNS —
+ * the server's — and never the field the client sent.
+ */
+export type DeviceSignatureProfileBinding =
+  | { readonly bound: true; readonly profile: DeviceSignatureProfile }
+  | { readonly bound: false; readonly refusal: 'PROFILE_NOT_APPROVED' | 'PROFILE_CLAIM_MISMATCH' };
+
+export function bindClaimedSignatureProfile(claimed: unknown, serverResolved: unknown): DeviceSignatureProfileBinding {
+  if (!isApprovedDeviceSignatureProfile(serverResolved)) return { bound: false, refusal: 'PROFILE_NOT_APPROVED' };
+  if (claimed !== serverResolved) return { bound: false, refusal: 'PROFILE_CLAIM_MISMATCH' };
+  return { bound: true, profile: serverResolved };
 }
 
 // ---------------------------------------------------------------------------
@@ -94,13 +131,38 @@ export type DeviceSignatureDecodeResult =
   | { readonly ok: false; readonly rejection: DeviceSignatureRejection };
 
 /**
- * The wire form. Length is pinned here as well as in the decoder so a malformed
- * value is refused by the schema before any decode is attempted.
+ * C15-01: the wire form, and the ONLY way to obtain one.
+ *
+ * The schema runs the full canonical decode — canonical unpadded base64url,
+ * exactly 64 bytes, `1 <= r < n`, `1 <= s <= floor(n/2)` — and brands its
+ * output. The brand is the load-bearing part: `CanonicalP256Signature` is not
+ * "a string that looked right", it is a string that DECODED, and TypeScript
+ * will not let an unparsed string stand in for one. Every signature field in
+ * WP-23 is typed by this schema, so a high-S or malformed value cannot exist
+ * inside a parsed `DeviceRequestProof`, possession response, offline envelope
+ * or Edge receipt at all — the compound parse fails, not some later caller who
+ * remembered to check.
+ *
+ * The rejection reason is attached to the issue for internal audit granularity
+ * and deliberately collapsed at any device-facing surface, for the reason
+ * `DeviceSignatureRejection` already documents: naming the malformation is a
+ * free oracle.
  */
 export const DeviceSignatureSchema = z
   .string()
-  .length(P256_SIGNATURE_BASE64URL_LENGTH)
-  .regex(/^[A-Za-z0-9_-]+$/u, 'signature must be canonical unpadded base64url');
+  .superRefine((value, context) => {
+    const decoded = decodeCanonicalP256Signature(value);
+    if (decoded.ok) return;
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `signature is not a canonical P-256 signature: ${decoded.rejection}`,
+      params: { rejection: decoded.rejection },
+    });
+  })
+  .brand<'CanonicalP256Signature'>();
+
+/** A signature that provably decoded. Only `DeviceSignatureSchema` can mint one. */
+export type CanonicalP256Signature = z.infer<typeof DeviceSignatureSchema>;
 
 // ---------------------------------------------------------------------------
 // Canonical decoding
@@ -193,6 +255,125 @@ export function encodeCanonicalP256Signature(r: bigint, s: bigint): string {
 }
 
 // ---------------------------------------------------------------------------
+// The canonical PUBLIC KEY (C15-02)
+// ---------------------------------------------------------------------------
+
+/**
+ * C15-02: A THUMBPRINT CANNOT VERIFY AN ECDSA SIGNATURE.
+ *
+ * WP-23 shipped `public_key_thumbprint` and nothing else, which is a digest of
+ * a key — enough to recognise a key you already hold, useless for verifying a
+ * signature. A registry that cannot verify is not a registry. So exactly one
+ * representation of a P-256 public key is defined, here, next to the signature
+ * rules and for the same reason: one accepted representation means one byte
+ * identity, and one byte identity means a thumbprint is a stable name.
+ *
+ * The representation is the uncompressed SEC1 point `0x04 || X(32) || Y(32)`,
+ * 65 bytes, canonical unpadded base64url.
+ *
+ * COMPRESSED POINTS, DER/SPKI AND PEM ARE NOT ALTERNATE INPUTS. A compressed
+ * point (`0x02`/`0x03`, 33 bytes) names the SAME key as its uncompressed form
+ * with DIFFERENT bytes, so admitting both would give one key two thumbprints —
+ * and a device could then present whichever one the registry was not looking
+ * for. DER and PEM are worse: both admit several encodings of one key. Each is
+ * refused structurally, by prefix and by length.
+ */
+export const P256_PUBLIC_KEY_UNCOMPRESSED_PREFIX = 0x04;
+export const P256_PUBLIC_KEY_BYTES = 65;
+/** 65 bytes encode to exactly 87 base64url characters with no padding. */
+export const P256_PUBLIC_KEY_BASE64URL_LENGTH = 87;
+
+/** The P-256 field prime. A coordinate is a field element, so it is `< p`. */
+export const P256_FIELD_PRIME = BigInt('0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF');
+
+export const DeviceP256PublicKeyRejectionSchema = z.enum([
+  'ENCODING_NOT_BASE64URL',
+  'ENCODING_PADDED',
+  'ENCODING_NOT_CANONICAL',
+  'WRONG_LENGTH',
+  'NOT_UNCOMPRESSED_POINT',
+  'COORDINATE_OUT_OF_RANGE',
+]);
+export type DeviceP256PublicKeyRejection = z.infer<typeof DeviceP256PublicKeyRejectionSchema>;
+
+export interface DeviceP256PublicKeyPoint {
+  readonly x: bigint;
+  readonly y: bigint;
+  readonly bytes: Uint8Array;
+}
+
+export type DeviceP256PublicKeyDecodeResult =
+  | { readonly ok: true; readonly point: DeviceP256PublicKeyPoint }
+  | { readonly ok: false; readonly rejection: DeviceP256PublicKeyRejection };
+
+/**
+ * Structural only, and safe on untrusted input: no point is put on the curve
+ * here. Whether `(x, y)` actually satisfies the curve equation is the runtime
+ * verifier's job at the moment it imports the key (WP-25/WP-27); what this
+ * decides is whether the bytes are the ONE representation the platform accepts.
+ */
+export function decodeCanonicalP256PublicKey(value: string): DeviceP256PublicKeyDecodeResult {
+  if (value.includes('=')) return { ok: false, rejection: 'ENCODING_PADDED' };
+  if (!/^[A-Za-z0-9_-]*$/u.test(value)) return { ok: false, rejection: 'ENCODING_NOT_BASE64URL' };
+
+  const decoded = Buffer.from(value, 'base64url');
+  if (decoded.toString('base64url') !== value) return { ok: false, rejection: 'ENCODING_NOT_CANONICAL' };
+  // Length is checked before the prefix so a 33-byte compressed point and a DER
+  // blob both die here rather than being half-interpreted.
+  if (decoded.byteLength !== P256_PUBLIC_KEY_BYTES) return { ok: false, rejection: 'WRONG_LENGTH' };
+
+  const bytes = new Uint8Array(decoded);
+  if (bytes[0] !== P256_PUBLIC_KEY_UNCOMPRESSED_PREFIX) return { ok: false, rejection: 'NOT_UNCOMPRESSED_POINT' };
+
+  const x = bytesToBigInt(bytes.subarray(1, 1 + P256_SCALAR_BYTES));
+  const y = bytesToBigInt(bytes.subarray(1 + P256_SCALAR_BYTES));
+  if (x >= P256_FIELD_PRIME || y >= P256_FIELD_PRIME) return { ok: false, rejection: 'COORDINATE_OUT_OF_RANGE' };
+  // The point at infinity has no uncompressed encoding and (0, 0) is not on the
+  // curve; refusing it here keeps a degenerate key out of the registry.
+  if (x === 0n && y === 0n) return { ok: false, rejection: 'COORDINATE_OUT_OF_RANGE' };
+
+  return { ok: true, point: { x, y, bytes } };
+}
+
+/** The public-key wire form, branded so a parsed key provably decoded (C15-01's rule, applied to keys). */
+export const DeviceP256PublicKeySchema = z
+  .string()
+  .superRefine((value, context) => {
+    const decoded = decodeCanonicalP256PublicKey(value);
+    if (decoded.ok) return;
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `public key is not a canonical uncompressed P-256 point: ${decoded.rejection}`,
+      params: { rejection: decoded.rejection },
+    });
+  })
+  .brand<'CanonicalP256PublicKey'>();
+
+export type CanonicalP256PublicKey = z.infer<typeof DeviceP256PublicKeySchema>;
+
+/**
+ * C15-02: THE THUMBPRINT IS COMPUTED, NEVER BELIEVED.
+ *
+ * SHA-256 hex over the canonical 65 key bytes. An independently supplied digest
+ * is not evidence about a key — it is a second, unverified claim, and accepting
+ * one would let a device name a key it does not hold. Everywhere a thumbprint
+ * arrives alongside a key, the contract recomputes it and refuses on
+ * disagreement; that is what `deviceKeyThumbprintMatches` is for.
+ */
+export function deriveP256PublicKeyThumbprint(publicKey: string): string {
+  const decoded = decodeCanonicalP256PublicKey(publicKey);
+  if (!decoded.ok) throw new RangeError(`public key is not canonical: ${decoded.rejection}`);
+  return createHash('sha256').update(decoded.point.bytes).digest('hex');
+}
+
+/** True when `thumbprint` is exactly the digest derived from `publicKey`. */
+export function deviceKeyThumbprintMatches(publicKey: string, thumbprint: string): boolean {
+  const decoded = decodeCanonicalP256PublicKey(publicKey);
+  if (!decoded.ok) return false;
+  return deriveP256PublicKeyThumbprint(publicKey) === thumbprint;
+}
+
+// ---------------------------------------------------------------------------
 // The verification boundary
 // ---------------------------------------------------------------------------
 
@@ -200,7 +381,8 @@ export type DeviceSignatureVerification =
   | { readonly outcome: 'VERIFIED' }
   | { readonly outcome: 'REFUSED'; readonly rejection: DeviceSignatureRejection }
   | { readonly outcome: 'INVALID_SIGNATURE' }
-  | { readonly outcome: 'PROFILE_NOT_APPROVED' };
+  | { readonly outcome: 'PROFILE_NOT_APPROVED' }
+  | { readonly outcome: 'PROFILE_CLAIM_MISMATCH' };
 
 /**
  * The gate a runtime verifier must sit behind.
@@ -212,13 +394,20 @@ export type DeviceSignatureVerification =
  * malleable or malformed value cannot reach curve arithmetic and cannot be
  * "rescued" by a permissive library.
  *
+ * C15-01 adds the profile binding to that ordering. `serverResolvedProfile` is
+ * the registry's answer for this key; `claimedProfile` is the device's field.
+ * They must be equal before a verifier is reachable, so a client that names a
+ * different profile is refused rather than served — and the SERVER's value is
+ * the one any canonical statement goes on to bind.
+ *
  * The regression that matters here asserts the callback was **not called**.
  */
 export function verifyCanonicalDeviceSignature(
-  input: { readonly profile: unknown; readonly signature: string },
+  input: { readonly serverResolvedProfile: unknown; readonly claimedProfile: unknown; readonly signature: string },
   verify: (scalars: DeviceSignatureScalars) => boolean,
 ): DeviceSignatureVerification {
-  if (!isApprovedDeviceSignatureProfile(input.profile)) return { outcome: 'PROFILE_NOT_APPROVED' };
+  const binding = bindClaimedSignatureProfile(input.claimedProfile, input.serverResolvedProfile);
+  if (!binding.bound) return { outcome: binding.refusal };
   const decoded = decodeCanonicalP256Signature(input.signature);
   if (!decoded.ok) return { outcome: 'REFUSED', rejection: decoded.rejection };
   return verify(decoded.scalars) ? { outcome: 'VERIFIED' } : { outcome: 'INVALID_SIGNATURE' };
