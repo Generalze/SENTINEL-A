@@ -1,8 +1,8 @@
 # Milestone 3 - Trusted Device & Degraded Operations
 
-**Status:** M3A in execution. **WP-23 CLOSED; WP-24 ACTIVE.**
-**Current development base:** `ded82d596f4198088d9f717f53aab1d3f03c3466`
-(the WP-23 merge commit on `main`)
+**Status:** M3A in execution. **WP-23 and WP-24 CLOSED; WP-25 ACTIVE.**
+**Current development base:** `578055a288d436d4e51b10fb428c1ba025d2c5b2`
+(the WP-24 merge commit on `main`)
 **Milestone-2 freeze point:** `f660407c78f3600c6c6307d2bd3c7d310274f026`
 (`milestone-2-field-workflow`) — history, not a workspace
 **Owner of record:** masterzee001
@@ -170,11 +170,12 @@ MILESTONE 3                       M3A IN EXECUTION
 M3A target                        Proof C — genuine authenticated device
 M3B target                        Proof D — genuine WAN-loss / Edge recovery
 
-new development base              ded82d596f4198088d9f717f53aab1d3f03c3466
+new development base              578055a288d436d4e51b10fb428c1ba025d2c5b2
 
 WP-23 Device Identity Contract    CLOSED at ded82d596
-WP-24 Shield Device Registry      ACTIVE
-WP-25 Authenticated Device Gateway  HOLD
+WP-24 Shield Device Registry      CLOSED at 578055a2
+WP-25 Authenticated Device Gateway  ACTIVE (directive/design GO,
+                                    implementation HOLD)
 WP-26 Field Mobile Foundation     HOLD
 WP-27 Real DEVICE_ACTION Whisper  HOLD
 WP-28 Proof C gate                UNCLAIMED
@@ -185,12 +186,26 @@ Proof D                           UNCLAIMED
 original repository               FROZEN at bd6076e
 ```
 
+### Engineering debt (recorded, not carried into WP-25 scope)
+
+Two conditions were verified during WP-24 and ruled out of its scope by the
+CTO. Neither blocks WP-25. Both are recorded here so they are tracked rather
+than rediscovered, and each needs its own work package.
+
+| Condition | Evidence | Ruling |
+|---|---|---|
+| **Migration-history drift** | Diffing the pre-WP-24 20-migration chain against its datamodel emits 8 `ALTER COLUMN … DROP DEFAULT` and 25 `RENAME CONSTRAINT` statements on a clean base with every WP-24 file absent | Not a blocker — all 21 migrations deploy cleanly. Needs a dedicated migration-hygiene work package with its own reproduction, compatibility ruling and migration proof. Historical migrations are not to be rewritten casually. |
+| **Shared-Postgres live-suite contention** | 12 live suites run in parallel against one database; one pre-existing test fails intermittently per full local run (patrol / Whisper / M2 / Fusion — never Shield). One identified contributor: `test/app.e2e.spec.ts` boots AppModule via `NestFactory.create` and so runs a **live patrol sweeper**, while every other live spec overrides `PATROL_SWEEP_SCHEDULER` with the WP-22 no-op seam | Not a blocker — hosted CI is green. Needs a dedicated test-infrastructure work package. **Constrains WP-25:** no new uncontrolled background schedulers, no increased cross-suite state coupling. If it ever fails hosted CI or could mask a gateway security assertion, it becomes a blocker immediately. |
+
 ### Status history
 
 This block previously read `MILESTONE 3 — PLANNING`, with WP-23 implementation
-on HOLD and WP-24..31 all on HOLD. That was true when it was written and is no
-longer true: WP-23 merged as `ded82d596f4198088d9f717f53aab1d3f03c3466` and
-WP-24 is authorised to implement. The correction is to the CURRENT gate only.
+on HOLD and WP-24..31 all on HOLD; it was then corrected to WP-23 CLOSED /
+WP-24 ACTIVE. Each statement was true when written. WP-23 merged as
+`ded82d596f4198088d9f717f53aab1d3f03c3466`, WP-24 merged as
+`578055a288d436d4e51b10fb428c1ba025d2c5b2`, and WP-25 is authorised for
+directive and design only — implementation remains on HOLD pending its gate.
+The correction is to the CURRENT gate only.
 **The Milestone-2 boundary above is untouched** — `f660407` remains the frozen
 M2 point, and nothing in M3 amends, reinterprets or re-bases it.
 
