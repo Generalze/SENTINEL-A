@@ -21,6 +21,7 @@ import { FieldModule } from './modules/field/field.module';
 import { FieldMessagingModule } from './modules/field-messaging/field-messaging.module';
 import { FieldOfflineModule } from './modules/field-offline/field-offline.module';
 import { PatrolModule } from './modules/patrol/patrol.module';
+import { ShieldModule } from './modules/shield/shield.module';
 import { WhisperModule } from './modules/whisper/whisper.module';
 
 @Module({
@@ -66,6 +67,12 @@ import { WhisperModule } from './modules/whisper/whisper.module';
     // because an authenticated device context cannot come from a JSON body
     // (W21-05, the C10-02 boundary applied to a silent duress channel).
     WhisperModule,
+    // WP-24 Shield device registry. Registered for dependency wiring only: the
+    // module declares NO controller, so this adds no HTTP surface at all
+    // (D24-13). There is still no production facility that authenticates an
+    // incoming physical device, and WP-25 is the work package that lifts that
+    // prohibition.
+    ShieldModule,
   ],
 })
 export class AppModule {}
