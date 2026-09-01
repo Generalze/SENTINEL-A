@@ -1,9 +1,10 @@
 # Milestone 3 - Trusted Device & Degraded Operations
 
-**Status:** Planning. **WP-23 roadmap + directive authoring GO; all
-implementation HOLD.**
-**Frozen development base:** `f660407c78f3600c6c6307d2bd3c7d310274f026`
-(`milestone-2-field-workflow`)
+**Status:** M3A in execution. **WP-23 CLOSED; WP-24 ACTIVE.**
+**Current development base:** `ded82d596f4198088d9f717f53aab1d3f03c3466`
+(the WP-23 merge commit on `main`)
+**Milestone-2 freeze point:** `f660407c78f3600c6c6307d2bd3c7d310274f026`
+(`milestone-2-field-workflow`) — history, not a workspace
 **Owner of record:** masterzee001
 
 Milestone 2 proved the **server side** of the Field workflow: assignment,
@@ -165,17 +166,34 @@ milestone.
 
 ```text
 MILESTONE 2                       FROZEN at f660407
-new development base              f660407c78f3600c6c6307d2bd3c7d310274f026
-
-MILESTONE 3                       PLANNING
+MILESTONE 3                       M3A IN EXECUTION
 M3A target                        Proof C — genuine authenticated device
 M3B target                        Proof D — genuine WAN-loss / Edge recovery
 
-WP-23 roadmap + directive         GO (this document and the directive)
-WP-23 implementation              HOLD
-WP-24 .. WP-31                    HOLD
+new development base              ded82d596f4198088d9f717f53aab1d3f03c3466
+
+WP-23 Device Identity Contract    CLOSED at ded82d596
+WP-24 Shield Device Registry      ACTIVE
+WP-25 Authenticated Device Gateway  HOLD
+WP-26 Field Mobile Foundation     HOLD
+WP-27 Real DEVICE_ACTION Whisper  HOLD
+WP-28 Proof C gate                UNCLAIMED
+WP-29 .. WP-31 / Proof D          HOLD / UNCLAIMED
 
 Proof C                           UNCLAIMED
 Proof D                           UNCLAIMED
 original repository               FROZEN at bd6076e
 ```
+
+### Status history
+
+This block previously read `MILESTONE 3 — PLANNING`, with WP-23 implementation
+on HOLD and WP-24..31 all on HOLD. That was true when it was written and is no
+longer true: WP-23 merged as `ded82d596f4198088d9f717f53aab1d3f03c3466` and
+WP-24 is authorised to implement. The correction is to the CURRENT gate only.
+**The Milestone-2 boundary above is untouched** — `f660407` remains the frozen
+M2 point, and nothing in M3 amends, reinterprets or re-bases it.
+
+`ded82d596` is the *development* base. It is not a milestone freeze, and it
+does not claim either proof: Proof C and Proof D remain UNCLAIMED, exactly as
+they were at the end of Milestone 2.
