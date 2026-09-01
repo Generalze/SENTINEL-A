@@ -11,3 +11,7 @@ export * from './field.js';
 export * from './field-offline.js';
 export * from './whisper.js';
 export * from './device.js';
+export * from './device-signature.js';
+export * from './device-identity.js';
+export * from './device-context.js';
+export * from './device-offline.js';
