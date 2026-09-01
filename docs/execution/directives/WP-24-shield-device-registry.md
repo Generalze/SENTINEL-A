@@ -99,15 +99,19 @@ device.revoke                revoke / quarantine / declare compromised
 Locked initial matrix:
 
 ```text
-                            site.commander   operator   field.supervisor   others
+                            site.commander   operator   all others
 
-device.registry.read              Y             Y              Y             -
-device.enrollment.issue           Y             -              -             -
-device.enrollment.approve         Y             -              -             -
-device.trust.manage               Y             -              -             -
-device.key.rotate                 Y             -              -             -
-device.revoke                     Y             -              -             -
+device.registry.read              Y             Y            -
+device.enrollment.issue           Y             -            -
+device.enrollment.approve         Y             -            -
+device.trust.manage               Y             -            -
+device.key.rotate                 Y             -            -
+device.revoke                     Y             -            -
 ```
+
+(Revised per the CTO ruling in D24-02a below: the originally issued matrix
+also listed a `field.supervisor` column, and that role is deliberately not
+minted in this work package.)
 
 Three rules ride with it, and each is enforced rather than documented:
 
@@ -128,14 +132,34 @@ Every `Y` remains organisation- and site-scoped through the existing ABAC
 boundary. The action table is RBAC only; site scope, clearance and purpose are
 layered on top by the access guard exactly as they are for every other action.
 
-### D24-02a — `field.supervisor` did not previously exist
+### D24-02a — `field.supervisor` is NOT minted here (CTO ruling)
 
-The directive's matrix names a role that is not in the §62 `ROLES` registry.
-The minimal faithful implementation is to add the role string with **exactly
-the one action the matrix grants it** (`device.registry.read`) and nothing
-else. That is an addition to a code-versioned table, not a redesign of
-Identity: `UserRole.role` is already a free string column and no schema change
-is required. Flagged here because the directive named it as though it existed.
+The directive's original matrix named a role that is not in the §62 `ROLES`
+registry. I flagged it rather than inventing it, and the CTO has ruled:
+
+> **Do not add a new application role just to satisfy this matrix.** The
+> architecture conceptually includes Field Supervisor, but introducing a
+> partially implemented supervisor role whose only capability is
+> device-registry read would create a misleading role boundary.
+> `field.supervisor` stays an architectural role awaiting deliberate
+> activation across the broader authority model.
+
+The matrix WP-24 implements is therefore:
+
+```text
+                            site.commander   operator   all others
+
+device.registry.read              Y             Y            -
+device.enrollment.issue           Y             -            -
+device.enrollment.approve         Y             -            -
+device.trust.manage               Y             -            -
+device.key.rotate                 Y             -            -
+device.revoke                     Y             -            -
+```
+
+A role that exists in half the authority model is worse than a role that does
+not exist yet: it reads as though supervisors have been considered everywhere
+when they have been considered in exactly one place. `ROLES` is unchanged.
 
 ---
 
@@ -403,6 +427,143 @@ If the frozen contracts do not carry enough to express a safe rotation proof
 without inventing a new signed statement, implementation **stops and reports the
 exact missing contract** rather than improvising one.
 
+
+### D24-10A — The key-rotation possession contract (CTO ruling, prerequisite)
+
+D24-10's stop condition fired. WP-23 could express rotation CONTINUITY — a
+`DeviceRequestProof` with `purpose: 'DEVICE_KEY_ROTATION'` signed by the
+current key — but had no way at all to express POSSESSION OF THE NEW KEY. The
+only possession statement in the frozen contracts is enrollment-scoped
+(`sentinel.device.possession-challenge.v1`, binding `enrollment_request_id`
+and `enrollment_request_fingerprint`), and repurposing it would have made a
+rotation proof BYTE-IDENTICAL to an enrollment proof for the same ids —
+collapsing the domain separation the domain tag exists for — while filing
+rotation consumption under an enrollment replay identity.
+
+**This is not a reopening of WP-23.** WP-23 remains closed at `ded82d596`.
+This is a WP-24 PREREQUISITE contract extension, versioned forward because
+WP-24 is the first runtime that needs a safe rotation ceremony. It lives in a
+new file, adds two new domains, and changes nothing frozen.
+
+```text
+packages/contracts/src/device-key-rotation.ts
+sentinel.device.key-rotation-possession.v1
+sentinel.device.key-rotation.replay-identity.v1
+```
+
+#### Rotation is a two-key proof, and neither half substitutes for the other
+
+```text
+CURRENT REGISTERED KEY
+    | DeviceRequestProof, purpose = DEVICE_KEY_ROTATION
+    | payload_digest = the EXACT rotation-request fingerprint
+    v
+CONTINUITY OF THE OLD CREDENTIAL
+    +  server validates and IMPORTS the new public key
+    +  server issues a rotation challenge
+    v
+NEW KEY SIGNS sentinel.device.key-rotation-possession.v1
+    v
+POSSESSION OF THE NEW CREDENTIAL
+    v
+transaction re-reads current registry state
+    v
+old key CURRENT -> ROTATED     new key -> CURRENT
+```
+
+Binding the continuity proof's `payload_digest` to the exact rotation-request
+fingerprint is what stops an otherwise valid current-key proof being borrowed
+for a DIFFERENT replacement key.
+
+#### The rotation request is an exact semantic object
+
+Not "some payload". The canonical request binds `schema_version`,
+`rotation_request_id`, `organisation_id`, `device_id`, `current_key_id`,
+`current_key_version`, `proposed_key_id`, `proposed_key_version`,
+`new_public_key`, `new_public_key_thumbprint`, `new_key_storage` and the
+`server_resolved_signature_profile`. The thumbprint stays DERIVED from the
+canonical public key, never independently trusted.
+
+```text
+proposed_key_version === current_key_version + 1
+```
+
+Exactly one, not merely "greater than". No skipped versions, and no client
+choosing a version that shapes registry history — the server generates the
+proposed key identity and version.
+
+#### The new-key possession statement
+
+Binds organisation, device, `rotation_request_id` and its fingerprint, the
+current key id/version, the proposed key id/version, the new public-key
+thumbprint, the rotation challenge id and nonce, and the SERVER-RESOLVED
+signature profile. The new public key itself is not repeated inside the signed
+bytes — the request fingerprint already commits to it — but the thumbprint
+stays explicit as a readable cryptographic binding.
+
+#### The rotation challenge and its own ceiling
+
+`DeviceKeyRotationChallenge` is server-issued and binds the whole proposal, so
+a challenge cannot be answered for a different rotation.
+
+```text
+DEVICE_KEY_ROTATION_CHALLENGE_MAX_AGE_MS = 120_000
+```
+
+Numerically equal to the enrollment possession ceiling today, and deliberately
+its OWN constant with its OWN tests: rotation policy and enrollment policy must
+not become silently coupled because they once happened to share a duration.
+`expires_at` follows the existing exclusive-boundary doctrine.
+
+#### The verification result, and no naked boolean
+
+A server-owned `DeviceKeyRotationPossessionVerificationResult`, source
+`SENTINEL_DEVICE_KEY_ROTATION_VERIFIER`, binding organisation, device, request
+id and fingerprint, challenge id, current and proposed key identity, new
+thumbprint, profile, the canonical statement fingerprint and `verified_at`. A
+verdict from another rotation, challenge, device, proposed key or request
+fingerprint is structurally unusable. **There is no
+`newKeyPossessionVerified: true` anywhere in the runtime.**
+
+#### Replay identity, kept distinct from the fingerprint
+
+Its own one-shot identity under
+`sentinel.device.key-rotation.replay-identity.v1`, binding organisation,
+device, rotation request id, challenge id, current key id/version, proposed key
+id/version and nonce. The WP-23 rule is unchanged: same identity + same
+fingerprint converges and never rotates twice; same identity + changed
+fingerprint conflicts and mutates nothing.
+
+#### Import precedes possession
+
+The new key passes structural parse, canonical public-key checks, server
+profile resolution and Node/OpenSSL P-256 import **before** its signature can
+establish possession. An off-curve key cannot acquire a valid rotation
+verification result. No elliptic-curve arithmetic is added to contracts.
+
+#### The commit transaction refuses a moved world
+
+At commit the runtime re-reads and requires: the same device identity; the same
+current key id, version and `CURRENT` status; the current key not
+independently revoked; the device not independently revoked or compromised;
+`proposed === current + 1`; exact request fingerprint, continuity proof,
+possession verdict and unexpired challenge; an admissible replay fact; and a
+runtime-valid new key whose thumbprint and server-selected profile match.
+
+Then atomically: old key `CURRENT -> ROTATED` with `rotated_at` at
+authoritative server time, new key `CURRENT`, and the device keeping its
+`device_id` and `sequence_namespace_id` while its current key reference and
+version advance.
+
+If the current key moved while the ceremony was in progress the answer is
+`STALE_ROTATION` — never a helpful rotation from whatever key happens to be
+current now.
+
+#### Migration consequence
+
+The rotation request, challenge and replay persistence belong inside the SAME
+single WP-24 migration. The chain target is unchanged: `20 -> 21`. This is
+precisely why the stop happened before schema work rather than after.
 ---
 
 ## D24-11 — Anti-replay becomes persistent transactional state
