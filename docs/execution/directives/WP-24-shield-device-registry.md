@@ -161,6 +161,30 @@ A role that exists in half the authority model is worse than a role that does
 not exist yet: it reads as though supervisors have been considered everywhere
 when they have been considered in exactly one place. `ROLES` is unchanged.
 
+
+### D24-02b — a seventh action, because the frozen contract names it
+
+D24-02's matrix listed six actions. Implementation found a seventh authority
+already named IN THE FROZEN CONTRACT:
+
+```text
+DEVICE_TRUST_RESTORATION_CAPABILITY = 'device.trust.restore'
+```
+
+`evaluateDeviceTrustTransition` refuses a controlled restoration whose decision
+carries any other capability string, so a device climbing back out of
+`SUSPICIOUS` or `QUARANTINED` cannot be authorised without it. This is not an
+invention; it is a requirement the matrix omitted.
+
+It is deliberately NOT folded into `device.trust.manage`. Rehabilitating
+hardware we previously suspected is a different power from routine trust
+administration, and folding it in would mean any future role granted
+`device.trust.manage` — to flip a stale device to `OFFLINE`, say — silently
+inherits the authority to vouch for a quarantined one. That is exactly the
+inheritance D24-02 exists to prevent.
+
+**Effective authority today is unchanged:** `site.commander` holds all seven,
+`operator` holds `device.registry.read` only, every other role holds none.
 ---
 
 ## D24-03 — Enrollment requires a dual human/device binding

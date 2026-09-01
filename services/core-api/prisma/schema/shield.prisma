@@ -1,0 +1,1085 @@
+// SENTINEL Shield device registry (WP-24, architecture sections 61, 62, 62.1).
+// Owned exclusively by services/core-api/src/modules/shield. This file is
+// PERSISTENCE ONLY: every rule it serves is already frozen in
+// packages/contracts/src/device-identity.ts, device-signature.ts and
+// device-key-rotation.ts (D24-01). Nothing here re-states a rule the contracts
+// own; these tables exist to make those rules DURABLE and to put a second,
+// database-level defence under the ones that matter most.
+//
+// THE INVARIANT THIS SCHEMA EXISTS TO HOLD
+// ----------------------------------------
+//
+//     USER AUTHORITY
+//            +
+//     DEVICE IDENTITY
+//            +
+//     CURRENT DEVICE TRUST
+//            +
+//     SITE / CONTEXT AUTHORITY
+//
+//     must remain INDEPENDENT facts.
+//
+// A user login never manufactures trusted hardware. A registered device never
+// manufactures user authority. Neither stands in for the other anywhere in
+// this module, and the shapes below are chosen so that a query CANNOT quietly
+// collapse them: the columns that name a human on a device are PROVENANCE
+// columns (who this device was enrolled by, who it was meant for, who it is
+// currently issued to), and not one of them is ever consulted to answer a live
+// authorisation question. That is C14-02 — custody is not identity — expressed
+// as table structure rather than as prose a service is trusted to remember.
+//
+// Device security is its own schema file, and not a corner of Field or
+// Whisper, for the reason D24-04 gives: the module that answers "what hardware
+// do we trust" must be reviewable on its own.
+//
+// THE LIVE / HISTORY SPLIT (the WP-17A rule applied to WP-24)
+// -----------------------------------------------------------
+// The doctrine header of prisma/schema/field.prisma states the locked ruling
+// and docs/execution/directives/WP-17A-field-site-integrity.md records it. It
+// divides tables by what they ASSERT, and Shield divides the same way.
+//
+//   LIVE STATE and CEREMONY STATE
+//     Device, DeviceSiteScope, DeviceKey, EnrollmentBootstrapGrant,
+//     EnrollmentRequest, EnrollmentApproval, PossessionChallenge,
+//     PossessionVerification, DeviceKeyRotationRequest,
+//     DeviceKeyRotationChallenge, DeviceKeyRotationVerification.
+//
+//     These assert something true *right now* — "this hardware is registered
+//     under this tenant", "this device is scoped to this site", "this key is
+//     the authoritative credential", "this ceremony is in flight" — so every
+//     Site and User they name must exist and must belong to the same
+//     organisation. Each such reference is COMPOSITE, over the
+//     (id, organisation_id) candidate keys `sites_id_organisation_key`
+//     (WP-17A) and `users_id_organisation_key` (added by this work package,
+//     D24-04a), rather than a plain FK to `id`. A plain FK would still admit a
+//     row pairing one tenant's organisation with another tenant's site or
+//     user; the composite reference makes the DATABASE reject it. That is
+//     section 62.1's tenant boundary given a defence BELOW the service layer,
+//     which for this module is the difference between a device registry whose
+//     tenant isolation is a service invariant and one whose tenant isolation
+//     is a schema invariant.
+//
+//     Every one of them is onDelete: Restrict. A site's or a user's lifecycle
+//     must never silently delete the record of what hardware Sentinel trusts,
+//     because a device row that vanishes does not become an untrusted device
+//     — it becomes a device the registry can no longer make a statement about.
+//
+//   HISTORICAL ARTEFACTS
+//     DeviceAttestationObservation, DeviceTrustTransition, DeviceSecurityEvent
+//     and DeviceNonceConsumption carry NO Site, User or Device foreign key at
+//     all, per the historical-artefact rule the WP-17A header states and
+//     applies to FieldOperativeStateHistory, FieldStateUpdateIdempotency,
+//     FieldAuditLog, FieldOutbox, FieldOfflineOperationReceipt and
+//     WhisperRecognitionReceipt. Their site/user/device identifiers are the
+//     identifiers AS RECORDED at the moment of the event, and they must stay
+//     that way. `Cascade` would let a site's, a user's or a device's lifecycle
+//     erase the record of what Sentinel DECIDED about a piece of hardware —
+//     forbidden by section 61 — and for a consumption row it is worse than
+//     data loss: deleting a consumed replay identity RE-ADMITS the nonce it
+//     retired. `Restrict` would mean a site could never be removed once a
+//     single device had ever been observed there, silently inventing a Site
+//     retirement policy this work package has no mandate to decide. Integrity
+//     comes from the write-time check instead: the service proves the site,
+//     user and device exist in the organisation, and that the principal is
+//     authorised, BEFORE the transaction that appends the artefact.
+//
+// NOTHING IN THIS FILE EVER CASCADES. Contrast the WP-16/WP-18/WP-19 action
+// idempotency tables, which legitimately cascade because they only dedupe
+// requests against a live parent. Nothing here is that: a key record is a
+// verification credential, a trust transition is an audit of a decision, a
+// consumption row is a retired one-shot identity, and a security event is the
+// record of hardware trust being changed.
+//
+// See docs/execution/directives/WP-24-shield-device-registry.md for the
+// governing directive (D24-01, D24-04, D24-04a, D24-06, D24-10A, D24-11,
+// D24-12) and the WP-23 contracts for every vocabulary this file stores.
+//
+// A NOTE ON ENUM COLUMNS. Custody, trust, key lifecycle, enrollment state,
+// attestation outcome, revocation disposition and ceremony kind are stored as
+// TEXT, not as Postgres enum types, for the reason whisper.prisma states: the
+// vocabularies and their transition tables are owned by the frozen contracts
+// and versioned in reviewable code, not in a database type whose every
+// addition would be a migration. The contract is the authority; the column is
+// storage.
+
+// ===========================================================================
+// LIVE STATE
+// ===========================================================================
+
+/// One registered piece of hardware. THE authoritative answer to "what device
+/// is this, and what does Sentinel currently think of it".
+///
+/// `id` IS the server-generated `device_id` — not a surrogate key beside one.
+/// There is exactly one identifier for a device and the registry owns it, so
+/// no code path can ever be handed the "other" id.
+///
+/// LIVE STATE — composite tenant-aware relations, Restrict. See this file's
+/// header.
+model Device {
+  /// The device identity itself (D23-09). It survives key rotation unchanged;
+  /// a wipe or irrecoverable credential loss is a RE-ENROLLMENT producing a
+  /// NEW row with a new id, never a rehabilitation of this one.
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+
+  /// PERSONAL | CONTROLLED_SHARED (DeviceCustodySchema). The custody MODE is
+  /// device-level; who currently holds it is DeviceSiteScope's business.
+  custody String @db.Text
+
+  /// PROVENANCE, BOTH OF THEM (C14-02).
+  ///
+  /// `enrolled_by_user_id` is the human this device's enrollment is auditable
+  /// to; `intended_user_id` is the human it was enrolled FOR. NEITHER IS EVER
+  /// CONSULTED FOR A LIVE AUTHORISATION QUESTION. Being named here grants
+  /// nothing: no site scope, no action, no trust, no session. Every
+  /// authorisation is still answered from the current authenticated principal
+  /// and their current entitlement, and every device question is still
+  /// answered from current trust. These columns exist so that after the fact
+  /// an auditor can say WHO put this hardware into the estate and WHO it was
+  /// meant for — which is a different question from what anyone may do now.
+  enrolledByUserId String @map("enrolled_by_user_id") @db.Text
+  intendedUserId String @map("intended_user_id") @db.Text
+
+  /// DERIVED, NEVER CALLER-SUPPLIED (C15-08 / D24-04).
+  ///
+  /// Recomputed by the server from `deviceSequenceNamespaceId(organisation_id,
+  /// device_id)` and written; a client-selected namespace is the offline
+  /// sequence reset D23-09 says does not exist, arriving through the front
+  /// door. It is stored rather than recomputed on read so that the value the
+  /// offline queue actually partitions on is a durable fact with a history,
+  /// and so a change to it would be a visible write rather than a silent
+  /// difference between two call sites.
+  sequenceNamespaceId String @map("sequence_namespace_id") @db.Text
+
+  /// The six-state DeviceTrustSchema vocabulary: TRUSTED | DEGRADED |
+  /// SUSPICIOUS | QUARANTINED | COMPROMISED | OFFLINE.
+  ///
+  /// THE PLATFORM'S JUDGEMENT, NEVER THE DEVICE'S SELF-REPORT (D23-05,
+  /// D24-08). No request DTO may submit this value; it is concluded by the
+  /// server from server-owned evidence, because a field a client could set
+  /// would make the whole trust model decorative. COMPROMISED is TERMINAL for
+  /// this device identity — recovery is a new enrolled identity, never a
+  /// transition out of this column.
+  trust String @db.Text
+
+  /// D24-09: LOST | STOLEN | COMPROMISED_KEY, and they are three DIFFERENT
+  /// facts, not three labels for one. NULL while the device stands.
+  revocationDisposition String? @map("revocation_disposition") @db.Text
+  /// C15-R4-final applied to the device side: device-level and key-level
+  /// revocation are asked INDEPENDENTLY at runtime because they do not move
+  /// atomically. This column, and DeviceKey.revoked_at, are separate answers
+  /// and either one on its own is sufficient to refuse.
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz(3)
+
+  /// The currently authoritative credential. NULLABLE only because a device
+  /// row and its first key are written in the same enrollment transaction and
+  /// a schema cannot express "not null after the second statement"; the
+  /// service never leaves an enrolled device without a CURRENT key. These are
+  /// a denormalised POINTER for the hot path — DeviceKey remains the authority
+  /// on lifecycle state, and a reader that needs to know whether the key is
+  /// still usable reads DeviceKey, never these two columns.
+  currentKeyId String? @map("current_key_id") @db.Text
+  currentKeyVersion Int? @map("current_key_version")
+
+  /// The ceremony this identity came out of. Retained so a committed device
+  /// can always be traced back to the exact approved request fingerprint.
+  enrollmentRequestId String @map("enrollment_request_id") @db.Uuid
+
+  enrolledAt DateTime @map("enrolled_at") @db.Timestamptz(3)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  /// Direct tenant FK. Restrict: a tenant holding registered hardware is not
+  /// silently removable.
+  organisation Organisation @relation(fields: [organisationId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// Composite, over `users_id_organisation_key`: the database itself rejects
+  /// a device pairing org-A with a provenance user belonging to org-B
+  /// (D24-04a). Restrict, per this file's header.
+  enrolledByUser User @relation("DeviceEnrolledByUser", fields: [enrolledByUserId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  intendedUser User @relation("DeviceIntendedUser", fields: [intendedUserId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
+  /// Composite, over `enrollment_request_id_organisation_key`: a device may
+  /// not be attached to another tenant's enrollment request.
+  enrollmentRequest EnrollmentRequest @relation(fields: [enrollmentRequestId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
+  siteScopes DeviceSiteScope[]
+  keys DeviceKey[]
+  keyRotationRequests DeviceKeyRotationRequest[]
+
+  /// Candidate key, deliberately redundant with the primary key — it is what
+  /// every child table in this file references, so a child binds to THIS
+  /// device UNDER THIS TENANT rather than to an id that merely exists. Same
+  /// technique, same reason, as `sites_id_organisation_key` and
+  /// `whisper_signal_version_id_org_key`.
+  @@unique([id, organisationId], map: "devices_id_organisation_key")
+  /// D24-06: ONE DEVICE PER ENROLLMENT REQUEST, enforced BELOW the service
+  /// layer.
+  ///
+  /// The enrollment commit is a single transaction that re-reads and locks
+  /// every authority-bearing row, and that is what makes the normal path
+  /// sound. This constraint is what makes it sound anyway when the normal path
+  /// is not taken: a duplicate commit — a retried request racing itself, a
+  /// crashed transaction re-driven, a service-bypassing writer — CANNOT create
+  /// a second device off one approved ceremony. An exact retry converges on
+  /// the SAME device identity; a second insert is a unique violation, not a
+  /// second piece of trusted hardware.
+  @@unique([organisationId, enrollmentRequestId], map: "devices_enrollment_request_key")
+  /// The roster query: every device in a tenant at a given standing.
+  @@index([organisationId, trust])
+  @@map("devices")
+}
+
+/// The AUTHORITATIVE SERVER-SIDE site scope of a device (D24-04).
+///
+/// This is server persistence, NOT a list a client sends. A device that claims
+/// a site proves nothing; this table is where the claim is checked against.
+///
+/// The custody shape is the contract's (DeviceCustodyAssociationSchema,
+/// C15-08) and the two modes are mutually exclusive: a PERSONAL device names
+/// the operative it is issued to and no regime, a CONTROLLED_SHARED device
+/// names the regime governing hand-over and no permanent assignee — because a
+/// shared device with a permanent assignee is exactly the fusion of custody
+/// into identity that C14-02 forbids, and a personal device under a shared
+/// regime is an accountability gap wearing a policy's name. The exclusivity is
+/// refined by the contract on write; the columns are nullable here because
+/// each mode legitimately leaves one of them empty.
+///
+/// NONE OF THIS IS LIVE AUTHORITY. The association records where the device
+/// belongs and who it is FOR; every authorisation question is still answered
+/// from the current session and current entitlement.
+///
+/// LIVE STATE — composite tenant-aware relations, Restrict.
+model DeviceSiteScope {
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  deviceId String @map("device_id") @db.Uuid
+  siteId String @map("site_id") @db.Text
+
+  /// Denormalised from Device deliberately: this row must record the custody
+  /// mode UNDER WHICH the association was made, so the nullability rule above
+  /// can be checked against the mode that actually applied rather than against
+  /// whatever the device's mode happens to be at read time.
+  custody String @db.Text
+
+  /// PERSONAL only. NULL for CONTROLLED_SHARED (C14-02).
+  assignedUserId String? @map("assigned_user_id") @db.Text
+  /// CONTROLLED_SHARED only. A REFERENCE to a named custody regime, never
+  /// executable policy. NULL for PERSONAL.
+  custodyRegimeId String? @map("custody_regime_id") @db.Text
+
+  associatedAt DateTime @map("associated_at") @db.Timestamptz(3)
+  /// Set when the association ends. A released device is bound to nothing —
+  /// the row is retained rather than deleted so the history of where a piece
+  /// of hardware has been remains answerable.
+  releasedAt DateTime? @map("released_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  /// WP-17A live-state precedent: composite so the PAIR must match, not just
+  /// the site id. This is the row D24-04a names first — org-A device + org-B
+  /// site — and it is the database, not the service, that refuses it.
+  site Site @relation(fields: [siteId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  device Device @relation(fields: [deviceId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  /// MATCH SIMPLE: a NULL `assigned_user_id` (every CONTROLLED_SHARED row)
+  /// leaves this composite constraint unenforced rather than dangling, which
+  /// is the correct reading — a shared device names no assignee at all.
+  assignedUser User? @relation(fields: [assignedUserId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
+  /// One live scope row per (tenant, device, site). A second association of
+  /// the same device to the same site is a re-association of the existing row,
+  /// never a duplicate binding that two readers could disagree about.
+  @@unique([organisationId, deviceId, siteId], map: "device_site_scope_key")
+  @@index([organisationId, siteId])
+  @@map("device_site_scopes")
+}
+
+/// One registered credential version. THE FOUR-STATE LIFECYCLE, NOT A BOOLEAN
+/// (D24-01).
+///
+/// CURRENT | ROTATED | REVOKED | COMPROMISED answer two different questions —
+/// *may this key authorise new work?* and *may this key still verify what it
+/// legitimately signed?* — and a boolean `revoked` can answer only one of
+/// them. Routine rotation and compromise are not the same event and are never
+/// stored as though they were.
+///
+/// LIVE STATE — composite tenant-aware relation to Device, Restrict.
+model DeviceKey {
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  deviceId String @map("device_id") @db.Uuid
+
+  /// The key's own identity, server-generated. A client that picks its own key
+  /// identity shapes registry history (D24-10A).
+  keyId String @map("key_id") @db.Text
+  keyVersion Int @map("key_version")
+
+  /// THE ACTUAL KEY: the canonical uncompressed SEC1 point, base64url, exactly
+  /// as DeviceP256PublicKeySchema defines it (C15-02).
+  ///
+  /// A THUMBPRINT ALONE CANNOT VERIFY A SIGNATURE, and a registry that cannot
+  /// verify is not a registry. The digest below is a convenience name for this
+  /// value and is refused unless it equals the value DERIVED from it; it is
+  /// never independently trusted and never a substitute for this column.
+  publicKey String @map("public_key") @db.Text
+  publicKeyThumbprint String @map("public_key_thumbprint") @db.Text
+
+  /// SERVER-selected, and the only thing that ever selects a verifier
+  /// (C11-04 / C15-01). A device's claimed profile is checked against this,
+  /// never the reverse.
+  signatureProfile String @map("signature_profile") @db.Text
+  /// HARDWARE_BACKED | SOFTWARE. D23-03: a SOFTWARE key can never carry a
+  /// TRUSTED identity, so this column is a trust input and not mere metadata.
+  keyStorage String @map("key_storage") @db.Text
+
+  /// CURRENT | ROTATED | REVOKED | COMPROMISED (DeviceKeyLifecycleStateSchema).
+  status String @db.Text
+
+  registeredAt DateTime @map("registered_at") @db.Timestamptz(3)
+
+  /// TWO SEPARATE COLUMNS, DELIBERATELY.
+  ///
+  /// `rotated_at` records that a routine rotation superseded this version;
+  /// `revoked_at` records that the credential was withdrawn or declared
+  /// compromised. Collapsing them into one "ended_at" would make a rotated key
+  /// and a stolen key indistinguishable after the fact, and they are the two
+  /// facts an incident investigation most needs to tell apart (D24-09).
+  ///
+  /// C15-R4-final: `status` and `revoked_at` are asked INDEPENDENTLY at
+  /// runtime, because they do not move atomically. A caller may not assume
+  /// that a key whose status still reads CURRENT has no revocation instant, or
+  /// that a key carrying a revocation instant has already had its status
+  /// advanced. Either one saying the credential is gone is sufficient on its
+  /// own to refuse.
+  rotatedAt DateTime? @map("rotated_at") @db.Timestamptz(3)
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz(3)
+  /// LOST | STOLEN | COMPROMISED_KEY. Only a REVOKED or COMPROMISED key
+  /// carries one.
+  revocationDisposition String? @map("revocation_disposition") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  device Device @relation(fields: [deviceId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
+  /// A KEY VERSION IS NEVER REUSED, enforced below the service layer.
+  ///
+  /// D24-10 forbids resurrecting an older key, returning a ROTATED key to
+  /// CURRENT, or reusing a version — and every one of those becomes possible
+  /// the moment two rows can share (device, version). With this constraint a
+  /// second registration at an existing version is a unique violation rather
+  /// than a second credential competing to be believed, and the offline
+  /// contexts pinned to a key version keep a single meaning forever.
+  @@unique([organisationId, deviceId, keyVersion], map: "device_key_version_key")
+  /// A key id resolves to exactly one key within a tenant: the lookup the
+  /// verifier performs when a request names the credential it signed with.
+  @@unique([organisationId, keyId], map: "device_key_id_key")
+  /// "Which key of this device is CURRENT" — the hot path of every
+  /// verification.
+  @@index([organisationId, deviceId, status])
+  @@map("device_keys")
+}
+
+// ===========================================================================
+// CEREMONY STATE
+// ===========================================================================
+
+/// A bootstrap grant: PROVENANCE FOR A CEREMONY, NEVER A CREDENTIAL (D24-03).
+///
+/// On its own it can enrol nothing. It is bound to an organisation, a site, an
+/// intended user and an issuing human; it is single-use, revocable and bounded
+/// by the WP-23 lifetime ceiling; and a second use is a conflict and a refusal,
+/// never a second device.
+///
+/// THERE IS NO TOKEN COLUMN, AND THAT IS THE POINT (D23-14 / D24-03a).
+///
+/// The secret exists only in transit: at least 256 bits of cryptographically
+/// random entropy, returned ONCE to the authorised issuing caller, and
+/// persisted ONLY as `token_digest`. It is never persisted raw, never logged
+/// and never placed in an audit payload. This is not a rule the service is
+/// asked to remember — A STRUCTURE WITH NOWHERE TO PUT A RAW TOKEN CANNOT LEAK
+/// ONE. A future column named `token` would be a schema change and therefore a
+/// reviewable diff, which is precisely the property prose could not give.
+///
+/// CEREMONY STATE — composite tenant-aware relations, Restrict.
+model EnrollmentBootstrapGrant {
+  /// `id` IS the `grant_id`.
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  siteId String @map("site_id") @db.Text
+  /// Enrollment provenance, NOT hardware identity (C14-02).
+  intendedUserId String @map("intended_user_id") @db.Text
+  /// The human this grant is auditable to (D23-04). The commit additionally
+  /// requires issuer != approver != intended user; the ids are stored so that
+  /// separation is auditable after the fact and not merely enforced in flight.
+  issuedByUserId String @map("issued_by_user_id") @db.Text
+
+  /// The DIGEST of the bearer secret, and the only form of it that exists at
+  /// rest. See this model's header.
+  tokenDigest String @map("token_digest") @db.Text
+
+  issuedAt DateTime @map("issued_at") @db.Timestamptz(3)
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(3)
+  /// Set when the grant is burned. Presenting a grant in an unexpected
+  /// organisation, site or user context ALSO burns it and raises a security
+  /// event: a probe is not a typo, and a grant that survives being probed is a
+  /// grant an attacker may keep trying (D24-03a).
+  consumedAt DateTime? @map("consumed_at") @db.Timestamptz(3)
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  site Site @relation(fields: [siteId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  intendedUser User @relation("BootstrapGrantIntendedUser", fields: [intendedUserId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  issuedByUser User @relation("BootstrapGrantIssuedByUser", fields: [issuedByUserId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
+  enrollmentRequests EnrollmentRequest[]
+
+  /// THE LOOKUP KEY. A presented token is digested and resolved through this
+  /// index; the raw value is never compared against anything at rest because
+  /// the raw value is not at rest. Unique within the tenant so one digest can
+  /// name at most one grant.
+  @@unique([organisationId, tokenDigest], map: "bootstrap_grant_token_digest_key")
+  /// Candidate key so EnrollmentRequest binds to THIS grant UNDER THIS TENANT.
+  @@unique([id, organisationId], map: "bootstrap_grant_id_organisation_key")
+  /// "What grants are outstanding for this operative."
+  @@index([organisationId, intendedUserId])
+  @@map("device_enrollment_bootstrap_grants")
+}
+
+/// One enrollment request: a physical device's hardware-backed key offered for
+/// registration, together with the evidence offered about it.
+///
+/// CEREMONY STATE — composite tenant-aware relations, Restrict.
+model EnrollmentRequest {
+  /// `id` IS the `enrollment_request_id`.
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  siteId String @map("site_id") @db.Text
+  /// Provenance: who this enrollment was meant for, not who is authenticated
+  /// now.
+  intendedUserId String @map("intended_user_id") @db.Text
+  bootstrapGrantId String @map("bootstrap_grant_id") @db.Uuid
+
+  custody String @db.Text
+
+  /// C15-02: THE ACTUAL KEY, in the one canonical representation. Without it
+  /// the registry could recognise this device and never verify it.
+  publicKey String @map("public_key") @db.Text
+  publicKeyThumbprint String @map("public_key_thumbprint") @db.Text
+  keyStorage String @map("key_storage") @db.Text
+
+  /// C11-04 / C15-01: A CLAIM, NOT AN AUTHORITY.
+  ///
+  /// `claimed_signature_profile` is retained as THE RECORD OF WHAT THE CLIENT
+  /// CLAIMED, and it is NEVER the verifier selector. The device says which
+  /// profile it believes it used; the server decides which profile is in
+  /// force, writes it to `server_selected_signature_profile`, and the two are
+  /// equality-bound before any verification runs. Both columns exist so the
+  /// binding is auditable — a claim that disagreed with the server's selection
+  /// is a fact worth being able to see after the fact, and it cannot be seen
+  /// if only one of the two was ever stored. The `claimed_`/`server_selected_`
+  /// names are load-bearing: no future caller can reach for the wrong one by
+  /// accident.
+  claimedSignatureProfile String @map("claimed_signature_profile") @db.Text
+  serverSelectedSignatureProfile String @map("server_selected_signature_profile") @db.Text
+
+  /// The exact canonical fingerprint of this request
+  /// (`deviceEnrollmentRequestFingerprint`). This, and not the request id, is
+  /// what a human approves — see EnrollmentApproval.
+  requestFingerprint String @map("request_fingerprint") @db.Text
+
+  /// C14-05: VERIFIED | NEGATIVE | INVALID | REVOKED | UNAVAILABLE, and
+  /// UNAVAILABLE IS NOT NEGATIVE EVIDENCE. A provider outage is not a
+  /// statement about a device.
+  attestationOutcome String @map("attestation_outcome") @db.Text
+  attestationEvaluatedAt DateTime @map("attestation_evaluated_at") @db.Timestamptz(3)
+  /// An opaque correlation handle into the server-owned evaluation seam.
+  /// NEVER the attestation token or the vendor blob (D24-12).
+  attestationReference String? @map("attestation_reference") @db.Text
+
+  requestedAt DateTime @map("requested_at") @db.Timestamptz(3)
+
+  /// REQUESTED | APPROVED | POSSESSION_PROVEN | ENROLLED | REJECTED | EXPIRED
+  /// | REVOKED (DeviceEnrollmentStateSchema). The transition table is the
+  /// contract's; this column stores where the ceremony stands.
+  state String @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  site Site @relation(fields: [siteId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  intendedUser User @relation(fields: [intendedUserId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  bootstrapGrant EnrollmentBootstrapGrant @relation(fields: [bootstrapGrantId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
+  approvals EnrollmentApproval[]
+  possessionChallenges PossessionChallenge[]
+  possessionVerifications PossessionVerification[]
+  devices Device[]
+
+  /// Candidate key: every child of this ceremony — the approval, the
+  /// challenge, the verification and the committed Device — binds to THIS
+  /// request UNDER THIS TENANT rather than to an id that merely exists.
+  @@unique([id, organisationId], map: "enrollment_request_id_organisation_key")
+  /// The commander's work queue: requests awaiting approval in this tenant.
+  @@index([organisationId, state])
+  @@map("device_enrollment_requests")
+}
+
+/// THE INDEPENDENT HUMAN APPROVAL OF ONE EXACT FINGERPRINT (D24-03, C15-03).
+///
+/// C14-02's ruling is what this table exists for: proof of possession proves
+/// possession of *the key being enrolled*, and says NOTHING about whether that
+/// is the hardware the issuer intended. A human must therefore approve the
+/// exact request fingerprint, and the commit requires
+/// `issuer != approver != intended user`. There is no self-approval path.
+///
+/// The `approved_*` columns are the approval's OWN record of what was
+/// approved, deliberately duplicated from the request rather than joined to
+/// it. The fingerprint alone would be sufficient cryptographically; the rest
+/// are stored because an approval that no longer matches its request is an
+/// approval of something that no longer exists, and the commit must be able to
+/// SEE that disagreement rather than infer it from a row that has since moved.
+/// For the same reason `approved_site_id` and `approved_intended_user_id` are
+/// plain columns and NOT relations: they are what the approver was shown, not
+/// live pointers that would follow the request if it changed.
+///
+/// CEREMONY STATE — composite tenant-aware relations, Restrict.
+model EnrollmentApproval {
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  enrollmentRequestId String @map("enrollment_request_id") @db.Uuid
+
+  /// The Command principal holding the explicit `device.enrollment.approve`
+  /// capability (D23-04 / D24-02).
+  approvedByUserId String @map("approved_by_user_id") @db.Text
+
+  /// THE EXACT FINGERPRINT THIS HUMAN APPROVED. Not "the request" — the bytes.
+  approvedRequestFingerprint String @map("approved_request_fingerprint") @db.Text
+  approvedSiteId String @map("approved_site_id") @db.Text
+  approvedIntendedUserId String @map("approved_intended_user_id") @db.Text
+  approvedCustody String @map("approved_custody") @db.Text
+
+  approvedAt DateTime @map("approved_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  enrollmentRequest EnrollmentRequest @relation(fields: [enrollmentRequestId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  approvedByUser User @relation(fields: [approvedByUserId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
+  /// EXACTLY ONE APPROVAL PER REQUEST. A second approval row would let an
+  /// enrollment be re-attested after the fact, or let two partial approvals be
+  /// mistaken for the one the ceremony requires.
+  @@unique([organisationId, enrollmentRequestId], map: "enrollment_approval_request_key")
+  @@map("device_enrollment_approvals")
+}
+
+/// A fresh server-issued possession challenge. One-shot, scoped to the
+/// identity that consumes it (D23-12), and bounded by
+/// DEVICE_POSSESSION_CHALLENGE_MAX_AGE_MS.
+///
+/// CEREMONY STATE — composite tenant-aware relation, Restrict.
+model PossessionChallenge {
+  /// `id` IS the `challenge_id`.
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  enrollmentRequestId String @map("enrollment_request_id") @db.Uuid
+
+  /// SERVER-generated. The device never chooses what it is asked to sign.
+  nonce String @db.Text
+
+  issuedAt DateTime @map("issued_at") @db.Timestamptz(3)
+  /// Exclusive boundary, per the existing WP-23 doctrine.
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  enrollmentRequest EnrollmentRequest @relation(fields: [enrollmentRequestId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([organisationId, enrollmentRequestId])
+  @@map("device_possession_challenges")
+}
+
+/// THE SERVER'S BOUND VERDICT — never a naked boolean (C15-03).
+///
+/// `verified` is a real, recordable answer and `false` is a real verdict; but
+/// it is never readable on its own. Every column beside it is a BINDING, so a
+/// verdict produced for another challenge, another request, another request
+/// fingerprint, another key or another signature profile is STRUCTURALLY
+/// unusable here rather than merely wrong. There is no
+/// `possessionVerified: true` anywhere in the runtime.
+///
+/// `verified_at` is THE SERVER'S verification instant, and freshness is judged
+/// on it — never on the device's self-reported `answered_at`, which is
+/// telemetry and is not persisted as authority.
+///
+/// CEREMONY STATE — composite tenant-aware relation, Restrict.
+model PossessionVerification {
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  challengeId String @map("challenge_id") @db.Uuid
+  enrollmentRequestId String @map("enrollment_request_id") @db.Uuid
+
+  /// The fingerprint of the request this verdict was produced against.
+  enrollmentRequestFingerprint String @map("enrollment_request_fingerprint") @db.Text
+  /// The APPROVED key's identity, so a verdict for another key cannot be
+  /// borrowed.
+  publicKeyThumbprint String @map("public_key_thumbprint") @db.Text
+  /// The exact canonical possession statement the signature was checked over.
+  possessionStatementFingerprint String @map("possession_statement_fingerprint") @db.Text
+  /// The SERVER-selected profile the check actually ran under (C15-01).
+  signatureProfile String @map("signature_profile") @db.Text
+
+  verified Boolean
+  verifiedAt DateTime @map("verified_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  enrollmentRequest EnrollmentRequest @relation(fields: [enrollmentRequestId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
+  /// ONE VERDICT PER CHALLENGE. A challenge that could accumulate verdicts is
+  /// a challenge that can be answered until one of the answers is `true`.
+  @@unique([organisationId, challengeId], map: "possession_verification_challenge_key")
+  @@map("device_possession_verifications")
+}
+
+// ===========================================================================
+// ROTATION CEREMONY (D24-10A)
+// ===========================================================================
+
+/// A proposed key rotation. ROTATION PRESERVES IDENTITY; IT NEVER RESETS IT
+/// (D24-10): the `device_id` and the `sequence_namespace_id` are untouched,
+/// the old key goes CURRENT -> ROTATED and the new key becomes CURRENT.
+///
+/// A wipe, a re-provision or an irrecoverable credential loss is a
+/// RE-ENROLLMENT, not a rotation, and produces a new identity with a fresh
+/// sequence namespace (D23-09).
+///
+/// Mirrors DeviceKeyRotationRequestSchema, plus the tenant column every table
+/// in this file carries.
+///
+/// CEREMONY STATE — composite tenant-aware relation, Restrict.
+model DeviceKeyRotationRequest {
+  /// `id` IS the `rotation_request_id`.
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  deviceId String @map("device_id") @db.Uuid
+
+  /// The credential being superseded, AS THE REGISTRY CURRENTLY HOLDS IT. At
+  /// commit the runtime re-reads these and refuses if the world moved: if the
+  /// current key changed while the ceremony was in progress the answer is
+  /// STALE_ROTATION, never a helpful rotation from whatever key happens to be
+  /// current now.
+  currentKeyId String @map("current_key_id") @db.Text
+  currentKeyVersion Int @map("current_key_version")
+
+  /// SERVER-generated, both of them. A client that picks its own key identity
+  /// or version shapes registry history. The contract additionally refuses
+  /// anything but `proposed_key_version === current_key_version + 1` — exactly
+  /// one, not merely greater: no skipped versions.
+  proposedKeyId String @map("proposed_key_id") @db.Text
+  proposedKeyVersion Int @map("proposed_key_version")
+
+  /// The actual new key, in WP-23's single canonical representation. The
+  /// thumbprint stays DERIVED from it and is never independently trusted.
+  newPublicKey String @map("new_public_key") @db.Text
+  newPublicKeyThumbprint String @map("new_public_key_thumbprint") @db.Text
+  newKeyStorage String @map("new_key_storage") @db.Text
+
+  /// SERVER-resolved for the proposed key. Never a client's claim
+  /// (C11-04 / C15-01) — which is why, unlike EnrollmentRequest, there is no
+  /// `claimed_` column here at all: the rotation contract never accepted one.
+  serverResolvedSignatureProfile String @map("server_resolved_signature_profile") @db.Text
+
+  /// The exact canonical rotation-request fingerprint. The current key's
+  /// continuity proof binds its `payload_digest` to THIS value, which is what
+  /// stops an otherwise valid current-key proof being borrowed for a DIFFERENT
+  /// replacement key.
+  requestFingerprint String @map("request_fingerprint") @db.Text
+
+  requestedAt DateTime @map("requested_at") @db.Timestamptz(3)
+  state String @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  device Device @relation(fields: [deviceId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
+  challenges DeviceKeyRotationChallenge[]
+  verifications DeviceKeyRotationVerification[]
+
+  /// Candidate key so the challenge and the verdict bind to THIS proposal
+  /// UNDER THIS TENANT.
+  @@unique([id, organisationId], map: "rotation_request_id_organisation_key")
+  /// One proposal per (tenant, device, proposed version). Two concurrent
+  /// proposals for the same next version would be two futures for one
+  /// credential, and the loser would still hold a signed challenge.
+  @@unique([organisationId, deviceId, proposedKeyVersion], map: "rotation_request_proposed_version_key")
+  @@index([organisationId, deviceId, state])
+  @@map("device_key_rotation_requests")
+}
+
+/// The rotation challenge. Server-issued, and it BINDS THE WHOLE PROPOSAL —
+/// device, request, request fingerprint, both key identities and the new
+/// thumbprint — so a challenge cannot be answered for a different rotation.
+///
+/// Its ceiling is DEVICE_KEY_ROTATION_CHALLENGE_MAX_AGE_MS, which is
+/// numerically equal to the enrollment possession ceiling today and is
+/// deliberately its OWN constant: rotation policy and enrollment policy must
+/// not become silently coupled because they once happened to share a duration.
+///
+/// Mirrors DeviceKeyRotationChallengeSchema field for field, plus the tenant
+/// column.
+///
+/// CEREMONY STATE — composite tenant-aware relation, Restrict.
+model DeviceKeyRotationChallenge {
+  /// `id` IS the `challenge_id`.
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  deviceId String @map("device_id") @db.Uuid
+  rotationRequestId String @map("rotation_request_id") @db.Uuid
+  rotationRequestFingerprint String @map("rotation_request_fingerprint") @db.Text
+
+  currentKeyId String @map("current_key_id") @db.Text
+  currentKeyVersion Int @map("current_key_version")
+  proposedKeyId String @map("proposed_key_id") @db.Text
+  proposedKeyVersion Int @map("proposed_key_version")
+  newPublicKeyThumbprint String @map("new_public_key_thumbprint") @db.Text
+
+  /// SERVER-generated. The new key signs
+  /// `sentinel.device.key-rotation-possession.v1` over this — its OWN domain,
+  /// so a rotation proof can never be byte-identical to an enrollment proof.
+  nonce String @db.Text
+
+  issuedAt DateTime @map("issued_at") @db.Timestamptz(3)
+  /// Exclusive boundary, per the existing WP-23 doctrine.
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  rotationRequest DeviceKeyRotationRequest @relation(fields: [rotationRequestId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([organisationId, rotationRequestId])
+  @@map("device_key_rotation_challenges")
+}
+
+/// The server's bound rotation verdict. Mirrors
+/// DeviceKeyRotationPossessionVerificationResultSchema.
+///
+/// Same rule as PossessionVerification, and for the same reason: a verdict
+/// from another rotation, challenge, device, proposed key or request
+/// fingerprint is structurally unusable, and there is no
+/// `newKeyPossessionVerified: true` anywhere in the runtime. Import precedes
+/// possession — the new key passes canonical parse, server profile resolution
+/// and Node/OpenSSL P-256 import BEFORE its signature can establish
+/// possession, so an off-curve key cannot acquire a row here at all.
+///
+/// CEREMONY STATE — composite tenant-aware relation, Restrict.
+model DeviceKeyRotationVerification {
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  deviceId String @map("device_id") @db.Uuid
+  rotationRequestId String @map("rotation_request_id") @db.Uuid
+  rotationRequestFingerprint String @map("rotation_request_fingerprint") @db.Text
+  rotationChallengeId String @map("rotation_challenge_id") @db.Uuid
+
+  currentKeyId String @map("current_key_id") @db.Text
+  currentKeyVersion Int @map("current_key_version")
+  proposedKeyId String @map("proposed_key_id") @db.Text
+  proposedKeyVersion Int @map("proposed_key_version")
+  newPublicKeyThumbprint String @map("new_public_key_thumbprint") @db.Text
+
+  /// The SERVER-selected profile the check actually ran under.
+  signatureProfile String @map("signature_profile") @db.Text
+  /// The exact canonical possession statement the signature was checked over.
+  canonicalStatementFingerprint String @map("canonical_statement_fingerprint") @db.Text
+
+  verified Boolean
+  /// THE SERVER'S verification instant. This, and not a device's
+  /// `answered_at`, is freshness.
+  verifiedAt DateTime @map("verified_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  rotationRequest DeviceKeyRotationRequest @relation(fields: [rotationRequestId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
+  /// ONE VERDICT PER ROTATION CHALLENGE, for the reason
+  /// `possession_verification_challenge_key` gives.
+  @@unique([organisationId, rotationChallengeId], map: "rotation_verification_challenge_key")
+  @@map("device_key_rotation_verifications")
+}
+
+// ===========================================================================
+// REPLAY CONSUMPTION (D24-11)
+// ===========================================================================
+
+/// THE DURABLE ANTI-REPLAY RECORD. The WP-23 seam given persistent
+/// transactional state, with the same three outcomes:
+///
+///     FIRST_SEEN                      proceed
+///     EXACT_DUPLICATE                 converge on the stored outcome;
+///                                     NO second effect
+///     REUSED_WITH_CHANGED_SEMANTICS   conflict; never a convergence
+///
+/// A ceremony may be RETRIED. It may never be REPLAYED.
+///
+/// THE UNIQUE KEY IS THE REPLAY IDENTITY, NEVER THE STATEMENT FINGERPRINT.
+///
+/// This is the single most important line in this file, so it is argued
+/// rather than asserted. The entire purpose of the row is to detect CHANGED
+/// SEMANTICS HIDING BEHIND A REUSED IDENTITY. Key the constraint on the
+/// statement fingerprint instead and the failure is silent and total: two
+/// requests that share a one-shot identity but differ in what they actually
+/// ask for produce two DIFFERENT fingerprints, so they land in two unrelated
+/// rows, neither collides, and the store reports FIRST_SEEN twice. The
+/// altered request is admitted, and the table that exists to stop exactly
+/// that reports nothing wrong. Keyed on the identity, the second request
+/// collides, its fingerprint is compared against the stored one, and the
+/// mismatch IS the REUSED_WITH_CHANGED_SEMANTICS conflict — the outcome that
+/// mutates nothing.
+///
+/// WHY A DIGEST OF THE IDENTITY, AND NOT THE IDENTITY ITSELF, IS THE KEY.
+///
+/// Only because a btree index has a size limit and the canonical replay
+/// identity is unbounded in principle — it is canonical JSON over ids whose
+/// contract length is bounded but whose composition is not something a schema
+/// should bet an index page on. `replay_identity_digest` is the SHA-256 hex of
+/// `replay_key`. It is a digest OF THE IDENTITY, not of the statement, and the
+/// distinction is not pedantry: digesting the statement here would reintroduce
+/// precisely the fingerprint-keyed failure described above, wearing a
+/// different column name.
+///
+/// `replay_key` retains the FULL canonical replay-identity JSON alongside it,
+/// because a hash is not an identity — you cannot query it, audit it, or
+/// reason about its parts. C15-05 states the same rule for the contract's
+/// structured identity helpers, and this column is that rule applied to
+/// storage: the identity stays auditable and queryable, and the digest is only
+/// how the database is asked to enforce it.
+///
+/// HISTORICAL ARTEFACT — no Site, User or Device foreign key, deliberately.
+/// See this file's header. Cascading a consumption row away would not merely
+/// lose history: it would RE-ADMIT the one-shot identity it had retired.
+model DeviceNonceConsumption {
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+
+  /// Which ceremony's one-shot identity this row retires:
+  /// ENROLLMENT_BOOTSTRAP | POSSESSION_CHALLENGE | KEY_ROTATION. Bootstrap
+  /// consumption, possession consumption and rotation consumption share this
+  /// table and this doctrine; they do NOT share an identity, because each has
+  /// its own domain separator in the contracts.
+  ceremony String @db.Text
+
+  /// SHA-256 hex of `replay_key`. THE ENFORCED KEY. See this model's header.
+  replayIdentityDigest String @map("replay_identity_digest") @db.Text
+  /// The FULL canonical replay identity, as JSON. Retained for audit and
+  /// query; never the enforced key, only because of the index size limit.
+  replayKey String @map("replay_key") @db.Text
+
+  /// The canonical statement fingerprint SEEN UNDER THIS IDENTITY. Compared,
+  /// never keyed: equal means EXACT_DUPLICATE and the caller converges;
+  /// different means REUSED_WITH_CHANGED_SEMANTICS and the caller refuses.
+  statementFingerprint String @map("statement_fingerprint") @db.Text
+
+  /// C15-R1: the outcome an EXACT_DUPLICATE converges ON.
+  ///
+  /// NULLABLE because FIRST_SEEN and REUSED_WITH_CHANGED_SEMANTICS carry none:
+  /// nothing has happened yet under a first-seen identity, and a conflict has
+  /// no shared outcome to point at. The contract's discriminated union deletes
+  /// the "EXACT_DUPLICATE with a null ref" state entirely, and every evaluator
+  /// re-checks the fact through DeviceNonceConsumptionSchema before acting on
+  /// it — so a half-written row here fails CLOSED with a named refusal rather
+  /// than falling past the convergence branch and causing a second effect.
+  storedOutcomeRef String? @map("stored_outcome_ref") @db.Text
+
+  /// When this identity was FIRST presented. Not updated by a later
+  /// presentation: a retry does not move the instant at which the one-shot was
+  /// spent.
+  firstSeenAt DateTime @map("first_seen_at") @db.Timestamptz(3)
+
+  /// The trace of the FIRST presentation. `trace_id` is non-semantic, so a
+  /// legitimate retry may carry a fresh trace without changing the request —
+  /// which is exactly why the first one is the one worth retaining.
+  traceId String @map("trace_id") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  /// THE constraint this table exists for. Read this model's header before
+  /// changing it; keying it on `statement_fingerprint` would silently disable
+  /// replay detection while leaving every test that only exercises the happy
+  /// path green.
+  @@unique([organisationId, replayIdentityDigest], map: "device_nonce_consumption_identity_key")
+  @@index([organisationId, ceremony, firstSeenAt])
+  @@map("device_nonce_consumptions")
+}
+
+// ===========================================================================
+// HISTORICAL ARTEFACTS — append-only
+// ===========================================================================
+
+/// One attestation evaluation, as observed. APPEND-ONLY.
+///
+/// C14-05's split is preserved exactly: VERIFIED is positive evidence;
+/// NEGATIVE, INVALID and REVOKED are device evidence and may lower trust or
+/// quarantine; UNAVAILABLE IS NOT NEGATIVE EVIDENCE — a provider outage is not
+/// a statement about a device. A device that has NEVER been verified cannot
+/// become TRUSTED during unavailability.
+///
+/// HISTORICAL ARTEFACT — NO Site, User or Device foreign key at all,
+/// deliberately, per the WP-17A doctrine in this file's header and in
+/// field.prisma: a site's, a user's or a device's lifecycle must never erase
+/// the record of what Sentinel decided about a piece of hardware (section 61).
+/// The identifiers here are the identifiers AS RECORDED at evaluation time.
+model DeviceAttestationObservation {
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+
+  /// NULLABLE, and a PLAIN COLUMN. Enrollment observations PREDATE the device:
+  /// the evidence about a piece of hardware is evaluated while the request is
+  /// still a request, and there is no device row to name yet. Backfilling one
+  /// later would rewrite the observation into something it was not.
+  deviceId String? @map("device_id") @db.Uuid
+  /// NULLABLE for the mirror-image case: an observation about an
+  /// already-registered device belongs to no enrollment request.
+  enrollmentRequestId String? @map("enrollment_request_id") @db.Uuid
+
+  /// VERIFIED | NEGATIVE | INVALID | REVOKED | UNAVAILABLE.
+  outcome String @db.Text
+
+  /// An OPAQUE CORRELATION HANDLE into the server-owned evaluation seam.
+  /// NEVER the attestation token and NEVER the vendor blob (D24-12). A raw
+  /// vendor payload in an audit row is a credential in an audit row.
+  attestationReference String? @map("attestation_reference") @db.Text
+
+  /// When the evaluation itself concluded, versus when this server recorded
+  /// it. Two columns because the WP-23 grace window is measured against the
+  /// evaluation, and a delayed write must not make stale evidence look fresh.
+  evaluatedAt DateTime @map("evaluated_at") @db.Timestamptz(3)
+  observedAt DateTime @map("observed_at") @db.Timestamptz(3)
+
+  traceId String @map("trace_id") @db.Text
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  /// "What is the current attestation standing of this device" — the newest
+  /// qualifying observation, per tenant and device.
+  @@index([organisationId, deviceId, evaluatedAt])
+  @@index([organisationId, enrollmentRequestId])
+  @@map("device_attestation_observations")
+}
+
+/// One server-owned trust decision. APPEND-ONLY (D24-08).
+///
+/// Every trust change writes one of these. A device can never promote itself,
+/// COMPROMISED is terminal, and recovery from QUARANTINED requires an explicit
+/// authorised server decision AND qualifying current evidence — so the row
+/// carries both the machine's reason and the human who authorised it where one
+/// was involved.
+///
+/// HISTORICAL ARTEFACT — NO Device or User foreign key at all, deliberately.
+/// See this file's header: a device's or a user's lifecycle must never erase
+/// the record of what Sentinel decided about a piece of hardware (section 61).
+model DeviceTrustTransition {
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  /// Plain column, no FK. The device as recorded at decision time.
+  deviceId String @map("device_id") @db.Uuid
+
+  /// Both ends of the edge. Storing only the new state would make the history
+  /// unreadable without replaying every prior row in order, and would hide a
+  /// transition that skipped a state the matrix forbids.
+  previousTrust String @map("previous_trust") @db.Text
+  newTrust String @map("new_trust") @db.Text
+
+  /// A machine-readable reason code, never free prose.
+  reason String @db.Text
+  /// SERVER evidence references — attestation observation ids, security event
+  /// ids, key ids. References, never the evidence itself: this is an audit
+  /// row, not an evidence store.
+  evidenceRefs String[] @default([]) @map("evidence_refs")
+
+  /// NULLABLE plain column: many transitions are concluded by the server from
+  /// evidence with no human in the loop at all, and inventing one would be a
+  /// lie in an audit trail. Set only where a human actually authorised the
+  /// change.
+  authorisedByUserId String? @map("authorised_by_user_id") @db.Text
+
+  occurredAt DateTime @map("occurred_at") @db.Timestamptz(3)
+  traceId String @map("trace_id") @db.Text
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  /// "How did this device's standing get here" — the ordered history.
+  @@index([organisationId, deviceId, occurredAt])
+  @@map("device_trust_transitions")
+}
+
+/// The append-only device-security audit stream (D24-12).
+///
+/// Covers at minimum: BOOTSTRAP_ISSUED, BOOTSTRAP_REVOKED, BOOTSTRAP_CONSUMED,
+/// BOOTSTRAP_REPLAY_REFUSED, ENROLLMENT_REQUESTED, ENROLLMENT_APPROVED,
+/// ENROLLMENT_REFUSED, POSSESSION_VERIFIED, DEVICE_ENROLLED, TRUST_CHANGED,
+/// DEVICE_QUARANTINED, DEVICE_LOST, DEVICE_STOLEN, DEVICE_REVOKED,
+/// KEY_ROTATED, KEY_REVOKED, KEY_COMPROMISED, REPLAY_CONFLICT.
+///
+/// APPEND-ONLY: there is no application update or delete path, and a source
+/// guard regression protects that property rather than trusting review to
+/// notice.
+///
+/// THE PAYLOAD IS A STRICT ALLOWLIST BUILT BY THE APPLICATION, NEVER A
+/// FILTERED FREE-FORM OBJECT. The distinction decides whether this column is
+/// an audit record or a credential store. A denylist filter is a promise that
+/// every future field someone adds upstream will be remembered about here; an
+/// allowlist is a structure in which an unanticipated field simply does not
+/// arrive. NEVER RECORDED: private key material, a raw bootstrap token, a raw
+/// possession secret or response, a raw attestation vendor blob, signatures
+/// unless specifically required, and any authentication or session credential.
+/// Fingerprints, key ids, request ids and reason codes instead.
+///
+/// HISTORICAL ARTEFACT — NO Site, User or Device foreign key at all,
+/// deliberately. See this file's header (section 61).
+model DeviceSecurityEvent {
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  /// NULLABLE plain column: bootstrap and enrollment events legitimately
+  /// precede the existence of any device.
+  deviceId String? @map("device_id") @db.Uuid
+
+  eventType String @map("event_type") @db.Text
+  /// NULLABLE plain column: many of these events have no human actor —
+  /// a server-concluded revocation is not somebody's action.
+  actorUserId String? @map("actor_user_id") @db.Text
+
+  payload Json @default("{}")
+
+  occurredAt DateTime @map("occurred_at") @db.Timestamptz(3)
+  traceId String @map("trace_id") @db.Text
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  /// "Show me every revocation in this tenant" — the event-type sweep.
+  @@index([organisationId, eventType, occurredAt])
+  /// "Show me everything that ever happened to this device."
+  @@index([organisationId, deviceId, occurredAt])
+  @@map("device_security_events")
+}
