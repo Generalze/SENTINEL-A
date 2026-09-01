@@ -174,8 +174,8 @@ new development base              578055a288d436d4e51b10fb428c1ba025d2c5b2
 
 WP-23 Device Identity Contract    CLOSED at ded82d596
 WP-24 Shield Device Registry      CLOSED at 578055a2
-WP-25 Authenticated Device Gateway  ACTIVE (directive/design GO,
-                                    implementation HOLD)
+WP-25 Authenticated Device Gateway  ACTIVE (design PASSED with addendum;
+                                    IMPLEMENTATION GO; migration target 22)
 WP-26 Field Mobile Foundation     HOLD
 WP-27 Real DEVICE_ACTION Whisper  HOLD
 WP-28 Proof C gate                UNCLAIMED

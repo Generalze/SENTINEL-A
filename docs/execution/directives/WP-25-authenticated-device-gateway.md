@@ -1,7 +1,7 @@
 # WP-25 — Authenticated Device Gateway
 
-**Status:** DIRECTIVE / DESIGN GO. **Implementation HOLD** pending the gate on
-this document.
+**Status:** DESIGN PASSED with an addendum (CTO gate, 2026-09-02).
+**IMPLEMENTATION GO.**
 **Base:** `578055a288d436d4e51b10fb428c1ba025d2c5b2` (the WP-24 merge commit).
 **Branch:** `wp-25-authenticated-device-gateway`.
 **Execution repository:** `Generalze/SENTINEL-A`. The original repository
@@ -75,66 +75,153 @@ have required a proof for.
 
 ---
 
-## D25-02 — The ingress pipeline, in a fixed order
+## D25-02 — The ingress pipeline: preflight, then ONE effect transaction
 
-Every device-authenticated request runs exactly this, and the order is the
-argument:
-
-```text
- 1. parse the DeviceRequestProof            contract boundary; a malformed or
-                                            high-S signature cannot exist in a
-                                            parsed proof at all (C15-01)
- 2. resolve the registry record             SERVER-owned, by key_id + key_version,
-                                            within the organisation
- 3. bind the claimed profile                bindClaimedSignatureProfile; the client
-                                            never selects its verifier
- 4. import the registered key               WP-24's P-256 importer, OpenSSL
- 5. verify the signature                    over the canonical statement, with
-                                            the SERVER's profile
- 6. build DeviceRegistryFacts               current trust, revocation, key state,
-                                            AND the current actor's authority
- 7. evaluateDeviceRequestProof              the frozen evaluator, unmodified
- 8. evaluateDeviceOperationPrincipals       both principals, independently
- 9. consume the replay identity             durable, transactional, WP-24's seam
-10. execute                                 the domain, unchanged
-```
-
-Two properties this ordering exists to hold. **The key is never taken from the
-request** — step 2 resolves it from the registry, and there is no parameter
-through which a caller could supply one. And **possession is checked before any
-domain effect**, never alongside it.
-
-Steps 7 and 8 are separate on purpose. Step 7 asks *is this proof good for this
-context?*; step 8 asks *are both principals present and sufficient?* Collapsing
-them would let a strong device proof paper over a missing session.
-
----
-
-## D25-03 — Establishing a context is itself device-authenticated
-
-A context is minted only by a request that already proved possession. The
-bootstrap problem is real and is solved without an exemption:
+**AMENDED at the design gate.** The first draft ended `9. consume the replay
+identity → 10. execute`, which is precisely the failure class WP-24 spent two
+correction batches eliminating: if consumption commits and the domain effect
+then fails, Sentinel remembers an operation that never happened. Replay
+consumption and the domain effect are now one transaction.
 
 ```text
-device holds a registered key
-   -> device signs a context REQUEST with that key
-   -> server verifies against the REGISTRY record
-   -> user session presented alongside, independently authenticated
-   -> server mints AuthenticatedDeviceContext, bounded by
-      DEVICE_CONTEXT_MAX_LIFETIME_MS (300 s, frozen)
+PREFLIGHT — establishes nothing, commits nothing
+────────────────────────────────────────────────
+parse the typed operation envelope     gateway-owned, canonical (D25-10)
+resolve the persisted context          server state, never a credential
+resolve the current registry key       by key_id + key_version, in-org
+bind the server profile                bindClaimedSignatureProfile
+import the key                         WP-24's P-256 importer, OpenSSL
+verify the signature                   over the canonical statement
+build current registry + actor facts   DeviceRegistryFacts, read now
+classify existing replay state         WITHOUT creating an effect
+evaluateDeviceRequestProof             the frozen evaluator, unmodified
+evaluateDeviceOperationPrincipals      both principals, independently
+
+FINAL EFFECT TRANSACTION — one transaction, or nothing
+──────────────────────────────────────────────────────
+re-read AND LOCK:  persisted context (open, unexpired)
+                   current device, current key, key version
+                   revocation state, effective trust
+                   current actor authority, current site authority
+                   the domain target itself
+then atomically:   claim the replay identity
+                   execute the domain effect
+                   record the authoritative outcome reference
+                   append the gateway security audit
+COMMIT TOGETHER
 ```
 
-The server owns every field of the minted context. `device_trust` is copied
-from the registry at issuance and is **never** authority at use — D23-07 and
-C15-04 already require the registry to be re-read on every request, and WP-24's
-effective-standing helper is what answers it, so an attestation that aged out
-mid-context degrades the answer immediately.
+The governing invariant, in the same words WP-24 earned:
 
-A context is bound to one `key_id + key_version`. A rotation invalidates every
-context issued against the superseded version, which `evaluateDeviceRequestProof`
+```text
+NO FIRST_SEEN DEVICE REPLAY CONSUMPTION MAY SURVIVE
+WITHOUT ITS CORRESPONDING DOMAIN EFFECT.
+```
+
+```text
+same identity + same fingerprint + a committed outcome that RESOLVES
+    -> CONVERGE
+same identity + different fingerprint
+    -> CONFLICT
+a stored outcome reference that cannot be proved against the actual
+authoritative domain row
+    -> FAIL CLOSED, never manufacture convergence
+```
+
+Two properties the ordering exists to hold. **The key is never taken from the
+request** — it is resolved from the registry, and there is no parameter through
+which a caller could supply one. And **possession is proven before any domain
+effect**, never alongside it.
+
+Steps 9 and 10 of the preflight stay separate on purpose. One asks *is this
+proof good for this context?*; the other asks *are both principals present and
+sufficient?* Collapsing them would let a strong device proof paper over a
+missing session.
+
+**If an approved domain service cannot participate safely in that transaction,
+implementation STOPS and reports the missing transactional seam.** It does not
+duplicate or reinterpret that domain's security logic inside the gateway.
+
+## D25-03 — Establishing a context, without the circularity
+
+**AMENDED at the design gate. The first draft was circular and wrong.** It said
+"the device signs a context request, the server verifies, the server mints a
+context" — but the frozen `DeviceRequestProof` is itself bound to a
+`context_id`, and its evaluator takes an `AuthenticatedDeviceContext`. Requiring
+an issued context in order to obtain the first context cannot work. The defect
+was mine; this is the corrected ceremony.
+
+It is NOT solved with a bearer bootstrap token, and NOT by inventing another
+cryptographic domain.
+
+### D25-03A — the pre-context establishment challenge
+
+```text
+CURRENT HUMAN SESSION requests establishment for a registered device + site
+        |
+        v
+SERVER resolves, from its own state only:
+   organisation · current actor · device · current key id + version
+   current registry standing · current actor/site intersection
+        |
+        v
+SERVER creates a short-lived, ONE-SHOT establishment challenge:
+   establishment_id · PROPOSED context_id · organisation_id
+   actor_user_id · device_id · site_id · key_id + key_version
+   server nonce · issued_at · expires_at
+        |
+        v
+   NO CONTEXT HAS BEEN ISSUED.  NO DEVICE AUTHORITY EXISTS.
+        |
+        v
+DEVICE signs a frozen DeviceRequestProof:
+   context_id     = the PROPOSED context_id
+   purpose        = RECONNECT_HANDSHAKE
+   payload_digest = digest of the EXACT establishment challenge
+        |
+        v
+SERVER reconstructs an IN-MEMORY CANDIDATE context from SERVER facts
+        |
+        v
+P-256 signature verified against the CURRENT Shield registry key
+        |
+        v
+evaluateDeviceRequestProof (authentication-only semantics)
+   + evaluateDeviceOperationPrincipals
+        |
+        v
+FINAL TRANSACTION: re-read current facts · consume the establishment
+challenge · consume the replay identity · persist the issued context ·
+persist the audit
+        |
+        v
+AuthenticatedDeviceContext ISSUED
+```
+
+**The candidate is not an issued context.** It is assembled in memory from
+server facts purely so the frozen evaluator has something to judge; it is never
+returned to the client and is accepted nowhere else. That distinction is the
+whole reason this is not a bearer bootstrap.
+
+**The establishment challenge is not a secret.** Stealing `establishment_id`,
+the proposed `context_id` and the server nonce confers ZERO device authority
+without both the registered private key AND the independent current human
+session. It is single-use and short-lived because a one-shot identity is
+cheaper to reason about than a secret, not because it is one.
+
+The server owns every field of the minted context. `device_trust` is copied at
+issuance because the frozen contract requires the field, but it is **historical
+issuance state only** — every operation uses current Shield standing, via
+WP-24's effective-standing helper, so an attestation that ages out mid-context
+degrades the answer immediately.
+
+A context is bound to one `key_id + key_version`; a rotation invalidates every
+context issued against the superseded version, which the frozen evaluator
 already enforces as `KEY_VERSION_ROTATED`.
 
----
+**STOP CONDITION A.** If the frozen `DeviceRequestProof` proves incapable of
+expressing this ceremony safely, implementation STOPS and reports. It does not
+preemptively add a signed-statement domain.
 
 ## D25-04 — Revocation must land inside a live session
 
@@ -294,3 +381,132 @@ the shape of the work:
    existing controllers. My recommendation is a distinct module owning the
    pipeline, with existing modules unchanged, so D25-02's ordering has exactly
    one implementation.
+
+---
+
+# Gate addendum - CTO rulings, 2026-09-02
+
+The four open questions are ruled. These are locked; they are not re-litigated
+during implementation.
+
+## D25-10 - Locked scope
+
+| Question | Ruling |
+|---|---|
+| Transport | **REST only.** Device-originated REST ingress. No device WebSocket authentication path in WP-25. Existing server-to-client realtime is untouched. |
+| Context storage | **Persist.** Both the establishment challenge and the issued context, as server state - never credentials. |
+| Initial surfaces | **Exactly three**, below. |
+| Module boundary | **A dedicated module**, `services/core-api/src/modules/device-gateway/`. |
+
+WP-26/27 may later add device realtime ingress. When they do the rule is
+unchanged: **socket authenticated is not message authorized**, and every
+effect-causing device message carries its own fresh signed proof.
+
+### The three initial operations, exactly
+
+```text
+A. Field state update
+B. Assignment acknowledgement - ACCEPT and DECLINE ONLY
+   NOT start, complete, cancel or reassign
+C. Incident Field Message acknowledgement - DELIVERED -> ACKNOWLEDGED
+```
+
+B reuses the Field domain's existing `accept` and `decline` semantics rather
+than inventing a generic acknowledgement. C adapts
+`FieldMessagingService.acknowledge()` - which already permits only the named
+recipient to acknowledge their own delivery row, and already preserves the
+delivery-state and idempotency behaviour. **A second Delivery implementation is
+not created.**
+
+All three map to the frozen `purpose = FIELD_OPERATION`. **No new
+`DeviceRequestPurpose` value is added** merely because there are three route
+types; their semantic distinction lives in the canonical payload digest.
+
+The module owns context establishment, proof parsing, registry and key
+resolution, cryptographic verification, current-principal assembly, replay
+orchestration, the domain adapters, gateway audit and the REST controller. It
+does **not** own Field, Delivery, Shield, Whisper or Identity, and device-proof
+verification is not scattered into their controllers. Existing human controller
+behaviour is unchanged.
+
+## D25-11 - The canonical typed operation envelope
+
+A device must not sign `SHA256(whatever JSON arrived)`. The gateway owns a
+canonical typed envelope and hashes the **parsed semantic object**:
+
+```text
+schema_version . operation_kind
+organisation_id . site_id . actor_user_id . device_id
+target_type . target_id
+semantic_payload
+```
+
+```text
+FIELD_STATE_UPDATE . ASSIGNMENT_ACCEPT . ASSIGNMENT_DECLINE
+INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE
+```
+
+**The route chooses `operation_kind` and `purpose`. Neither is caller-controlled
+security input.** This is what stops a valid proof for an assignment accept
+being carried to a field-state update because the two bodies happened to
+serialise similarly.
+
+## D25-12 - Timing constants
+
+The frozen values are used exactly, and WP-25 introduces no second freshness
+opinion:
+
+```text
+DEVICE_CONTEXT_MAX_LIFETIME_MS           = 300_000
+DEVICE_REQUEST_PROOF_MAX_AGE_MS          =  60_000     (sixty seconds, not 120)
+DEVICE_REQUEST_PROOF_MAX_FUTURE_SKEW_MS  =   5_000
+```
+
+One new WP-25 ceiling is approved, with its own name and its own tests, and it
+does **not** alter the frozen 60-second request-proof freshness:
+
+```text
+DEVICE_CONTEXT_ESTABLISHMENT_MAX_AGE_MS  = 120_000
+```
+
+Expiry is evaluated at request time. **No expiry scheduler** - which also
+satisfies D25-08's constraint against new background schedulers.
+
+## D25-13 - The refusal boundary is not an enumeration oracle
+
+Externally indistinguishable, internally precise:
+
+```text
+foreign-tenant device      nonexistent device
+foreign context            nonexistent context
+device not usable by this actor / site
+```
+
+all shape the same external refusal. The precise security reason and the trace
+id are appended to the internal audit. No raw signature, private key,
+authentication credential or bearer-like secret enters an audit payload. The
+`context_id` itself is safe to expose, precisely because it authorises nothing.
+
+## D25-14 - Migration budget
+
+```text
+WP-24 canonical total   21
+WP-25                   +1
+candidate total         22
+```
+
+The frozen WP-24 migration is not touched.
+
+## D25-15 - The two mid-pass STOP conditions
+
+Everything else is an ordinary implementation finding, accumulated and fixed
+inside the one pass. Only these two come back before improvisation:
+
+```text
+A. the frozen DeviceRequestProof cannot safely perform the D25-03A
+   pre-context establishment ceremony;
+
+B. an approved initial domain surface has no safe transaction-aware seam,
+   and using it would require duplicating or reinterpreting that domain's
+   security logic.
+```
