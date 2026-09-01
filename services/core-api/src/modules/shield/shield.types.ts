@@ -124,6 +124,30 @@ export const SHIELD_REFUSALS = [
    * custody mode, or the request bytes — moved after the human decided.
    */
   'APPROVED_SEMANTICS_MISMATCH',
+  /**
+   * C16-R1: the APPROVAL's own regime record and the (locked) REQUEST's regime
+   * disagree.
+   *
+   * `approved_custody_regime_id` is the approval's INDEPENDENT record — it is
+   * stored exactly like `approved_site_id`, precisely so the commit can see a
+   * disagreement rather than inherit one. Nothing in the approved-semantics
+   * digest recomputed from the REQUEST can detect a rewrite of the APPROVAL, so
+   * the two records are compared directly and the disagreement is reported as
+   * ITSELF rather than as a digest mismatch: an operator reading this refusal
+   * learns which of the two rows moved.
+   */
+  'APPROVED_CUSTODY_REGIME_MISMATCH',
+  /**
+   * C16-R1: the approval row does not agree with ITS OWN digest.
+   *
+   * The digest is recomputed from the approval's own approved fingerprint,
+   * approved custody and approved regime and required to equal the
+   * `approved_semantics_digest` the approval stored. A mismatch means the
+   * approval record was rewritten after the human decided — the one thing a
+   * recomputation from the REQUEST can never see, because it never reads the
+   * approval's own fields.
+   */
+  'APPROVAL_RECORD_INCONSISTENT',
 
   // -------------------------------------------------------------------------
   // C16-02 — a replay row may never outlive the effect it claims
@@ -347,10 +371,26 @@ export type CommitKeyRotationOutcome =
       readonly toKeyVersion: number;
     }
   /**
-   * C16-03: an EXACT retry of a rotation that already landed. The identity,
-   * version and key returned are read back from the REGISTRY, not echoed from
-   * the request — the runtime resolves the stored outcome reference to the
-   * committed key row and refuses (never converges) if it does not resolve.
+   * C16-03 / C16-R4: an EXACT retry of a rotation that already landed.
+   *
+   * THIS OUTCOME IS A HISTORICAL FACT AND CONFERS NO CURRENT KEY AUTHORITY.
+   *
+   * It answers "did THIS rotation commit?", not "is that key live now?". A
+   * later rotation may already have superseded it — R1 rotates v1->v2, R2
+   * rotates v2->v3, an exact retry of R1 arrives and CONVERGES on v2 while the
+   * registry's current key is v3 — and `committedKeyLifecycleState` will then
+   * read `ROTATED`. It may equally read `REVOKED` or `COMPROMISED`.
+   *
+   * So NOTHING may treat `toKeyId`/`toKeyVersion` as the credential to verify
+   * against. `DeviceRegistryService.resolveRegistryKeyRecord` and
+   * `deviceMayAct` are the only answers to "which credential is live, and may
+   * this device act?", and they read the registry rather than a replay row.
+   *
+   * The identity, version and lifecycle state are all read back FROM THE
+   * REGISTRY, not echoed from the request: the runtime resolves the stored
+   * outcome reference to the committed key row and refuses — never converges —
+   * if it does not resolve to this device, this tenant, this proposed key id
+   * and this proposed version.
    */
   | {
       readonly outcome: 'CONVERGED';
@@ -358,6 +398,12 @@ export type CommitKeyRotationOutcome =
       readonly storedOutcomeRef: string;
       readonly toKeyId: string;
       readonly toKeyVersion: number;
+      /**
+       * The committed key's lifecycle state AS IT STANDS NOW. Present precisely
+       * so a reader cannot mistake this outcome for a statement that the key is
+       * still current — it frequently is not.
+       */
+      readonly committedKeyLifecycleState: DeviceKeyLifecycleState;
     }
   | ShieldRefused;
 
@@ -395,7 +441,23 @@ export interface DeviceStanding {
   readonly deviceId: string;
   readonly organisationId: string;
   readonly custody: DeviceCustody;
+  /**
+   * C16-R5: THE EFFECTIVE TRUST — the persisted conclusion reconciled with the
+   * attestation evidence it rests on, against authoritative server time.
+   *
+   * A device that reached TRUSTED and then went dark keeps a persisted
+   * `TRUSTED` for ever, because the durable `TRUSTED -> DEGRADED` move only
+   * happens when an observation ARRIVES and no observation ever does. This
+   * field reports what the registry would ACT on, so the read surface can never
+   * advertise a TRUSTED that `deviceMayAct` would refuse.
+   */
   readonly trust: DeviceTrust;
+  /**
+   * C16-R5: the raw `device.trust` column, exposed beside the effective value
+   * so an operator can see when the durable row has not caught up with expired
+   * evidence yet. NOTHING may authorise on this field.
+   */
+  readonly persistedTrust: DeviceTrust;
   readonly revocationDisposition: DeviceRevocationDisposition | null;
   readonly revokedAt: Date | null;
   readonly sequenceNamespaceId: string;

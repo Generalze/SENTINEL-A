@@ -37,6 +37,25 @@ import { PrismaService } from '../../prisma/prisma.service';
 
 export type Tx = Prisma.TransactionClient;
 
+/**
+ * C16-R2: is this the driver's UNIQUENESS violation?
+ *
+ * Exported from the persistence layer so `@prisma/client` error internals stay
+ * here rather than leaking into a service. A service that wants to resolve a
+ * lost insert race needs to recognise the collision — and recognising it by
+ * matching an error MESSAGE is exactly the sort of string archaeology that
+ * quietly stops working on a driver upgrade.
+ *
+ * Deliberately NOT narrowed to one constraint name. Prisma reports
+ * `meta.target` differently across connectors and versions (a string here, an
+ * array of field names there), so the caller confirms WHICH row it lost to by
+ * RE-READING the authoritative row it expects — a database fact — and re-throws
+ * if that read does not find one.
+ */
+export function isUniqueConstraintViolation(error: unknown): boolean {
+  return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002';
+}
+
 // ---------------------------------------------------------------------------
 // Row projections
 //
@@ -334,6 +353,33 @@ export class ShieldRepository {
     return this.prisma.deviceCustodyRegime.findFirst({ where: { id, organisationId } });
   }
 
+  /**
+   * C16-R1: the SAME regime, re-read and LOCKED inside the commit transaction.
+   *
+   * `findCustodyRegime` above answers "was this regime acceptable when the
+   * request was opened?". That question was asked minutes or hours before the
+   * commit, and a regime can be retired in between. D24-06's rule — every
+   * authority-bearing row is re-read under `FOR UPDATE` at commit and
+   * re-validated there — applies to the custody regime exactly as it applies to
+   * the grant, the request and the approval: the regime is what governs the
+   * hand-over discipline of the hardware this transaction is about to register.
+   *
+   * `FOR UPDATE` and not `FOR SHARE`: retirement is an UPDATE of this row, and
+   * the claim being made is "this regime must not be retired between the moment
+   * I judged it live and the moment I commit a device under it".
+   */
+  async lockCustodyRegime(tx: Tx, organisationId: string, id: string): Promise<DeviceCustodyRegimeRow | null> {
+    if (!isUuid(id)) return null;
+    const rows = await tx.$queryRaw<DeviceCustodyRegimeRow[]>(Prisma.sql`
+      SELECT id, organisation_id AS "organisationId", site_id AS "siteId", name,
+             defined_by_user_id AS "definedByUserId", created_at AS "createdAt",
+             retired_at AS "retiredAt"
+      FROM device_custody_regimes
+      WHERE id = ${id}::uuid AND organisation_id = ${organisationId}
+      FOR UPDATE`);
+    return first(rows);
+  }
+
   // -------------------------------------------------------------------------
   // Bootstrap grants (D24-03a)
   // -------------------------------------------------------------------------
@@ -473,6 +519,65 @@ export class ShieldRepository {
    */
   async findEnrollmentRequestByGrant(organisationId: string, bootstrapGrantId: string): Promise<EnrollmentRequestRow | null> {
     return this.prisma.enrollmentRequest.findFirst({ where: { organisationId, bootstrapGrantId } });
+  }
+
+  /**
+   * C16-R2: the SAME question, asked INSIDE the writing transaction and under
+   * `FOR UPDATE`.
+   *
+   * `findEnrollmentRequestByGrant` above is a read-before-write, and two
+   * simultaneous first submissions can both be answered "none". One then wins
+   * the insert and the other collides with `enrollment_request_grant_key`. This
+   * read is what the loser uses to discover the ONE authoritative request that
+   * actually exists, in the transaction that is resolving its own collision, so
+   * the convergence/conflict answer is decided against a row that cannot move
+   * underneath it.
+   */
+  async lockEnrollmentRequestByGrant(
+    tx: Tx,
+    organisationId: string,
+    bootstrapGrantId: string,
+  ): Promise<EnrollmentRequestRow | null> {
+    if (!isUuid(bootstrapGrantId)) return null;
+    const rows = await tx.$queryRaw<EnrollmentRequestRow[]>(Prisma.sql`
+      SELECT id, organisation_id AS "organisationId", site_id AS "siteId",
+             intended_user_id AS "intendedUserId", bootstrap_grant_id AS "bootstrapGrantId",
+             custody, custody_regime_id AS "custodyRegimeId",
+             approved_semantics_digest AS "approvedSemanticsDigest",
+             public_key AS "publicKey", public_key_thumbprint AS "publicKeyThumbprint",
+             key_storage AS "keyStorage", claimed_signature_profile AS "claimedSignatureProfile",
+             server_selected_signature_profile AS "serverSelectedSignatureProfile",
+             request_fingerprint AS "requestFingerprint", attestation_outcome AS "attestationOutcome",
+             attestation_evaluated_at AS "attestationEvaluatedAt",
+             attestation_reference AS "attestationReference",
+             requested_at AS "requestedAt", state
+      FROM device_enrollment_requests
+      WHERE organisation_id = ${organisationId} AND bootstrap_grant_id = ${bootstrapGrantId}::uuid
+      FOR UPDATE`);
+    return first(rows);
+  }
+
+  /**
+   * C16-R2 — THE SAVEPOINT THE GRANT RACE IS RESOLVED INSIDE.
+   *
+   * A uniqueness violation aborts the whole Postgres transaction: every
+   * statement after it fails with 25P02 until the transaction ends. So a
+   * service that wants to CATCH the collision and then re-read the winning row
+   * in the same transaction cannot simply try/catch — it has to mark a point it
+   * can rewind to first.
+   *
+   * The name is a module constant and not a parameter. A savepoint name is a
+   * SQL identifier, it cannot be bound as a parameter, and the only safe way to
+   * keep an unparameterisable value out of an attacker's reach is to give
+   * callers no way to supply one.
+   */
+  async openEnrollmentRequestSavepoint(tx: Tx): Promise<void> {
+    await tx.$executeRaw(Prisma.sql`SAVEPOINT wp24_enrollment_request_insert`);
+  }
+
+  /** C16-R2: rewind to the savepoint above, leaving the transaction usable. */
+  async rollbackEnrollmentRequestSavepoint(tx: Tx): Promise<void> {
+    await tx.$executeRaw(Prisma.sql`ROLLBACK TO SAVEPOINT wp24_enrollment_request_insert`);
   }
 
   /** D24-06: the request itself, locked, so its state cannot advance mid-commit. */
@@ -1102,6 +1207,40 @@ export class ShieldRepository {
       where: { organisationId, deviceId },
       orderBy: [{ evaluatedAt: 'desc' }, { id: 'desc' }],
       select: { outcome: true, evaluatedAt: true },
+    });
+  }
+
+  /**
+   * C16-R5: the two attestation reads AND the authoritative server instant,
+   * taken together for a caller that is not already inside a transaction.
+   *
+   * The READ side needs the same resolution the write side performs, and the
+   * one thing it must not do is take the instant from this process's clock:
+   * every other timing rule in this module is judged against
+   * `clock_timestamp()` (see `dbNow`), and a standing that aged against the
+   * Node clock would age against a different clock from the one that recorded
+   * the evidence. So the instant comes from the database, in the same
+   * transaction as the reads.
+   *
+   * No lock is taken. This is a READ answering "what is true now", not a
+   * decision about to raise trust — `lockLatestAttestationObservation` is the
+   * locking variant and exists for that case. It also does not WRITE: see
+   * `DeviceRegistryService.effectiveDeviceStanding` for why a read that notices
+   * expiry does not mutate the device row.
+   */
+  async readAttestationEvidence(
+    organisationId: string,
+    deviceId: string,
+  ): Promise<{
+    latest: { outcome: string; evaluatedAt: Date } | null;
+    decisive: { outcome: string; evaluatedAt: Date } | null;
+    now: Date;
+  }> {
+    return this.transaction(async (tx) => {
+      const now = await this.dbNow(tx);
+      const latest = await this.latestAttestationObservation(tx, organisationId, deviceId);
+      const decisive = await this.latestDecisiveAttestation(tx, organisationId, deviceId);
+      return { latest, decisive, now };
     });
   }
 

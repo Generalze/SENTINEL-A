@@ -12,6 +12,7 @@ import {
   type DeviceTrust,
 } from '@sentinel/contracts';
 import type { Principal } from '../../common/security/principal';
+import { effectiveDeviceTrust, resolveAttestationStanding } from './attestation.standing';
 import { checkDeviceAuthority, projectReadableDeviceSites, readableSiteIds } from './shield.authority';
 import { ACTION_DEVICE_REGISTRY_READ } from './shield.constants';
 import { ShieldRepository, type DeviceKeyRow, type DeviceRow } from './shield.repository';
@@ -220,7 +221,50 @@ export class DeviceRegistryService {
     if (device === null) return false;
     const key = device.currentKeyId === null ? null : await this.repository.findDeviceKeyByKeyId(organisationId, device.currentKeyId);
     if (this.deviceLevelWithdrawn(device) || this.keyLevelWithdrawn(key)) return false;
-    return deviceTrustPermitsPurpose(device.trust as DeviceTrust, purpose);
+    // C16-R5: the EFFECTIVE trust, not the persisted column. See
+    // `effectiveDeviceStanding` — a device whose attestation aged out of the
+    // six-hour grace while nothing was observing it still reads TRUSTED in the
+    // database, and reading that column here is what let it keep firing Whisper.
+    return deviceTrustPermitsPurpose(await this.effectiveDeviceStanding(device), purpose);
+  }
+
+  /**
+   * C16-R5 — THE ONE CANONICAL EFFECTIVE-DEVICE-STANDING RESOLUTION.
+   *
+   * Every surface in this service that reports or acts on trust asks THIS, and
+   * nothing reads `device.trust` for an authorisation or standing answer any
+   * more.
+   *
+   * WHY IT EXISTS. `device.trust` is a persisted conclusion, and for `TRUSTED`
+   * that conclusion rests on attestation evidence with an expiry. C16-05 made
+   * the expiry act — but only when an observation ARRIVES. A device that goes
+   * dark inside the grace and is never looked at again crosses the six-hour
+   * boundary with nothing running: no observation, no job, no write. The row
+   * says TRUSTED for ever, and before this method `deviceMayAct` believed it.
+   *
+   * HOW. The attestation history is resolved through the module's ONE evidence
+   * selector (`resolveAttestationStanding`, C16-05) against AUTHORITATIVE SERVER
+   * TIME — `clock_timestamp()`, read in the same transaction as the evidence,
+   * consistent with every other timing decision in this module — and the
+   * standing is reconciled with the persisted trust by `effectiveDeviceTrust`,
+   * which calls the contract's `attestationStandingPermitsTrusted` rather than
+   * restating any policy.
+   *
+   * IT FAILS CLOSED IMMEDIATELY AND WRITES NOTHING. The degradation takes effect
+   * on the very next question asked. It deliberately does NOT mutate the device
+   * row: a read path that writes turns every authorisation check into a writer
+   * and would race the observation path that owns the durable
+   * `TRUSTED -> DEGRADED` transition and its D24-08 record.
+   */
+  private async effectiveDeviceStanding(device: DeviceRow): Promise<DeviceTrust> {
+    const persisted = device.trust as DeviceTrust;
+    // Only TRUSTED rests on expiring evidence, so only TRUSTED needs the
+    // history read. Skipping it elsewhere is not an optimisation dressed as a
+    // rule: `effectiveDeviceTrust` returns the persisted value unchanged for
+    // every other state, so the read could not change the answer.
+    if (persisted !== 'TRUSTED') return persisted;
+    const evidence = await this.repository.readAttestationEvidence(device.organisationId, device.id);
+    return effectiveDeviceTrust(persisted, resolveAttestationStanding(evidence));
   }
 
   private async buildStanding(device: DeviceRow, siteIds: string[]): Promise<DeviceStanding> {
@@ -232,7 +276,13 @@ export class DeviceRegistryService {
       deviceId: device.id,
       organisationId: device.organisationId,
       custody: device.custody as DeviceCustody,
-      trust: device.trust as DeviceTrust,
+      // C16-R5: THE EFFECTIVE TRUST. The registry must never advertise a
+      // TRUSTED it would refuse to act on a line later, so the read surface
+      // applies exactly the resolution `deviceMayAct` applies. `persistedTrust`
+      // beside it is the raw column, for an operator who needs to see that the
+      // durable row has not caught up yet.
+      trust: await this.effectiveDeviceStanding(device),
+      persistedTrust: device.trust as DeviceTrust,
       revocationDisposition: device.revocationDisposition as DeviceRevocationDisposition | null,
       revokedAt: device.revokedAt,
       sequenceNamespaceId: device.sequenceNamespaceId,

@@ -271,7 +271,8 @@ export class DeviceKeyService {
 
     // ONE transaction: the challenge and the state it advances the request to
     // are one fact about how far the ceremony has got.
-    return this.repository.transaction(async (tx) => {
+    try {
+      return await this.repository.transaction(async (tx) => {
       const issuedAt = await this.repository.dbNow(tx);
       const expiresAt = new Date(issuedAt.getTime() + DEVICE_KEY_ROTATION_CHALLENGE_MAX_AGE_MS);
       const challenge = await this.repository.createRotationChallenge(tx, {
@@ -291,9 +292,19 @@ export class DeviceKeyService {
         issuedAt,
         expiresAt,
       });
-      await this.repository.setRotationRequestState(tx, input.organisationId, request.id, request.state, ROTATION_STATE_CHALLENGED);
+      // C16-R3(b): fenced on the state read before the transaction opened, and
+      // performed AFTER the challenge row was written. A discarded zero left a
+      // live challenge attached to a request whose state never advanced — the
+      // ceremony would then present a challenge the state machine does not
+      // believe was issued.
+      const advanced = await this.repository.setRotationRequestState(tx, input.organisationId, request.id, request.state, ROTATION_STATE_CHALLENGED);
+      if (advanced !== 1) throw new ShieldTransactionRollback('ROTATION_STATE_INVALID', { audited: false });
       return { outcome: 'ISSUED', challengeId: challenge.id, nonce, expiresAt };
-    });
+      });
+    } catch (error) {
+      if (!isShieldTransactionRollback(error)) throw error;
+      return { outcome: 'REFUSED', refusal: error.refusal };
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -485,11 +496,13 @@ export class DeviceKeyService {
           outcome: 'CONVERGED',
           deviceId: locked.device.id,
           storedOutcomeRef: peeked.storedOutcomeRef,
-          // Read back from the REGISTRY. A convergence answer that echoed the
-          // request would be a claim about what the caller asked for rather
-          // than about what the registry holds.
+          // C16-R4: read back from the REGISTRY, and reporting WHAT THIS
+          // ROTATION COMMITTED — not what is current now. A later rotation may
+          // already have superseded this key; this answer says the retried
+          // ceremony landed, and grants nothing.
           toKeyId: committed.keyId,
           toKeyVersion: committed.keyVersion,
+          committedKeyLifecycleState: committed.status as DeviceKeyLifecycleState,
         };
       }
 
@@ -597,7 +610,20 @@ export class DeviceKeyService {
       );
       if (advanced !== 1) throw new ShieldTransactionRollback('STALE_ROTATION');
 
-      await this.repository.setRotationRequestState(tx, input.organisationId, locked.rotationRequestId, locked.rotationRequestState, ROTATION_STATE_ROTATED);
+      // C16-R3(b): the third fenced CAS, and its count was being discarded too.
+      // Fenced on the state the lock read observed, so zero rows means the
+      // rotation request left that state between the `FOR UPDATE` and here. The
+      // key writes above are already committed-in-transaction at this point, so
+      // returning would have left a device rotated under a request whose state
+      // machine never recorded the rotation. It throws, and the lot unwinds.
+      const stateAdvanced = await this.repository.setRotationRequestState(
+        tx,
+        input.organisationId,
+        locked.rotationRequestId,
+        locked.rotationRequestState,
+        ROTATION_STATE_ROTATED,
+      );
+      if (stateAdvanced !== 1) throw new ShieldTransactionRollback('ROTATION_STATE_INVALID');
 
       await this.audit.record(
         tx,
@@ -819,24 +845,44 @@ export class DeviceKeyService {
   }
 
   /**
-   * C16-03: does this stored outcome reference name the EXACT committed
-   * rotation it claims?
+   * C16-03 / C16-R4: does this stored outcome reference name the EXACT
+   * committed rotation it claims?
    *
-   * Every one of the six conditions below is load-bearing, and a convergence
-   * answer is given only when all of them hold:
+   * THE QUESTION THIS ANSWERS IS "DID IT COMMIT?", NOT "IS IT STILL CURRENT?"
+   * ------------------------------------------------------------------------
+   * C16-03's first version also required the resolved key to still be `CURRENT`
+   * AND still be the device's pointer. Those two conditions conflated a
+   * historical fact with a live one, and rejected a perfectly ordinary history:
    *
-   *   the key row exists                    ... or nothing was committed;
-   *   under this tenant and this device      ... or it is someone else's key;
-   *   carrying the proposed key id           ... or it is a different rotation;
-   *   at the proposed key version            ... or a different version landed;
-   *   with status CURRENT                    ... or it has since been retired
-   *                                              or revoked, and answering
-   *                                              CONVERGE would hand the caller
-   *                                              a credential that is gone;
-   *   and the DEVICE POINTER agrees          ... or the registry itself does
-   *                                              not consider this key current,
-   *                                              which is a half-applied
-   *                                              rotation and not a success.
+   *     R1 rotates v1 -> v2 and COMMITS
+   *     R2 rotates v2 -> v3 and COMMITS
+   *     an exact network retry of R1 arrives
+   *
+   * R1 really did commit — its replay row is the durable proof — but v2 is now
+   * `ROTATED`, so the old conditions called R1 unresolvable and answered
+   * `ROTATION_OUTCOME_UNRESOLVABLE`: a fail-closed refusal aimed at a ceremony
+   * that succeeded. Worse, that refusal is indistinguishable from the one raised
+   * when the store is genuinely corrupt, so a real integrity fault would have
+   * been drowned in the noise of honest retries.
+   *
+   * What still has to hold is everything that ties the stored reference to THIS
+   * rotation, and every one of these is load-bearing:
+   *
+   *   the key row exists                ... or nothing was ever committed;
+   *   in THIS tenant                    ... enforced by `findDeviceKeyRowById`,
+   *                                         which is scoped to the organisation;
+   *   on THIS device                    ... or it is another device's key;
+   *   carrying the proposed key id      ... or it is a different rotation;
+   *   at the proposed key version       ... or a different version landed.
+   *
+   * The key's CURRENT lifecycle state is deliberately NOT among them: `ROTATED`,
+   * `REVOKED` and `COMPROMISED` are all consistent with "this rotation
+   * committed, and the world has moved since".
+   *
+   * WHAT THE CALLER MAY DO WITH THE ANSWER: nothing operational. See the
+   * `CONVERGED` arm of `CommitKeyRotationOutcome` — it reports a historical
+   * commit and confers NO current key authority. `DeviceRegistryService` is the
+   * only thing that answers "which credential is live?".
    *
    * `null` means "this does not resolve", and the caller fails closed.
    */
@@ -850,9 +896,6 @@ export class DeviceKeyService {
     if (key.deviceId !== locked.device.id) return null;
     if (key.keyId !== locked.contractRequest.proposed_key_id) return null;
     if (key.keyVersion !== locked.contractRequest.proposed_key_version) return null;
-    if (key.status !== 'CURRENT') return null;
-    if (locked.device.currentKeyId !== key.keyId) return null;
-    if (locked.device.currentKeyVersion !== key.keyVersion) return null;
     return key;
   }
 

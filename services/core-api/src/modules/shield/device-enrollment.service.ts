@@ -23,6 +23,7 @@ import {
   evaluateDeviceEnrollmentCommit,
   initialDeviceTrustOnEnrollment,
   type DeviceCustody,
+  type DeviceCustodyAssociation,
   type DeviceEnrollmentApproval,
   type DeviceEnrollmentBootstrapGrant,
   type DeviceEnrollmentRequest,
@@ -50,6 +51,7 @@ import {
   TRUST_REASON_ENROLLMENT_INITIAL,
 } from './shield.constants';
 import {
+  isUniqueConstraintViolation,
   ShieldRepository,
   type BootstrapGrantRow,
   type EnrollmentApprovalRow,
@@ -539,8 +541,32 @@ export class DeviceEnrollmentService {
     // security event. A request persisted without the observation that judged
     // it would leave the commit gate reading evidence with no append-only
     // record behind it.
-    await this.repository.transaction(async (tx) => {
-      await this.repository.createEnrollmentRequest(tx, {
+    //
+    // C16-R2 — THE FIRST-USE RACE IS RESOLVED HERE, NOT HOPED AWAY.
+    //
+    // The read-before-write above answers "has this grant already opened a
+    // request?" — and two simultaneous FIRST submissions can both be answered
+    // "no". One then wins `enrollment_request_grant_key` and the other collides
+    // with it. Before this change the loser received a raw
+    // `PrismaClientKnownRequestError` (P2002) instead of the convergence or the
+    // named conflict the surface promises, and a driver exception escaping a
+    // security ceremony is a refusal nobody classified.
+    //
+    // The collision is caught, the transaction is rewound TO A SAVEPOINT (a
+    // uniqueness violation aborts the whole Postgres transaction otherwise —
+    // every later statement would fail 25P02), the ONE authoritative request is
+    // re-read under `FOR UPDATE` in the same transaction, and the SAME semantic
+    // comparison the read-before-write path uses decides the answer. Identical
+    // submission -> CONVERGED on the request that exists; materially different
+    // -> ENROLLMENT_REQUEST_CONFLICT.
+    //
+    // Note WHY the winner's row is guaranteed visible to that re-read: Postgres
+    // makes the second inserter WAIT on the unique index until the first
+    // transaction ends. A P2002 is therefore proof that the winner COMMITTED.
+    return this.repository.transaction(async (tx) => {
+      await this.repository.openEnrollmentRequestSavepoint(tx);
+      try {
+        await this.repository.createEnrollmentRequest(tx, {
         id: enrollmentRequestId,
         organisationId: submission.organisationId,
         siteId: submission.siteId,
@@ -563,7 +589,31 @@ export class DeviceEnrollmentService {
         attestationReference: evidence.attestation_reference,
         requestedAt,
         state: 'REQUESTED',
-      });
+        });
+      } catch (error) {
+        // Anything that is not a uniqueness violation is a real fault and is
+        // re-thrown untouched. A P2002 that does NOT turn out to be this
+        // grant's row is re-thrown too — the answer below is only honest when
+        // an authoritative request genuinely exists.
+        if (!isUniqueConstraintViolation(error)) throw error;
+        await this.repository.rollbackEnrollmentRequestSavepoint(tx);
+        const authoritative = await this.repository.lockEnrollmentRequestByGrant(tx, grant.organisationId, grant.id);
+        if (authoritative === null) throw error;
+        if (!this.submissionMatchesRequest(submission, authoritative)) {
+          return { outcome: 'REFUSED' as const, refusal: 'ENROLLMENT_REQUEST_CONFLICT' as const };
+        }
+        // The loser writes NOTHING: not the request (it lost), not a second
+        // attestation observation, not a second ENROLLMENT_REQUESTED event. The
+        // winner already recorded all three for this one ceremony.
+        return {
+          outcome: 'CONVERGED' as const,
+          enrollmentRequestId: authoritative.id,
+          requestFingerprint: authoritative.requestFingerprint,
+          serverSelectedSignatureProfile: SERVER_SELECTED_SIGNATURE_PROFILE,
+          attestationOutcome: authoritative.attestationOutcome,
+        };
+      }
+
       // D24-07: every observation is persisted, append-only, whatever it said.
       await this.repository.appendAttestationObservation(tx, {
         organisationId: submission.organisationId,
@@ -591,15 +641,15 @@ export class DeviceEnrollmentService {
           attestationOutcome: evidence.outcome,
         },
       );
-    });
 
-    return {
-      outcome: 'REQUESTED',
-      enrollmentRequestId,
-      requestFingerprint: fingerprint,
-      serverSelectedSignatureProfile: SERVER_SELECTED_SIGNATURE_PROFILE,
-      attestationOutcome: evidence.outcome,
-    };
+      return {
+        outcome: 'REQUESTED' as const,
+        enrollmentRequestId,
+        requestFingerprint: fingerprint,
+        serverSelectedSignatureProfile: SERVER_SELECTED_SIGNATURE_PROFILE,
+        attestationOutcome: evidence.outcome,
+      };
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -669,18 +719,23 @@ export class DeviceEnrollmentService {
       return { outcome: 'REFUSED', refusal: 'APPROVED_SEMANTICS_MISMATCH' };
     }
 
-    return this.repository.transaction(async (tx) => {
+    try {
+      return await this.repository.transaction(async (tx) => {
       const now = await this.repository.dbNow(tx);
       // The contract's own state matrix decides whether this move is legal.
       if (!canTransitionDeviceEnrollment('REQUESTED', 'APPROVED')) {
         return { outcome: 'REFUSED', refusal: 'ENROLLMENT_STATE_INVALID' };
       }
       const advanced = await this.repository.advanceEnrollmentState(tx, input.organisationId, request.id, 'REQUESTED', 'APPROVED');
-      // Lost to a concurrent approval. The unique index on
+      // C16-R3(b): lost to a concurrent approval. The unique index on
       // (organisation_id, enrollment_request_id) would refuse the second
       // approval row anyway; this reports it as a state refusal rather than a
-      // driver fault.
-      if (advanced !== 1) return { outcome: 'REFUSED', refusal: 'ALREADY_APPROVED' };
+      // driver fault. It THROWS rather than returns for the reason every other
+      // fenced CAS in this module now does: a normal return COMMITS, and the
+      // rule "exactly one row, or nothing happened" must not depend on a
+      // reviewer noticing that this particular update happens to be the first
+      // write in its transaction.
+      if (advanced !== 1) throw new ShieldTransactionRollback('ALREADY_APPROVED', { audited: false });
 
       const approval = await this.repository.createEnrollmentApproval(tx, {
         organisationId: input.organisationId,
@@ -713,7 +768,11 @@ export class DeviceEnrollmentService {
       );
 
       return { outcome: 'APPROVED', approvalId: approval.id, approvedRequestFingerprint: fingerprint };
-    });
+      });
+    } catch (error) {
+      if (!isShieldTransactionRollback(error)) throw error;
+      return { outcome: 'REFUSED', refusal: error.refusal };
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -840,7 +899,8 @@ export class DeviceEnrollmentService {
       claimedProfile: response.claimed_signature_profile,
     });
 
-    return this.repository.transaction(async (tx) => {
+    try {
+      return await this.repository.transaction(async (tx) => {
       // C15-03: THE SERVER's instant is freshness. `response.answered_at` — the
       // device's own claim — is read nowhere in this method or in the gate.
       const verifiedAt = await this.repository.dbNow(tx);
@@ -857,7 +917,15 @@ export class DeviceEnrollmentService {
       });
 
       if (verified) {
-        await this.repository.advanceEnrollmentState(tx, input.organisationId, request.id, 'APPROVED', 'POSSESSION_PROVEN');
+        // C16-R3(b): the count is the concurrency signal. This update is fenced
+        // on `state = 'APPROVED'`, and it runs AFTER the verification row has
+        // been written — so a discarded zero committed a `verified: true`
+        // verdict, and its D24-12 audit event, for a ceremony whose state never
+        // advanced. The next commit would then find POSSESSION_VERIFICATION but
+        // a request that is not POSSESSION_PROVEN. It throws instead, and the
+        // whole transaction — verdict row included — unwinds.
+        const advanced = await this.repository.advanceEnrollmentState(tx, input.organisationId, request.id, 'APPROVED', 'POSSESSION_PROVEN');
+        if (advanced !== 1) throw new ShieldTransactionRollback('ENROLLMENT_STATE_INVALID', { audited: false });
       }
 
       await this.audit.record(
@@ -879,7 +947,15 @@ export class DeviceEnrollmentService {
         verificationId: row.id,
         possessionStatementFingerprint: statementFingerprint,
       };
-    });
+      });
+    } catch (error) {
+      // C16-R3(b): the fenced-CAS rollback, translated back into this module's
+      // refusal-as-data discipline. Nothing was recorded, because nothing
+      // survived the abort — including the verification row this transaction
+      // had already written.
+      if (!isShieldTransactionRollback(error)) throw error;
+      return { outcome: 'REFUSED', refusal: error.refusal };
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -977,6 +1053,70 @@ export class DeviceEnrollmentService {
           return { outcome: 'REFUSED', refusal: 'APPROVED_SEMANTICS_MISMATCH' };
         }
 
+        // C16-R1: THE APPROVAL'S OWN REGIME RECORD IS BOUND TOO.
+        //
+        // The check above recomputes the digest from the REQUEST. It proves the
+        // request still says what the approval bound — and it proves NOTHING
+        // about the approval row itself, which is where `performCommit` actually
+        // reads the regime from. `approved_custody_regime_id` is the approval's
+        // INDEPENDENT record (that is the point of it: a disagreement must be
+        // visible rather than inherited), so a writer that moves the approval's
+        // regime A -> B and leaves `approved_semantics_digest` alone changed
+        // nothing either the frozen fingerprint or the request-derived digest
+        // can see, and the device would have been associated under B.
+        //
+        // Two checks close it, and the ORDER is deliberate: the direct
+        // comparison first, so two records disagreeing is reported as ITSELF and
+        // an operator is told which row moved rather than being handed a digest
+        // mismatch to work backwards from.
+        if (locked.approval.approvedCustodyRegimeId !== locked.request.custodyRegimeId) {
+          await this.recordEnrollmentRefusal(tx, input, locked.fingerprint, 'APPROVED_CUSTODY_REGIME_MISMATCH', now, principal.user.id);
+          return { outcome: 'REFUSED', refusal: 'APPROVED_CUSTODY_REGIME_MISMATCH' };
+        }
+
+        // ... and the approval must agree with its OWN digest, recomputed from
+        // its OWN approved fields. Together with the request-derived
+        // recomputation above this pins the whole triple — fingerprint, custody
+        // and regime — on BOTH rows: if both recomputations equal the one stored
+        // digest, the two triples are equal, so the approval's approved
+        // fingerprint and approved custody are the request's too.
+        const approvalOwnDigest = approvedEnrollmentSemanticsDigest({
+          enrollmentRequestFingerprint: locked.approval.approvedRequestFingerprint,
+          custody: locked.approval.approvedCustody as DeviceCustody,
+          custodyRegimeId: locked.approval.approvedCustodyRegimeId,
+        });
+        if (approvalOwnDigest !== locked.approval.approvedSemanticsDigest) {
+          await this.recordEnrollmentRefusal(tx, input, locked.fingerprint, 'APPROVAL_RECORD_INCONSISTENT', now, principal.user.id);
+          return { outcome: 'REFUSED', refusal: 'APPROVAL_RECORD_INCONSISTENT' };
+        }
+
+        // C16-R1: AND THE REGIME ITSELF, RE-READ AND LOCKED AT FINAL COMMIT.
+        //
+        // `resolveSubmittedCustodyRegime` judged this regime when the REQUEST
+        // was opened. That was a different moment: a regime can be retired, and
+        // a row can be rewritten, between a request and its commit. D24-06's
+        // rule is that every authority-bearing row is re-read under `FOR UPDATE`
+        // inside the commit transaction and re-validated there, and the custody
+        // regime is such a row — it governs the hand-over discipline of the
+        // hardware this transaction is about to register.
+        //
+        // Absent, foreign-tenant and right-tenant-wrong-site all answer
+        // `CUSTODY_REGIME_NOT_FOUND`, exactly as they do at request time;
+        // retirement is reported distinctly for the same reason it is there.
+        if (locked.request.custodyRegimeId !== null) {
+          const regime = await this.repository.lockCustodyRegime(tx, input.organisationId, locked.request.custodyRegimeId);
+          const regimeRefusal =
+            regime === null || regime.siteId !== locked.contractRequest.site_id
+              ? ('CUSTODY_REGIME_NOT_FOUND' as const)
+              : regime.retiredAt !== null
+                ? ('CUSTODY_REGIME_RETIRED' as const)
+                : null;
+          if (regimeRefusal !== null) {
+            await this.recordEnrollmentRefusal(tx, input, locked.fingerprint, regimeRefusal, now, principal.user.id);
+            return { outcome: 'REFUSED', refusal: regimeRefusal };
+          }
+        }
+
         // C16-02: RESOLVE BEFORE BURNING. Both one-shot identities must name
         // ONE canonical committed outcome, and it must be an outcome the
         // database can actually produce. This is a pure read; a refusal here is
@@ -1007,6 +1147,41 @@ export class DeviceEnrollmentService {
         if (!resolved.resolved) {
           await this.recordEnrollmentRefusal(tx, input, locked.fingerprint, resolved.refusal, now, principal.user.id);
           return { outcome: 'REFUSED', refusal: resolved.refusal };
+        }
+
+        // C16-R3: THE LAST STRUCTURAL CHECK, MOVED IN FRONT OF THE BURN.
+        //
+        // C15-08's custody shape used to be parsed inside `performCommit`, and a
+        // failure there RETURNED a `MALFORMED_CONTRACT_STRUCTURE` refusal —
+        // after both replay identities had been consumed. A normal return from a
+        // Prisma interactive transaction COMMITS, so that refusal left two
+        // consumption rows behind for a device that was never created: exactly
+        // the defect C16-02 closed everywhere else and missed here.
+        //
+        // It is a pure function of rows already in hand, so it belongs here. The
+        // rule this restores, and which `performCommit`'s return type now proves
+        // structurally, is: THERE IS NO ORDINARY REFUSAL PATH AFTER THE FIRST
+        // CONSUMPTION WRITE.
+        const association = DeviceCustodyAssociationSchema.safeParse({
+          schema_version: 1,
+          organisation_id: input.organisationId,
+          device_id: resolved.outcomeRef,
+          custody: locked.contractRequest.custody,
+          assigned_user_id: locked.contractRequest.custody === 'PERSONAL' ? locked.contractRequest.intended_user_id : null,
+          // C16-01: THE RÉGIME COMES FROM THE APPROVAL ROW. Not from a commit
+          // parameter (there is none any more), and not from the request either:
+          // the approval is the human decision. C16-R1's two checks above have
+          // proved the approval agrees with its own digest AND with the locked
+          // request, so reading the approval here is a statement about the
+          // human's decision rather than a bet that nothing moved.
+          custody_regime_id: locked.approval.approvedCustodyRegimeId,
+          associated_site_ids: [locked.contractRequest.site_id],
+          associated_at: now.toISOString(),
+          released_at: null,
+        });
+        if (!association.success) {
+          await this.recordEnrollmentRefusal(tx, input, locked.fingerprint, 'MALFORMED_CONTRACT_STRUCTURE', now, principal.user.id);
+          return { outcome: 'REFUSED', refusal: 'MALFORMED_CONTRACT_STRUCTURE' };
         }
 
         // ---- FIRST CONSUMPTION WRITE -----------------------------------
@@ -1074,6 +1249,7 @@ export class DeviceEnrollmentService {
           now,
           deviceId: resolved.outcomeRef,
           fingerprint: decision.enrollment_request_fingerprint,
+          association: association.data,
         });
       });
     } catch (error) {
@@ -1108,9 +1284,15 @@ export class DeviceEnrollmentService {
       now: Date;
       deviceId: string;
       fingerprint: string;
+      /**
+       * C16-R3: PARSED BEFORE THE BURN, by the caller. Passing the already-valid
+       * structure in is what makes "no ordinary refusal after first consumption"
+       * a property of the code rather than a promise about it.
+       */
+      association: DeviceCustodyAssociation;
     },
-  ): Promise<CommitEnrollmentOutcome> {
-    const { input, locked, now, deviceId } = context;
+  ): Promise<Extract<CommitEnrollmentOutcome, { outcome: 'COMMITTED' }>> {
+    const { input, locked, now, deviceId, association } = context;
 
     // D24-04: DERIVED, never caller-selected. There is no parameter through
     // which a namespace could arrive, and D23-09's rule that the only way to a
@@ -1137,27 +1319,10 @@ export class DeviceEnrollmentService {
       attestationStanding: standing.standing,
     });
 
-    // C15-08's custody shape, enforced by the CONTRACT rather than by an `if`
-    // here: a PERSONAL device names its operative and no régime, a
-    // CONTROLLED_SHARED device names its régime and no permanent assignee.
-    const association = DeviceCustodyAssociationSchema.safeParse({
-      schema_version: 1,
-      organisation_id: input.organisationId,
-      device_id: deviceId,
-      custody: locked.contractRequest.custody,
-      assigned_user_id: locked.contractRequest.custody === 'PERSONAL' ? locked.contractRequest.intended_user_id : null,
-      // C16-01: THE RÉGIME COMES FROM THE APPROVAL ROW. Not from a commit
-      // parameter (there is none any more), and not from the request either:
-      // the approval is the human decision, and the prevalidation above has
-      // already proved the request still agrees with it. Reading the approval
-      // is what makes "committed under a régime the approver never saw"
-      // unrepresentable rather than merely unlikely.
-      custody_regime_id: locked.approval.approvedCustodyRegimeId,
-      associated_site_ids: [locked.contractRequest.site_id],
-      associated_at: now.toISOString(),
-      released_at: null,
-    });
-    if (!association.success) return { outcome: 'REFUSED', refusal: 'MALFORMED_CONTRACT_STRUCTURE' };
+    // C15-08's custody shape came in ALREADY PARSED by the caller (C16-R3): a
+    // PERSONAL device names its operative and no régime, a CONTROLLED_SHARED
+    // device names its régime and no permanent assignee, and the CONTRACT
+    // enforced that before either replay identity was spent.
 
     const keyId = randomUUID();
     const keyVersion = 1;
@@ -1200,8 +1365,8 @@ export class DeviceEnrollmentService {
       deviceId,
       siteId: locked.contractRequest.site_id,
       custody: locked.contractRequest.custody,
-      assignedUserId: association.data.assigned_user_id,
-      custodyRegimeId: association.data.custody_regime_id,
+      assignedUserId: association.assigned_user_id,
+      custodyRegimeId: association.custody_regime_id,
       associatedAt: now,
     });
 
@@ -1232,7 +1397,19 @@ export class DeviceEnrollmentService {
       traceId: input.traceId,
     });
 
-    await this.repository.advanceEnrollmentState(tx, input.organisationId, locked.request.id, 'POSSESSION_PROVEN', 'ENROLLED');
+    // C16-R3(b): THE COUNT IS THE CONCURRENCY SIGNAL, AND IT WAS BEING THROWN
+    // AWAY.
+    //
+    // This is a FENCED update — `state = 'POSSESSION_PROVEN'` is in the WHERE
+    // clause — so a count of zero means the request left POSSESSION_PROVEN
+    // between the `FOR UPDATE` read at the top of this transaction and here.
+    // Discarding that left the device, its key, its scope, its trust transition
+    // and its DEVICE_ENROLLED audit committed against a ceremony whose state
+    // machine says the enrollment never completed. There is no ordinary refusal
+    // available at this point (see the return type), so it THROWS and Postgres
+    // unwinds everything this transaction wrote.
+    const enrolled = await this.repository.advanceEnrollmentState(tx, input.organisationId, locked.request.id, 'POSSESSION_PROVEN', 'ENROLLED');
+    if (enrolled !== 1) throw new ShieldTransactionRollback('ENROLLMENT_STATE_INVALID');
 
     const envelope = {
       organisationId: input.organisationId,

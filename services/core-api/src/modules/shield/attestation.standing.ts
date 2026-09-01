@@ -1,7 +1,9 @@
 import {
+  attestationStandingPermitsTrusted,
   evaluateAttestationStanding,
   type DeviceAttestationOutcome,
   type DeviceAttestationStanding,
+  type DeviceTrust,
 } from '@sentinel/contracts';
 
 /**
@@ -156,4 +158,51 @@ export function resolveAttestationStanding(input: {
     now: input.now.toISOString(),
     hasPriorVerified: evidence.hasPriorVerified,
   }).standing;
+}
+
+/**
+ * WP-24/C16-R5 — THE ONE PLACE PERSISTED TRUST IS RECONCILED WITH EXPIRING
+ * EVIDENCE.
+ *
+ * THE HOLE IT CLOSES
+ * ------------------
+ * C16-05 made ageing happen, but only as an EVENT: the `TRUSTED -> DEGRADED`
+ * move is written when an attestation observation is RECORDED. For the history
+ *
+ *     VERIFIED (t0) -> UNAVAILABLE (t1, inside the grace)   ... and then silence
+ *
+ * nothing ever runs again. At t0 + 6h + 1ms no observation arrives, no job
+ * fires, and the persisted `device.trust` column still reads `TRUSTED` — for
+ * ever. `deviceMayAct` read that column directly, so it kept answering `true`
+ * for `WHISPER_DEVICE_ACTION` on evidence that had expired.
+ *
+ * THE RULE
+ * --------
+ * AUTHORISATION MUST NOT REST ON PERSISTED TRUST ALONE WHEN THAT TRUST DEPENDS
+ * ON EVIDENCE THAT EXPIRES. `TRUSTED` is the only trust state
+ * `attestationStandingPermitsTrusted` gates, so it is the only one this
+ * function can lower: everything else is either already below TRUSTED or is a
+ * conclusion (`COMPROMISED`) that attestation does not create and must not
+ * erase.
+ *
+ * DEGRADED, not QUARANTINED — the same choice C16-05 made for the recorded
+ * transition, for the same reason. An expired attestation is IGNORANCE, not
+ * suspicion; nothing has accused this device of anything, and the capability
+ * ordering keeps those apart.
+ *
+ * IT FAILS CLOSED IMMEDIATELY AND IT DOES NOT WRITE. A read that notices expiry
+ * changes the ANSWER at once; it deliberately does NOT mutate the device row.
+ * A read path that writes turns every authorisation check into a writer,
+ * couples availability of reads to availability of writes, and would race the
+ * genuine observation path that owns the `TRUSTED -> DEGRADED` transition and
+ * its D24-08 transition record. The durable move remains
+ * `recordAttestationObservation`'s; this is the live answer in the meantime.
+ *
+ * THE POLICY IS STILL THE CONTRACT'S. `attestationStandingPermitsTrusted` is
+ * called, never paraphrased — which of the standings can carry TRUSTED is not a
+ * decision this module gets a second opinion about.
+ */
+export function effectiveDeviceTrust(persistedTrust: DeviceTrust, standing: DeviceAttestationStanding): DeviceTrust {
+  if (persistedTrust !== 'TRUSTED') return persistedTrust;
+  return attestationStandingPermitsTrusted(standing) ? 'TRUSTED' : 'DEGRADED';
 }

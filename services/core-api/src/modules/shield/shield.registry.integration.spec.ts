@@ -429,7 +429,14 @@ async function enrol(options: CeremonyOptions = {}): Promise<EnrolledDevice> {
 async function rotate(
   device: EnrolledDevice,
   options: { newKeyPair?: TestDeviceKeyPair; keyStorage?: DeviceKeyStorage } = {},
-): Promise<{ outcome: Awaited<ReturnType<DeviceKeyService['commitKeyRotation']>>; newKeyPair: TestDeviceKeyPair }> {
+): Promise<{
+  outcome: Awaited<ReturnType<DeviceKeyService['commitKeyRotation']>>;
+  newKeyPair: TestDeviceKeyPair;
+  /** C16-R4: everything an EXACT retry of this rotation needs, byte for byte. */
+  rotationRequestId: string;
+  challengeId: string;
+  continuityProof: Record<string, unknown>;
+}> {
   const newKeyPair = options.newKeyPair ?? generateTestDeviceKeyPair();
   const tenant = device.prepared.tenant;
 
@@ -482,26 +489,28 @@ async function rotate(
     traceId: traceId(),
   });
 
+  // The CURRENT key proves continuity, over the EXACT rotation-request
+  // fingerprint. This is what stops a valid current-key proof being borrowed
+  // for a different replacement key.
+  const continuityProof = buildContinuityProof(device.keyPair, {
+    organisationId: tenant.organisationId,
+    siteId: tenant.siteId,
+    actorUserId: tenant.intendedUserId,
+    deviceId: device.deviceId,
+    keyId: standing.standing.currentKeyId as string,
+    keyVersion: standing.standing.currentKeyVersion as number,
+    payloadDigest: request.rotationRequestFingerprint,
+  });
+
   const outcome = await deviceKeys.commitKeyRotation(tenant.approver, {
     organisationId: tenant.organisationId,
     rotationRequestId: request.rotationRequestId,
     challengeId: challenge.challengeId,
-    // The CURRENT key proves continuity, over the EXACT rotation-request
-    // fingerprint. This is what stops a valid current-key proof being borrowed
-    // for a different replacement key.
-    continuityProof: buildContinuityProof(device.keyPair, {
-      organisationId: tenant.organisationId,
-      siteId: tenant.siteId,
-      actorUserId: tenant.intendedUserId,
-      deviceId: device.deviceId,
-      keyId: standing.standing.currentKeyId as string,
-      keyVersion: standing.standing.currentKeyVersion as number,
-      payloadDigest: request.rotationRequestFingerprint,
-    }),
+    continuityProof,
     traceId: traceId(),
   });
 
-  return { outcome, newKeyPair };
+  return { outcome, newKeyPair, rotationRequestId: request.rotationRequestId, challengeId: challenge.challengeId, continuityProof };
 }
 
 /** C16-01: one server-issued custody regime, through the real service. */
@@ -547,6 +556,33 @@ async function associateExtraSite(deviceId: string, siteId: string): Promise<voi
  * the evidence is aged instead, which exercises the same arithmetic from the
  * other side and keeps the authoritative clock authoritative.
  */
+/**
+ * C16-R5: the same ageing, but PRESERVING THE ORDER of the history.
+ *
+ * `ageAttestation` stamps every row with ONE instant, which is exactly right
+ * when a fresh observation is about to be appended after it — and useless when
+ * the point of the fixture is that NO further observation ever arrives. With
+ * equal timestamps the "newest observation" is decided by the uuid tiebreak,
+ * so which row is latest becomes a coin toss. Shifting each row by the same
+ * delta keeps `VERIFIED -> UNAVAILABLE` in that order while moving the whole
+ * history past the grace.
+ */
+async function ageAttestationPreservingOrder(deviceId: string, ageMs: number): Promise<void> {
+  const rows = await prisma.deviceAttestationObservation.findMany({
+    where: { deviceId },
+    select: { id: true, evaluatedAt: true, observedAt: true },
+  });
+  for (const row of rows) {
+    await prisma.deviceAttestationObservation.update({
+      where: { id: row.id },
+      data: {
+        evaluatedAt: new Date(row.evaluatedAt.getTime() - ageMs),
+        observedAt: new Date(row.observedAt.getTime() - ageMs),
+      },
+    });
+  }
+}
+
 async function ageAttestation(deviceId: string, ageMs: number): Promise<void> {
   const at = new Date(Date.now() - ageMs);
   await prisma.deviceAttestationObservation.updateMany({
@@ -2820,6 +2856,446 @@ describe('WP-24 Shield device registry (live)', () => {
           'e'.repeat(64),
         ),
       ).rejects.toThrow(/fkey|foreign key/iu);
+    });
+  });
+
+  // ==========================================================================
+  // C16-R RESIDUAL BATCH
+  //
+  // Five residuals from the final adversarial pass over the C16 batch. Each
+  // block drives the REAL services against the live stack and asserts the
+  // property that was missing — never merely that the new code runs.
+  // ==========================================================================
+
+  describe('C16-R1 the approval OWN regime record is bound at commit', () => {
+    it('THE BLOCKER: mutating ONLY the approval regime refuses, with zero devices and zero consumption rows', async () => {
+      const approved = await defineRegime(A.issuer, fx.orgA, fx.siteA1);
+      const substituted = await defineRegime(A.issuer, fx.orgA, fx.siteA1);
+      const prepared = await prepareCeremony({ custody: 'CONTROLLED_SHARED', custodyRegimeId: approved });
+
+      // THE ATTACK THE OLD CODE LOST. `performCommit` reads the régime from the
+      // APPROVAL row; the C16-01 check recomputes the digest from the REQUEST.
+      // So a writer that moves the APPROVAL's own régime A -> B and leaves the
+      // stored digest alone changed nothing the frozen fingerprint could see,
+      // nothing the request-derived digest could see — and everything the
+      // device would actually be governed by. The existing C16-01 regression
+      // mutates the REQUEST, which is the other row entirely.
+      const approvalBefore = await prisma.enrollmentApproval.findFirstOrThrow({
+        where: { organisationId: fx.orgA, enrollmentRequestId: prepared.enrollmentRequestId },
+      });
+      expect(approvalBefore.approvedCustodyRegimeId).toBe(approved);
+      await prisma.enrollmentApproval.update({
+        where: { id: approvalBefore.id },
+        data: { approvedCustodyRegimeId: substituted },
+      });
+      const approvalAfter = await prisma.enrollmentApproval.findUniqueOrThrow({ where: { id: approvalBefore.id } });
+      // The digest is UNTOUCHED. That is the whole point: nothing derived from
+      // the request can detect this.
+      expect(approvalAfter.approvedSemanticsDigest).toBe(approvalBefore.approvedSemanticsDigest);
+
+      const consumptionsBefore = await prisma.deviceNonceConsumption.count({ where: { organisationId: fx.orgA } });
+      // Reported as ITSELF: the two records disagree, and an operator is told
+      // that rather than being handed a digest mismatch to work backwards from.
+      expect(await commit(prepared)).toEqual({ outcome: 'REFUSED', refusal: 'APPROVED_CUSTODY_REGIME_MISMATCH' });
+
+      expect(
+        await prisma.device.count({ where: { organisationId: fx.orgA, enrollmentRequestId: prepared.enrollmentRequestId } }),
+      ).toBe(0);
+      // AND NEITHER ONE-SHOT IDENTITY WAS SPENT. The refusal is reached before
+      // the first consumption write, so nothing was burned for an effect that
+      // never happened.
+      expect(await prisma.deviceNonceConsumption.count({ where: { organisationId: fx.orgA } })).toBe(consumptionsBefore);
+    });
+
+    it('an approval rewritten to disagree with its OWN digest refuses', async () => {
+      const approved = await defineRegime(A.issuer, fx.orgA, fx.siteA1);
+      const prepared = await prepareCeremony({ custody: 'CONTROLLED_SHARED', custodyRegimeId: approved });
+
+      // Both records still name the same régime, so the direct comparison
+      // passes. What moved is the approval's record of WHICH CUSTODY it
+      // approved — a field only the approval's own recomputation reads.
+      const approval = await prisma.enrollmentApproval.findFirstOrThrow({
+        where: { organisationId: fx.orgA, enrollmentRequestId: prepared.enrollmentRequestId },
+      });
+      await prisma.enrollmentApproval.update({ where: { id: approval.id }, data: { approvedCustody: 'PERSONAL' } });
+
+      expect(await commit(prepared)).toEqual({ outcome: 'REFUSED', refusal: 'APPROVAL_RECORD_INCONSISTENT' });
+      expect(
+        await prisma.device.count({ where: { organisationId: fx.orgA, enrollmentRequestId: prepared.enrollmentRequestId } }),
+      ).toBe(0);
+    });
+
+    it('THE BLOCKER: a regime retired AFTER approval but BEFORE commit refuses', async () => {
+      const regime = await defineRegime(A.issuer, fx.orgA, fx.siteA1);
+      const prepared = await prepareCeremony({ custody: 'CONTROLLED_SHARED', custodyRegimeId: regime });
+
+      // The régime was live when the request was opened and when the human
+      // approved. It is withdrawn before the commit — which is precisely the
+      // window D24-06 exists for, and the régime was the one authority-bearing
+      // row nothing re-read under lock at commit.
+      await prisma.deviceCustodyRegime.update({ where: { id: regime }, data: { retiredAt: new Date() } });
+
+      const consumptionsBefore = await prisma.deviceNonceConsumption.count({ where: { organisationId: fx.orgA } });
+      expect(await commit(prepared)).toEqual({ outcome: 'REFUSED', refusal: 'CUSTODY_REGIME_RETIRED' });
+      expect(
+        await prisma.device.count({ where: { organisationId: fx.orgA, enrollmentRequestId: prepared.enrollmentRequestId } }),
+      ).toBe(0);
+      expect(await prisma.deviceNonceConsumption.count({ where: { organisationId: fx.orgA } })).toBe(consumptionsBefore);
+    });
+  });
+
+  describe('C16-R2 the grant to request first-use race never leaks a driver exception', () => {
+    /** One submission, expressed once so a "repeat" is genuinely byte-identical. */
+    function submissionFor(grantToken: string, keyPair: TestDeviceKeyPair, keyStorage: DeviceKeyStorage = 'HARDWARE_BACKED') {
+      return {
+        organisationId: fx.orgA,
+        siteId: fx.siteA1,
+        intendedUserId: fx.operativeAlpha,
+        bootstrapToken: grantToken,
+        custody: 'PERSONAL' as const,
+        publicKey: keyPair.publicKey,
+        keyStorage,
+        claimedSignatureProfile: PROFILE,
+        custodyRegimeId: null,
+        traceId: traceId(),
+      };
+    }
+
+    async function freshGrant(): Promise<string> {
+      const grant = await enrollment.issueBootstrapGrant(A.issuer, {
+        organisationId: fx.orgA,
+        siteId: fx.siteA1,
+        intendedUserId: fx.operativeAlpha,
+        traceId: traceId(),
+      });
+      if (grant.outcome !== 'ISSUED') throw new Error('grant not issued');
+      return grant.token;
+    }
+
+    it('THE BLOCKER: the LOSER of the race CONVERGES instead of surfacing a Prisma P2002', async () => {
+      const token = await freshGrant();
+      const keyPair = generateTestDeviceKeyPair();
+
+      const first = await enrollment.createEnrollmentRequest(submissionFor(token, keyPair));
+      expect(first.outcome).toBe('REQUESTED');
+      if (first.outcome !== 'REQUESTED') throw new Error('unreachable');
+
+      // FAULT INJECTION, and it is the race exactly. The read-before-write is
+      // forced to answer "no request yet" once — which is what BOTH callers see
+      // when two first submissions arrive together — so the insert is attempted
+      // against a row that already exists.
+      const spy = vi.spyOn(repository, 'findEnrollmentRequestByGrant').mockResolvedValueOnce(null);
+      let escaped: unknown = null;
+      let second: Awaited<ReturnType<DeviceEnrollmentService['createEnrollmentRequest']>> | null = null;
+      try {
+        second = await enrollment.createEnrollmentRequest(submissionFor(token, keyPair));
+      } catch (error) {
+        escaped = error;
+      } finally {
+        spy.mockRestore();
+      }
+
+      // NOTHING ESCAPED. Before C16-R2 this was a raw
+      // `PrismaClientKnownRequestError` (P2002) thrown out of a security
+      // ceremony — a refusal nobody classified and no caller could handle.
+      expect((escaped as { name?: string } | null)?.name).not.toBe('PrismaClientKnownRequestError');
+      expect(escaped).toBeNull();
+
+      expect(second).toEqual({
+        outcome: 'CONVERGED',
+        enrollmentRequestId: first.enrollmentRequestId,
+        requestFingerprint: first.requestFingerprint,
+        serverSelectedSignatureProfile: PROFILE,
+        attestationOutcome: first.attestationOutcome,
+      });
+
+      // EXACTLY ONE request behind the grant, and the loser wrote no second
+      // attestation observation and no second ENROLLMENT_REQUESTED event.
+      const row = await prisma.enrollmentRequest.findUniqueOrThrow({ where: { id: first.enrollmentRequestId } });
+      expect(
+        await prisma.enrollmentRequest.count({ where: { organisationId: fx.orgA, bootstrapGrantId: row.bootstrapGrantId } }),
+      ).toBe(1);
+      expect(
+        await prisma.deviceAttestationObservation.count({ where: { enrollmentRequestId: first.enrollmentRequestId } }),
+      ).toBe(1);
+      const events = await repository.listSecurityEvents(fx.orgA, null);
+      expect(
+        events.filter(
+          (event) =>
+            event.eventType === 'ENROLLMENT_REQUESTED' &&
+            (event.payload as { enrollment_request_id?: string }).enrollment_request_id === first.enrollmentRequestId,
+        ),
+      ).toHaveLength(1);
+    });
+
+    it('THE BLOCKER: a MATERIALLY DIFFERENT losing submission is the named conflict, not a driver fault', async () => {
+      const token = await freshGrant();
+      const first = await enrollment.createEnrollmentRequest(submissionFor(token, generateTestDeviceKeyPair()));
+      expect(first.outcome).toBe('REQUESTED');
+
+      const spy = vi.spyOn(repository, 'findEnrollmentRequestByGrant').mockResolvedValueOnce(null);
+      let escaped: unknown = null;
+      let second: Awaited<ReturnType<DeviceEnrollmentService['createEnrollmentRequest']>> | null = null;
+      try {
+        // A DIFFERENT key: this is the thing `enrollment_request_grant_key`
+        // exists to stop, and it must be reported as the ceremony's own refusal.
+        second = await enrollment.createEnrollmentRequest(submissionFor(token, generateTestDeviceKeyPair()));
+      } catch (error) {
+        escaped = error;
+      } finally {
+        spy.mockRestore();
+      }
+      expect(escaped).toBeNull();
+      expect(second).toEqual({ outcome: 'REFUSED', refusal: 'ENROLLMENT_REQUEST_CONFLICT' });
+    });
+
+    it('two genuinely simultaneous first submissions produce one REQUESTED and one CONVERGED', async () => {
+      const token = await freshGrant();
+      const keyPair = generateTestDeviceKeyPair();
+      // No fault injection at all: the real race, driven concurrently. Whether
+      // the loser reaches the collision or merely reads the winner's row first,
+      // those two legal answers are the only two answers.
+      const [left, right] = await Promise.all([
+        enrollment.createEnrollmentRequest(submissionFor(token, keyPair)),
+        enrollment.createEnrollmentRequest(submissionFor(token, keyPair)),
+      ]);
+      expect([left.outcome, right.outcome].sort()).toEqual(['CONVERGED', 'REQUESTED']);
+    });
+  });
+
+  describe('C16-R3 no ordinary refusal, and no ignored CAS count, after the first consumption', () => {
+    it('THE BLOCKER: a failed enrollment-state CAS leaves no device, no key, no scope, no consumption and no success audit', async () => {
+      const prepared = await prepareCeremony({ attestationOutcome: 'VERIFIED', keyStorage: 'HARDWARE_BACKED' });
+
+      const before = {
+        devices: await prisma.device.count({ where: { organisationId: fx.orgA } }),
+        keys: await prisma.deviceKey.count({ where: { organisationId: fx.orgA } }),
+        scopes: await prisma.deviceSiteScope.count({ where: { organisationId: fx.orgA } }),
+        consumptions: await prisma.deviceNonceConsumption.count({ where: { organisationId: fx.orgA } }),
+      };
+
+      // FAULT INJECTION. The POSSESSION_PROVEN -> ENROLLED compare-and-set
+      // reports zero rows, exactly as it would if the request had left that
+      // state between the `FOR UPDATE` read and the write. The count used to be
+      // DISCARDED, so the device, its key, its scope, its trust transition and
+      // its DEVICE_ENROLLED audit all committed against a ceremony the state
+      // machine says never completed.
+      const spy = vi.spyOn(repository, 'advanceEnrollmentState').mockResolvedValue(0);
+      let outcome: CommitEnrollmentOutcome;
+      try {
+        outcome = await commit(prepared);
+      } finally {
+        spy.mockRestore();
+      }
+      expect(outcome).toEqual({ outcome: 'REFUSED', refusal: 'ENROLLMENT_STATE_INVALID' });
+
+      expect(await prisma.device.count({ where: { organisationId: fx.orgA } })).toBe(before.devices);
+      expect(await prisma.deviceKey.count({ where: { organisationId: fx.orgA } })).toBe(before.keys);
+      expect(await prisma.deviceSiteScope.count({ where: { organisationId: fx.orgA } })).toBe(before.scopes);
+      // The two one-shot identities were consumed BEFORE the CAS, so this is
+      // the assertion that proves the rollback reached them.
+      expect(await prisma.deviceNonceConsumption.count({ where: { organisationId: fx.orgA } })).toBe(before.consumptions);
+
+      const events = await repository.listSecurityEvents(fx.orgA, null);
+      const success = events.filter(
+        (event) =>
+          (event.eventType === 'DEVICE_ENROLLED' || event.eventType === 'BOOTSTRAP_CONSUMED') &&
+          (event.payload as { enrollment_request_id?: string }).enrollment_request_id === prepared.enrollmentRequestId,
+      );
+      expect(success).toEqual([]);
+      // The D24-12 trail still records the refusal itself.
+      expect(
+        events.filter(
+          (event) =>
+            event.eventType === 'ENROLLMENT_REFUSED' &&
+            (event.payload as { enrollment_request_id?: string }).enrollment_request_id === prepared.enrollmentRequestId,
+        ).length,
+      ).toBeGreaterThan(0);
+    });
+
+    it('THE BLOCKER: a failed FINAL rotation-state CAS leaves the original key CURRENT and no successor', async () => {
+      const device = await enrol({ attestationOutcome: 'VERIFIED', keyStorage: 'HARDWARE_BACKED' });
+      const consumptionsBefore = await prisma.deviceNonceConsumption.count({
+        where: { organisationId: fx.orgA, ceremony: 'KEY_ROTATION' },
+      });
+
+      // Only the FINAL transition is made to fail; the challenge step keeps its
+      // real behaviour, so this is the last fenced CAS in the effect and not a
+      // ceremony that never started.
+      const original = repository.setRotationRequestState.bind(repository);
+      const spy = vi
+        .spyOn(repository, 'setRotationRequestState')
+        .mockImplementation(async (tx, organisationId, id, from, to) =>
+          to === 'ROTATED' ? 0 : original(tx, organisationId, id, from, to),
+        );
+      let outcome: Awaited<ReturnType<DeviceKeyService['commitKeyRotation']>>;
+      try {
+        outcome = (await rotate(device)).outcome;
+      } finally {
+        spy.mockRestore();
+      }
+      expect(outcome).toEqual({ outcome: 'REFUSED', refusal: 'ROTATION_STATE_INVALID' });
+
+      const keys = await prisma.deviceKey.findMany({ where: { organisationId: fx.orgA, deviceId: device.deviceId } });
+      expect(keys).toHaveLength(1);
+      expect(keys[0]?.keyId).toBe(device.keyId);
+      expect(keys[0]?.status).toBe('CURRENT');
+      expect(keys[0]?.rotatedAt).toBeNull();
+      const row = await prisma.device.findUniqueOrThrow({ where: { id: device.deviceId } });
+      expect(row.currentKeyId).toBe(device.keyId);
+      expect(row.currentKeyVersion).toBe(1);
+      expect(
+        await prisma.deviceNonceConsumption.count({ where: { organisationId: fx.orgA, ceremony: 'KEY_ROTATION' } }),
+      ).toBe(consumptionsBefore);
+      const events = await repository.listSecurityEvents(fx.orgA, device.deviceId);
+      expect(events.filter((event) => event.eventType === 'KEY_ROTATED')).toHaveLength(0);
+    });
+  });
+
+  describe('C16-R4 rotation convergence answers did-it-commit, not is-it-still-current', () => {
+    it('THE BLOCKER: an exact retry of R1 CONVERGES after R2 superseded it', async () => {
+      const device = await enrol({ attestationOutcome: 'VERIFIED', keyStorage: 'HARDWARE_BACKED' });
+
+      const r1 = await rotate(device);
+      if (r1.outcome.outcome !== 'ROTATED') throw new Error(`R1 refused: ${JSON.stringify(r1.outcome)}`);
+      expect(r1.outcome.toKeyVersion).toBe(2);
+
+      // R2 rotates v2 -> v3, which is ordinary history and not an attack.
+      const afterR1: EnrolledDevice = {
+        ...device,
+        keyId: r1.outcome.toKeyId,
+        keyVersion: r1.outcome.toKeyVersion,
+        keyPair: r1.newKeyPair,
+      };
+      const r2 = await rotate(afterR1);
+      if (r2.outcome.outcome !== 'ROTATED') throw new Error(`R2 refused: ${JSON.stringify(r2.outcome)}`);
+      expect(r2.outcome.toKeyVersion).toBe(3);
+
+      // THE EXACT NETWORK RETRY OF R1. It really did commit — its replay row is
+      // the durable proof — but v2 is now ROTATED, so the old "still CURRENT
+      // and still the device pointer" conditions called it unresolvable and
+      // refused a ceremony that had succeeded.
+      const retried = await deviceKeys.commitKeyRotation(A.approver, {
+        organisationId: fx.orgA,
+        rotationRequestId: r1.rotationRequestId,
+        challengeId: r1.challengeId,
+        continuityProof: r1.continuityProof,
+        traceId: traceId(),
+      });
+      expect(retried).toMatchObject({
+        outcome: 'CONVERGED',
+        deviceId: device.deviceId,
+        toKeyId: r1.outcome.toKeyId,
+        toKeyVersion: 2,
+        // AND IT SAYS SO. The converged key is NOT current, and the outcome
+        // reports that rather than letting a caller assume otherwise.
+        committedKeyLifecycleState: 'ROTATED',
+      });
+
+      // THE REGISTRY IS UNMOVED. Convergence is a statement about history and
+      // grants no current key authority.
+      const standing = await registry.readDeviceStanding(A.approver, { organisationId: fx.orgA, deviceId: device.deviceId });
+      if (standing.outcome !== 'FOUND') throw new Error('device vanished');
+      expect(standing.standing.currentKeyId).toBe(r2.outcome.toKeyId);
+      expect(standing.standing.currentKeyVersion).toBe(3);
+      expect(await prisma.deviceKey.count({ where: { organisationId: fx.orgA, deviceId: device.deviceId } })).toBe(3);
+    });
+
+    it('a stored reference naming ANOTHER key still fails closed', async () => {
+      const device = await enrol({ attestationOutcome: 'VERIFIED', keyStorage: 'HARDWARE_BACKED' });
+      const other = await enrol({ attestationOutcome: 'VERIFIED', keyStorage: 'HARDWARE_BACKED' });
+      const r1 = await rotate(device);
+      if (r1.outcome.outcome !== 'ROTATED') throw new Error('R1 refused');
+
+      const otherKeyRow = await prisma.deviceKey.findFirstOrThrow({
+        where: { organisationId: fx.orgA, deviceId: other.deviceId },
+      });
+      // The reference this rotation actually stored is the KEY ROW id of the
+      // key it committed — resolved precisely rather than by "the newest
+      // rotation row", so this test cannot quietly rewrite someone else's.
+      const committedKeyRow = await prisma.deviceKey.findFirstOrThrow({
+        where: { organisationId: fx.orgA, deviceId: device.deviceId, keyId: r1.outcome.toKeyId },
+      });
+      const updated = await prisma.deviceNonceConsumption.updateMany({
+        where: { organisationId: fx.orgA, ceremony: 'KEY_ROTATION', storedOutcomeRef: committedKeyRow.id },
+        data: { storedOutcomeRef: otherKeyRow.id },
+      });
+      expect(updated.count).toBe(1);
+
+      // Dropping "still CURRENT" did NOT drop the binding to this device, this
+      // tenant, this proposed key id and this proposed version.
+      expect(
+        await deviceKeys.commitKeyRotation(A.approver, {
+          organisationId: fx.orgA,
+          rotationRequestId: r1.rotationRequestId,
+          challengeId: r1.challengeId,
+          continuityProof: r1.continuityProof,
+          traceId: traceId(),
+        }),
+      ).toEqual({ outcome: 'REFUSED', refusal: 'ROTATION_OUTCOME_UNRESOLVABLE' });
+    });
+  });
+
+  describe('C16-R5 the six-hour ceiling is authority-driven, not event-driven', () => {
+    it('THE BLOCKER: evidence that ages out with NO further observation still stops the device acting', async () => {
+      const device = await enrol({ attestationOutcome: 'VERIFIED', keyStorage: 'HARDWARE_BACKED' });
+      expect(device.trust).toBe('TRUSTED');
+
+      // VERIFIED -> UNAVAILABLE, INSIDE the grace. Nothing moves, correctly:
+      // an outage is an absence of evidence, and last-known-good still carries
+      // TRUSTED (C14-05).
+      attestation.outcome = 'UNAVAILABLE';
+      await trust.recordAttestationObservation({ organisationId: fx.orgA, deviceId: device.deviceId, traceId: traceId() });
+      expect((await prisma.device.findUniqueOrThrow({ where: { id: device.deviceId } })).trust).toBe('TRUSTED');
+      expect(await registry.deviceMayAct(fx.orgA, device.deviceId, 'WHISPER_DEVICE_ACTION')).toBe(true);
+
+      // ... AND THEN NOTHING EVER OBSERVES THIS DEVICE AGAIN. The evidence
+      // simply ages past six hours. No job runs at 6h + 1ms, no observation
+      // arrives, so the C16-05 ageing branch — which only fires when an
+      // observation is RECORDED — never executes.
+      await ageAttestationPreservingOrder(device.deviceId, DEVICE_ATTESTATION_UNAVAILABLE_GRACE_MS + 600_000);
+
+      // THE PERSISTED ROW STILL SAYS TRUSTED. That is not a bug being asserted;
+      // it is the premise. Nothing ran, so nothing could have written.
+      expect((await prisma.device.findUniqueOrThrow({ where: { id: device.deviceId } })).trust).toBe('TRUSTED');
+
+      // AND THE ANSWER IS ALREADY NO. Authorisation resolves the standing
+      // against authoritative server time rather than trusting the column.
+      expect(await registry.deviceMayAct(fx.orgA, device.deviceId, 'WHISPER_DEVICE_ACTION')).toBe(false);
+
+      // THE TWO QUESTIONS STAY SEPARATE (C16-07). The CREDENTIAL is untouched:
+      // no revocation, a healthy CURRENT key. Expired attestation is ignorance,
+      // not a withdrawn credential.
+      expect(await registry.credentialAdmitsNewOperations(fx.orgA, device.deviceId)).toBe(true);
+
+      // DEGRADED, not QUARANTINED: the field is still open to it (W21-05
+      // mirrored), Whisper is not.
+      expect(await registry.deviceMayAct(fx.orgA, device.deviceId, 'FIELD_OPERATION')).toBe(true);
+
+      // AND THE READ SURFACE NEVER ADVERTISES A TRUSTED IT WOULD REFUSE.
+      const standing = await registry.readDeviceStanding(A.approver, { organisationId: fx.orgA, deviceId: device.deviceId });
+      if (standing.outcome !== 'FOUND') throw new Error('device vanished');
+      expect(standing.standing.trust).toBe('DEGRADED');
+      // The raw column is still visible, and is still TRUSTED, so an operator
+      // can see that the durable row has not caught up.
+      expect(standing.standing.persistedTrust).toBe('TRUSTED');
+      expect(standing.standing.credentialAdmitsNewOperations).toBe(true);
+
+      attestation.outcome = 'UNAVAILABLE';
+    });
+
+    it('a device still inside the grace keeps acting, and no read wrote anything', async () => {
+      const device = await enrol({ attestationOutcome: 'VERIFIED', keyStorage: 'HARDWARE_BACKED' });
+      await ageAttestationPreservingOrder(device.deviceId, DEVICE_ATTESTATION_UNAVAILABLE_GRACE_MS - 600_000);
+
+      const transitionsBefore = (await repository.listTrustTransitions(fx.orgA, device.deviceId)).length;
+      expect(await registry.deviceMayAct(fx.orgA, device.deviceId, 'WHISPER_DEVICE_ACTION')).toBe(true);
+
+      // A READ THAT NOTICES EXPIRY DOES NOT WRITE, and neither does one that
+      // does not: the durable TRUSTED -> DEGRADED move belongs to the
+      // observation path, and an authorisation check that mutated would race it.
+      expect((await repository.listTrustTransitions(fx.orgA, device.deviceId)).length).toBe(transitionsBefore);
+      expect((await prisma.device.findUniqueOrThrow({ where: { id: device.deviceId } })).trust).toBe('TRUSTED');
     });
   });
 });
