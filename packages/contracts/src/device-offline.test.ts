@@ -38,8 +38,13 @@ import {
 import {
   DEVICE_OFFLINE_LEASE_MAX_LIFETIME_MS,
   DEVICE_TIME_NOT_AUTHORITATIVE,
+  DeviceNonceConsumptionSchema,
+  DeviceRegistryKeyRecordSchema,
   DeviceRevocationDispositionSchema,
+  deviceKeyStatePermitsHistoricalVerification,
+  deviceKeyStatePermitsNewOperations,
   type DeviceNonceConsumption,
+  type DeviceRegistryKeyRecord,
 } from './device-identity.js';
 import { deriveP256PublicKeyThumbprint } from './device-signature.js';
 import { DEVICE_REQUEST_PROOF_DOMAIN } from './device-context.js';
@@ -62,6 +67,14 @@ const EDGE_PUBLIC_KEY = Buffer.from(
   .subarray(-65)
   .toString('base64url');
 const EDGE_THUMBPRINT = deriveP256PublicKeyThumbprint(EDGE_PUBLIC_KEY);
+
+/** C15-R4: the DEVICE's registry key record is an input now, so it needs a real point too. */
+const DEVICE_PUBLIC_KEY = Buffer.from(
+  generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).publicKey.export({ type: 'spki', format: 'der' }),
+)
+  .subarray(-65)
+  .toString('base64url');
+const DEVICE_THUMBPRINT = deriveP256PublicKeyThumbprint(DEVICE_PUBLIC_KEY);
 
 function iso(deltaMs: number): string {
   return new Date(Date.parse(NOW) + deltaMs).toISOString();
@@ -151,8 +164,31 @@ function edgeKeyRecord(overrides: Record<string, unknown> = {}): EdgeRegistryKey
     signature_profile: 'P256_ECDSA_SHA256',
     status: 'CURRENT',
     edge_trust: 'TRUSTED',
+    /** C15-R4: an Edge witnesses for named sites, never for the estate. */
+    authorised_site_ids: ['site-1', 'site-2'],
     registered_at: iso(-100 * HOUR),
     revoked_at: null,
+    ...overrides,
+  });
+}
+
+/** C15-R4: the SERVER's registry record for the device key the envelope names. */
+function deviceKeyRecord(overrides: Record<string, unknown> = {}): DeviceRegistryKeyRecord {
+  return DeviceRegistryKeyRecordSchema.parse({
+    schema_version: 1,
+    organisation_id: 'org-1',
+    device_id: 'device-1',
+    key_id: 'key-1',
+    key_version: 4,
+    public_key: DEVICE_PUBLIC_KEY,
+    public_key_thumbprint: DEVICE_THUMBPRINT,
+    signature_profile: 'P256_ECDSA_SHA256',
+    key_storage: 'HARDWARE_BACKED',
+    status: 'CURRENT',
+    registered_at: iso(-100 * HOUR),
+    rotated_at: null,
+    revoked_at: null,
+    revocation_disposition: null,
     ...overrides,
   });
 }
@@ -171,18 +207,17 @@ function edgeWitness(
 }
 
 /** C15-05: a store report shaped for the envelope actually being presented. */
-function consumptionFor(
-  target: DeviceOfflineOperationEnvelope,
-  overrides: Partial<DeviceNonceConsumption> = {},
-): DeviceNonceConsumption {
-  return {
+function consumptionFor(target: DeviceOfflineOperationEnvelope, overrides: Record<string, unknown> = {}): DeviceNonceConsumption {
+  // C15-R1: parsed, so every fixture built here is provably a consistent fact.
+  // The malformed ones the guard exists to catch are built inline and cast.
+  return DeviceNonceConsumptionSchema.parse({
     source: 'SENTINEL_NONCE_STORE',
     outcome: 'FIRST_SEEN',
     replay_key: deviceOfflineOperationReplayKey(target),
     statement_fingerprint: deviceOfflineOperationFingerprint(offlineStatement(target)),
     stored_outcome_ref: null,
     ...overrides,
-  };
+  });
 }
 
 function admissibility(overrides: Partial<DeviceOfflineAdmissibilityInput> = {}): DeviceOfflineAdmissibilityInput {
@@ -195,7 +230,7 @@ function admissibility(overrides: Partial<DeviceOfflineAdmissibilityInput> = {})
     expectedPayloadDigest: PAYLOAD_DIGEST,
     deviceRevokedAt: null,
     signatureVerified: true,
-    registeredSignatureProfile: 'P256_ECDSA_SHA256',
+    registeredKey: deviceKeyRecord(),
     consumption: consumptionFor(target),
     ...overrides,
   };
@@ -603,7 +638,14 @@ describe('C15-01 the offline envelope and Edge receipt do not choose their profi
   });
 
   it('LOCKED: an envelope claiming a profile the registry did not select refuses', () => {
-    expect(evaluateOfflineOperationAdmissibility(admissibility({ registeredSignatureProfile: 'Ed25519' as never }))).toEqual({
+    // C15-R4: the profile is read out of the registry KEY RECORD now, so the
+    // mismatch is staged there — the record schema itself will not store an
+    // unapproved profile, which is why it is built by hand past the parse.
+    expect(
+      evaluateOfflineOperationAdmissibility(
+        admissibility({ registeredKey: { ...deviceKeyRecord(), signature_profile: 'Ed25519' as never } }),
+      ),
+    ).toEqual({
       admitted: false,
       refusal: 'SIGNATURE_PROFILE_CLAIM_MISMATCH',
     });
@@ -858,7 +900,210 @@ describe('C15-05 the offline envelope nonce is one-shot through a contract seam'
     const { consumption, ...withoutFact } = admissibility();
     expect(consumption).toBeDefined();
     expect(Object.keys(withoutFact)).not.toContain('consumption');
-    expect(() => evaluateOfflineOperationAdmissibility(withoutFact as unknown as DeviceOfflineAdmissibilityInput)).toThrow();
+    // C15-R1: an absent fact used to crash on a property access. It is now a
+    // NAMED refusal — auditable rather than a 500, and still no effect.
+    expect(evaluateOfflineOperationAdmissibility(withoutFact as unknown as DeviceOfflineAdmissibilityInput)).toEqual({
+      admitted: false,
+      refusal: 'NONCE_CONSUMPTION_INCONSISTENT',
+    });
+  });
+});
+
+describe('C15-R4 reconciliation is bound to exact tenant, site and key authority', () => {
+  it('LOCKED: a FOREIGN TENANT Edge is not evidence about this operation at all', () => {
+    const target = envelope();
+    // `organisation_id` had been on the Edge record since C15-02 and was never
+    // compared to anything, so any registered Edge in the estate could witness
+    // any tenant's work into a lease window.
+    expect(
+      evaluateOfflineOperationAdmissibility(
+        admissibility({
+          envelope: target,
+          witness: edgeWitness(target, { registeredEdgeKey: edgeKeyRecord({ organisation_id: 'org-9' }) }),
+        }),
+      ),
+    ).toEqual({ admitted: false, refusal: 'EDGE_ORGANISATION_MISMATCH' });
+  });
+
+  it('LOCKED: an Edge with no presence at the operation’s site witnessed nothing', () => {
+    const target = envelope();
+    expect(
+      evaluateOfflineOperationAdmissibility(
+        admissibility({
+          envelope: target,
+          witness: edgeWitness(target, { registeredEdgeKey: edgeKeyRecord({ authorised_site_ids: ['site-7'] }) }),
+        }),
+      ),
+    ).toEqual({ admitted: false, refusal: 'EDGE_SITE_NOT_AUTHORISED' });
+  });
+
+  it('the tenant and site checks run FIRST in the Edge branch, ahead of any question about its key', () => {
+    const target = envelope();
+    // A foreign Edge whose key is ALSO unusable still reports the tenant
+    // mismatch: asking whether its key verifies would concede it might have
+    // been evidence.
+    expect(
+      evaluateOfflineOperationAdmissibility(
+        admissibility({
+          envelope: target,
+          witness: edgeWitness(target, {
+            registeredEdgeKey: edgeKeyRecord({ organisation_id: 'org-9', status: 'REVOKED', revoked_at: iso(-HOUR), edge_trust: 'REVOKED' }),
+          }),
+        }),
+      ),
+    ).toEqual({ admitted: false, refusal: 'EDGE_ORGANISATION_MISMATCH' });
+  });
+
+  it('an Edge record must name the sites it may witness for, with no org-wide wildcard', () => {
+    expect(edgeKeyRecord().authorised_site_ids).toEqual(['site-1', 'site-2']);
+    // Empty is not "all sites" — it is a record that authorises nothing, and
+    // the schema refuses it rather than letting it read as a wildcard.
+    expect(() => edgeKeyRecord({ authorised_site_ids: [] })).toThrow();
+    expect(() => edgeKeyRecord({ authorised_site_ids: undefined })).toThrow();
+  });
+
+  it('LOCKED: a device key record about another organisation or another device is not evidence here', () => {
+    for (const overrides of [{ organisation_id: 'org-9' }, { device_id: 'device-9' }]) {
+      expect(evaluateOfflineOperationAdmissibility(admissibility({ registeredKey: deviceKeyRecord(overrides) })), JSON.stringify(overrides)).toEqual({
+        admitted: false,
+        refusal: 'REGISTRY_IDENTITY_MISMATCH',
+      });
+    }
+  });
+
+  it('LOCKED: a record about a different key or key VERSION refuses (D23-09: a rotation is a new credential)', () => {
+    expect(evaluateOfflineOperationAdmissibility(admissibility({ registeredKey: deviceKeyRecord({ key_id: 'key-9' }) }))).toEqual({
+      admitted: false,
+      refusal: 'REGISTRY_KEY_MISMATCH',
+    });
+    expect(evaluateOfflineOperationAdmissibility(admissibility({ registeredKey: deviceKeyRecord({ key_version: 9 }) }))).toEqual({
+      admitted: false,
+      refusal: 'REGISTRY_KEY_MISMATCH',
+    });
+  });
+
+  it('LOCKED: REVOKED, COMPROMISED and ROTATED keys cannot cause a new offline effect', () => {
+    const states: Array<[string, Record<string, unknown>]> = [
+      ['REVOKED', { status: 'REVOKED', revoked_at: iso(-HOUR), revocation_disposition: 'STOLEN' }],
+      ['COMPROMISED', { status: 'COMPROMISED', revoked_at: iso(-HOUR), revocation_disposition: 'COMPROMISED_KEY' }],
+      ['ROTATED', { status: 'ROTATED', rotated_at: iso(-HOUR) }],
+    ];
+    for (const [label, overrides] of states) {
+      expect(evaluateOfflineOperationAdmissibility(admissibility({ registeredKey: deviceKeyRecord(overrides) })), label).toEqual({
+        admitted: false,
+        refusal: 'DEVICE_KEY_NOT_USABLE',
+      });
+    }
+  });
+
+  it('ROTATED specifically: a key may still VERIFY history and still not AUTHORISE fresh work', () => {
+    // This is the distinction the two lifecycle predicates exist to keep apart.
+    // An offline operation being reconciled has NOT been applied yet, so
+    // admitting it creates its effect NOW, under a key we already replaced.
+    expect(deviceKeyStatePermitsHistoricalVerification('ROTATED')).toBe(true);
+    expect(deviceKeyStatePermitsNewOperations('ROTATED')).toBe(false);
+    expect(evaluateOfflineOperationAdmissibility(admissibility({ registeredKey: deviceKeyRecord({ status: 'ROTATED', rotated_at: iso(-HOUR) }) }))).toEqual({
+      admitted: false,
+      refusal: 'DEVICE_KEY_NOT_USABLE',
+    });
+  });
+
+  it('LOCKED: the NON-ATOMIC case — the key registry says revoked while deviceRevokedAt is still null', () => {
+    // The two sources are separate writes to separate places and the window in
+    // which one has landed and the other has not is ordinary. Either one
+    // saying "revoked" is sufficient; they are never required to agree.
+    //
+    // Built by hand past the parse for the same reason as the profile-mismatch
+    // case above: the record schema will not itself pair CURRENT with a
+    // revocation instant, so a store that assembles the record from a row is
+    // where this shape actually arises.
+    const nonAtomic = { ...deviceKeyRecord(), revoked_at: iso(-HOUR) };
+    expect(evaluateOfflineOperationAdmissibility(admissibility({ registeredKey: nonAtomic, deviceRevokedAt: null }))).toEqual({
+      admitted: false,
+      refusal: 'CREDENTIAL_REVOKED',
+    });
+    // And the original check is untouched, in its original place.
+    expect(evaluateOfflineOperationAdmissibility(admissibility({ deviceRevokedAt: iso(-HOUR) }))).toEqual({
+      admitted: false,
+      refusal: 'CREDENTIAL_REVOKED',
+    });
+  });
+
+  it('the happy path still admits: a CURRENT, correctly-bound key and a correctly-scoped Edge', () => {
+    const target = envelope();
+    // The lease that was in force at the moment the Edge witnessed the work —
+    // which is the whole point of having an independent time witness.
+    expect(evaluateOfflineOperationAdmissibility(admissibility({ envelope: target, lease: expiredLease() }))).toEqual({
+      admitted: true,
+      effect: 'PROCEED',
+      time_basis: 'EDGE_WITNESS',
+      established_at: iso(-2 * HOUR),
+      operation_fingerprint: deviceOfflineOperationFingerprint(offlineStatement(target)),
+    });
+  });
+});
+
+describe('C15-R1 a malformed duplicate can never reach PROCEED', () => {
+  function malformed(target: DeviceOfflineOperationEnvelope): Array<[string, DeviceNonceConsumption]> {
+    const wellFormed = consumptionFor(target);
+    const base = {
+      source: 'SENTINEL_NONCE_STORE',
+      replay_key: wellFormed.replay_key,
+      statement_fingerprint: wellFormed.statement_fingerprint,
+    };
+    return (
+      [
+        ['EXACT_DUPLICATE with a null ref', { ...base, outcome: 'EXACT_DUPLICATE', stored_outcome_ref: null }],
+        ['EXACT_DUPLICATE with an empty ref', { ...base, outcome: 'EXACT_DUPLICATE', stored_outcome_ref: '' }],
+        ['EXACT_DUPLICATE with a blank ref', { ...base, outcome: 'EXACT_DUPLICATE', stored_outcome_ref: '   ' }],
+        ['FIRST_SEEN carrying a stored ref', { ...base, outcome: 'FIRST_SEEN', stored_outcome_ref: 'assignment-42' }],
+        ['a foreign source', { ...base, source: 'EDGE_CLAIM', outcome: 'FIRST_SEEN', stored_outcome_ref: null }],
+        ['a missing outcome', { ...base, stored_outcome_ref: null }],
+        ['a missing stored_outcome_ref', { ...base, outcome: 'EXACT_DUPLICATE' }],
+      ] as Array<[string, unknown]>
+    ).map(([label, fact]) => [label, fact as DeviceNonceConsumption]);
+  }
+
+  it('LOCKED: every malformed fact refuses, on both the Edge-witness and server-receipt exits', () => {
+    // THE DEFECT: `storedOutcomeRef = outcome === 'EXACT_DUPLICATE' ? ref : null`
+    // and then `if (storedOutcomeRef !== null) converge` — else PROCEED, at
+    // BOTH exits. A reconnecting queue re-sends by design, so this evaluator
+    // saw more duplicates than any other, and a duplicate with a missing
+    // pointer APPLIED THE QUEUED OPERATION A SECOND TIME.
+    const timeBound = envelope();
+    const staleTolerant = envelope({ operation_kind: 'INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE' });
+    for (const target of [timeBound, staleTolerant]) {
+      for (const [label, fact] of malformed(target)) {
+        expect(
+          evaluateOfflineOperationAdmissibility(admissibility({ envelope: target, witness: edgeWitness(target), consumption: fact })),
+          `${target.operation_kind} / ${label}`,
+        ).toEqual({ admitted: false, refusal: 'NONCE_CONSUMPTION_INCONSISTENT' });
+      }
+    }
+  });
+
+  it('a well-formed EXACT_DUPLICATE still converges at both exits', () => {
+    const target = envelope();
+    expect(
+      evaluateOfflineOperationAdmissibility(
+        admissibility({
+          envelope: target,
+          lease: expiredLease(),
+          consumption: consumptionFor(target, { outcome: 'EXACT_DUPLICATE', stored_outcome_ref: 'assignment-42' }),
+        }),
+      ),
+    ).toMatchObject({ admitted: true, effect: 'CONVERGE_ON_STORED_OUTCOME', time_basis: 'EDGE_WITNESS', stored_outcome_ref: 'assignment-42' });
+
+    const stale = envelope({ operation_kind: 'INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE' });
+    expect(
+      evaluateOfflineOperationAdmissibility(
+        admissibility({
+          envelope: stale,
+          witness: { kind: 'NONE' },
+          consumption: consumptionFor(stale, { outcome: 'EXACT_DUPLICATE', stored_outcome_ref: 'ack-7' }),
+        }),
+      ),
+    ).toMatchObject({ admitted: true, effect: 'CONVERGE_ON_STORED_OUTCOME', time_basis: 'SERVER_RECEIPT', stored_outcome_ref: 'ack-7' });
   });
 });
 

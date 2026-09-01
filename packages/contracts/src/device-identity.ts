@@ -591,19 +591,118 @@ export type DeviceNonceConsumptionOutcome = z.infer<typeof DeviceNonceConsumptio
  * evaluator can prove the fact it was handed is about the request in front of
  * it — a consumption fact for a DIFFERENT request is not evidence about this
  * one.
+ *
+ * C15-R1: AN EXACT DUPLICATE WITHOUT A STORED OUTCOME IS NOT A DUPLICATE.
+ *
+ * This was one flat interface carrying `stored_outcome_ref: string | null`
+ * regardless of outcome, and every evaluator in WP-23 wrote the same
+ * fall-through around it:
+ *
+ *     if (outcome === 'EXACT_DUPLICATE' && stored_outcome_ref !== null) converge
+ *     ...otherwise PROCEED / COMMIT
+ *
+ * So an EXACT_DUPLICATE whose ref was `null` — a half-written store row, a
+ * driver handing back NULL, a hand-built fact — fell straight past the
+ * convergence branch and CAUSED A SECOND EFFECT. The exact retry the store had
+ * just reported executed again: a second device enrolled off one ceremony, a
+ * queued operation applied twice, a request proceeding for the second time.
+ * Preventing precisely that is the only reason the consumption fact exists.
+ *
+ * The union deletes the fall-through by deleting the state that produced it.
+ * There is no EXACT_DUPLICATE without a ref to converge on, and no FIRST_SEEN
+ * or REUSED_WITH_CHANGED_SEMANTICS carrying one — a ref on either of those
+ * would be the store naming an outcome for something it has just said has no
+ * outcome, which is two claims in conflict rather than evidence.
  */
-export interface DeviceNonceConsumption {
-  readonly source: 'SENTINEL_NONCE_STORE';
-  readonly outcome: DeviceNonceConsumptionOutcome;
-  /** The canonical replay-identity string this fact is about. */
-  readonly replay_key: string;
-  /** The canonical-statement fingerprint this fact is about. */
-  readonly statement_fingerprint: string;
-  /**
-   * On EXACT_DUPLICATE, a pointer to the outcome already recorded, so the
-   * caller converges on it. `null` in every other case.
-   */
-  readonly stored_outcome_ref: string | null;
+export type DeviceNonceConsumption =
+  | {
+      readonly source: 'SENTINEL_NONCE_STORE';
+      readonly outcome: 'FIRST_SEEN';
+      /** The canonical replay-identity string this fact is about. */
+      readonly replay_key: string;
+      /** The canonical-statement fingerprint this fact is about. */
+      readonly statement_fingerprint: string;
+      /** Nothing has happened under this identity yet, so there is nothing to point at. */
+      readonly stored_outcome_ref: null;
+    }
+  | {
+      readonly source: 'SENTINEL_NONCE_STORE';
+      readonly outcome: 'EXACT_DUPLICATE';
+      readonly replay_key: string;
+      readonly statement_fingerprint: string;
+      /**
+       * REQUIRED, and non-empty. This is the outcome the caller converges ON;
+       * a duplicate that cannot name one is not a fact any evaluator can act
+       * on, and every evaluator refuses it rather than proceeding.
+       */
+      readonly stored_outcome_ref: string;
+    }
+  | {
+      readonly source: 'SENTINEL_NONCE_STORE';
+      readonly outcome: 'REUSED_WITH_CHANGED_SEMANTICS';
+      readonly replay_key: string;
+      readonly statement_fingerprint: string;
+      /** A conflict has no shared outcome, so there is nothing to converge on. */
+      readonly stored_outcome_ref: null;
+    };
+
+/**
+ * C15-R1: the same union expressed as a RUNTIME check, because the fact crosses
+ * an I/O boundary.
+ *
+ * The union above is a COMPILE-TIME guarantee, and it binds only the code the
+ * compiler saw. The consumption fact arrives from the replay store — across a
+ * driver, a row mapping and a JSON boundary — so at the instant an evaluator
+ * reads it, its shape is a CLAIM rather than a guarantee. A persistence bug
+ * must therefore fail CLOSED with a named refusal instead of becoming the
+ * second effect the old `string | null` field let it become. Every evaluator
+ * re-checks the fact through this schema before it may influence a decision.
+ *
+ * Strict, and discriminated on `outcome`: an unknown outcome, a missing field,
+ * an extra field, a foreign `source`, and a blank or whitespace-only
+ * `stored_outcome_ref` on the duplicate arm are each inconsistent.
+ */
+export const DeviceNonceConsumptionSchema = z.discriminatedUnion('outcome', [
+  z
+    .object({
+      source: z.literal('SENTINEL_NONCE_STORE'),
+      outcome: z.literal('FIRST_SEEN'),
+      replay_key: z.string().min(1),
+      statement_fingerprint: z.string().min(1),
+      stored_outcome_ref: z.literal(null),
+    })
+    .strict(),
+  z
+    .object({
+      source: z.literal('SENTINEL_NONCE_STORE'),
+      outcome: z.literal('EXACT_DUPLICATE'),
+      replay_key: z.string().min(1),
+      statement_fingerprint: z.string().min(1),
+      /** Non-empty AFTER trimming: an empty or whitespace ref names no outcome. */
+      stored_outcome_ref: z.string().trim().min(1),
+    })
+    .strict(),
+  z
+    .object({
+      source: z.literal('SENTINEL_NONCE_STORE'),
+      outcome: z.literal('REUSED_WITH_CHANGED_SEMANTICS'),
+      replay_key: z.string().min(1),
+      statement_fingerprint: z.string().min(1),
+      stored_outcome_ref: z.literal(null),
+    })
+    .strict(),
+]);
+
+/**
+ * C15-R1: the guard every evaluator runs before it touches the fact at all.
+ *
+ * `false` is a REFUSAL, never a shrug — see the `*_CONSUMPTION_INCONSISTENT`
+ * refusals in `device-context.ts`, `device-offline.ts` and the enrollment
+ * commit gate below. Refusing costs an honest caller a retry; admitting costs
+ * a tenant a duplicated effect, which is not recoverable by retrying.
+ */
+export function isConsistentDeviceNonceConsumption(fact: unknown): fact is DeviceNonceConsumption {
+  return DeviceNonceConsumptionSchema.safeParse(fact).success;
 }
 
 /**
@@ -611,6 +710,14 @@ export interface DeviceNonceConsumption {
  * and what (if anything) the store already holds for that identity, it says
  * which of the three cases this is. No I/O, no clock, no side effect — the
  * store performs the atomic insert-or-read and calls this to name the result.
+ *
+ * C15-R1: the LOGIC here is unchanged; only the return type narrowed to the
+ * union. A store row holding a blank `stored_outcome_ref` still produces the
+ * EXACT_DUPLICATE arm, because this function reports what the store said, and
+ * inventing a different answer for a malformed row would be this contract
+ * guessing at persistence it cannot see. It is the runtime guard in each
+ * evaluator that catches such a row — and it REFUSES, rather than converging
+ * on nothing or proceeding to a second effect.
  */
 export function classifyDeviceNonceConsumption(input: {
   readonly replay_key: string;
@@ -997,7 +1104,15 @@ export const DeviceEnrollmentBootstrapGrantSchema = z
   });
 export type DeviceEnrollmentBootstrapGrant = z.infer<typeof DeviceEnrollmentBootstrapGrantSchema>;
 
-export const DeviceBootstrapGrantStandingSchema = z.enum(['USABLE', 'EXPIRED', 'CONSUMED', 'REVOKED', DEVICE_TIME_NOT_AUTHORITATIVE]);
+export const DeviceBootstrapGrantStandingSchema = z.enum([
+  'USABLE',
+  /** C15-R3: the grant names an issuance instant that has not arrived yet. */
+  'NOT_YET_VALID',
+  'EXPIRED',
+  'CONSUMED',
+  'REVOKED',
+  DEVICE_TIME_NOT_AUTHORITATIVE,
+]);
 export type DeviceBootstrapGrantStanding = z.infer<typeof DeviceBootstrapGrantStandingSchema>;
 
 /**
@@ -1009,12 +1124,21 @@ export type DeviceBootstrapGrantStanding = z.infer<typeof DeviceBootstrapGrantSt
  * an unreadable clock is `TIME_NOT_AUTHORITATIVE`, which is not `USABLE` — so
  * the commit gate's `!== 'USABLE'` test refuses it without needing to know
  * about it.
+ *
+ * C15-R3: a grant was only ever judged against its FAR end. A record whose
+ * `issued_at` has not arrived yet — a clock-skewed issuer, a back-office row
+ * written ahead of time, a forged grant dated forward to widen its window —
+ * read as `USABLE`, because nothing compared `now` to the near end at all. The
+ * standing is now `NOT_YET_VALID`, which like every other non-`USABLE` value
+ * is refused by the commit gate's single `!== 'USABLE'` test: a grant may only
+ * be spent INSIDE the window it names, from both directions.
  */
 export function classifyDeviceBootstrapGrant(grant: DeviceEnrollmentBootstrapGrant, now: string): DeviceBootstrapGrantStanding {
   if (grant.revoked_at !== null) return 'REVOKED';
   if (grant.consumed_at !== null) return 'CONSUMED';
-  const instants = parseAuthoritativeInstants({ now, expires: grant.expires_at });
+  const instants = parseAuthoritativeInstants({ now, issued: grant.issued_at, expires: grant.expires_at });
   if (instants === null) return DEVICE_TIME_NOT_AUTHORITATIVE;
+  if (instants.now < instants.issued) return 'NOT_YET_VALID';
   if (isExpiredAt(instants.now, instants.expires)) return 'EXPIRED';
   return 'USABLE';
 }
@@ -1326,13 +1450,25 @@ export const DeviceEnrollmentRefusalSchema = z.enum([
   'BOOTSTRAP_GRANT_REUSED',
   /** C15-05: the consumption fact handed in is about some other grant. */
   'BOOTSTRAP_CONSUMPTION_MISBOUND',
+  /**
+   * C15-R1: the store's fact about the grant is not a shape this contract can
+   * act on — most importantly an EXACT_DUPLICATE naming no stored outcome.
+   * Also raised when the grant and the challenge are BOTH exact duplicates but
+   * point at DIFFERENT stored outcomes: the store is telling two stories about
+   * one ceremony, and there is no honest way to pick a winner.
+   */
+  'BOOTSTRAP_CONSUMPTION_INCONSISTENT',
   'REQUEST_EXPIRED',
+  /** C15-R3: the request predates the grant that is supposed to authorise it. */
+  'REQUEST_PRECEDES_GRANT',
   /** C15-07: the request claims to have been made in the future. */
   'REQUEST_NOT_YET_MADE',
   'APPROVAL_MISSING',
   'APPROVAL_FINGERPRINT_MISMATCH',
   /** C15-07: the approval claims to have happened in the future. */
   'APPROVAL_NOT_YET_MADE',
+  /** C15-R3: the approval predates the request it claims to approve. */
+  'APPROVAL_PRECEDES_REQUEST',
   'USER_NOT_AUTHENTICATED',
   'USER_NOT_INTENDED',
   'CHALLENGE_MISSING',
@@ -1340,10 +1476,16 @@ export const DeviceEnrollmentRefusalSchema = z.enum([
   'CHALLENGE_EXPIRED',
   /** C15-07: the challenge claims to have been issued in the future. */
   'CHALLENGE_NOT_YET_ISSUED',
+  /** C15-R3: the challenge was issued before the approval that authorised it. */
+  'CHALLENGE_PRECEDES_APPROVAL',
+  /** C15-R3: the server's possession verdict claims to come from after `now`. */
+  'POSSESSION_VERIFIED_IN_FUTURE',
   /** C15-05: the challenge's one-shot identity was presented again with new meaning. */
   'CHALLENGE_REUSED',
   /** C15-05: the consumption fact handed in is about some other challenge. */
   'CHALLENGE_CONSUMPTION_MISBOUND',
+  /** C15-R1: the store's fact about the challenge is not a shape this contract can act on. */
+  'CHALLENGE_CONSUMPTION_INCONSISTENT',
   'POSSESSION_NOT_PROVEN',
   /** C15-03: no server verdict at all. A missing verdict is never a passing one. */
   'POSSESSION_VERIFICATION_MISSING',
@@ -1429,6 +1571,33 @@ export type DeviceEnrollmentCommitDecision =
  * `initialDeviceTrustOnEnrollment`. Refusing the enrollment outright would make
  * a provider outage an enrollment outage, which is exactly the conflation
  * C14-05 corrected.
+ *
+ * C15-R3: THE CEREMONY HAS AN ORDER, AND THE ORDER IS ENFORCED END TO END.
+ *
+ * Each of the four facts was checked for freshness against `now`, and each in
+ * isolation — so a set of facts that were individually recent could still be
+ * mutually impossible. An approval dated before the request it approves, a
+ * challenge minted before the approval that called for it, a request predating
+ * its own grant: every one of those was admissible, which meant the short
+ * lifetimes on the grant and the challenge bounded nothing about the ceremony
+ * as a whole. The full chain is now required:
+ *
+ *     grant.issued_at
+ *       <= request.requested_at
+ *       <= approval.approved_at
+ *       <= challenge.issued_at
+ *       <= verification.verified_at
+ *       <= now
+ *     and verification.verified_at < challenge.expires_at   (exclusive)
+ *
+ * Every link is `<=`, so a fast ceremony where two instants coincide still
+ * commits; only an INVERSION refuses. Every instant goes through the shared
+ * fail-closed parser, so an unreadable one is `TIME_NOT_AUTHORITATIVE` rather
+ * than a comparison that silently answers "fine".
+ *
+ * `answered_at` — the DEVICE's claim about when it answered — is read nowhere
+ * in this function, and adding it to the chain would hand the device a lever on
+ * the ceremony's chronology. The chain is built exclusively from server facts.
  */
 export function evaluateDeviceEnrollmentCommit(input: DeviceEnrollmentCommitInput): DeviceEnrollmentCommitDecision {
   const { request } = input;
@@ -1457,15 +1626,25 @@ export function evaluateDeviceEnrollmentCommit(input: DeviceEnrollmentCommitInpu
     intended_user_id: input.grant.intended_user_id,
     grant_id: input.grant.grant_id,
   });
-  if (input.grantConsumption.replay_key !== grantReplayKey || input.grantConsumption.statement_fingerprint !== fingerprint) {
+  // C15-R1: the fact is checked for INTERNAL CONSISTENCY before it is checked
+  //   for relevance. It came from the replay store across an I/O boundary, so
+  //   its shape is a claim; an EXACT_DUPLICATE naming no stored outcome would
+  //   otherwise have fallen through this whole gate to a second COMMIT.
+  const grantFact = input.grantConsumption;
+  if (!isConsistentDeviceNonceConsumption(grantFact)) {
+    return { decision: 'REFUSE', refusal: 'BOOTSTRAP_CONSUMPTION_INCONSISTENT' };
+  }
+  if (grantFact.replay_key !== grantReplayKey || grantFact.statement_fingerprint !== fingerprint) {
     return { decision: 'REFUSE', refusal: 'BOOTSTRAP_CONSUMPTION_MISBOUND' };
   }
-  if (input.grantConsumption.outcome === 'REUSED_WITH_CHANGED_SEMANTICS') {
+  if (grantFact.outcome === 'REUSED_WITH_CHANGED_SEMANTICS') {
     return { decision: 'REFUSE', refusal: 'BOOTSTRAP_GRANT_REUSED' };
   }
 
   // C15-07: every instant this decision turns on, parsed once, fail-closed.
-  const instants = parseAuthoritativeInstants({ now: input.now, requested: request.requested_at });
+  // C15-R3 adds the grant's issuance instant to the same bag, because the
+  // ceremony's chronology starts there and nothing was comparing against it.
+  const instants = parseAuthoritativeInstants({ now: input.now, requested: request.requested_at, grantIssued: input.grant.issued_at });
   if (instants === null) return { decision: 'REFUSE', refusal: DEVICE_TIME_NOT_AUTHORITATIVE };
 
   // The request itself must still be live — and must not claim to come from the
@@ -1473,6 +1652,11 @@ export function evaluateDeviceEnrollmentCommit(input: DeviceEnrollmentCommitInpu
   const requestAgeMs = instants.now - instants.requested;
   if (requestAgeMs < 0) return { decision: 'REFUSE', refusal: 'REQUEST_NOT_YET_MADE' };
   if (requestAgeMs > DEVICE_ENROLLMENT_REQUEST_MAX_AGE_MS) return { decision: 'REFUSE', refusal: 'REQUEST_EXPIRED' };
+  // C15-R3, link 1 of the chain: a request cannot have been made before the
+  // grant that is supposed to authorise it existed. Without this, a request
+  // backdated behind its grant was admissible, and the grant's short lifetime
+  // stopped bounding anything the request could claim.
+  if (instants.requested < instants.grantIssued) return { decision: 'REFUSE', refusal: 'REQUEST_PRECEDES_GRANT' };
 
   // 2. The approval, bound to the exact request fingerprint.
   if (input.approval === null) return { decision: 'REFUSE', refusal: 'APPROVAL_MISSING' };
@@ -1482,6 +1666,10 @@ export function evaluateDeviceEnrollmentCommit(input: DeviceEnrollmentCommitInpu
   const approvalInstants = parseAuthoritativeInstants({ approved: input.approval.approved_at });
   if (approvalInstants === null) return { decision: 'REFUSE', refusal: DEVICE_TIME_NOT_AUTHORITATIVE };
   if (approvalInstants.approved > instants.now) return { decision: 'REFUSE', refusal: 'APPROVAL_NOT_YET_MADE' };
+  // C15-R3, link 2: nobody approves a request that has not been made. An
+  // approval dated behind its request is either a clock nobody can trust or an
+  // approval reused from an earlier ceremony, and neither may enrol hardware.
+  if (approvalInstants.approved < instants.requested) return { decision: 'REFUSE', refusal: 'APPROVAL_PRECEDES_REQUEST' };
 
   // 3. The intended user, authenticated now.
   if (input.authenticatedUserId === null) return { decision: 'REFUSE', refusal: 'USER_NOT_AUTHENTICATED' };
@@ -1502,10 +1690,15 @@ export function evaluateDeviceEnrollmentCommit(input: DeviceEnrollmentCommitInpu
     challenge_id: input.challenge.challenge_id,
     nonce: input.challenge.nonce,
   });
-  if (input.challengeConsumption.replay_key !== challengeReplayKey || input.challengeConsumption.statement_fingerprint !== fingerprint) {
+  // C15-R1: consistency before relevance, for the same reason as the grant.
+  const challengeFact = input.challengeConsumption;
+  if (!isConsistentDeviceNonceConsumption(challengeFact)) {
+    return { decision: 'REFUSE', refusal: 'CHALLENGE_CONSUMPTION_INCONSISTENT' };
+  }
+  if (challengeFact.replay_key !== challengeReplayKey || challengeFact.statement_fingerprint !== fingerprint) {
     return { decision: 'REFUSE', refusal: 'CHALLENGE_CONSUMPTION_MISBOUND' };
   }
-  if (input.challengeConsumption.outcome === 'REUSED_WITH_CHANGED_SEMANTICS') {
+  if (challengeFact.outcome === 'REUSED_WITH_CHANGED_SEMANTICS') {
     return { decision: 'REFUSE', refusal: 'CHALLENGE_REUSED' };
   }
 
@@ -1549,21 +1742,53 @@ export function evaluateDeviceEnrollmentCommit(input: DeviceEnrollmentCommitInpu
   });
   if (window === null) return { decision: 'REFUSE', refusal: DEVICE_TIME_NOT_AUTHORITATIVE };
   if (window.issued > instants.now) return { decision: 'REFUSE', refusal: 'CHALLENGE_NOT_YET_ISSUED' };
+  // C15-R3, link 3: the challenge is issued in RESPONSE to the approval, so it
+  // cannot predate it. A challenge dated behind its approval is a challenge
+  // minted for some earlier ceremony being replayed into this one.
+  if (window.issued < approvalInstants.approved) return { decision: 'REFUSE', refusal: 'CHALLENGE_PRECEDES_APPROVAL' };
   // Verification cannot precede the issuance of the thing it verified.
   if (window.verified < window.issued) return { decision: 'REFUSE', refusal: 'CHALLENGE_NOT_YET_ISSUED' };
+  // C15-R3, link 5: and it cannot come from after the server's own clock. This
+  // is checked BEFORE expiry deliberately: a verdict dated in the future is a
+  // broken or forged server fact, which is a different and more fundamental
+  // failure than a verdict that merely arrived too late. A challenge window
+  // that has already closed still reports CHALLENGE_EXPIRED, because a
+  // verification inside a closed window is not in the future.
+  if (window.verified > instants.now) return { decision: 'REFUSE', refusal: 'POSSESSION_VERIFIED_IN_FUTURE' };
   if (isExpiredAt(window.verified, window.expires)) return { decision: 'REFUSE', refusal: 'CHALLENGE_EXPIRED' };
 
   if (!verification.verified) return { decision: 'REFUSE', refusal: 'POSSESSION_NOT_PROVEN' };
 
-  // C15-05: an exact retry converges on what already happened rather than
-  // enrolling a second device off one ceremony.
-  if (input.challengeConsumption.outcome === 'EXACT_DUPLICATE' || input.grantConsumption.outcome === 'EXACT_DUPLICATE') {
-    const storedOutcomeRef = input.challengeConsumption.stored_outcome_ref ?? input.grantConsumption.stored_outcome_ref;
-    if (storedOutcomeRef !== null) {
-      return { decision: 'CONVERGE', enrollment_request_fingerprint: fingerprint, stored_outcome_ref: storedOutcomeRef };
+  // C15-05/C15-R1: an exact retry converges on what already happened rather
+  // than enrolling a second device off one ceremony.
+  //
+  // C15-R1 removes the fall-through this block used to end in. The old code
+  // coalesced the two refs and, if the result was still `null`, DROPPED THROUGH
+  // TO COMMIT — so a store reporting "you have already done this" with a
+  // missing pointer enrolled a second device. The union makes a duplicate
+  // without a ref unrepresentable, the guards above make it unreachable at
+  // runtime, and there is now no path from EXACT_DUPLICATE to COMMIT at all.
+  //
+  // Two duplicates that disagree are the remaining hazard, and it is a refusal
+  // rather than a choice: if the grant slot and the challenge slot point at
+  // DIFFERENT stored outcomes, the store is telling two stories about one
+  // ceremony. Converging on either would be picking one at random, and picking
+  // wrong hands the caller someone else's enrolment.
+  if (grantFact.outcome === 'EXACT_DUPLICATE' && challengeFact.outcome === 'EXACT_DUPLICATE') {
+    if (grantFact.stored_outcome_ref !== challengeFact.stored_outcome_ref) {
+      return { decision: 'REFUSE', refusal: 'BOOTSTRAP_CONSUMPTION_INCONSISTENT' };
     }
+    return { decision: 'CONVERGE', enrollment_request_fingerprint: fingerprint, stored_outcome_ref: challengeFact.stored_outcome_ref };
+  }
+  if (challengeFact.outcome === 'EXACT_DUPLICATE') {
+    return { decision: 'CONVERGE', enrollment_request_fingerprint: fingerprint, stored_outcome_ref: challengeFact.stored_outcome_ref };
+  }
+  if (grantFact.outcome === 'EXACT_DUPLICATE') {
+    return { decision: 'CONVERGE', enrollment_request_fingerprint: fingerprint, stored_outcome_ref: grantFact.stored_outcome_ref };
   }
 
+  // Only when BOTH facts say FIRST_SEEN has nothing happened yet, and only then
+  // may this ceremony cause its first effect.
   return { decision: 'COMMIT', enrollment_request_fingerprint: fingerprint };
 }
 

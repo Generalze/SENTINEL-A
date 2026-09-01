@@ -18,15 +18,18 @@ import {
   DeviceEnrollmentStateSchema,
   DeviceKeyLifecycleStateSchema,
   deviceKeyStatePermitsHistoricalVerification,
+  deviceKeyStatePermitsNewOperations,
   DeviceKeyVersionSchema,
   DeviceNonceSchema,
   DeviceTraceIdSchema,
   DEVICE_OFFLINE_LEASE_MAX_LIFETIME_MS,
   DEVICE_TIME_NOT_AUTHORITATIVE,
+  isConsistentDeviceNonceConsumption,
   isExpiredAt,
   parseAuthoritativeInstants,
   refineDeviceInstantWindow,
   type DeviceNonceConsumption,
+  type DeviceRegistryKeyRecord,
   type DeviceRevocationDisposition,
 } from './device-identity.js';
 
@@ -496,6 +499,22 @@ export const EdgeRegistryKeyRecordSchema = z
     status: DeviceKeyLifecycleStateSchema,
     /** The Edge principal's trust, which is a different question from the key's. */
     edge_trust: DeviceEdgeTrustStatusSchema,
+    /**
+     * C15-R4: the sites this Edge may witness FOR.
+     *
+     * There was no site binding at all, and `organisation_id` — present since
+     * C15-02 — was never compared to anything. So any registered Edge could
+     * witness any operation: a foreign tenant's Edge, or an Edge legitimately
+     * deployed at one site of this tenant, could place another site's operation
+     * inside a lease window it has no visibility of. A time witness is only
+     * evidence about work it could actually have observed.
+     *
+     * There is deliberately no org-wide wildcard. A wildcard would be a
+     * widening nobody has asked for and it cannot be reviewed once it exists;
+     * if a genuinely org-wide Edge is ever justified, it arrives as a visible
+     * diff against this line.
+     */
+    authorised_site_ids: z.array(scopedId).min(1),
     registered_at: timestamp,
     revoked_at: timestamp.nullable(),
   })
@@ -589,10 +608,26 @@ export const DeviceOfflineAdmissibilityRefusalSchema = z.enum([
   'EDGE_SIGNATURE_PROFILE_CLAIM_MISMATCH',
   /** C15-02: the Edge key record is about a different key, or is no longer usable. */
   'EDGE_KEY_NOT_USABLE',
+  /** C15-R4: the device key record handed in is about another organisation or device. */
+  'REGISTRY_IDENTITY_MISMATCH',
+  /** C15-R4: the device key record is about a different key or key version than the envelope names. */
+  'REGISTRY_KEY_MISMATCH',
+  /** C15-R4: the device key may no longer authorise NEW work (REVOKED, COMPROMISED, or merely ROTATED). */
+  'DEVICE_KEY_NOT_USABLE',
+  /** C15-R4: the witnessing Edge belongs to a different tenant entirely. */
+  'EDGE_ORGANISATION_MISMATCH',
+  /** C15-R4: the witnessing Edge is not entitled to the site this operation belongs to. */
+  'EDGE_SITE_NOT_AUTHORISED',
   /** C15-05: this one-shot identity was already spent on different bytes. */
   'NONCE_REUSED_WITH_CHANGED_SEMANTICS',
   /** C15-05: the consumption fact handed in is about some other operation. */
   'NONCE_CONSUMPTION_MISBOUND',
+  /**
+   * C15-R1: the store's fact is not a shape this contract can act on — above
+   * all an EXACT_DUPLICATE naming no stored outcome, which used to fall through
+   * to a second application of a queued operation.
+   */
+  'NONCE_CONSUMPTION_INCONSISTENT',
   /** C15-07: an instant this decision depends on is unreadable. */
   DEVICE_TIME_NOT_AUTHORITATIVE,
 ]);
@@ -615,10 +650,22 @@ export interface DeviceOfflineAdmissibilityInput {
   /** The server's verdict on the device signature over the canonical statement. */
   readonly signatureVerified: boolean;
   /**
-   * C15-01: the profile the registry key record names for this device's
-   * `key_id + key_version`. `envelope.claimed_signature_profile` is bound to it.
+   * C15-R4: THE WHOLE REGISTRY KEY RECORD, not a bare profile.
+   *
+   * This was `registeredSignatureProfile: DeviceSignatureProfile` — a single
+   * enum value lifted out of the record. Binding the claimed profile to it
+   * proved that the envelope named the algorithm the server had chosen, and
+   * NOTHING ELSE: the evaluator never learned WHICH key, whose device it was,
+   * or whether that key was still allowed to author work. A profile is not an
+   * identity, so an envelope naming any `key_id` and any `key_version` passed
+   * this seam untouched, and a revoked or superseded key was indistinguishable
+   * from the key in force.
+   *
+   * Passing the record makes the identity, the version, the lifecycle state and
+   * the revocation instant available to the checks below, and the profile is
+   * then read FROM it rather than handed in beside it.
    */
-  readonly registeredSignatureProfile: DeviceSignatureProfile;
+  readonly registeredKey: DeviceRegistryKeyRecord;
   /**
    * C15-05: the store's report on this envelope's one-shot identity. REQUIRED,
    * with no default — a reconnecting queue re-sends by design, so an evaluator
@@ -652,6 +699,11 @@ export type DeviceOfflineAdmissibility =
  *
  * Read the ordering as the argument it is:
  *
+ *  0. (C15-R4) the registry key record must be about THIS tenant, THIS device
+ *     and THIS key version, and that key must still be permitted to author new
+ *     work. This runs before everything else because the server-selected
+ *     signature profile is read out of that record: binding the envelope's
+ *     claim to a profile taken from the wrong record proves nothing;
  *  1. the device signature must verify — origin before anything else;
  *  2. a server-known revocation refuses the operation WHOLESALE (D23-08),
  *     including one the device claims predates the revocation, because a
@@ -673,11 +725,48 @@ export type DeviceOfflineAdmissibility =
  * because nothing ever reads it.
  */
 export function evaluateOfflineOperationAdmissibility(input: DeviceOfflineAdmissibilityInput): DeviceOfflineAdmissibility {
-  const { envelope, lease, witness } = input;
+  const { envelope, lease, witness, registeredKey } = input;
 
-  // C15-01: bind the claimed profile to the registry's BEFORE anything else, so
-  // the fingerprint below is computed over the server's profile.
-  const profileBinding = bindClaimedSignatureProfile(envelope.claimed_signature_profile, input.registeredSignatureProfile);
+  // C15-R4: WHOSE KEY, WHICH KEY, AND MAY IT STILL AUTHOR WORK.
+  //
+  // These run before the profile binding because the profile is read OUT of
+  // this record: binding a claim to a profile taken from the wrong tenant's
+  // record proves nothing about anything.
+
+  // The record must be about this tenant and this device, or it is not evidence
+  // concerning this operation at all.
+  if (registeredKey.organisation_id !== envelope.organisation_id || registeredKey.device_id !== envelope.device_id) {
+    return { admitted: false, refusal: 'REGISTRY_IDENTITY_MISMATCH' };
+  }
+  // And about the exact key the envelope names. D23-09: a rotation is a new
+  // credential, so a record for another version is a record about another key.
+  if (registeredKey.key_id !== envelope.key_id || registeredKey.key_version !== envelope.key_version) {
+    return { admitted: false, refusal: 'REGISTRY_KEY_MISMATCH' };
+  }
+  // The load-bearing rule. REVOKED and COMPROMISED obviously cannot cause a new
+  // effect. ROTATED is the subtle one: `deviceKeyStatePermitsHistoricalVerification`
+  // admits it, correctly, because a routinely superseded key may still verify
+  // what it legitimately signed — and the Edge branch below relies on exactly
+  // that. But VERIFYING HISTORY IS NOT AUTHORISING WORK. An offline operation
+  // being reconciled has NOT been applied yet; admitting it creates its effect
+  // now, under the authority of a key we have already replaced. So new work
+  // goes through `deviceKeyStatePermitsNewOperations`, which is CURRENT only.
+  if (!deviceKeyStatePermitsNewOperations(registeredKey.status)) {
+    return { admitted: false, refusal: 'DEVICE_KEY_NOT_USABLE' };
+  }
+  // C15-R4: revocation is read from BOTH sources, independently, and either one
+  // is sufficient. This deliberately does NOT assume `deviceRevokedAt` and the
+  // key registry move atomically — they are separate writes to separate places,
+  // and a window in which one has landed and the other has not is ordinary
+  // rather than exceptional. Requiring them to agree would make that window
+  // admit work; requiring either to object closes it. The existing
+  // `deviceRevokedAt !== null` check stays exactly where it is, below.
+  if (registeredKey.revoked_at !== null) return { admitted: false, refusal: 'CREDENTIAL_REVOKED' };
+
+  // C15-01: bind the claimed profile to the registry's BEFORE the fingerprint is
+  // computed, so the signed bytes carry the server's profile. C15-R4: the
+  // profile is now read from the record above rather than supplied beside it.
+  const profileBinding = bindClaimedSignatureProfile(envelope.claimed_signature_profile, registeredKey.signature_profile);
   if (!profileBinding.bound) return { admitted: false, refusal: 'SIGNATURE_PROFILE_CLAIM_MISMATCH' };
 
   if (!input.signatureVerified) return { admitted: false, refusal: 'SIGNATURE_NOT_VERIFIED' };
@@ -703,16 +792,47 @@ export function evaluateOfflineOperationAdmissibility(input: DeviceOfflineAdmiss
 
   // C15-05: the one-shot identity, and the fact must be about THIS operation.
   const replayKey = deviceOfflineOperationReplayKey(envelope);
-  if (input.consumption.replay_key !== replayKey || input.consumption.statement_fingerprint !== fingerprint) {
+  // C15-R1: consistency BEFORE relevance. A reconnecting queue re-sends by
+  // design, so this evaluator sees more duplicates than any other — and an
+  // EXACT_DUPLICATE naming no stored outcome used to coalesce to `null` here
+  // and then PROCEED, applying a queued operation for the second time.
+  const fact = input.consumption;
+  if (!isConsistentDeviceNonceConsumption(fact)) {
+    return { admitted: false, refusal: 'NONCE_CONSUMPTION_INCONSISTENT' };
+  }
+  if (fact.replay_key !== replayKey || fact.statement_fingerprint !== fingerprint) {
     return { admitted: false, refusal: 'NONCE_CONSUMPTION_MISBOUND' };
   }
-  if (input.consumption.outcome === 'REUSED_WITH_CHANGED_SEMANTICS') {
+  if (fact.outcome === 'REUSED_WITH_CHANGED_SEMANTICS') {
     return { admitted: false, refusal: 'NONCE_REUSED_WITH_CHANGED_SEMANTICS' };
   }
-  const storedOutcomeRef = input.consumption.outcome === 'EXACT_DUPLICATE' ? input.consumption.stored_outcome_ref : null;
+  // C15-R1: `null` here now means FIRST_SEEN and only FIRST_SEEN. There is no
+  // longer a duplicate that lands in this variable as `null` and falls through
+  // to PROCEED at either exit below.
+  const storedOutcomeRef = fact.outcome === 'EXACT_DUPLICATE' ? fact.stored_outcome_ref : null;
 
   if (deviceOfflineOperationRequiresTimeWitness(envelope.operation_kind)) {
     if (witness.kind === 'NONE') return { admitted: false, refusal: 'NO_TRUSTWORTHY_TIME_WITNESS' };
+    // C15-R4: TENANT AND SITE FIRST — before any question about the Edge's key.
+    //
+    // These run ahead of the key-identity checks deliberately. A foreign
+    // tenant's Edge is not weak evidence about this operation, it is NOT
+    // EVIDENCE AT ALL, and asking whether its key verifies concedes that it
+    // might have been. `organisation_id` has been on this record since C15-02
+    // and was never once compared to the envelope's, so any registered Edge
+    // anywhere in the estate could place any tenant's operation inside a lease
+    // window — the exact cross-tenant hole the lease identity checks close on
+    // every other input.
+    //
+    // The site check is the same argument one level down: a witness attests
+    // that it OBSERVED something. An Edge with no presence at the operation's
+    // site observed nothing, whatever its clock says.
+    if (witness.registeredEdgeKey.organisation_id !== envelope.organisation_id) {
+      return { admitted: false, refusal: 'EDGE_ORGANISATION_MISMATCH' };
+    }
+    if (!witness.registeredEdgeKey.authorised_site_ids.includes(envelope.site_id)) {
+      return { admitted: false, refusal: 'EDGE_SITE_NOT_AUTHORISED' };
+    }
     // C15-02: the Edge key record must be ABOUT this receipt's key and must
     // still be able to verify. A key we revoked cannot witness anything, and a
     // record for another key is not evidence about this signature.

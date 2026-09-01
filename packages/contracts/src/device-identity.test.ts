@@ -10,8 +10,10 @@ import {
   DEVICE_NONCE_CONSUMPTION_OUTCOMES,
   DEVICE_TIME_NOT_AUTHORITATIVE,
   DeviceCustodyAssociationSchema,
+  DeviceNonceConsumptionSchema,
   DevicePossessionVerificationResultSchema,
   DeviceRegistryKeyRecordSchema,
+  isConsistentDeviceNonceConsumption,
   deviceBootstrapGrantReplayKey,
   deviceCustodyAssociationBindsSite,
   deviceKeyStatePermitsHistoricalVerification,
@@ -104,16 +106,25 @@ function iso(base: string, deltaMs: number): string {
   return new Date(Date.parse(base) + deltaMs).toISOString();
 }
 
-/** C15-05: a store report shaped for the thing actually being presented. */
-function consumption(replayKey: string, statementFingerprint: string, overrides: Partial<DeviceNonceConsumption> = {}): DeviceNonceConsumption {
-  return {
+/**
+ * C15-05: a store report shaped for the thing actually being presented.
+ *
+ * C15-R1: the fact is a discriminated union now, so `Partial<...>` distributes
+ * into three mutually incompatible partials and cannot type this helper. The
+ * overrides are an open record and the RESULT IS PARSED, which means every
+ * fixture built here is provably a consistent fact. The malformed facts the
+ * C15-R1 tests need are built inline and cast, so nothing can accidentally
+ * smuggle one in through the happy-path builder.
+ */
+function consumption(replayKey: string, statementFingerprint: string, overrides: Record<string, unknown> = {}): DeviceNonceConsumption {
+  return DeviceNonceConsumptionSchema.parse({
     source: 'SENTINEL_NONCE_STORE',
     outcome: 'FIRST_SEEN',
     replay_key: replayKey,
     statement_fingerprint: statementFingerprint,
     stored_outcome_ref: null,
     ...overrides,
-  };
+  });
 }
 
 function grant(overrides: Record<string, unknown> = {}): DeviceEnrollmentBootstrapGrant {
@@ -216,7 +227,11 @@ function verificationFor(
   });
 }
 
-function grantConsumptionFor(theGrant: DeviceEnrollmentBootstrapGrant, fingerprint: string): DeviceNonceConsumption {
+function grantConsumptionFor(
+  theGrant: DeviceEnrollmentBootstrapGrant,
+  fingerprint: string,
+  overrides: Record<string, unknown> = {},
+): DeviceNonceConsumption {
   return consumption(
     deviceBootstrapGrantReplayKey({
       organisation_id: theGrant.organisation_id,
@@ -225,6 +240,7 @@ function grantConsumptionFor(theGrant: DeviceEnrollmentBootstrapGrant, fingerpri
       grant_id: theGrant.grant_id,
     }),
     fingerprint,
+    overrides,
   );
 }
 
@@ -232,6 +248,7 @@ function challengeConsumptionFor(
   target: DeviceEnrollmentRequest,
   theChallenge: DevicePossessionChallenge,
   fingerprint: string,
+  overrides: Record<string, unknown> = {},
 ): DeviceNonceConsumption {
   return consumption(
     devicePossessionChallengeReplayKey({
@@ -243,7 +260,28 @@ function challengeConsumptionFor(
       nonce: theChallenge.nonce,
     }),
     fingerprint,
+    overrides,
   );
+}
+
+/**
+ * C15-R1: the malformed facts the runtime guard exists to catch. Each one is
+ * something a broken replay store could genuinely hand an evaluator, and every
+ * one of them used to be able to reach COMMIT.
+ */
+function malformedConsumptionFacts(wellFormed: DeviceNonceConsumption): Array<[string, DeviceNonceConsumption]> {
+  const { replay_key, statement_fingerprint } = wellFormed;
+  const base = { source: 'SENTINEL_NONCE_STORE', replay_key, statement_fingerprint };
+  return [
+    ['EXACT_DUPLICATE with a null ref', { ...base, outcome: 'EXACT_DUPLICATE', stored_outcome_ref: null }],
+    ['EXACT_DUPLICATE with an empty ref', { ...base, outcome: 'EXACT_DUPLICATE', stored_outcome_ref: '' }],
+    ['EXACT_DUPLICATE with a blank ref', { ...base, outcome: 'EXACT_DUPLICATE', stored_outcome_ref: '   ' }],
+    ['FIRST_SEEN carrying a stored ref', { ...base, outcome: 'FIRST_SEEN', stored_outcome_ref: 'device-1' }],
+    ['a foreign source', { ...base, source: 'DEVICE_CLAIM', outcome: 'FIRST_SEEN', stored_outcome_ref: null }],
+    ['a missing outcome', { ...base, stored_outcome_ref: null }],
+    ['a missing stored_outcome_ref', { ...base, outcome: 'EXACT_DUPLICATE' }],
+    ['an unknown outcome', { ...base, outcome: 'PROBABLY_FINE', stored_outcome_ref: null }],
+  ].map(([label, fact]) => [label as string, fact as unknown as DeviceNonceConsumption]);
 }
 
 function commitInput(overrides: Partial<DeviceEnrollmentCommitInput> = {}): DeviceEnrollmentCommitInput {
@@ -310,10 +348,22 @@ describe('WP-23 numeric ceilings', () => {
     expect(() => challenge({ issued_at, expires_at: iso(NOW, DEVICE_POSSESSION_CHALLENGE_MAX_AGE_MS + 1) })).toThrow();
   });
 
-  it('accepts an enrollment request exactly at DEVICE_ENROLLMENT_REQUEST_MAX_AGE_MS and refuses one millisecond past it (C14-02)', () => {
+  it('treats DEVICE_ENROLLMENT_REQUEST_MAX_AGE_MS as an inclusive bound, one millisecond past which the request is EXPIRED (C14-02)', () => {
+    // C15-R3: this asserted COMMIT at the bound, and it can no longer do so —
+    // for a reason worth stating rather than papering over. The bootstrap
+    // grant's own ceiling is 600s (DEVICE_ENROLLMENT_BOOTSTRAP_MAX_AGE_MS) and
+    // a grant must still be unexpired at `now`, so no USABLE grant can have
+    // been issued 900s ago; the chain then requires the request to FOLLOW its
+    // grant. The effective ceiling on a committable request is therefore the
+    // grant window, not this constant — the tighter of the two binds, which is
+    // the correct direction for a bound to move.
+    //
+    // The constant's own boundary is still asserted exactly, by what does NOT
+    // refuse: at the bound the request is not yet expired, so the chain check
+    // behind it is what speaks.
     const requested_at = iso(NOW, -DEVICE_ENROLLMENT_REQUEST_MAX_AGE_MS);
     const atBound = commitInput({ request: request({ requested_at }) });
-    expect(evaluateDeviceEnrollmentCommit(atBound).decision).toBe('COMMIT');
+    expect(evaluateDeviceEnrollmentCommit(atBound)).toEqual({ decision: 'REFUSE', refusal: 'REQUEST_PRECEDES_GRANT' });
 
     const pastBound = commitInput({ request: request({ requested_at: iso(NOW, -DEVICE_ENROLLMENT_REQUEST_MAX_AGE_MS - 1) }) });
     expect(evaluateDeviceEnrollmentCommit(pastBound)).toEqual({ decision: 'REFUSE', refusal: 'REQUEST_EXPIRED' });
@@ -581,13 +631,22 @@ describe('the enrollment commit gate (C14-02)', () => {
   it('refuses a challenge verified after it expired, and one bound to another request', () => {
     // C15-03/C15-07: judged on the SERVER's verification instant, and the
     // expiry boundary is exclusive — exactly at expires_at is already expired.
+    //
+    // C15-R3: the server clock is advanced past the challenge window for both
+    // halves of this case. It used to sit at NOW, which put BOTH the expired
+    // instant (NOW+60s) and the "just inside" instant (NOW+59.999s) in the
+    // FUTURE relative to the server — and the old gate committed on the second
+    // of those, admitting a verdict the server could not yet have produced.
+    // That is precisely what `POSSESSION_VERIFIED_IN_FUTURE` now refuses, so
+    // the boundary is asserted from a clock that has actually reached it.
+    const later = iso(NOW, 70_000);
     const expired = verificationFor(request(), challenge(), { verified_at: iso(NOW, 60_000) });
-    expect(evaluateDeviceEnrollmentCommit(commitInput({ possessionVerification: expired }))).toEqual({
+    expect(evaluateDeviceEnrollmentCommit(commitInput({ now: later, possessionVerification: expired }))).toEqual({
       decision: 'REFUSE',
       refusal: 'CHALLENGE_EXPIRED',
     });
     const justInside = verificationFor(request(), challenge(), { verified_at: iso(NOW, 59_999) });
-    expect(evaluateDeviceEnrollmentCommit(commitInput({ possessionVerification: justInside })).decision).toBe('COMMIT');
+    expect(evaluateDeviceEnrollmentCommit(commitInput({ now: later, possessionVerification: justInside })).decision).toBe('COMMIT');
 
     expect(evaluateDeviceEnrollmentCommit(commitInput({ challenge: challenge({ enrollment_request_id: 'enrol-other' }) }))).toEqual({
       decision: 'REFUSE',
@@ -1223,18 +1282,20 @@ describe('C15-05 one-shot consumption is a required fact', () => {
 
   it('a reused challenge carrying DIFFERENT semantics conflicts', () => {
     const fingerprint = deviceEnrollmentRequestFingerprint(request());
-    const reused = challengeConsumptionFor(request(), challenge(), fingerprint);
-    expect(
-      evaluateDeviceEnrollmentCommit(commitInput({ challengeConsumption: { ...reused, outcome: 'REUSED_WITH_CHANGED_SEMANTICS' } })),
-    ).toEqual({ decision: 'REFUSE', refusal: 'CHALLENGE_REUSED' });
+    const reused = challengeConsumptionFor(request(), challenge(), fingerprint, { outcome: 'REUSED_WITH_CHANGED_SEMANTICS' });
+    expect(evaluateDeviceEnrollmentCommit(commitInput({ challengeConsumption: reused }))).toEqual({
+      decision: 'REFUSE',
+      refusal: 'CHALLENGE_REUSED',
+    });
   });
 
   it('D23-04: a reused bootstrap grant conflicts rather than producing a second device', () => {
     const fingerprint = deviceEnrollmentRequestFingerprint(request());
-    const reused = grantConsumptionFor(grant(), fingerprint);
-    expect(
-      evaluateDeviceEnrollmentCommit(commitInput({ grantConsumption: { ...reused, outcome: 'REUSED_WITH_CHANGED_SEMANTICS' } })),
-    ).toEqual({ decision: 'REFUSE', refusal: 'BOOTSTRAP_GRANT_REUSED' });
+    const reused = grantConsumptionFor(grant(), fingerprint, { outcome: 'REUSED_WITH_CHANGED_SEMANTICS' });
+    expect(evaluateDeviceEnrollmentCommit(commitInput({ grantConsumption: reused }))).toEqual({
+      decision: 'REFUSE',
+      refusal: 'BOOTSTRAP_GRANT_REUSED',
+    });
   });
 
   it('LOCKED: a consumption fact for a DIFFERENT identity cannot stand in for this one', () => {
@@ -1262,7 +1323,15 @@ describe('C15-05 one-shot consumption is a required fact', () => {
     expect(grantConsumption).toBeDefined();
     expect(challengeConsumption).toBeDefined();
     expect(Object.keys(withoutFacts)).not.toContain('grantConsumption');
-    expect(() => evaluateDeviceEnrollmentCommit(withoutFacts as unknown as DeviceEnrollmentCommitInput)).toThrow();
+    // C15-R1: this used to CRASH on a property access against `undefined`.
+    // The runtime consistency guard now catches an absent fact and turns it
+    // into a NAMED refusal — strictly better, because a caller that drops the
+    // fact gets an auditable "the store told me nothing" rather than a 500,
+    // and the outcome is still that nothing is committed.
+    expect(evaluateDeviceEnrollmentCommit(withoutFacts as unknown as DeviceEnrollmentCommitInput)).toEqual({
+      decision: 'REFUSE',
+      refusal: 'BOOTSTRAP_CONSUMPTION_INCONSISTENT',
+    });
   });
 
   it('replay identities are canonical JSON, so no two distinct tuples collide (C11-01)', () => {
@@ -1280,6 +1349,297 @@ describe('C15-05 one-shot consumption is a required fact', () => {
     });
     expect(c).toContain('sentinel.device.possession-challenge.replay-identity.v1');
     expect(c).not.toBe(a);
+  });
+});
+
+describe('C15-R1 a malformed duplicate can never reach COMMIT', () => {
+  const fingerprint = deviceEnrollmentRequestFingerprint(request());
+
+  it('the guard accepts the three well-formed arms and rejects every malformed one', () => {
+    const wellFormed = grantConsumptionFor(grant(), fingerprint);
+    expect(isConsistentDeviceNonceConsumption(wellFormed)).toBe(true);
+    expect(isConsistentDeviceNonceConsumption(grantConsumptionFor(grant(), fingerprint, { outcome: 'REUSED_WITH_CHANGED_SEMANTICS' }))).toBe(true);
+    expect(
+      isConsistentDeviceNonceConsumption(grantConsumptionFor(grant(), fingerprint, { outcome: 'EXACT_DUPLICATE', stored_outcome_ref: 'device-1' })),
+    ).toBe(true);
+    for (const [label, fact] of malformedConsumptionFacts(wellFormed)) {
+      expect(isConsistentDeviceNonceConsumption(fact), label).toBe(false);
+    }
+  });
+
+  it('LOCKED: a malformed GRANT consumption fact refuses and never COMMITS', () => {
+    // THE DEFECT: the old gate coalesced the two refs and, when the result was
+    // still null, DROPPED THROUGH TO COMMIT — so a store reporting "you have
+    // already done this" with a missing pointer enrolled a SECOND device off
+    // one ceremony. Every one of these used to reach that fall-through.
+    for (const [label, fact] of malformedConsumptionFacts(grantConsumptionFor(grant(), fingerprint))) {
+      expect(evaluateDeviceEnrollmentCommit(commitInput({ grantConsumption: fact })), label).toEqual({
+        decision: 'REFUSE',
+        refusal: 'BOOTSTRAP_CONSUMPTION_INCONSISTENT',
+      });
+    }
+  });
+
+  it('LOCKED: a malformed CHALLENGE consumption fact refuses and never COMMITS', () => {
+    for (const [label, fact] of malformedConsumptionFacts(challengeConsumptionFor(request(), challenge(), fingerprint))) {
+      expect(evaluateDeviceEnrollmentCommit(commitInput({ challengeConsumption: fact })), label).toEqual({
+        decision: 'REFUSE',
+        refusal: 'CHALLENGE_CONSUMPTION_INCONSISTENT',
+      });
+    }
+  });
+
+  it('LOCKED: two duplicates pointing at DIFFERENT stored outcomes refuse rather than picking one', () => {
+    // The store is telling two stories about one ceremony. Converging on
+    // either would hand the caller someone else's enrolment at random.
+    const decision = evaluateDeviceEnrollmentCommit(
+      commitInput({
+        grantConsumption: grantConsumptionFor(grant(), fingerprint, { outcome: 'EXACT_DUPLICATE', stored_outcome_ref: 'device-1' }),
+        challengeConsumption: challengeConsumptionFor(request(), challenge(), fingerprint, {
+          outcome: 'EXACT_DUPLICATE',
+          stored_outcome_ref: 'device-2',
+        }),
+      }),
+    );
+    expect(decision).toEqual({ decision: 'REFUSE', refusal: 'BOOTSTRAP_CONSUMPTION_INCONSISTENT' });
+  });
+
+  it('two duplicates AGREEING converge on the one outcome they both name', () => {
+    expect(
+      evaluateDeviceEnrollmentCommit(
+        commitInput({
+          grantConsumption: grantConsumptionFor(grant(), fingerprint, { outcome: 'EXACT_DUPLICATE', stored_outcome_ref: 'device-1' }),
+          challengeConsumption: challengeConsumptionFor(request(), challenge(), fingerprint, {
+            outcome: 'EXACT_DUPLICATE',
+            stored_outcome_ref: 'device-1',
+          }),
+        }),
+      ),
+    ).toEqual({ decision: 'CONVERGE', enrollment_request_fingerprint: fingerprint, stored_outcome_ref: 'device-1' });
+  });
+
+  it('EITHER duplicate alone converges, and only BOTH-FIRST_SEEN may COMMIT', () => {
+    const duplicateGrant = grantConsumptionFor(grant(), fingerprint, { outcome: 'EXACT_DUPLICATE', stored_outcome_ref: 'device-7' });
+    expect(evaluateDeviceEnrollmentCommit(commitInput({ grantConsumption: duplicateGrant }))).toEqual({
+      decision: 'CONVERGE',
+      enrollment_request_fingerprint: fingerprint,
+      stored_outcome_ref: 'device-7',
+    });
+    const duplicateChallenge = challengeConsumptionFor(request(), challenge(), fingerprint, {
+      outcome: 'EXACT_DUPLICATE',
+      stored_outcome_ref: 'device-8',
+    });
+    expect(evaluateDeviceEnrollmentCommit(commitInput({ challengeConsumption: duplicateChallenge }))).toEqual({
+      decision: 'CONVERGE',
+      enrollment_request_fingerprint: fingerprint,
+      stored_outcome_ref: 'device-8',
+    });
+    // Only when nothing has happened under either identity does anything happen.
+    expect(evaluateDeviceEnrollmentCommit(commitInput()).decision).toBe('COMMIT');
+  });
+
+  it('the classifier reports what the store said, and the schema is what refuses a bad row', () => {
+    // C15-R1 deliberately does NOT teach the classifier a fourth answer: it
+    // names what the store reported. A blank ref still classifies as a
+    // duplicate here, and is caught at the evaluator by the runtime guard.
+    const blank = classifyDeviceNonceConsumption({
+      replay_key: 'k',
+      statement_fingerprint: 'f',
+      stored: { statement_fingerprint: 'f', stored_outcome_ref: '   ' },
+    });
+    expect(blank.outcome).toBe('EXACT_DUPLICATE');
+    expect(isConsistentDeviceNonceConsumption(blank)).toBe(false);
+    // And a well-formed row classifies AND validates.
+    const good = classifyDeviceNonceConsumption({
+      replay_key: 'k',
+      statement_fingerprint: 'f',
+      stored: { statement_fingerprint: 'f', stored_outcome_ref: 'outcome-1' },
+    });
+    expect(isConsistentDeviceNonceConsumption(good)).toBe(true);
+    expect(DeviceNonceConsumptionSchema.safeParse(good).success).toBe(true);
+  });
+});
+
+describe('C15-R3 the ceremony chronology is complete and authoritative', () => {
+  /**
+   * A ceremony whose instants are all shifted into an explicit, consistent
+   * order, so a single mutation can invert exactly one link at a time.
+   */
+  function chain(overrides: Partial<DeviceEnrollmentCommitInput> = {}): DeviceEnrollmentCommitInput {
+    const theGrant = grant({ issued_at: iso(NOW, -200_000), expires_at: iso(NOW, 100_000) });
+    const theRequest = request({ requested_at: iso(NOW, -150_000) });
+    const theChallenge = challenge({ issued_at: iso(NOW, -50_000), expires_at: iso(NOW, 60_000) });
+    const fingerprint = deviceEnrollmentRequestFingerprint(theRequest);
+    return {
+      request: theRequest,
+      grant: theGrant,
+      approval: approvalFor(theRequest, { approved_at: iso(NOW, -100_000) }),
+      challenge: theChallenge,
+      serverSelectedSignatureProfile: 'P256_ECDSA_SHA256',
+      possessionVerification: verificationFor(theRequest, theChallenge, { verified_at: iso(NOW, -20_000) }),
+      grantConsumption: grantConsumptionFor(theGrant, fingerprint),
+      challengeConsumption: challengeConsumptionFor(theRequest, theChallenge, fingerprint),
+      authenticatedUserId: 'user-1',
+      now: NOW,
+      ...overrides,
+    };
+  }
+
+  it('the consistent chain COMMITS, so every refusal below is caused by the mutation and nothing else', () => {
+    expect(evaluateDeviceEnrollmentCommit(chain()).decision).toBe('COMMIT');
+  });
+
+  it('a grant whose issuance has not arrived is NOT_YET_VALID, and refuses the commit', () => {
+    const future = grant({ issued_at: iso(NOW, 10_000), expires_at: iso(NOW, 310_000) });
+    expect(classifyDeviceBootstrapGrant(future, NOW)).toBe('NOT_YET_VALID');
+    // It maps to the existing unusable refusal: the gate's single
+    // `!== 'USABLE'` test already covers it, and a new refusal would be a new
+    // thing to keep in step for no additional information.
+    expect(evaluateDeviceEnrollmentCommit(commitInput({ grant: future }))).toEqual({
+      decision: 'REFUSE',
+      refusal: 'BOOTSTRAP_GRANT_UNUSABLE',
+    });
+    // REVOKED and CONSUMED are still decided FIRST, so a burned grant reads as
+    // burned rather than as merely not-yet-valid.
+    expect(classifyDeviceBootstrapGrant(grant({ issued_at: iso(NOW, 10_000), expires_at: iso(NOW, 310_000), revoked_at: NOW }), NOW)).toBe('REVOKED');
+    expect(classifyDeviceBootstrapGrant(grant({ issued_at: iso(NOW, 10_000), expires_at: iso(NOW, 310_000), consumed_at: NOW }), NOW)).toBe(
+      'CONSUMED',
+    );
+  });
+
+  it('LINK 1: a request made before its grant existed refuses', () => {
+    const theGrant = grant({ issued_at: iso(NOW, -100_000), expires_at: iso(NOW, 100_000) });
+    const theRequest = request({ requested_at: iso(NOW, -100_001) });
+    expect(
+      evaluateDeviceEnrollmentCommit(
+        chain({
+          grant: theGrant,
+          request: theRequest,
+          grantConsumption: grantConsumptionFor(theGrant, deviceEnrollmentRequestFingerprint(theRequest)),
+        }),
+      ),
+    ).toEqual({ decision: 'REFUSE', refusal: 'REQUEST_PRECEDES_GRANT' });
+  });
+
+  it('LINK 2: an approval dated before the request it approves refuses', () => {
+    const theRequest = request({ requested_at: iso(NOW, -150_000) });
+    expect(
+      evaluateDeviceEnrollmentCommit(chain({ approval: approvalFor(theRequest, { approved_at: iso(NOW, -150_001) }) })),
+    ).toEqual({ decision: 'REFUSE', refusal: 'APPROVAL_PRECEDES_REQUEST' });
+  });
+
+  it('LINK 3: a challenge issued before the approval that called for it refuses', () => {
+    const theRequest = request({ requested_at: iso(NOW, -150_000) });
+    const early = challenge({ issued_at: iso(NOW, -100_001), expires_at: iso(NOW, -1) });
+    const fingerprint = deviceEnrollmentRequestFingerprint(theRequest);
+    expect(
+      evaluateDeviceEnrollmentCommit(
+        chain({
+          challenge: early,
+          possessionVerification: verificationFor(theRequest, early, { verified_at: iso(NOW, -100_000) }),
+          challengeConsumption: challengeConsumptionFor(theRequest, early, fingerprint),
+        }),
+      ),
+    ).toEqual({ decision: 'REFUSE', refusal: 'CHALLENGE_PRECEDES_APPROVAL' });
+  });
+
+  it('LINK 4: a verification dated before the challenge it verified refuses (existing refusal, unchanged)', () => {
+    const theRequest = request({ requested_at: iso(NOW, -150_000) });
+    const theChallenge = challenge({ issued_at: iso(NOW, -50_000), expires_at: iso(NOW, 60_000) });
+    expect(
+      evaluateDeviceEnrollmentCommit(
+        chain({ possessionVerification: verificationFor(theRequest, theChallenge, { verified_at: iso(NOW, -50_001) }) }),
+      ),
+    ).toEqual({ decision: 'REFUSE', refusal: 'CHALLENGE_NOT_YET_ISSUED' });
+  });
+
+  it('LINK 5: a verification ONE MILLISECOND after the server clock refuses', () => {
+    const theRequest = request({ requested_at: iso(NOW, -150_000) });
+    const theChallenge = challenge({ issued_at: iso(NOW, -50_000), expires_at: iso(NOW, 60_000) });
+    expect(
+      evaluateDeviceEnrollmentCommit(
+        chain({ possessionVerification: verificationFor(theRequest, theChallenge, { verified_at: iso(NOW, 1) }) }),
+      ),
+    ).toEqual({ decision: 'REFUSE', refusal: 'POSSESSION_VERIFIED_IN_FUTURE' });
+  });
+
+  it('the challenge expiry stays EXCLUSIVE: exactly AT expires_at is already expired', () => {
+    const theRequest = request({ requested_at: iso(NOW, -150_000) });
+    // A window that has already CLOSED relative to `now`, so the expiry
+    // boundary is reachable without the verification also being in the future.
+    const closed = challenge({ issued_at: iso(NOW, -50_000), expires_at: iso(NOW, -10_000) });
+    const fingerprint = deviceEnrollmentRequestFingerprint(theRequest);
+    function at(verified_at: string): DeviceEnrollmentCommitInput {
+      return chain({
+        challenge: closed,
+        possessionVerification: verificationFor(theRequest, closed, { verified_at }),
+        challengeConsumption: challengeConsumptionFor(theRequest, closed, fingerprint),
+      });
+    }
+    expect(evaluateDeviceEnrollmentCommit(at(iso(NOW, -10_000)))).toEqual({ decision: 'REFUSE', refusal: 'CHALLENGE_EXPIRED' });
+    expect(evaluateDeviceEnrollmentCommit(at(iso(NOW, -9_999)))).toEqual({ decision: 'REFUSE', refusal: 'CHALLENGE_EXPIRED' });
+    expect(evaluateDeviceEnrollmentCommit(at(iso(NOW, -10_001))).decision).toBe('COMMIT');
+  });
+
+  it('EVERY link is `<=`, so exact equality all the way down still COMMITS', () => {
+    // The fast path: a scripted enrolment where several steps land on the same
+    // millisecond must not be refused for being fast.
+    const theGrant = grant({ issued_at: NOW, expires_at: iso(NOW, 300_000) });
+    const theRequest = request({ requested_at: NOW });
+    const theChallenge = challenge({ issued_at: NOW, expires_at: iso(NOW, 60_000) });
+    const fingerprint = deviceEnrollmentRequestFingerprint(theRequest);
+    const decision = evaluateDeviceEnrollmentCommit({
+      request: theRequest,
+      grant: theGrant,
+      approval: approvalFor(theRequest, { approved_at: NOW }),
+      challenge: theChallenge,
+      serverSelectedSignatureProfile: 'P256_ECDSA_SHA256',
+      // verified_at === now EXACTLY is admissible: `<= now`, not `< now`.
+      possessionVerification: verificationFor(theRequest, theChallenge, { verified_at: NOW }),
+      grantConsumption: grantConsumptionFor(theGrant, fingerprint),
+      challengeConsumption: challengeConsumptionFor(theRequest, theChallenge, fingerprint),
+      authenticatedUserId: 'user-1',
+      now: NOW,
+    });
+    expect(decision).toEqual({ decision: 'COMMIT', enrollment_request_fingerprint: fingerprint });
+  });
+
+  it('every instant in the chain goes through the fail-closed parser', () => {
+    const theRequest = request({ requested_at: iso(NOW, -150_000) });
+    const theChallenge = challenge({ issued_at: iso(NOW, -50_000), expires_at: iso(NOW, 60_000) });
+    const unreadable: Array<[string, DeviceEnrollmentCommitInput]> = [
+      ['server clock', chain({ now: 'whenever' })],
+      [
+        'verification instant',
+        chain({
+          possessionVerification: {
+            ...verificationFor(theRequest, theChallenge),
+            verified_at: 'not-a-time',
+          } as unknown as DevicePossessionVerificationResult,
+        }),
+      ],
+      ['approval instant', chain({ approval: { ...approvalFor(theRequest), approved_at: 'nope' } as unknown as DeviceEnrollmentApproval })],
+    ];
+    for (const [label, input] of unreadable) {
+      expect(evaluateDeviceEnrollmentCommit(input), label).toEqual({ decision: 'REFUSE', refusal: DEVICE_TIME_NOT_AUTHORITATIVE });
+    }
+  });
+
+  it("the device's own `answered_at` is still read NOWHERE in the chain", () => {
+    // The chronology is built exclusively from server facts. Moving the
+    // device's claim must change nothing at all.
+    const theRequest = request({ requested_at: iso(NOW, -150_000) });
+    const theChallenge = challenge({ issued_at: iso(NOW, -50_000), expires_at: iso(NOW, 60_000) });
+    const baseline = evaluateDeviceEnrollmentCommit(chain());
+    for (const answered_at of [iso(NOW, -1_000_000), iso(NOW, 1_000_000)]) {
+      const withClaim = chain({
+        possessionVerification: {
+          ...verificationFor(theRequest, theChallenge, { verified_at: iso(NOW, -20_000) }),
+          answered_at,
+        } as unknown as DevicePossessionVerificationResult,
+      });
+      expect(evaluateDeviceEnrollmentCommit(withClaim), answered_at).toEqual(baseline);
+    }
   });
 });
 

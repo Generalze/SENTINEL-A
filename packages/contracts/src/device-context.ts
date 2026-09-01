@@ -11,6 +11,7 @@ import {
   DEVICE_REQUEST_PROOF_MAX_AGE_MS,
   DEVICE_REQUEST_PROOF_MAX_FUTURE_SKEW_MS,
   DEVICE_TIME_NOT_AUTHORITATIVE,
+  isConsistentDeviceNonceConsumption,
   isExpiredAt,
   parseAuthoritativeInstants,
   refineDeviceInstantWindow,
@@ -388,6 +389,12 @@ export const DeviceRequestProofRefusalSchema = z.enum([
   'NONCE_REUSED_WITH_CHANGED_SEMANTICS',
   /** C15-05: the consumption fact handed in is about some other request. */
   'NONCE_CONSUMPTION_MISBOUND',
+  /**
+   * C15-R1: the store's fact is not a shape this contract can act on — an
+   * EXACT_DUPLICATE naming no stored outcome, a FIRST_SEEN carrying one, a
+   * foreign source, a missing field. It fails CLOSED rather than proceeding.
+   */
+  'NONCE_CONSUMPTION_INCONSISTENT',
   /** C15-07: an instant this decision depends on is unreadable. */
   DEVICE_TIME_NOT_AUTHORITATIVE,
 ]);
@@ -554,6 +561,32 @@ export type DeviceRequestProofDecision =
  * from the future cannot either (W21-08 / D23-12).
  */
 export function evaluateDeviceRequestProof(input: DeviceRequestProofEvaluationInput): DeviceRequestProofDecision {
+  return evaluateDeviceRequestProofUnderMode(input, input.expectedPurpose, 'ENFORCE_ACTOR_AUTHORITY');
+}
+
+/**
+ * C15-R2: WHAT AN EVALUATION IS ALLOWED TO SKIP, STATED AS A REQUIRED CHOICE.
+ *
+ * `ENFORCE_ACTOR_AUTHORITY` is the ordinary mode and runs every step.
+ * `AUTHENTICATION_ONLY` skips exactly step 5 — the CURRENT actor identity,
+ * capability and site-entitlement checks — and nothing else. It exists for one
+ * caller: reconnect authentication, which answers "is the registered hardware
+ * on the other end of this connection?" and must be answerable even when the
+ * operative's authority has since changed. What that authority permits is a
+ * SEPARATE question, asked at queue admission.
+ *
+ * This is a REQUIRED two-valued discriminant rather than an optional boolean.
+ * An optional flag defaults, a default is what a caller forgets, and a
+ * forgotten default here silently drops three authority checks. Naming the mode
+ * at every call site costs one argument and makes the omission impossible.
+ */
+type DeviceRequestProofEvaluationMode = 'ENFORCE_ACTOR_AUTHORITY' | 'AUTHENTICATION_ONLY';
+
+function evaluateDeviceRequestProofUnderMode(
+  input: Omit<DeviceRequestProofEvaluationInput, 'expectedPurpose'>,
+  expectedPurpose: DeviceRequestPurpose,
+  mode: DeviceRequestProofEvaluationMode,
+): DeviceRequestProofDecision {
   const { context, proof, registered } = input;
 
   // 0. C15-07: every instant, parsed once, fail-closed. An unreadable clock
@@ -596,7 +629,7 @@ export function evaluateDeviceRequestProof(input: DeviceRequestProofEvaluationIn
   // 4. C15-04: purpose is EXPECTED — exactly one — and the registry's current
   //    trust must admit it. A proof minted for another purpose refuses here,
   //    so cross-purpose reuse is a refusal rather than a default.
-  if (proof.purpose !== input.expectedPurpose) return { admitted: false, refusal: 'PURPOSE_NOT_ALLOWED' };
+  if (proof.purpose !== expectedPurpose) return { admitted: false, refusal: 'PURPOSE_NOT_ALLOWED' };
   if (!deviceTrustPermitsPurpose(registered.trust, proof.purpose)) {
     return { admitted: false, refusal: 'DEVICE_TRUST_NOT_PERMITTED' };
   }
@@ -604,9 +637,17 @@ export function evaluateDeviceRequestProof(input: DeviceRequestProofEvaluationIn
   // 5. C15-04: CURRENT user authority, not the context's snapshot of it. The
   //    context said who was entitled when it was issued; between then and now
   //    that person can have been suspended or moved off the site.
-  if (registered.actor.user_id !== context.actor_user_id) return { admitted: false, refusal: 'ACTOR_AUTHORITY_REMOVED' };
-  if (!registered.actor.holds_required_capability) return { admitted: false, refusal: 'ACTOR_AUTHORITY_REMOVED' };
-  if (!registered.actor.authorised_site_ids.includes(proof.site_id)) return { admitted: false, refusal: 'SITE_ENTITLEMENT_LOST' };
+  //
+  //    C15-R2: this is the ONLY block `AUTHENTICATION_ONLY` skips. It is about
+  //    what the HUMAN may do; everything above and below it is about which
+  //    hardware is speaking and whether these exact bytes are fresh, bound and
+  //    unspent. Reconnect authentication needs the second question answered
+  //    while the first is still in flux, and gets no other exemption.
+  if (mode === 'ENFORCE_ACTOR_AUTHORITY') {
+    if (registered.actor.user_id !== context.actor_user_id) return { admitted: false, refusal: 'ACTOR_AUTHORITY_REMOVED' };
+    if (!registered.actor.holds_required_capability) return { admitted: false, refusal: 'ACTOR_AUTHORITY_REMOVED' };
+    if (!registered.actor.authorised_site_ids.includes(proof.site_id)) return { admitted: false, refusal: 'SITE_ENTITLEMENT_LOST' };
+  }
 
   // 6. C15-01: the server resolved the profile; the proof merely claimed one.
   //    Bound before any verification, so the client cannot steer the verifier.
@@ -627,10 +668,18 @@ export function evaluateDeviceRequestProof(input: DeviceRequestProofEvaluationIn
   // 9. C15-05: the one-shot identity. The fact must be about THIS request —
   //    a consumption record for another proof is not evidence about this one.
   const replayKey = deviceRequestProofReplayKey(proof);
-  if (input.consumption.replay_key !== replayKey || input.consumption.statement_fingerprint !== fingerprint) {
+  // C15-R1: consistency BEFORE relevance. The fact crossed an I/O boundary from
+  // the replay store, so its shape is a claim; an EXACT_DUPLICATE naming no
+  // stored outcome used to fall past the convergence branch below and PROCEED,
+  // executing a second effect for a retry the store had already reported.
+  const fact = input.consumption;
+  if (!isConsistentDeviceNonceConsumption(fact)) {
+    return { admitted: false, refusal: 'NONCE_CONSUMPTION_INCONSISTENT' };
+  }
+  if (fact.replay_key !== replayKey || fact.statement_fingerprint !== fingerprint) {
     return { admitted: false, refusal: 'NONCE_CONSUMPTION_MISBOUND' };
   }
-  if (input.consumption.outcome === 'REUSED_WITH_CHANGED_SEMANTICS') {
+  if (fact.outcome === 'REUSED_WITH_CHANGED_SEMANTICS') {
     return { admitted: false, refusal: 'NONCE_REUSED_WITH_CHANGED_SEMANTICS' };
   }
 
@@ -638,12 +687,15 @@ export function evaluateDeviceRequestProof(input: DeviceRequestProofEvaluationIn
   //     credential — which is exactly what C14-03 refuses to ship.
   if (!input.verified) return { admitted: false, refusal: 'POSSESSION_NOT_PROVEN' };
 
-  if (input.consumption.outcome === 'EXACT_DUPLICATE' && input.consumption.stored_outcome_ref !== null) {
+  // C15-R1: no fall-through. EXACT_DUPLICATE converges, always; PROCEED is
+  // reachable only from FIRST_SEEN, which is the only outcome that means
+  // nothing has happened yet.
+  if (fact.outcome === 'EXACT_DUPLICATE') {
     return {
       admitted: true,
       effect: 'CONVERGE_ON_STORED_OUTCOME',
       fingerprint,
-      stored_outcome_ref: input.consumption.stored_outcome_ref,
+      stored_outcome_ref: fact.stored_outcome_ref,
     };
   }
 
@@ -651,85 +703,207 @@ export function evaluateDeviceRequestProof(input: DeviceRequestProofEvaluationIn
 }
 
 // ---------------------------------------------------------------------------
-// The reconnect handshake (D23-13 / C14-03)
+// Reconnect: authentication and queue admission are two decisions (C15-R2)
 // ---------------------------------------------------------------------------
 
 /**
- * D23-13's handshake obeys the same rule as every other use: IT AUTHENTICATES
- * BY POSSESSION, NEVER BY PRESENTING A TOKEN.
+ * C15-R2: A HANDSHAKE THAT REFUSES TO AUTHENTICATE AN OFFLINE DEVICE, AND THEN
+ * UNLOCKS THE QUEUE FOR AUTHENTICATING, WAS BOTH HALVES WRONG AT ONCE.
  *
- * This is a thin wrapper rather than a second proof type on purpose. A separate
- * handshake credential would be a second thing to get wrong, and history says
- * the second thing is where the bearer-token exemption creeps back in. So the
- * handshake reuses `DeviceRequestProofSchema` with `purpose:
- * 'RECONNECT_HANDSHAKE'` and inherits the whole evaluation, including the
- * possession check.
+ * The single `evaluateDeviceReconnectHandshake` this replaces did two
+ * contradictory things.
  *
- * A device that reconnects by presenting a context and nothing else is refused
- * with `POSSESSION_NOT_PROVEN`; a proof minted for some other purpose is
- * refused with `PURPOSE_NOT_ALLOWED`. The handshake completes BEFORE any queued
- * operation is examined, and it fails closed as a whole rather than partially
- * admitting a queue.
+ * FIRST, it refused before it authenticated. Its very first check was
+ * `isDeviceTrustDowngrade(context.device_trust, registered.trust)` — a generic
+ * comparison of a STALE snapshot against the CURRENT registry rank. A device
+ * that was TRUSTED when its context was issued and is now, precisely because it
+ * went dark, registry-OFFLINE reads as a downgrade and was refused
+ * `DEVICE_TRUST_DOWNGRADED` before it could present possession of its hardware
+ * key. Meanwhile `DEVICE_PURPOSE_PERMITTED_TRUST.RECONNECT_HANDSHAKE`
+ * deliberately admits OFFLINE, for exactly the reason written beside it: a
+ * device coming back from the dark is OFFLINE by definition and refusing it the
+ * handshake makes re-establishing trust impossible for the devices that need it
+ * most. The contract contradicted itself, and the stricter half won — so the
+ * intended path did not exist.
  *
- * C15-04: THREE THINGS CHANGE WHILE A DEVICE IS DARK, AND ALL THREE ARE NAMED.
+ * SECOND, having authenticated, it returned `queue_examination_permitted: true`
+ * — so proving possession of the hardware key ALSO unlocked the queue of work
+ * that hardware had accumulated while unsupervised. Those are not the same
+ * question. One is "is the registered device on the other end of this
+ * connection?", which possession answers completely. The other is "may the work
+ * this device queued while we could not see it now take effect?", which
+ * possession does not begin to answer.
  *
- * The reconnect is the one moment where a long gap between issuance and use is
- * GUARANTEED — that is what being offline means. So the three facts most likely
- * to have moved are checked explicitly, each with its own refusal:
+ * So there are two functions, and they are ordered rather than merged.
  *
- *   1. DEVICE_TRUST_DOWNGRADED   the platform lowered its judgement while the
- *                                device was away. The context still says what
- *                                it said on the day it was issued.
- *   2. ACTOR_AUTHORITY_REMOVED   the operative was suspended, replaced, or had
- *                                the capability withdrawn.
- *   3. SITE_ENTITLEMENT_LOST     the operative no longer works that site.
+ * `evaluateDeviceReconnectAuthentication` answers the first question, from
+ * possession alone, under `AUTHENTICATION_ONLY`. There is deliberately NO
+ * `isDeviceTrustDowngrade` call anywhere in it: a generic stale-versus-current
+ * rank comparison is not an authority decision, and using one as a gate is what
+ * produced the contradiction above. The trust gate that remains is the purpose
+ * table, which is a stated policy about which trust states may attempt which
+ * purpose — and it still refuses QUARANTINED and COMPROMISED, because those are
+ * decisions rather than ignorance.
  *
- * `queue_examination_permitted` makes D23-13's ordering a CONTRACT rather than
- * a comment: identity, trust and entitlement are established first, and the
- * caller is handed a `false` it cannot ignore on any refusal. There is no
- * partial admission — a queue is examined in full or not at all.
+ * `evaluateDeviceOfflineQueueAdmission` answers the second, against registry
+ * facts RE-READ AFTER authentication, and it is where OFFLINE and SUSPICIOUS
+ * are stopped.
+ *
+ * WHAT THIS DELIBERATELY DOES NOT DO: a successful handshake does not restore
+ * trust. A device returning from the dark authenticates on possession and stays
+ * registry-OFFLINE until the platform performs an EVIDENCED trust transition
+ * through `evaluateDeviceTrustTransition`, which has its own basis and its own
+ * audit trail. Restoring trust is an authority decision, not a side effect of a
+ * successful handshake — if a reconnect could silently re-TRUST a device, the
+ * cheapest way to launder a downgraded device would be to disconnect it and
+ * reconnect it.
  */
-export type DeviceReconnectHandshakeDecision =
-  | { readonly admitted: true; readonly effect: 'PROCEED'; readonly fingerprint: string; readonly queue_examination_permitted: true }
+export type DeviceReconnectAuthenticationDecision =
   | {
-      readonly admitted: true;
+      readonly authenticated: true;
+      readonly effect: 'PROCEED';
+      readonly fingerprint: string;
+      /** The registry's CURRENT trust at the moment authentication succeeded. */
+      readonly authenticated_device_trust: DeviceTrust;
+      /**
+       * C15-R2: the literal `false` on the SUCCESS arm is the whole ruling.
+       * AUTHENTICATION NEVER UNLOCKS A QUEUE. The type gives a caller nothing
+       * to read here but `false`, so there is no branch in which a successful
+       * handshake hands back permission to examine queued work.
+       */
+      readonly queue_examination_permitted: false;
+    }
+  | {
+      readonly authenticated: true;
       readonly effect: 'CONVERGE_ON_STORED_OUTCOME';
       readonly fingerprint: string;
       readonly stored_outcome_ref: string;
-      readonly queue_examination_permitted: true;
+      readonly authenticated_device_trust: DeviceTrust;
+      /** Still `false`: a converged retry authenticates no differently. */
+      readonly queue_examination_permitted: false;
     }
-  | { readonly admitted: false; readonly refusal: DeviceRequestProofRefusal; readonly queue_examination_permitted: false };
+  | { readonly authenticated: false; readonly refusal: DeviceRequestProofRefusal; readonly queue_examination_permitted: false };
 
-export function evaluateDeviceReconnectHandshake(
+/**
+ * Possession-based reconnect authentication, and nothing else.
+ *
+ * Inherits every step of `evaluateDeviceRequestProof` except the CURRENT actor
+ * authority block — including the possession check, so a device that reconnects
+ * by presenting a context and nothing else is still refused
+ * `POSSESSION_NOT_PROVEN`, and a proof minted for another purpose is still
+ * refused `PURPOSE_NOT_ALLOWED`.
+ */
+export function evaluateDeviceReconnectAuthentication(
   input: Omit<DeviceRequestProofEvaluationInput, 'expectedPurpose'>,
-): DeviceReconnectHandshakeDecision {
-  const { context, registered, proof } = input;
-
-  // D23-13: identity, trust and entitlement BEFORE any queue is examined —
-  // which is why these three run ahead of the shared evaluation rather than
-  // being folded into it.
-  if (isDeviceTrustDowngrade(context.device_trust, registered.trust)) {
-    return { admitted: false, refusal: 'DEVICE_TRUST_DOWNGRADED', queue_examination_permitted: false };
-  }
-  if (registered.actor.user_id !== context.actor_user_id || !registered.actor.holds_required_capability) {
-    return { admitted: false, refusal: 'ACTOR_AUTHORITY_REMOVED', queue_examination_permitted: false };
-  }
-  if (!registered.actor.authorised_site_ids.includes(proof.site_id)) {
-    return { admitted: false, refusal: 'SITE_ENTITLEMENT_LOST', queue_examination_permitted: false };
-  }
-
-  const decision = evaluateDeviceRequestProof({ ...input, expectedPurpose: 'RECONNECT_HANDSHAKE' });
-  if (!decision.admitted) return { admitted: false, refusal: decision.refusal, queue_examination_permitted: false };
+): DeviceReconnectAuthenticationDecision {
+  const decision = evaluateDeviceRequestProofUnderMode(input, 'RECONNECT_HANDSHAKE', 'AUTHENTICATION_ONLY');
+  if (!decision.admitted) return { authenticated: false, refusal: decision.refusal, queue_examination_permitted: false };
   if (decision.effect === 'CONVERGE_ON_STORED_OUTCOME') {
     return {
-      admitted: true,
+      authenticated: true,
       effect: 'CONVERGE_ON_STORED_OUTCOME',
       fingerprint: decision.fingerprint,
       stored_outcome_ref: decision.stored_outcome_ref,
-      queue_examination_permitted: true,
+      authenticated_device_trust: input.registered.trust,
+      queue_examination_permitted: false,
     };
   }
-  return { admitted: true, effect: 'PROCEED', fingerprint: decision.fingerprint, queue_examination_permitted: true };
+  return {
+    authenticated: true,
+    effect: 'PROCEED',
+    fingerprint: decision.fingerprint,
+    authenticated_device_trust: input.registered.trust,
+    queue_examination_permitted: false,
+  };
+}
+
+/**
+ * C15-R2: the SECOND decision — may this device's queued work take effect?
+ *
+ * Each refusal names a distinct fact that moved while the device was dark, so
+ * an operator reading the audit trail learns which one, not merely that
+ * something did.
+ */
+export const DeviceQueueAdmissionRefusalSchema = z.enum([
+  /** The handshake did not authenticate. Nothing downstream is even asked. */
+  'NOT_AUTHENTICATED',
+  /** The registry's CURRENT trust does not admit the queued purpose. */
+  'DEVICE_TRUST_NOT_PERMITTED',
+  /** The operative was suspended, replaced, or lost the capability. */
+  'ACTOR_AUTHORITY_REMOVED',
+  /** The operative no longer works the site the queued work belongs to. */
+  'SITE_ENTITLEMENT_LOST',
+  /** The registry record handed in is about a different organisation or device. */
+  'REGISTRY_IDENTITY_MISMATCH',
+  /** The credential was revoked while the device was away (D23-08). */
+  'CREDENTIAL_REVOKED',
+]);
+export type DeviceQueueAdmissionRefusal = z.infer<typeof DeviceQueueAdmissionRefusalSchema>;
+
+export type DeviceQueueAdmissionDecision =
+  | { readonly permitted: true }
+  | { readonly permitted: false; readonly refusal: DeviceQueueAdmissionRefusal };
+
+export interface DeviceOfflineQueueAdmissionInput {
+  /** The outcome of `evaluateDeviceReconnectAuthentication`, which must have succeeded. */
+  readonly authentication: DeviceReconnectAuthenticationDecision;
+  /**
+   * The registry record RE-READ AFTER authentication. Not the record the
+   * handshake was evaluated against, and never the context's snapshot: the
+   * whole point of splitting the decision is that this read is where a
+   * still-OFFLINE or freshly-downgraded device is stopped.
+   */
+  readonly registered: DeviceRegistryFacts;
+  readonly context: AuthenticatedDeviceContext;
+  /** The site the queued work belongs to. */
+  readonly site_id: string;
+  /** Exactly one purpose per admission, for the C15-04 reason. */
+  readonly queuedPurpose: DeviceRequestPurpose;
+}
+
+/**
+ * C15-R2: WHERE OFFLINE AND SUSPICIOUS ARE ACTUALLY STOPPED.
+ *
+ * `deviceTrustPermitsPurpose(registered.trust, queuedPurpose)` is the
+ * load-bearing line. `OFFLINE_SYNC` admits TRUSTED and DEGRADED only, so a
+ * device that authenticated while registry-OFFLINE — the exact device the old
+ * handshake refused outright — authenticates cleanly and is refused HERE,
+ * `DEVICE_TRUST_NOT_PERMITTED`, until the platform performs an evidenced trust
+ * transition. SUSPICIOUS behaves the same way: the purpose table admits it to
+ * the handshake, for the restricted recovery and remediation path, and this
+ * function refuses it the queue.
+ *
+ * That is the whole shape of the correction. A device can prove who it is
+ * without thereby proving what it may do.
+ */
+export function evaluateDeviceOfflineQueueAdmission(input: DeviceOfflineQueueAdmissionInput): DeviceQueueAdmissionDecision {
+  const { registered, context } = input;
+
+  // 1. Authentication first. A queue is never examined off an unauthenticated
+  //    connection, whatever the registry says about the device.
+  if (!input.authentication.authenticated) return { permitted: false, refusal: 'NOT_AUTHENTICATED' };
+
+  // 2. The record must be ABOUT this device, or it is not evidence here at all.
+  if (registered.organisation_id !== context.organisation_id || registered.device_id !== context.device_id) {
+    return { permitted: false, refusal: 'REGISTRY_IDENTITY_MISMATCH' };
+  }
+
+  // 3. D23-08: a revocation that landed while the device was dark refuses the
+  //    queue wholesale, however old the queued work claims to be.
+  if (registered.revoked) return { permitted: false, refusal: 'CREDENTIAL_REVOKED' };
+
+  // 4. The trust gate proper — see the note above.
+  if (!deviceTrustPermitsPurpose(registered.trust, input.queuedPurpose)) {
+    return { permitted: false, refusal: 'DEVICE_TRUST_NOT_PERMITTED' };
+  }
+
+  // 5. C15-04: the CURRENT authority of the CURRENT user, skipped during
+  //    authentication precisely so it could be asked here, where it belongs.
+  if (registered.actor.user_id !== context.actor_user_id) return { permitted: false, refusal: 'ACTOR_AUTHORITY_REMOVED' };
+  if (!registered.actor.holds_required_capability) return { permitted: false, refusal: 'ACTOR_AUTHORITY_REMOVED' };
+  if (!registered.actor.authorised_site_ids.includes(input.site_id)) return { permitted: false, refusal: 'SITE_ENTITLEMENT_LOST' };
+
+  return { permitted: true };
 }
 
 // ---------------------------------------------------------------------------

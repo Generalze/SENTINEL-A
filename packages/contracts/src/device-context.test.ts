@@ -14,7 +14,8 @@ import {
   deviceRequestProofReplayKey,
   deviceRequestProofStatementInput,
   deviceTrustPermitsPurpose,
-  evaluateDeviceReconnectHandshake,
+  evaluateDeviceOfflineQueueAdmission,
+  evaluateDeviceReconnectAuthentication,
   evaluateDeviceRequestProof,
   isDeviceContextExpired,
   isDeviceTrustDowngrade,
@@ -29,8 +30,11 @@ import {
   DEVICE_REQUEST_PROOF_MAX_AGE_MS,
   DEVICE_REQUEST_PROOF_MAX_FUTURE_SKEW_MS,
   DEVICE_TIME_NOT_AUTHORITATIVE,
+  DeviceNonceConsumptionSchema,
+  isConsistentDeviceNonceConsumption,
   type DeviceNonceConsumption,
 } from './device-identity.js';
+import { type DeviceTrust } from './device.js';
 import { WHISPER_SIGNED_STATEMENT_DOMAIN } from './whisper.js';
 
 /** WP-23 Crucible — the sender-constrained device context (D23-07 / C14-03). */
@@ -107,15 +111,17 @@ function registry(overrides: Partial<DeviceRegistryFacts> = {}): DeviceRegistryF
 }
 
 /** C15-05: a store report shaped for the proof actually being presented. */
-function consumptionFor(source: DeviceRequestProof = proof(), overrides: Partial<DeviceNonceConsumption> = {}): DeviceNonceConsumption {
-  return {
+function consumptionFor(source: DeviceRequestProof = proof(), overrides: Record<string, unknown> = {}): DeviceNonceConsumption {
+  // C15-R1: parsed, so every fixture built here is provably a consistent fact.
+  // The malformed ones the guard exists to catch are built inline and cast.
+  return DeviceNonceConsumptionSchema.parse({
     source: 'SENTINEL_NONCE_STORE',
     outcome: 'FIRST_SEEN',
     replay_key: deviceRequestProofReplayKey(source),
     statement_fingerprint: deviceRequestProofFingerprint(statement(source)),
     stored_outcome_ref: null,
     ...overrides,
-  };
+  });
 }
 
 function evaluation(overrides: Partial<DeviceRequestProofEvaluationInput> = {}): DeviceRequestProofEvaluationInput {
@@ -131,6 +137,17 @@ function evaluation(overrides: Partial<DeviceRequestProofEvaluationInput> = {}):
     consumption: consumptionFor(theProof),
     ...overrides,
   };
+}
+
+/**
+ * C15-R2: a reconnect input. The reconnect API takes NO `expectedPurpose` — it
+ * names RECONNECT_HANDSHAKE itself — so the fixture genuinely OMITS the field
+ * rather than passing one that happens to be ignored.
+ */
+function reconnect(overrides: Partial<DeviceRequestProofEvaluationInput> = {}): Omit<DeviceRequestProofEvaluationInput, 'expectedPurpose'> {
+  const full: Record<string, unknown> = { ...evaluation({ proof: proof({ purpose: 'RECONNECT_HANDSHAKE' }), ...overrides }) };
+  delete full.expectedPurpose;
+  return full as unknown as Omit<DeviceRequestProofEvaluationInput, 'expectedPurpose'>;
 }
 
 // ---------------------------------------------------------------------------
@@ -357,34 +374,33 @@ describe('the proof binds the body it accompanies', () => {
   });
 });
 
-describe('the reconnect handshake authenticates by possession (D23-13 / C14-03)', () => {
-  it('admits a reconnect proved with the hardware key', () => {
-    const decision = evaluateDeviceReconnectHandshake(evaluation({ proof: proof({ purpose: 'RECONNECT_HANDSHAKE' }) }));
-    expect(decision.admitted).toBe(true);
+describe('the reconnect authenticates by possession (D23-13 / C14-03)', () => {
+  it('authenticates a reconnect proved with the hardware key', () => {
+    const decision = evaluateDeviceReconnectAuthentication(reconnect());
+    expect(decision.authenticated).toBe(true);
   });
 
   it('refuses a presented token without possession', () => {
-    expect(evaluateDeviceReconnectHandshake(evaluation({ proof: proof({ purpose: 'RECONNECT_HANDSHAKE' }), verified: false }))).toEqual({
-      admitted: false,
+    expect(evaluateDeviceReconnectAuthentication(reconnect({ verified: false }))).toEqual({
+      authenticated: false,
       refusal: 'POSSESSION_NOT_PROVEN',
       queue_examination_permitted: false,
     });
   });
 
   it('refuses a proof minted for some other purpose being reused to reconnect', () => {
-    expect(evaluateDeviceReconnectHandshake(evaluation())).toEqual({
-      admitted: false,
+    expect(evaluateDeviceReconnectAuthentication(evaluation())).toEqual({
+      authenticated: false,
       refusal: 'PURPOSE_NOT_ALLOWED',
       queue_examination_permitted: false,
     });
   });
 
   it('fails closed as a whole before any queued operation could be examined', () => {
-    const revoked = evaluation({ proof: proof({ purpose: 'RECONNECT_HANDSHAKE' }), registered: registry({ revoked: true }) });
     // D23-13 as a CONTRACT rather than a comment: the caller is handed a
     // `false` it cannot ignore, so no queue is examined on any refusal.
-    expect(evaluateDeviceReconnectHandshake(revoked)).toEqual({
-      admitted: false,
+    expect(evaluateDeviceReconnectAuthentication(reconnect({ registered: registry({ revoked: true }) }))).toEqual({
+      authenticated: false,
       refusal: 'CREDENTIAL_REVOKED',
       queue_examination_permitted: false,
     });
@@ -516,16 +532,7 @@ describe('C15-04 current authority is present, and purpose is exact', () => {
   });
 });
 
-describe('C15-04 the reconnect handshake names its three Crucible cases (D23-13)', () => {
-  function handshake(overrides: Partial<DeviceRequestProofEvaluationInput> = {}): DeviceRequestProofEvaluationInput {
-    return evaluation({ proof: proof({ purpose: 'RECONNECT_HANDSHAKE' }), ...overrides });
-  }
-
-  it('admits a clean reconnect and permits the queue to be examined', () => {
-    const decision = evaluateDeviceReconnectHandshake(handshake());
-    expect(decision).toMatchObject({ admitted: true, effect: 'PROCEED', queue_examination_permitted: true });
-  });
-
+describe('C15-04 operational rank remains a fact rather than a feeling', () => {
   it('ranks operational capability so that a downgrade is a fact, not a feeling', () => {
     expect(DEVICE_TRUST_OPERATIONAL_RANK.COMPROMISED).toBeLessThan(DEVICE_TRUST_OPERATIONAL_RANK.QUARANTINED);
     // OFFLINE is ignorance, not suspicion, so it outranks SUSPICIOUS.
@@ -536,44 +543,219 @@ describe('C15-04 the reconnect handshake names its three Crucible cases (D23-13)
     expect(isDeviceTrustDowngrade('TRUSTED', 'TRUSTED')).toBe(false);
   });
 
-  it('CASE 1: refuses on a trust downgrade that happened while the device was dark', () => {
-    const decision = evaluateDeviceReconnectHandshake(handshake({ registered: registry({ trust: 'SUSPICIOUS' }) }));
-    expect(decision).toEqual({ admitted: false, refusal: 'DEVICE_TRUST_DOWNGRADED', queue_examination_permitted: false });
+  it('C15-R2: the rank comparison is NOT the reconnect authority decision any more', () => {
+    // It stays exported and stays correct — it just no longer gates a
+    // handshake, because "lower than it was" is not a statement about whether
+    // the hardware on the other end of this connection is the registered one.
+    expect(isDeviceTrustDowngrade('TRUSTED', 'OFFLINE')).toBe(true);
+    const offline = reconnect({ context: context({ device_trust: 'TRUSTED' }), registered: registry({ trust: 'OFFLINE' }) });
+    expect(evaluateDeviceReconnectAuthentication(offline).authenticated).toBe(true);
+  });
+});
+
+describe('C15-R2 reconnect authentication is separate from queue admission', () => {
+  /** The device that went dark while TRUSTED and is registry-OFFLINE now. */
+  function returnedFromTheDark(trust: DeviceTrust = 'OFFLINE'): Omit<DeviceRequestProofEvaluationInput, 'expectedPurpose'> {
+    return reconnect({ context: context({ device_trust: 'TRUSTED' }), registered: registry({ trust }) });
+  }
+
+  function admission(
+    overrides: Partial<Parameters<typeof evaluateDeviceOfflineQueueAdmission>[0]> = {},
+    trust: DeviceTrust = 'OFFLINE',
+  ): ReturnType<typeof evaluateDeviceOfflineQueueAdmission> {
+    return evaluateDeviceOfflineQueueAdmission({
+      authentication: evaluateDeviceReconnectAuthentication(returnedFromTheDark(trust)),
+      registered: registry({ trust }),
+      context: context({ device_trust: 'TRUSTED' }),
+      site_id: 'site-1',
+      queuedPurpose: 'OFFLINE_SYNC',
+      ...overrides,
+    });
+  }
+
+  it('THE CASE THE OLD CONTRACT COULD NOT EXPRESS: a formerly-TRUSTED, now registry-OFFLINE device authenticates', () => {
+    // The old handshake refused this device `DEVICE_TRUST_DOWNGRADED` before it
+    // could present possession — while the purpose table deliberately admitted
+    // OFFLINE. The contract contradicted itself and the stricter half won.
+    const decision = evaluateDeviceReconnectAuthentication(returnedFromTheDark());
+    expect(decision).toMatchObject({ authenticated: true, effect: 'PROCEED', authenticated_device_trust: 'OFFLINE' });
   });
 
-  it('CASE 2: refuses when the actor authority was removed', () => {
-    expect(
-      evaluateDeviceReconnectHandshake(
-        handshake({ registered: registry({ actor: { user_id: 'user-1', authorised_site_ids: ['site-1'], holds_required_capability: false } }) }),
-      ),
-    ).toEqual({ admitted: false, refusal: 'ACTOR_AUTHORITY_REMOVED', queue_examination_permitted: false });
-    expect(
-      evaluateDeviceReconnectHandshake(
-        handshake({ registered: registry({ actor: { user_id: 'user-9', authorised_site_ids: ['site-1'], holds_required_capability: true } }) }),
-      ),
-    ).toEqual({ admitted: false, refusal: 'ACTOR_AUTHORITY_REMOVED', queue_examination_permitted: false });
+  it('LOCKED: authentication NEVER unlocks a queue — the success arm carries the literal false', () => {
+    const decision = evaluateDeviceReconnectAuthentication(returnedFromTheDark());
+    expect(decision.queue_examination_permitted).toBe(false);
+    // And on the TRUSTED path too: the ruling is about authentication as such,
+    // not about which devices happen to be admissible afterwards.
+    expect(evaluateDeviceReconnectAuthentication(returnedFromTheDark('TRUSTED')).queue_examination_permitted).toBe(false);
   });
 
-  it('CASE 3: refuses when the site entitlement was lost', () => {
-    expect(
-      evaluateDeviceReconnectHandshake(
-        handshake({ registered: registry({ actor: { user_id: 'user-1', authorised_site_ids: ['site-7'], holds_required_capability: true } }) }),
-      ),
-    ).toEqual({ admitted: false, refusal: 'SITE_ENTITLEMENT_LOST', queue_examination_permitted: false });
+  it('refuses the OFFLINE device its QUEUE, which is where the trust question actually belongs', () => {
+    // OFFLINE_SYNC admits TRUSTED and DEGRADED only. Restoring trust is an
+    // evidenced transition through `evaluateDeviceTrustTransition`, never a
+    // side effect of a successful handshake.
+    expect(admission()).toEqual({ permitted: false, refusal: 'DEVICE_TRUST_NOT_PERMITTED' });
   });
 
-  it('D23-13: identity, trust and entitlement are established BEFORE the queue, on every refusal', () => {
-    const refusals = [
-      handshake({ registered: registry({ trust: 'QUARANTINED' }) }),
-      handshake({ registered: registry({ revoked: true, revocation_disposition: 'STOLEN' }) }),
-      handshake({ verified: false }),
-      handshake({ now: 'not-a-time' }),
+  it('a SUSPICIOUS device authenticates for the recovery path and is still refused the queue', () => {
+    expect(evaluateDeviceReconnectAuthentication(returnedFromTheDark('SUSPICIOUS')).authenticated).toBe(true);
+    expect(admission({}, 'SUSPICIOUS')).toEqual({ permitted: false, refusal: 'DEVICE_TRUST_NOT_PERMITTED' });
+  });
+
+  it('a TRUSTED device authenticates AND is admitted', () => {
+    expect(evaluateDeviceReconnectAuthentication(returnedFromTheDark('TRUSTED')).authenticated).toBe(true);
+    expect(admission({}, 'TRUSTED')).toEqual({ permitted: true });
+  });
+
+  it('each authority fact that moved while the device was dark refuses ADMISSION on its own, while authentication still succeeds', () => {
+    const cases: Array<[string, Partial<Parameters<typeof evaluateDeviceOfflineQueueAdmission>[0]>, string]> = [
+      ['lowered trust', { registered: registry({ trust: 'SUSPICIOUS' }) }, 'DEVICE_TRUST_NOT_PERMITTED'],
+      [
+        'capability withdrawn',
+        { registered: registry({ actor: { user_id: 'user-1', authorised_site_ids: ['site-1'], holds_required_capability: false } }) },
+        'ACTOR_AUTHORITY_REMOVED',
+      ],
+      [
+        'a different actor',
+        { registered: registry({ actor: { user_id: 'user-9', authorised_site_ids: ['site-1'], holds_required_capability: true } }) },
+        'ACTOR_AUTHORITY_REMOVED',
+      ],
+      [
+        'site entitlement lost',
+        { registered: registry({ actor: { user_id: 'user-1', authorised_site_ids: ['site-7'], holds_required_capability: true } }) },
+        'SITE_ENTITLEMENT_LOST',
+      ],
+      ['a revocation that landed while it was away', { registered: registry({ revoked: true }) }, 'CREDENTIAL_REVOKED'],
+      ['a record about another device', { registered: registry({ device_id: 'device-9' }) }, 'REGISTRY_IDENTITY_MISMATCH'],
     ];
-    for (const input of refusals) {
-      const decision = evaluateDeviceReconnectHandshake(input);
-      expect(decision.admitted).toBe(false);
-      expect(decision.queue_examination_permitted).toBe(false);
+    for (const [label, overrides, refusal] of cases) {
+      // Authentication is unaffected: possession of the hardware key is not in
+      // question in any of these, which is exactly why they are a separate
+      // decision. `registered` here is the record RE-READ after the handshake.
+      const authentication = evaluateDeviceReconnectAuthentication(returnedFromTheDark('TRUSTED'));
+      expect(authentication.authenticated, label).toBe(true);
+      expect(evaluateDeviceOfflineQueueAdmission({
+        authentication,
+        registered: registry({ trust: 'TRUSTED' }),
+        context: context({ device_trust: 'TRUSTED' }),
+        site_id: 'site-1',
+        queuedPurpose: 'OFFLINE_SYNC',
+        ...overrides,
+      }), label).toEqual({ permitted: false, refusal });
     }
+  });
+
+  it('a FAILED authentication refuses admission outright, before any registry fact is consulted', () => {
+    const authentication = evaluateDeviceReconnectAuthentication(reconnect({ verified: false }));
+    expect(authentication.authenticated).toBe(false);
+    expect(admission({ authentication, registered: registry({ trust: 'TRUSTED' }) }, 'TRUSTED')).toEqual({
+      permitted: false,
+      refusal: 'NOT_AUTHENTICATED',
+    });
+  });
+
+  it('QUARANTINED and COMPROMISED still fail AUTHENTICATION itself, via the purpose table', () => {
+    // Those are decisions rather than ignorance, so they do not even get to
+    // present possession — the widest row in DEVICE_PURPOSE_PERMITTED_TRUST
+    // deliberately excludes them.
+    for (const trust of ['QUARANTINED', 'COMPROMISED'] as const) {
+      expect(evaluateDeviceReconnectAuthentication(returnedFromTheDark(trust)), trust).toEqual({
+        authenticated: false,
+        refusal: 'DEVICE_TRUST_NOT_PERMITTED',
+        queue_examination_permitted: false,
+      });
+    }
+  });
+
+  it('AUTHENTICATION_ONLY skips exactly the actor-authority block and nothing else', () => {
+    // The removed actor does not block authentication...
+    const strippedActor = registry({ actor: { user_id: 'user-9', authorised_site_ids: ['site-7'], holds_required_capability: false } });
+    expect(evaluateDeviceReconnectAuthentication(reconnect({ registered: strippedActor })).authenticated).toBe(true);
+    // ...but every other step still runs, in its original order.
+    expect(evaluateDeviceReconnectAuthentication(reconnect({ expectedPayloadDigest: OTHER_DIGEST }))).toMatchObject({
+      authenticated: false,
+      refusal: 'PAYLOAD_DIGEST_MISMATCH',
+    });
+    expect(evaluateDeviceReconnectAuthentication(reconnect({ registered: registry({ key_version: 9 }) }))).toMatchObject({
+      authenticated: false,
+      refusal: 'KEY_VERSION_ROTATED',
+    });
+    expect(evaluateDeviceReconnectAuthentication(reconnect({ now: 'not-a-time' }))).toMatchObject({
+      authenticated: false,
+      refusal: DEVICE_TIME_NOT_AUTHORITATIVE,
+    });
+  });
+
+  it('the ordinary evaluator is unchanged: it still ENFORCES actor authority', () => {
+    // The refactor must not have leaked AUTHENTICATION_ONLY into the default
+    // path — this is the regression that would silently drop three checks.
+    expect(
+      evaluateDeviceRequestProof(
+        evaluation({ registered: registry({ actor: { user_id: 'user-9', authorised_site_ids: ['site-1'], holds_required_capability: true } }) }),
+      ),
+    ).toEqual({ admitted: false, refusal: 'ACTOR_AUTHORITY_REMOVED' });
+    expect(
+      evaluateDeviceRequestProof(
+        evaluation({ registered: registry({ actor: { user_id: 'user-1', authorised_site_ids: ['site-7'], holds_required_capability: true } }) }),
+      ),
+    ).toEqual({ admitted: false, refusal: 'SITE_ENTITLEMENT_LOST' });
+  });
+
+  it('a converged reconnect retry authenticates without unlocking the queue either', () => {
+    const source = proof({ purpose: 'RECONNECT_HANDSHAKE' });
+    const decision = evaluateDeviceReconnectAuthentication(
+      reconnect({ consumption: consumptionFor(source, { outcome: 'EXACT_DUPLICATE', stored_outcome_ref: 'handshake-1' }) }),
+    );
+    expect(decision).toMatchObject({
+      authenticated: true,
+      effect: 'CONVERGE_ON_STORED_OUTCOME',
+      stored_outcome_ref: 'handshake-1',
+      queue_examination_permitted: false,
+    });
+  });
+});
+
+describe('C15-R1 a malformed duplicate can never reach PROCEED', () => {
+  function malformed(): Array<[string, DeviceNonceConsumption]> {
+    const wellFormed = consumptionFor(proof());
+    const base = { source: 'SENTINEL_NONCE_STORE', replay_key: wellFormed.replay_key, statement_fingerprint: wellFormed.statement_fingerprint };
+    return (
+      [
+        ['EXACT_DUPLICATE with a null ref', { ...base, outcome: 'EXACT_DUPLICATE', stored_outcome_ref: null }],
+        ['EXACT_DUPLICATE with an empty ref', { ...base, outcome: 'EXACT_DUPLICATE', stored_outcome_ref: '' }],
+        ['EXACT_DUPLICATE with a blank ref', { ...base, outcome: 'EXACT_DUPLICATE', stored_outcome_ref: '   ' }],
+        ['FIRST_SEEN carrying a stored ref', { ...base, outcome: 'FIRST_SEEN', stored_outcome_ref: 'operation-1' }],
+        ['a foreign source', { ...base, source: 'DEVICE_CLAIM', outcome: 'FIRST_SEEN', stored_outcome_ref: null }],
+        ['a missing outcome', { ...base, stored_outcome_ref: null }],
+        ['a missing stored_outcome_ref', { ...base, outcome: 'EXACT_DUPLICATE' }],
+      ] as Array<[string, unknown]>
+    ).map(([label, fact]) => [label, fact as DeviceNonceConsumption]);
+  }
+
+  it('LOCKED: every malformed consumption fact refuses, and none of them PROCEEDS', () => {
+    // THE DEFECT: `if (outcome === 'EXACT_DUPLICATE' && ref !== null) converge`
+    // — else PROCEED. A duplicate carrying a null ref fell past the convergence
+    // branch and caused a SECOND EFFECT for a retry the store had reported.
+    for (const [label, fact] of malformed()) {
+      expect(evaluateDeviceRequestProof(evaluation({ consumption: fact })), label).toEqual({
+        admitted: false,
+        refusal: 'NONCE_CONSUMPTION_INCONSISTENT',
+      });
+    }
+  });
+
+  it('the guard itself accepts the three well-formed arms and rejects the malformed ones', () => {
+    expect(isConsistentDeviceNonceConsumption(consumptionFor(proof()))).toBe(true);
+    expect(isConsistentDeviceNonceConsumption(consumptionFor(proof(), { outcome: 'EXACT_DUPLICATE', stored_outcome_ref: 'x' }))).toBe(true);
+    expect(isConsistentDeviceNonceConsumption(consumptionFor(proof(), { outcome: 'REUSED_WITH_CHANGED_SEMANTICS' }))).toBe(true);
+    for (const [label, fact] of malformed()) {
+      expect(isConsistentDeviceNonceConsumption(fact), label).toBe(false);
+    }
+  });
+
+  it('a well-formed EXACT_DUPLICATE still converges: the guard closes a hole, it does not close the door', () => {
+    expect(
+      evaluateDeviceRequestProof(evaluation({ consumption: consumptionFor(proof(), { outcome: 'EXACT_DUPLICATE', stored_outcome_ref: 'op-1' }) })),
+    ).toMatchObject({ admitted: true, effect: 'CONVERGE_ON_STORED_OUTCOME', stored_outcome_ref: 'op-1' });
   });
 });
 
@@ -639,9 +821,14 @@ describe('C15-05 the request proof nonce is one-shot through a contract seam', (
     const { consumption, ...withoutFact } = evaluation();
     expect(consumption).toBeDefined();
     expect(Object.keys(withoutFact)).not.toContain('consumption');
-    // Without the fact there is no decision to make — it throws rather than
-    // silently admitting, which is the whole point of removing the default.
-    expect(() => evaluateDeviceRequestProof(withoutFact as unknown as DeviceRequestProofEvaluationInput)).toThrow();
+    // C15-R1: without the fact there is no decision to make. This used to
+    // CRASH on a property access; the runtime consistency guard now turns it
+    // into a NAMED refusal, which is auditable rather than a 500 and still
+    // admits nothing.
+    expect(evaluateDeviceRequestProof(withoutFact as unknown as DeviceRequestProofEvaluationInput)).toEqual({
+      admitted: false,
+      refusal: 'NONCE_CONSUMPTION_INCONSISTENT',
+    });
   });
 });
 
