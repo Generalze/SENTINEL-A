@@ -2,15 +2,17 @@ import { Inject, Injectable } from '@nestjs/common';
 import {
   DeviceRegistryKeyRecordSchema,
   deviceKeyStatePermitsNewOperations,
+  deviceTrustPermitsPurpose,
   type DeviceCustody,
   type DeviceKeyLifecycleState,
   type DeviceKeyStorage,
   type DeviceRegistryKeyRecord,
+  type DeviceRequestPurpose,
   type DeviceRevocationDisposition,
   type DeviceTrust,
 } from '@sentinel/contracts';
 import type { Principal } from '../../common/security/principal';
-import { checkDeviceAuthority, readableSiteIds } from './shield.authority';
+import { checkDeviceAuthority, projectReadableDeviceSites, readableSiteIds } from './shield.authority';
 import { ACTION_DEVICE_REGISTRY_READ } from './shield.constants';
 import { ShieldRepository, type DeviceKeyRow, type DeviceRow } from './shield.repository';
 import type { DeviceStanding, ListDevicesOutcome, ReadDeviceStandingOutcome } from './shield.types';
@@ -37,6 +39,36 @@ import type { DeviceStanding, ListDevicesOutcome, ReadDeviceStandingOutcome } fr
  * credential is gone is sufficient on its own, and the two half-answers are
  * exposed separately (`deviceLevelWithdrawn`, `keyLevelWithdrawn`) precisely so
  * a future reader cannot quietly start consulting one of them alone.
+ *
+ * C16-07 — `deviceAdmitsNewOperations` OVERCLAIMED, AND IS NOW TWO QUESTIONS
+ * ------------------------------------------------------------------------
+ * That name read like operational authorisation. The function checked device
+ * credential withdrawal and key lifecycle and NOTHING ELSE — so a QUARANTINED,
+ * SUSPICIOUS or OFFLINE device with a perfectly healthy key satisfied it. WP-25
+ * is about to consume this, and a gateway that gates work on a name it trusts
+ * is a gateway that admits a device the registry has already stopped vouching
+ * for.
+ *
+ *   `credentialAdmitsNewOperations`  the CREDENTIAL is intact. Nothing more.
+ *   `deviceMayAct(org, device, purpose)`  the credential is intact AND current
+ *                                    trust admits this PURPOSE, judged against
+ *                                    the frozen `DEVICE_PURPOSE_PERMITTED_TRUST`
+ *                                    matrix via `deviceTrustPermitsPurpose`.
+ *
+ * NEITHER IS COMPLETE AUTHORISATION (§62.1). User authority, site/context
+ * authority and policy are SEPARATE, INDEPENDENT facts and this service can
+ * answer none of them. A registered device never manufactures user authority,
+ * and `deviceMayAct` returning `true` means only that the hardware half of the
+ * question is satisfied.
+ *
+ * C16-06 — A SITE-SCOPED READER IS TOLD ONLY WHAT IT MAY SEE
+ * -------------------------------------------------------
+ * A read used to succeed if the reader held ONE of a device's sites, and then
+ * returned the device's ENTIRE active site list. Holding site A was therefore a
+ * way to enumerate every other site a device is deployed at. The standing now
+ * carries the PROJECTION `projectReadableDeviceSites` computes: the reader's
+ * granted scope intersected with the device's associations, and the full list
+ * only for genuine organisation-wide authority.
  */
 @Injectable()
 export class DeviceRegistryService {
@@ -62,16 +94,15 @@ export class DeviceRegistryService {
     if (device === null) return { outcome: 'REFUSED', refusal: 'DEVICE_NOT_FOUND' };
 
     const siteIds = await this.repository.listDeviceSiteIds(input.organisationId, device.id);
-    const scope = readableSiteIds(principal, ACTION_DEVICE_REGISTRY_READ);
-    // Site narrowing applied to the ANSWER, not only to the query: a
-    // site-scoped reader must not learn that a device exists at a site they do
-    // not hold, and the refusal must be the same one they get for an invented
-    // id.
-    if (scope !== null && !siteIds.some((siteId) => scope.includes(siteId))) {
-      return { outcome: 'REFUSED', refusal: 'DEVICE_NOT_FOUND' };
-    }
+    // C16-06: the projection decides BOTH whether this reader may see the
+    // device at all and WHICH of its sites they are told about. `null` is
+    // "not visible", and it is reported as the same refusal an invented id
+    // gets — a site-scoped reader must not learn that a device exists at a site
+    // they do not hold, nor that it is ALSO deployed somewhere they cannot see.
+    const visibleSiteIds = projectReadableDeviceSites(principal, ACTION_DEVICE_REGISTRY_READ, input.organisationId, siteIds);
+    if (visibleSiteIds === null) return { outcome: 'REFUSED', refusal: 'DEVICE_NOT_FOUND' };
 
-    return { outcome: 'FOUND', standing: await this.buildStanding(device, siteIds) };
+    return { outcome: 'FOUND', standing: await this.buildStanding(device, visibleSiteIds) };
   }
 
   /** The roster, organisation-scoped and narrowed to the reader's granted sites. */
@@ -82,7 +113,13 @@ export class DeviceRegistryService {
     const rows = await this.repository.listDevices(input.organisationId, readableSiteIds(principal, ACTION_DEVICE_REGISTRY_READ));
     const devices: DeviceStanding[] = [];
     for (const row of rows) {
-      devices.push(await this.buildStanding(row, await this.repository.listDeviceSiteIds(input.organisationId, row.id)));
+      const siteIds = await this.repository.listDeviceSiteIds(input.organisationId, row.id);
+      // C16-06: the SAME projection the single read applies. A roster that
+      // narrowed the QUERY but not the ANSWER would leak through the list what
+      // the single read no longer leaks directly.
+      const visibleSiteIds = projectReadableDeviceSites(principal, ACTION_DEVICE_REGISTRY_READ, input.organisationId, siteIds);
+      if (visibleSiteIds === null) continue;
+      devices.push(await this.buildStanding(row, visibleSiteIds));
     }
     return { outcome: 'FOUND', devices };
   }
@@ -130,19 +167,60 @@ export class DeviceRegistryService {
   }
 
   /**
-   * "May this device do new work?" — the helper D24-09 requires, consulting
-   * BOTH rows and assuming nothing about whether they moved together.
+   * C16-07: "IS THE CREDENTIAL INTACT?" — and that question ONLY.
+   *
+   * The D24-09 helper, renamed from `deviceAdmitsNewOperations` because the old
+   * name promised something it never delivered. It consults BOTH the device row
+   * and the key row, assuming nothing about whether they moved together, and it
+   * consults CURRENT TRUST NOT AT ALL. A QUARANTINED device with a healthy key
+   * returns `true` here, correctly: its credential IS intact. Whether it may
+   * DO anything is a different question, and `deviceMayAct` is where it is
+   * asked.
    *
    * Returns `false` for an unknown device, which is the only fail-closed
    * answer: a caller that cannot find a device has not established that it may
    * act, and treating "not found" as anything but a refusal would make the
    * whole registry optional.
    */
-  async deviceAdmitsNewOperations(organisationId: string, deviceId: string): Promise<boolean> {
+  async credentialAdmitsNewOperations(organisationId: string, deviceId: string): Promise<boolean> {
     const device = await this.repository.findDevice(organisationId, deviceId);
     if (device === null) return false;
     const key = device.currentKeyId === null ? null : await this.repository.findDeviceKeyByKeyId(organisationId, device.currentKeyId);
     return !this.deviceLevelWithdrawn(device) && !this.keyLevelWithdrawn(key);
+  }
+
+  /**
+   * C16-07: "MAY THIS DEVICE ACT FOR THIS PURPOSE?" — credential AND trust.
+   *
+   * Two independent facts, ANDed, and both are the registry's own:
+   *
+   *   1. the credential is intact (`credentialAdmitsNewOperations`);
+   *   2. CURRENT trust admits this purpose, judged by
+   *      `deviceTrustPermitsPurpose` against the frozen
+   *      `DEVICE_PURPOSE_PERMITTED_TRUST` matrix. The matrix is the contract's
+   *      and is never restated here: WHISPER_DEVICE_ACTION admits TRUSTED
+   *      alone (W21-05), RECONNECT_HANDSHAKE is deliberately the widest, and
+   *      widening any row is a security-contract change.
+   *
+   * THIS IS STILL NOT COMPLETE AUTHORISATION (§62.1).
+   *
+   *     USER AUTHORITY + DEVICE IDENTITY + CURRENT DEVICE TRUST
+   *       + SITE/CONTEXT AUTHORITY
+   *
+   * must remain INDEPENDENT facts. This method answers the middle two and has
+   * no way to answer the others: it takes no principal, knows nothing about the
+   * site an operation touches, and evaluates no policy. A caller that treats
+   * `true` as permission to proceed has collapsed four facts into one, which is
+   * precisely the fusion the whole module is shaped to prevent. WP-25's gateway
+   * must ask this AND the user-authority question AND the site/context
+   * question, separately, and require all of them.
+   */
+  async deviceMayAct(organisationId: string, deviceId: string, purpose: DeviceRequestPurpose): Promise<boolean> {
+    const device = await this.repository.findDevice(organisationId, deviceId);
+    if (device === null) return false;
+    const key = device.currentKeyId === null ? null : await this.repository.findDeviceKeyByKeyId(organisationId, device.currentKeyId);
+    if (this.deviceLevelWithdrawn(device) || this.keyLevelWithdrawn(key)) return false;
+    return deviceTrustPermitsPurpose(device.trust as DeviceTrust, purpose);
   }
 
   private async buildStanding(device: DeviceRow, siteIds: string[]): Promise<DeviceStanding> {
@@ -166,11 +244,12 @@ export class DeviceRegistryService {
       siteIds,
       deviceLevelWithdrawn,
       keyLevelWithdrawn,
-      // The AND is the only thing a caller should gate new work on, and it is
-      // computed here rather than left to each caller for exactly the reason
-      // C15-R4-final gives: the caller who forgets one half is the caller who
-      // admits a compromised credential.
-      admitsNewOperations: !deviceLevelWithdrawn && !keyLevelWithdrawn,
+      // The AND of the two CREDENTIAL checks, computed here rather than left
+      // to each caller for exactly the reason C15-R4-final gives: the caller
+      // who forgets one half is the caller who admits a compromised credential.
+      // C16-07: it is named `credential...` because it is not, and never was,
+      // an answer about whether the device may operate.
+      credentialAdmitsNewOperations: !deviceLevelWithdrawn && !keyLevelWithdrawn,
     };
   }
 

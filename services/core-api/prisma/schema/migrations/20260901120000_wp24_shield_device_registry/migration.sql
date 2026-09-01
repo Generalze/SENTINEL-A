@@ -3,8 +3,21 @@
 -- ONE migration, chain 20 -> 21 (D24-14). It adds:
 --   * the users_id_organisation_key candidate key on `users` (D24-04a) — an
 --     index only: no column is added, no existing constraint is altered.
---   * fifteen new device-security tables, all composite-tenant-referencing and
+--   * sixteen new device-security tables, all composite-tenant-referencing and
 --     all ON DELETE RESTRICT. Nothing here cascades.
+--
+-- C16 CORRECTION BATCH. This migration has never entered `main`, so it is
+-- EDITED IN PLACE rather than chained to a 22nd file (the CTO authorised
+-- exactly that). It now also carries:
+--   * `device_custody_regimes` and the enrollment columns that bind a custody
+--     regime to the human approval (C16-01);
+--   * `enrollment_request_grant_key`, so one bootstrap grant cannot spawn two
+--     competing approval candidates (C16-02);
+--   * `device_keys_one_current_key`, a PARTIAL unique index Prisma cannot
+--     model, so a device can never hold two CURRENT keys (C16-08);
+--   * composite candidate keys and foreign keys that make the possession and
+--     rotation verification tuples consistent BY REFERENTIAL INTEGRITY rather
+--     than by a service comparing duplicated scalars (C16-08).
 --
 -- No existing migration is edited and there is no destructive reset
 -- instruction anywhere below: every statement is CREATE or ADD.
@@ -56,6 +69,22 @@ CREATE TABLE "device_site_scopes" (
 );
 
 -- CreateTable
+-- C16-01: the server-issued custody regime catalogue. The id is a
+-- server-generated uuid and never caller-supplied text.
+CREATE TABLE "device_custody_regimes" (
+    "id" UUID NOT NULL,
+    "organisation_id" TEXT NOT NULL,
+    "site_id" TEXT NOT NULL,
+    "name" TEXT NOT NULL,
+    "defined_by_user_id" TEXT NOT NULL,
+    "created_at" TIMESTAMPTZ(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "retired_at" TIMESTAMPTZ(3),
+    "updated_at" TIMESTAMPTZ(3) NOT NULL,
+
+    CONSTRAINT "device_custody_regimes_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
 CREATE TABLE "device_keys" (
     "id" UUID NOT NULL,
     "organisation_id" TEXT NOT NULL,
@@ -103,12 +132,14 @@ CREATE TABLE "device_enrollment_requests" (
     "intended_user_id" TEXT NOT NULL,
     "bootstrap_grant_id" UUID NOT NULL,
     "custody" TEXT NOT NULL,
+    "custody_regime_id" UUID,
     "public_key" TEXT NOT NULL,
     "public_key_thumbprint" TEXT NOT NULL,
     "key_storage" TEXT NOT NULL,
     "claimed_signature_profile" TEXT NOT NULL,
     "server_selected_signature_profile" TEXT NOT NULL,
     "request_fingerprint" TEXT NOT NULL,
+    "approved_semantics_digest" TEXT NOT NULL,
     "attestation_outcome" TEXT NOT NULL,
     "attestation_evaluated_at" TIMESTAMPTZ(3) NOT NULL,
     "attestation_reference" TEXT,
@@ -130,6 +161,8 @@ CREATE TABLE "device_enrollment_approvals" (
     "approved_site_id" TEXT NOT NULL,
     "approved_intended_user_id" TEXT NOT NULL,
     "approved_custody" TEXT NOT NULL,
+    "approved_custody_regime_id" UUID,
+    "approved_semantics_digest" TEXT NOT NULL,
     "approved_at" TIMESTAMPTZ(3) NOT NULL,
     "created_at" TIMESTAMPTZ(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updated_at" TIMESTAMPTZ(3) NOT NULL,
@@ -316,7 +349,30 @@ CREATE INDEX "device_site_scopes_organisation_id_site_id_idx" ON "device_site_sc
 CREATE UNIQUE INDEX "device_site_scope_key" ON "device_site_scopes"("organisation_id", "device_id", "site_id");
 
 -- CreateIndex
+CREATE INDEX "device_custody_regimes_organisation_id_site_id_idx" ON "device_custody_regimes"("organisation_id", "site_id");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "device_custody_regime_id_organisation_key" ON "device_custody_regimes"("id", "organisation_id");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "device_custody_regime_name_key" ON "device_custody_regimes"("organisation_id", "site_id", "name");
+
+-- CreateIndex
 CREATE INDEX "device_keys_organisation_id_device_id_status_idx" ON "device_keys"("organisation_id", "device_id", "status");
+
+-- CreateIndex
+-- C16-08: AT MOST ONE `CURRENT` KEY PER (tenant, device).
+--
+-- PARTIAL, and Prisma cannot model a partial unique index at all: `@@unique`
+-- is unconditional, and an unconditional unique on (organisation_id,
+-- device_id) would forbid a device from holding more than one key version
+-- ever, which is the opposite of what routine rotation requires. So THIS SQL
+-- IS AUTHORITATIVE and prisma/schema/shield.prisma carries a comment saying so.
+--
+-- Without it, "which key is CURRENT" is a question the database permits two
+-- answers to, and a rotation that half-applied (or a service-bypassing writer)
+-- could leave two live credentials competing to be believed.
+CREATE UNIQUE INDEX "device_keys_one_current_key" ON "device_keys"("organisation_id", "device_id") WHERE "status" = 'CURRENT';
 
 -- CreateIndex
 CREATE UNIQUE INDEX "device_key_version_key" ON "device_keys"("organisation_id", "device_id", "key_version");
@@ -340,7 +396,18 @@ CREATE INDEX "device_enrollment_requests_organisation_id_state_idx" ON "device_e
 CREATE UNIQUE INDEX "enrollment_request_id_organisation_key" ON "device_enrollment_requests"("id", "organisation_id");
 
 -- CreateIndex
+-- C16-02: one bootstrap grant spawns at most one enrollment request, so a
+-- single piece of provenance cannot produce two competing approval candidates
+-- racing for the one replay identity the grant carries.
+CREATE UNIQUE INDEX "enrollment_request_grant_key" ON "device_enrollment_requests"("organisation_id", "bootstrap_grant_id");
+
+-- CreateIndex
 CREATE UNIQUE INDEX "enrollment_approval_request_key" ON "device_enrollment_approvals"("organisation_id", "enrollment_request_id");
+
+-- CreateIndex
+-- C16-08: the candidate key a possession verification references, so the
+-- (challenge, request, tenant) tuple is consistent by referential integrity.
+CREATE UNIQUE INDEX "possession_challenge_request_tuple_key" ON "device_possession_challenges"("id", "organisation_id", "enrollment_request_id");
 
 -- CreateIndex
 CREATE INDEX "device_possession_challenges_organisation_id_enrollment_req_idx" ON "device_possession_challenges"("organisation_id", "enrollment_request_id");
@@ -355,7 +422,17 @@ CREATE INDEX "device_key_rotation_requests_organisation_id_device_id_stat_idx" O
 CREATE UNIQUE INDEX "rotation_request_id_organisation_key" ON "device_key_rotation_requests"("id", "organisation_id");
 
 -- CreateIndex
+-- C16-08: the candidate key a rotation challenge references, so a challenge
+-- cannot claim a device its own rotation request does not name.
+CREATE UNIQUE INDEX "rotation_request_device_tuple_key" ON "device_key_rotation_requests"("id", "organisation_id", "device_id");
+
+-- CreateIndex
 CREATE UNIQUE INDEX "rotation_request_proposed_version_key" ON "device_key_rotation_requests"("organisation_id", "device_id", "proposed_key_version");
+
+-- CreateIndex
+-- C16-08: the candidate key a rotation verification references, carrying
+-- request, device and tenant with it.
+CREATE UNIQUE INDEX "rotation_challenge_tuple_key" ON "device_key_rotation_challenges"("id", "organisation_id", "rotation_request_id", "device_id");
 
 -- CreateIndex
 CREATE INDEX "device_key_rotation_challenges_organisation_id_rotation_req_idx" ON "device_key_rotation_challenges"("organisation_id", "rotation_request_id");
@@ -409,6 +486,12 @@ ALTER TABLE "device_site_scopes" ADD CONSTRAINT "device_site_scopes_device_id_or
 ALTER TABLE "device_site_scopes" ADD CONSTRAINT "device_site_scopes_assigned_user_id_organisation_id_fkey" FOREIGN KEY ("assigned_user_id", "organisation_id") REFERENCES "users"("id", "organisation_id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
+ALTER TABLE "device_custody_regimes" ADD CONSTRAINT "device_custody_regimes_site_id_organisation_id_fkey" FOREIGN KEY ("site_id", "organisation_id") REFERENCES "sites"("id", "organisation_id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "device_custody_regimes" ADD CONSTRAINT "device_custody_regimes_defined_by_user_id_organisation_id_fkey" FOREIGN KEY ("defined_by_user_id", "organisation_id") REFERENCES "users"("id", "organisation_id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
 ALTER TABLE "device_keys" ADD CONSTRAINT "device_keys_device_id_organisation_id_fkey" FOREIGN KEY ("device_id", "organisation_id") REFERENCES "devices"("id", "organisation_id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
@@ -430,6 +513,10 @@ ALTER TABLE "device_enrollment_requests" ADD CONSTRAINT "device_enrollment_reque
 ALTER TABLE "device_enrollment_requests" ADD CONSTRAINT "device_enrollment_requests_bootstrap_grant_id_organisation_fkey" FOREIGN KEY ("bootstrap_grant_id", "organisation_id") REFERENCES "device_enrollment_bootstrap_grants"("id", "organisation_id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
+-- C16-01: a request cannot name another tenant's custody regime.
+ALTER TABLE "device_enrollment_requests" ADD CONSTRAINT "device_enrollment_requests_custody_regime_id_organisation__fkey" FOREIGN KEY ("custody_regime_id", "organisation_id") REFERENCES "device_custody_regimes"("id", "organisation_id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
 ALTER TABLE "device_enrollment_approvals" ADD CONSTRAINT "device_enrollment_approvals_enrollment_request_id_organisa_fkey" FOREIGN KEY ("enrollment_request_id", "organisation_id") REFERENCES "device_enrollment_requests"("id", "organisation_id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
@@ -442,11 +529,22 @@ ALTER TABLE "device_possession_challenges" ADD CONSTRAINT "device_possession_cha
 ALTER TABLE "device_possession_verifications" ADD CONSTRAINT "device_possession_verifications_enrollment_request_id_orga_fkey" FOREIGN KEY ("enrollment_request_id", "organisation_id") REFERENCES "device_enrollment_requests"("id", "organisation_id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
+-- C16-08: and the CHALLENGE, request and tenant together. A verdict naming a
+-- challenge that belongs to another request or another tenant is now a
+-- foreign-key violation rather than something a service has to notice.
+ALTER TABLE "device_possession_verifications" ADD CONSTRAINT "device_possession_verifications_challenge_id_organisation__fkey" FOREIGN KEY ("challenge_id", "organisation_id", "enrollment_request_id") REFERENCES "device_possession_challenges"("id", "organisation_id", "enrollment_request_id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
 ALTER TABLE "device_key_rotation_requests" ADD CONSTRAINT "device_key_rotation_requests_device_id_organisation_id_fkey" FOREIGN KEY ("device_id", "organisation_id") REFERENCES "devices"("id", "organisation_id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "device_key_rotation_challenges" ADD CONSTRAINT "device_key_rotation_challenges_rotation_request_id_organis_fkey" FOREIGN KEY ("rotation_request_id", "organisation_id") REFERENCES "device_key_rotation_requests"("id", "organisation_id") ON DELETE RESTRICT ON UPDATE CASCADE;
+-- C16-08: the DEVICE travels inside the reference.
+ALTER TABLE "device_key_rotation_challenges" ADD CONSTRAINT "device_key_rotation_challenges_rotation_request_id_organis_fkey" FOREIGN KEY ("rotation_request_id", "organisation_id", "device_id") REFERENCES "device_key_rotation_requests"("id", "organisation_id", "device_id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "device_key_rotation_verifications" ADD CONSTRAINT "device_key_rotation_verifications_rotation_request_id_orga_fkey" FOREIGN KEY ("rotation_request_id", "organisation_id") REFERENCES "device_key_rotation_requests"("id", "organisation_id") ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE "device_key_rotation_verifications" ADD CONSTRAINT "device_key_rotation_verifications_rotation_request_id_orga_fkey" FOREIGN KEY ("rotation_request_id", "organisation_id", "device_id") REFERENCES "device_key_rotation_requests"("id", "organisation_id", "device_id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+-- C16-08: the whole rotation verification tuple, held by the database.
+ALTER TABLE "device_key_rotation_verifications" ADD CONSTRAINT "device_key_rotation_verifications_rotation_challenge_id_or_fkey" FOREIGN KEY ("rotation_challenge_id", "organisation_id", "rotation_request_id", "device_id") REFERENCES "device_key_rotation_challenges"("id", "organisation_id", "rotation_request_id", "device_id") ON DELETE RESTRICT ON UPDATE CASCADE;
 

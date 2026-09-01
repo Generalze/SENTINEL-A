@@ -2,11 +2,11 @@ import { Inject, Injectable } from '@nestjs/common';
 import {
   DEVICE_TRUST_RESTORATION_CAPABILITY,
   DEVICE_TRUST_RESTORATION_REQUIRED_FROM,
+  DEVICE_TRUST_UPWARD_TARGETS,
+  attestationStandingPermitsTrusted,
   canTransitionDeviceKeyLifecycle,
   deviceKeyStatePermitsNewOperations,
-  evaluateAttestationStanding,
   evaluateDeviceTrustTransition,
-  type DeviceAttestationOutcome,
   type DeviceAttestationStanding,
   type DeviceControlledRestorationDecision,
   type DeviceKeyLifecycleState,
@@ -17,7 +17,9 @@ import {
 import type { Principal } from '../../common/security/principal';
 import { DEVICE_ATTESTATION_EVALUATOR, type DeviceAttestationEvaluator } from './attestation.evaluator';
 import { DeviceSecurityAudit } from './device-security-audit';
-import { checkDeviceAuthority } from './shield.authority';
+import { resolveAttestationStanding } from './attestation.standing';
+import { checkGlobalDeviceMutationAuthority } from './shield.authority';
+import { ShieldTransactionRollback, isShieldTransactionRollback } from './shield.rollback';
 import {
   ACTION_DEVICE_REVOKE,
   ACTION_DEVICE_TRUST_MANAGE,
@@ -67,6 +69,39 @@ import type { ChangeDeviceTrustOutcome, DeclareDeviceDispositionOutcome, RecordA
  *   COMPROMISED_KEY  the key is COMPROMISED and the device identity is
  *                    COMPROMISED. Terminal at BOTH levels. Recovery is a new
  *                    enrolled identity (D23-09), never rehabilitation.
+ *
+ * C16-05 — EVIDENCE AGES, AND A NEGATIVE IS NEVER UN-SAID
+ * ------------------------------------------------------
+ * Two defects, both in how evidence was SELECTED rather than in how it was
+ * judged.
+ *
+ * (a) Recording `UNAVAILABLE` did nothing at all, so a device that reached
+ *     TRUSTED and then went dark stayed TRUSTED indefinitely. The contract has
+ *     always degraded last-known-good to EXPIRED past six hours; nothing ever
+ *     asked it again. `recordAttestationObservation` now resolves the device's
+ *     EFFECTIVE standing after every observation and degrades a TRUSTED device
+ *     whose standing no longer supports TRUSTED.
+ *
+ * (b) The standing was assembled from two INDEPENDENT reads — "latest
+ *     observation" and "latest VERIFIED observation" — so the history
+ *     VERIFIED -> NEGATIVE -> UNAVAILABLE rediscovered the old VERIFIED result
+ *     and reported LAST_KNOWN_GOOD. A provider outage ERASED the intervening
+ *     negative evidence. `attestation.standing.ts` now performs one canonical
+ *     resolution over the ORDERED history, and the old positive can never be
+ *     resurrected.
+ *
+ * AND UPWARD TRANSITIONS RE-READ UNDER LOCK. Lowering trust on a slightly stale
+ * read is safe; RAISING it is not. Every upward transition re-reads and LOCKS
+ * the device, the current key and the qualifying evidence inside its own
+ * transaction, so a key revoked between the pre-read and the commit cannot be
+ * used to restore TRUSTED.
+ *
+ * C16-04 — AND NOTHING PARTIAL COMMITS
+ * -----------------------------------
+ * `declareDisposition` used to move trust, write the transition record, then
+ * discover the key lifecycle transition was illegal — and RETURN, which commits.
+ * The legality is now prevalidated before the transaction opens, and any
+ * post-write failure throws `ShieldTransactionRollback`.
  */
 @Injectable()
 export class DeviceTrustService {
@@ -125,19 +160,16 @@ export class DeviceTrustService {
         traceId: input.traceId,
       });
 
-      const standing = evaluateAttestationStanding({
-        outcome: evidence.outcome,
-        lastVerifiedAt: null,
-        now: observedAt.toISOString(),
-        hasPriorVerified: false,
-      });
+      // C16-05: THE DEVICE'S EFFECTIVE STANDING, over the ORDERED history that
+      // now includes the row just appended — not a verdict about this one
+      // observation in isolation. That distinction is the whole of (b): judging
+      // an `UNAVAILABLE` on its own says "no evidence, no opinion", while
+      // judging the HISTORY says "the last conclusive thing we learned about
+      // this device was that it failed verification".
+      const standing = await this.effectiveAttestationStanding(tx, input.organisationId, device.id, observedAt);
 
-      // NEGATIVE is the only standing that is device evidence AND actionable
-      // without a human. EXPIRED, INELIGIBLE and INCONSISTENT all mean "we
-      // cannot vouch", which lowers what the device may DO (through the trust
-      // requirements of each operation) without being a statement that
-      // something is wrong with it.
-      if (standing.standing === 'NEGATIVE' && device.trust !== 'QUARANTINED') {
+      // NEGATIVE is device evidence AND actionable without a human: quarantine.
+      if (standing === 'NEGATIVE' && device.trust !== 'QUARANTINED') {
         const moved = await this.applyTrustTransition(tx, {
           device,
           key,
@@ -146,6 +178,7 @@ export class DeviceTrustService {
           evidenceRefs: [`observation:${observation.id}`],
           authorisedByUserId: null,
           restorationDecision: null,
+          standing,
           now: observedAt,
           traceId: input.traceId,
         });
@@ -154,6 +187,46 @@ export class DeviceTrustService {
             tx,
             { organisationId: input.organisationId, deviceId: device.id, actorUserId: null, occurredAt: observedAt, traceId: input.traceId },
             { type: 'DEVICE_QUARANTINED', previousTrust: moved.previousTrust, reason: `ATTESTATION_${evidence.outcome}` },
+          );
+        }
+      } else if (device.trust === 'TRUSTED' && !attestationStandingPermitsTrusted(standing)) {
+        // C16-05(a): AGEING. This is the branch that did not exist.
+        //
+        // `attestationStandingPermitsTrusted` is the CONTRACT's list of the two
+        // standings that can carry TRUSTED (CURRENT, LAST_KNOWN_GOOD); anything
+        // else — EXPIRED past the six-hour grace, INELIGIBLE, INCONSISTENT —
+        // means the platform can no longer vouch for this device, and a device
+        // it cannot vouch for must not remain TRUSTED merely because nothing
+        // negative was ever recorded.
+        //
+        // DEGRADED, not QUARANTINED. An expired attestation is IGNORANCE, not
+        // suspicion: nothing has accused this device of anything, and the
+        // capability ordering keeps those apart deliberately. The move still
+        // goes through the contract's transition evaluator, so COMPROMISED
+        // stays terminal even here.
+        const moved = await this.applyTrustTransition(tx, {
+          device,
+          key,
+          to: 'DEGRADED',
+          reason: `ATTESTATION_STANDING_${standing}`,
+          evidenceRefs: [`observation:${observation.id}`],
+          authorisedByUserId: null,
+          restorationDecision: null,
+          standing,
+          now: observedAt,
+          traceId: input.traceId,
+        });
+        if (moved.outcome === 'CHANGED') {
+          await this.audit.record(
+            tx,
+            { organisationId: input.organisationId, deviceId: device.id, actorUserId: null, occurredAt: observedAt, traceId: input.traceId },
+            {
+              type: 'TRUST_CHANGED',
+              previousTrust: moved.previousTrust,
+              newTrust: moved.newTrust,
+              reason: `ATTESTATION_STANDING_${standing}`,
+              authorisedByUserId: null,
+            },
           );
         }
       }
@@ -190,11 +263,13 @@ export class DeviceTrustService {
     if (device === null) return { outcome: 'REFUSED', refusal: 'DEVICE_NOT_FOUND' };
 
     const siteIds = await this.repository.listDeviceSiteIds(input.organisationId, device.id);
+    // C16-06: trust is ONE value on ONE device row, shared by every site the
+    // device serves. Changing it needs authority over the whole device.
     const scopeRefusal = this.authoriseAgainstDeviceSites(principal, ACTION_DEVICE_TRUST_MANAGE, input.organisationId, siteIds);
     if (scopeRefusal !== null) return { outcome: 'REFUSED', refusal: scopeRefusal };
 
-    const from = device.trust as DeviceTrust;
-    const needsRestoration = DEVICE_TRUST_RESTORATION_REQUIRED_FROM.includes(from);
+    const preReadFrom = device.trust as DeviceTrust;
+    const needsRestoration = DEVICE_TRUST_RESTORATION_REQUIRED_FROM.includes(preReadFrom);
     if (needsRestoration && !principal.hasAction(ACTION_DEVICE_TRUST_RESTORE)) {
       // Reported as the CONTRACT's own refusal, because that is exactly what
       // the contract would say if it were handed a null decision — and it will
@@ -203,12 +278,34 @@ export class DeviceTrustService {
       return { outcome: 'REFUSED', refusal: 'RESTORATION_DECISION_REQUIRED' };
     }
 
-    const key = await this.currentKey(device);
+    // C16-05: AN UPWARD TRANSITION IS DECIDED ON LOCKED ROWS, NOTHING ELSE.
+    //
+    // TRUSTED and DEGRADED are the contract's own `DEVICE_TRUST_UPWARD_TARGETS`.
+    // For those, the device row, its current key row and the qualifying
+    // evidence are all re-read INSIDE the transaction under lock, so a key
+    // revoked or a negative attestation recorded between the pre-read above and
+    // the commit cannot be missed by the decision that raises trust. Downward
+    // moves keep the cheaper path: acting slightly early on stale evidence
+    // lowers trust, which is the safe direction.
+    const upward = DEVICE_TRUST_UPWARD_TARGETS.includes(input.to);
 
     return this.repository.transaction(async (tx) => {
       const now = await this.repository.dbNow(tx);
+
+      const subject = upward ? await this.repository.lockDevice(tx, input.organisationId, device.id) : device;
+      if (subject === null) return { outcome: 'REFUSED', refusal: 'DEVICE_NOT_FOUND' };
+      const key = upward ? await this.lockCurrentKey(tx, subject) : await this.currentKey(subject);
+
+      const from = subject.trust as DeviceTrust;
+      // Re-derived from the LOCKED row: a device that fell into QUARANTINED
+      // between the pre-read and here needs the restoration capability, and the
+      // pre-read cannot be allowed to answer that question for it.
+      if (DEVICE_TRUST_RESTORATION_REQUIRED_FROM.includes(from) && !principal.hasAction(ACTION_DEVICE_TRUST_RESTORE)) {
+        return { outcome: 'REFUSED', refusal: 'RESTORATION_DECISION_REQUIRED' };
+      }
+
       const restorationDecision: DeviceControlledRestorationDecision | null =
-        needsRestoration && principal.hasAction(ACTION_DEVICE_TRUST_RESTORE)
+        DEVICE_TRUST_RESTORATION_REQUIRED_FROM.includes(from) && principal.hasAction(ACTION_DEVICE_TRUST_RESTORE)
           ? {
               decided_by_user_id: principal.user.id,
               // The contract's constant, not a string typed here. A decision
@@ -218,14 +315,19 @@ export class DeviceTrustService {
             }
           : null;
 
+      const standing = upward
+        ? await this.lockedAttestationStanding(tx, subject.organisationId, subject.id, now)
+        : await this.effectiveAttestationStanding(tx, subject.organisationId, subject.id, now);
+
       const result = await this.applyTrustTransition(tx, {
-        device,
+        device: subject,
         key,
         to: input.to,
         reason: input.reason,
         evidenceRefs: [],
         authorisedByUserId: principal.user.id,
         restorationDecision,
+        standing,
         now,
         traceId: input.traceId,
       });
@@ -233,7 +335,7 @@ export class DeviceTrustService {
       if (result.outcome === 'CHANGED') {
         await this.audit.record(
           tx,
-          { organisationId: input.organisationId, deviceId: device.id, actorUserId: principal.user.id, occurredAt: now, traceId: input.traceId },
+          { organisationId: input.organisationId, deviceId: subject.id, actorUserId: principal.user.id, occurredAt: now, traceId: input.traceId },
           { type: 'TRUST_CHANGED', previousTrust: result.previousTrust, newTrust: result.newTrust, reason: input.reason, authorisedByUserId: principal.user.id },
         );
       }
@@ -269,6 +371,8 @@ export class DeviceTrustService {
     if (device === null) return { outcome: 'REFUSED', refusal: 'DEVICE_NOT_FOUND' };
 
     const siteIds = await this.repository.listDeviceSiteIds(input.organisationId, device.id);
+    // C16-06: revocation withdraws the ONE credential every site this device
+    // serves depends on.
     const scopeRefusal = this.authoriseAgainstDeviceSites(principal, ACTION_DEVICE_REVOKE, input.organisationId, siteIds);
     if (scopeRefusal !== null) return { outcome: 'REFUSED', refusal: scopeRefusal };
 
@@ -280,7 +384,28 @@ export class DeviceTrustService {
     const key = await this.currentKey(device);
     if (key === null) return { outcome: 'REFUSED', refusal: 'DEVICE_KEY_NOT_FOUND' };
 
-    return this.repository.transaction(async (tx) => {
+    // The three dispositions differ in exactly three ways: the trust they land
+    // on, whether the DEVICE credential is revoked, and what happens to the
+    // KEY. Everything else is shared.
+    const newTrust: DeviceTrust = input.disposition === 'COMPROMISED_KEY' ? 'COMPROMISED' : 'QUARANTINED';
+    const revokesDeviceCredential = input.disposition !== 'LOST';
+    const keyTarget: DeviceKeyLifecycleState | null =
+      input.disposition === 'LOST' ? null : input.disposition === 'STOLEN' ? 'REVOKED' : 'COMPROMISED';
+
+    // C16-04: PREVALIDATED, BEFORE THE TRANSACTION OPENS.
+    //
+    // This check used to sit AFTER the trust move and the device-level
+    // revocation write, and it RETURNED — which committed both. A device could
+    // therefore be left quarantined and revoked with its key untouched because
+    // the key's lifecycle transition turned out to be illegal. The contract's
+    // four-state matrix is consulted here instead, where a refusal costs
+    // nothing, and it is never collapsed into a boolean (D24-01).
+    if (keyTarget !== null && !canTransitionDeviceKeyLifecycle(key.status as DeviceKeyLifecycleState, keyTarget)) {
+      return { outcome: 'REFUSED', refusal: 'DEVICE_CREDENTIAL_WITHDRAWN' };
+    }
+
+    try {
+      return await this.repository.transaction(async (tx) => {
       const now = await this.repository.dbNow(tx);
       const envelope = {
         organisationId: input.organisationId,
@@ -289,14 +414,6 @@ export class DeviceTrustService {
         occurredAt: now,
         traceId: input.traceId,
       };
-
-      // The three dispositions differ in exactly three ways: the trust they
-      // land on, whether the DEVICE credential is revoked, and what happens to
-      // the KEY. Everything else is shared.
-      const newTrust: DeviceTrust = input.disposition === 'COMPROMISED_KEY' ? 'COMPROMISED' : 'QUARANTINED';
-      const revokesDeviceCredential = input.disposition !== 'LOST';
-      const keyTarget: DeviceKeyLifecycleState | null =
-        input.disposition === 'LOST' ? null : input.disposition === 'STOLEN' ? 'REVOKED' : 'COMPROMISED';
 
       // The trust move still goes through the contract. A quarantine is a
       // downward transition and is admitted; the value of routing it here is
@@ -310,9 +427,13 @@ export class DeviceTrustService {
         evidenceRefs: [`disposition:${input.disposition}`],
         authorisedByUserId: principal.user.id,
         restorationDecision: null,
+        standing: await this.effectiveAttestationStanding(tx, input.organisationId, device.id, now),
         now,
         traceId: input.traceId,
       });
+      // Still a plain return: `applyTrustTransition` refuses only from the
+      // contract evaluator or from a fenced update that changed zero rows, so
+      // NOTHING has been written at this point.
       if (moved.outcome === 'REFUSED') return moved;
 
       // DEVICE level. `revoked_at` is set only where the credential is actually
@@ -328,17 +449,20 @@ export class DeviceTrustService {
       let keyStatus: DeviceKeyLifecycleState | null = key.status as DeviceKeyLifecycleState;
       if (keyTarget !== null) {
         const currentStatus = key.status as DeviceKeyLifecycleState;
-        // The contract's four-state matrix decides whether the move is legal.
-        // It is never collapsed into a boolean here (D24-01).
-        if (!canTransitionDeviceKeyLifecycle(currentStatus, keyTarget)) {
-          return { outcome: 'REFUSED', refusal: 'DEVICE_CREDENTIAL_WITHDRAWN' };
-        }
-        await this.repository.withdrawDeviceKey(tx, input.organisationId, key.keyId, {
+        const withdrawn = await this.repository.withdrawDeviceKey(tx, input.organisationId, key.keyId, {
           from: currentStatus,
           to: keyTarget,
           revokedAt: now,
           disposition: input.disposition,
         });
+        // C16-04: the withdrawal is fenced on the status this decision was
+        // taken against, and its count was previously DISCARDED. A zero here
+        // means another path moved the key between the read and this write, so
+        // the device-level revocation just written describes a key withdrawal
+        // that did not happen. It throws rather than returns: a device revoked
+        // with its credential untouched is exactly the partial security state
+        // C16-04 exists to make unrepresentable.
+        if (withdrawn !== 1) throw new ShieldTransactionRollback('DEVICE_CREDENTIAL_WITHDRAWN');
         keyStatus = keyTarget;
       }
 
@@ -391,7 +515,14 @@ export class DeviceTrustService {
         // of that.
         restorationPathRemains: input.disposition === 'LOST',
       };
-    });
+      });
+    } catch (error) {
+      if (!isShieldTransactionRollback(error)) throw error;
+      // C16-04: the whole transaction is gone — no trust move, no device
+      // revocation, no key withdrawal, and no audit event claiming any of them
+      // happened. The external refusal is produced only here, after the abort.
+      return { outcome: 'REFUSED', refusal: error.refusal };
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -416,12 +547,20 @@ export class DeviceTrustService {
       evidenceRefs: string[];
       authorisedByUserId: string | null;
       restorationDecision: DeviceControlledRestorationDecision | null;
+      /**
+       * C16-05: the standing is RESOLVED BY THE CALLER and passed in, because
+       * only the caller knows whether this transition is upward and therefore
+       * whether the evidence had to be read under lock. Resolving it here would
+       * put an unlocked read inside a decision that may be about to restore
+       * TRUSTED.
+       */
+      standing: DeviceAttestationStanding;
       now: Date;
       traceId: string;
     },
   ): Promise<ChangeDeviceTrustOutcome> {
     const from = input.device.trust as DeviceTrust;
-    const standing = await this.attestationStanding(input.device.organisationId, input.device.id, input.now);
+    const standing = input.standing;
 
     const decision = evaluateDeviceTrustTransition(from, input.to, {
       controlledRestoration: input.restorationDecision,
@@ -463,22 +602,49 @@ export class DeviceTrustService {
   }
 
   /**
-   * The device's attestation standing right now, from the append-only history.
+   * C16-05: THE device's effective attestation standing, from the ORDERED
+   * append-only history and the authoritative server clock.
    *
-   * A device with NO observation at all is treated as `UNAVAILABLE` rather than
-   * as anything negative: C14-05's asymmetry is that an absence of evidence is
-   * not evidence, and the standing evaluator then maps it to `INELIGIBLE` when
-   * there is no prior verified result to ride on.
+   * ONE resolution, used by every path in this service, so no caller can
+   * assemble a slightly different view of the same evidence. What counts as
+   * decisive evidence is `attestation.standing.ts`; what that evidence MEANS is
+   * still `evaluateAttestationStanding`, called from there.
+   *
+   * A device with NO observation at all is `UNAVAILABLE` with no prior
+   * verified result, which the contract maps to INELIGIBLE: C14-05's asymmetry
+   * is that an absence of evidence is not evidence, and a device that has never
+   * been vouched for cannot become TRUSTED during an outage.
    */
-  private async attestationStanding(organisationId: string, deviceId: string, now: Date): Promise<DeviceAttestationStanding> {
-    const latest = await this.repository.latestAttestationObservation(organisationId, deviceId);
-    const lastVerified = await this.repository.latestVerifiedAttestation(organisationId, deviceId);
-    return evaluateAttestationStanding({
-      outcome: (latest?.outcome ?? 'UNAVAILABLE') as DeviceAttestationOutcome,
-      lastVerifiedAt: lastVerified === null ? null : lastVerified.evaluatedAt.toISOString(),
-      now: now.toISOString(),
-      hasPriorVerified: lastVerified !== null,
-    }).standing;
+  private async effectiveAttestationStanding(
+    tx: Tx,
+    organisationId: string,
+    deviceId: string,
+    now: Date,
+  ): Promise<DeviceAttestationStanding> {
+    const latest = await this.repository.latestAttestationObservation(tx, organisationId, deviceId);
+    const decisive = await this.repository.latestDecisiveAttestation(tx, organisationId, deviceId);
+    return resolveAttestationStanding({ latest, decisive, now });
+  }
+
+  /**
+   * C16-05: the same resolution, with the qualifying evidence LOCKED inside the
+   * transaction that is about to raise this device's trust.
+   *
+   * Reading the evidence unlocked would leave a window in which a negative
+   * observation could land between "the evidence qualifies" and "trust is
+   * TRUSTED". The share lock closes it for the rows the decision actually
+   * reads; the device and key rows are locked `FOR UPDATE` by the caller, which
+   * is what stops a concurrent revocation.
+   */
+  private async lockedAttestationStanding(
+    tx: Tx,
+    organisationId: string,
+    deviceId: string,
+    now: Date,
+  ): Promise<DeviceAttestationStanding> {
+    const latest = await this.repository.lockLatestAttestationObservation(tx, organisationId, deviceId);
+    const decisive = await this.repository.lockLatestDecisiveAttestation(tx, organisationId, deviceId);
+    return resolveAttestationStanding({ latest, decisive, now });
   }
 
   /**
@@ -501,13 +667,29 @@ export class DeviceTrustService {
   }
 
   /**
-   * Site scope for an operation on an existing device.
+   * C16-05: the same key, LOCKED. Used by every upward transition, so a key
+   * revoked between the pre-read and the commit cannot be used to restore
+   * TRUSTED — the lock makes the concurrent revocation wait, and the value this
+   * decision reads is the one the commit will be judged against.
+   */
+  private async lockCurrentKey(tx: Tx, device: DeviceRow): Promise<DeviceKeyRow | null> {
+    if (device.currentKeyId === null) return null;
+    return this.repository.lockDeviceKeyByKeyId(tx, device.organisationId, device.currentKeyId);
+  }
+
+  /**
+   * C16-06: authority for a GLOBAL physical-device mutation.
    *
-   * The device's OWN sites are the subject, so an org-wide grant passes and a
-   * site-scoped grant must intersect at least one of them. A caller with the
-   * action at no relevant site gets `DEVICE_NOT_FOUND` — the same answer as a
-   * device that does not exist, because "you may not touch that device" and
-   * "there is no such device" must be indistinguishable from outside.
+   * Trust change and revocation each write ONE row that every site the device
+   * serves depends on, so "a site I hold is among them" is not the question.
+   * `checkGlobalDeviceMutationAuthority` requires genuine organisation-wide
+   * authority, or authority over EVERY active associated site; and it refuses a
+   * site-scoped caller on a device with no associations at all, where the old
+   * `some()` version returned "authorised" outright.
+   *
+   * The refusal is `DEVICE_NOT_FOUND` — the same answer a device that does not
+   * exist gets, because "you may not touch that device" and "there is no such
+   * device" must be indistinguishable from outside.
    */
   private authoriseAgainstDeviceSites(
     principal: Principal,
@@ -515,9 +697,6 @@ export class DeviceTrustService {
     organisationId: string,
     siteIds: string[],
   ): 'DEVICE_NOT_FOUND' | null {
-    if (checkDeviceAuthority(principal, action, organisationId, null) !== null) return 'DEVICE_NOT_FOUND';
-    if (siteIds.length === 0) return null;
-    const allowed = siteIds.some((siteId) => checkDeviceAuthority(principal, action, organisationId, siteId) === null);
-    return allowed ? null : 'DEVICE_NOT_FOUND';
+    return checkGlobalDeviceMutationAuthority(principal, action, organisationId, siteIds);
   }
 }

@@ -22,6 +22,7 @@ import {
   evaluateAttestationStanding,
   evaluateDeviceEnrollmentCommit,
   initialDeviceTrustOnEnrollment,
+  type DeviceCustody,
   type DeviceEnrollmentApproval,
   type DeviceEnrollmentBootstrapGrant,
   type DeviceEnrollmentRequest,
@@ -34,6 +35,8 @@ import { DeviceReplayService } from './device-replay.service';
 import { DeviceSecurityAudit } from './device-security-audit';
 import { P256KeyImporter } from './p256-key.importer';
 import { checkDeviceAuthority } from './shield.authority';
+import { ShieldTransactionRollback, isShieldTransactionRollback } from './shield.rollback';
+import { approvedEnrollmentSemanticsDigest } from './shield.semantics';
 import {
   ACTION_DEVICE_ENROLLMENT_APPROVE,
   ACTION_DEVICE_ENROLLMENT_ISSUE,
@@ -46,15 +49,23 @@ import {
   SERVER_SELECTED_SIGNATURE_PROFILE,
   TRUST_REASON_ENROLLMENT_INITIAL,
 } from './shield.constants';
-import { ShieldRepository, type BootstrapGrantRow, type EnrollmentRequestRow, type Tx } from './shield.repository';
+import {
+  ShieldRepository,
+  type BootstrapGrantRow,
+  type EnrollmentApprovalRow,
+  type EnrollmentRequestRow,
+  type Tx,
+} from './shield.repository';
 import type {
   ApproveEnrollmentOutcome,
   CommitEnrollmentOutcome,
   CreateEnrollmentRequestOutcome,
+  DefineCustodyRegimeOutcome,
   EnrollmentRequestSubmission,
   IssueBootstrapGrantOutcome,
   IssuePossessionChallengeOutcome,
   RevokeBootstrapGrantOutcome,
+  ShieldRefusalCode,
   VerifyPossessionOutcome,
 } from './shield.types';
 
@@ -102,6 +113,56 @@ import type {
  * `consumed_at` would make convergence structurally unreachable and turn every
  * honest retry into `BOOTSTRAP_GRANT_UNUSABLE`.
  *
+ * C16-02 — THE TRANSACTIONAL DOCTRINE THIS SERVICE NOW OBEYS
+ * -------------------------------------------------------------
+ *
+ *     NO `FIRST_SEEN` CONSUMPTION RECORD MAY SURVIVE A TRANSACTION IN WHICH
+ *     ITS CORRESPONDING EFFECT DID NOT COMMIT.
+ *
+ * The commit used to consume BOTH one-shot identities before the admissibility
+ * gate ran, storing a PRE-GENERATED device id as the outcome reference. When
+ * the gate then refused, the callback RETURNED — and a normal return from a
+ * Prisma interactive transaction COMMITS. So a refused enrollment left behind a
+ * consumption row naming a device that was never created, and the next exact
+ * retry classified as EXACT_DUPLICATE and converged toward an identity that
+ * does not exist. The registry would have reported success for hardware it had
+ * never registered.
+ *
+ * Three changes close it, and they are visible in `commitEnrollment` below:
+ *
+ *  1. EVERY fallible condition is PREVALIDATED before the first consumption
+ *     write. What remains after that point can only be a refusal the contract
+ *     produces from facts already in hand.
+ *  2. Any refusal reached after the first consumption write `throw`s
+ *     `ShieldTransactionRollback`, so Postgres aborts the whole transaction;
+ *     the external refusal — and its D24-12 audit event — are produced
+ *     afterwards, outside it. A refusal audit written before the first
+ *     consumption write may still be returned normally: it is the refusal's own
+ *     record, not the effect, and it is the only thing that transaction commits.
+ *  3. The two enrollment replay identities are resolved to ONE canonical
+ *     committed outcome BEFORE either is spent, by an authoritative read of the
+ *     device table. A stored reference that does not resolve to a real device
+ *     belonging to THIS request fails closed (`REPLAY_OUTCOME_UNRESOLVABLE`);
+ *     two references that disagree fail closed (`REPLAY_OUTCOME_DIVERGED`).
+ *     Convergence is never manufactured.
+ *
+ * C16-02 also binds a grant to ONE request at creation
+ * (`enrollment_request_grant_key`): a grant that could open two requests could
+ * collect two independent human approvals, and the two would then race for the
+ * single replay identity the grant carries.
+ *
+ * C16-01 — THE CUSTODY REGIME IS NOW APPROVAL-BOUND
+ * -------------------------------------------------
+ * `custodyRegimeId` used to arrive as a `commitEnrollment` parameter. The human
+ * approval binds `deviceEnrollmentRequestFingerprint`, and the frozen schema
+ * behind that fingerprint has NO REGIME FIELD — so a request approved for
+ * CONTROLLED_SHARED custody could be committed under a regime the approver
+ * never saw. The regime is now a row in a server-issued catalogue, it is named
+ * on the REQUEST, and `approvedSemanticsDigest` (see `shield.semantics.ts`)
+ * covers fingerprint + custody + regime together. The commit reads the regime
+ * from the APPROVAL row and recomputes the digest from the request; a
+ * disagreement refuses. There is no longer a commit parameter to disagree with.
+ *
  * Single use on the success path is therefore enforced where D24-11 says it is:
  * by the durable `DeviceNonceConsumption` row over the grant's own replay
  * identity. A second ceremony under the same grant presents the same replay
@@ -121,6 +182,7 @@ interface MintedBootstrapToken {
 /** Everything the commit transaction re-read under lock, before any judgement. */
 interface LockedCommitState {
   readonly request: EnrollmentRequestRow;
+  readonly approval: EnrollmentApprovalRow;
   readonly grant: BootstrapGrantRow;
   readonly contractRequest: DeviceEnrollmentRequest;
   readonly contractGrant: DeviceEnrollmentBootstrapGrant;
@@ -140,6 +202,55 @@ export class DeviceEnrollmentService {
     @Inject(P256KeyImporter) private readonly keys: P256KeyImporter,
     @Inject(DEVICE_ATTESTATION_EVALUATOR) private readonly attestation: DeviceAttestationEvaluator,
   ) {}
+
+  // -------------------------------------------------------------------------
+  // Step 0 — the custody regime catalogue (C16-01)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Defines ONE named custody regime, at one site, in one tenant.
+   *
+   * THE ID IS SERVER-GENERATED. There is no parameter here through which a
+   * caller could supply one, which is the same construction D24-04 uses for the
+   * sequence namespace and D24-10A uses for a proposed key identity: a value a
+   * client can choose is a value a client can shape history with. A caller
+   * names the regime; the server names the row.
+   *
+   * The authority is `device.enrollment.issue` and it is scoped to the site the
+   * regime governs. A regime is not an organisation-wide policy object, because
+   * custody — who may hold this hardware and under what hand-over discipline —
+   * is a site fact. A commander who may not issue a bootstrap grant at a site
+   * may not define the custody discipline devices there will be enrolled under.
+   *
+   * Retirement, not deletion, ends a regime's life: `retired_at` stops NEW
+   * enrollments and rewrites no history, so a device enrolled under a regime
+   * that is later withdrawn stays traceable to the regime that actually
+   * governed it.
+   */
+  async defineCustodyRegime(
+    principal: Principal,
+    input: { organisationId: string; siteId: string; name: string; traceId: string },
+  ): Promise<DefineCustodyRegimeOutcome> {
+    const refusal = checkDeviceAuthority(principal, ACTION_DEVICE_ENROLLMENT_ISSUE, input.organisationId, input.siteId);
+    if (refusal !== null) return { outcome: 'REFUSED', refusal };
+
+    // Proven before the write so a cross-tenant pairing answers with a refusal
+    // rather than surfacing the composite foreign key as a driver fault. The
+    // constraint remains the real defence (D24-04a).
+    if (!(await this.repository.siteExistsInOrganisation(input.organisationId, input.siteId))) {
+      return { outcome: 'REFUSED', refusal: 'SITE_NOT_FOUND' };
+    }
+
+    return this.repository.transaction(async (tx) => {
+      const regime = await this.repository.createCustodyRegime(tx, {
+        organisationId: input.organisationId,
+        siteId: input.siteId,
+        name: input.name,
+        definedByUserId: principal.user.id,
+      });
+      return { outcome: 'DEFINED', custodyRegimeId: regime.id, siteId: regime.siteId, name: regime.name };
+    });
+  }
 
   // -------------------------------------------------------------------------
   // Step 1 — the bootstrap grant (D24-03a)
@@ -347,6 +458,41 @@ export class DeviceEnrollmentService {
     // sends names the key; the digest is derived from the key itself.
     const thumbprint = deriveP256PublicKeyThumbprint(submission.publicKey);
 
+    // C16-01: the custody régime, resolved against the SERVER's catalogue
+    // before anything is written. CONTROLLED_SHARED must name one, PERSONAL
+    // must not, and the named one must exist, be live, and belong to this
+    // organisation AND this site.
+    const regimeRefusal = await this.resolveSubmittedCustodyRegime(submission);
+    if (regimeRefusal !== null) return { outcome: 'REFUSED', refusal: regimeRefusal };
+
+    // C16-02: ONE GRANT, ONE CEREMONY.
+    //
+    // `enrollment_request_grant_key` makes a second request under this grant
+    // impossible at the database level. That leaves the service one honest
+    // question: is this the SAME submission arriving twice, or a different one?
+    // An identical repeat is a retry — a dropped response, a re-driven client —
+    // and converges on the request that already exists rather than being told
+    // its own earlier success was a conflict. A materially different submission
+    // is the thing the constraint exists to stop, and refuses.
+    //
+    // Convergence is judged on the SUBMISSION's material content, not on the
+    // request fingerprint: the fingerprint commits to `requested_at` and to the
+    // attestation instant, so no two submissions could ever share one, and a
+    // fingerprint comparison here would make every retry a conflict.
+    const existing = await this.repository.findEnrollmentRequestByGrant(grant.organisationId, grant.id);
+    if (existing !== null) {
+      if (!this.submissionMatchesRequest(submission, existing)) {
+        return { outcome: 'REFUSED', refusal: 'ENROLLMENT_REQUEST_CONFLICT' };
+      }
+      return {
+        outcome: 'CONVERGED',
+        enrollmentRequestId: existing.id,
+        requestFingerprint: existing.requestFingerprint,
+        serverSelectedSignatureProfile: SERVER_SELECTED_SIGNATURE_PROFILE,
+        attestationOutcome: existing.attestationOutcome,
+      };
+    }
+
     const requestedAt = await this.repository.now();
     const evidence = await this.attestation.evaluate({
       organisationId: submission.organisationId,
@@ -380,6 +526,15 @@ export class DeviceEnrollmentService {
     if (!parsed.success) return { outcome: 'REFUSED', refusal: 'MALFORMED_CONTRACT_STRUCTURE' };
     const fingerprint = deviceEnrollmentRequestFingerprint(parsed.data);
 
+    // C16-01: the WP-24-owned digest that covers what the frozen fingerprint
+    // cannot — the custody régime. Persisted here so the approval can bind it
+    // and the commit can detect a régime that moved after the human decided.
+    const approvedSemanticsDigest = approvedEnrollmentSemanticsDigest({
+      enrollmentRequestFingerprint: fingerprint,
+      custody: submission.custody,
+      custodyRegimeId: submission.custodyRegimeId,
+    });
+
     // ONE transaction for the request row, its attestation observation and its
     // security event. A request persisted without the observation that judged
     // it would leave the commit gate reading evidence with no append-only
@@ -392,6 +547,7 @@ export class DeviceEnrollmentService {
         intendedUserId: submission.intendedUserId,
         bootstrapGrantId: grant.id,
         custody: submission.custody,
+        custodyRegimeId: submission.custodyRegimeId,
         publicKey: submission.publicKey,
         publicKeyThumbprint: thumbprint,
         keyStorage: submission.keyStorage,
@@ -401,6 +557,7 @@ export class DeviceEnrollmentService {
         // (C15-01).
         serverSelectedSignatureProfile: SERVER_SELECTED_SIGNATURE_PROFILE,
         requestFingerprint: fingerprint,
+        approvedSemanticsDigest,
         attestationOutcome: evidence.outcome,
         attestationEvaluatedAt: new Date(evidence.evaluated_at),
         attestationReference: evidence.attestation_reference,
@@ -495,6 +652,23 @@ export class DeviceEnrollmentService {
       return { outcome: 'REFUSED', refusal: 'APPROVAL_FINGERPRINT_MISMATCH' };
     }
 
+    // C16-01: WHAT THIS HUMAN IS ACTUALLY APPROVING.
+    //
+    // The frozen fingerprint above covers `DeviceEnrollmentRequestSchema`,
+    // which has no régime field, so on its own it cannot express "and under
+    // THIS custody régime". This digest can, and the approval binds it. The
+    // stored column on the request is recomputed rather than read as authority
+    // — an id names a row, a digest names its meaning, and only a recomputation
+    // detects a row that was rewritten between request and approval.
+    const semanticsDigest = approvedEnrollmentSemanticsDigest({
+      enrollmentRequestFingerprint: fingerprint,
+      custody: request.custody as DeviceCustody,
+      custodyRegimeId: request.custodyRegimeId,
+    });
+    if (semanticsDigest !== request.approvedSemanticsDigest) {
+      return { outcome: 'REFUSED', refusal: 'APPROVED_SEMANTICS_MISMATCH' };
+    }
+
     return this.repository.transaction(async (tx) => {
       const now = await this.repository.dbNow(tx);
       // The contract's own state matrix decides whether this move is legal.
@@ -516,6 +690,12 @@ export class DeviceEnrollmentService {
         approvedSiteId: request.siteId,
         approvedIntendedUserId: request.intendedUserId,
         approvedCustody: request.custody,
+        // C16-01: the régime is the APPROVAL's own record, exactly like
+        // `approved_site_id`. The commit reads the régime from HERE and never
+        // from the request, so a régime swapped behind a standing approval is a
+        // disagreement the commit can SEE rather than one it inherits.
+        approvedCustodyRegimeId: request.custodyRegimeId,
+        approvedSemanticsDigest: semanticsDigest,
         approvedAt: now,
       });
 
@@ -729,140 +909,181 @@ export class DeviceEnrollmentService {
       organisationId: string;
       enrollmentRequestId: string;
       challengeId: string;
-      /**
-       * CONTROLLED_SHARED only: the named custody régime governing hand-over
-       * (C15-08). It is supplied here rather than on the request because the
-       * frozen schema has no column for it on `device_enrollment_requests`;
-       * see the note in the module header and the WP-24 report.
-       */
-      custodyRegimeId: string | null;
       traceId: string;
     },
   ): Promise<CommitEnrollmentOutcome> {
     // The device id, minted before anything is locked so it can serve as the
-    // convergence reference for both one-shot identities.
+    // convergence reference for both one-shot identities on a FIRST attempt.
+    // On a retry it is discarded in favour of the outcome the registry
+    // actually holds — see `resolveCanonicalEnrollmentOutcome`.
     const candidateDeviceId = randomUUID();
 
-    return this.repository.transaction(async (tx) => {
-      const now = await this.repository.dbNow(tx);
+    // C16-02: what the rolled-back transaction still needs to RECORD. A
+    // transaction that aborts takes its audit rows with it, so the values the
+    // D24-12 event needs are captured in this closure variable and the event is
+    // written afterwards, in its own transaction. The refusal is external; the
+    // security state is not.
+    const rolledBack: { fingerprint: string | null; replayIdentityDigest: string | null } = {
+      fingerprint: null,
+      replayIdentityDigest: null,
+    };
 
-      const locked = await this.lockCommitState(tx, input.organisationId, input.enrollmentRequestId, input.challengeId);
-      if (typeof locked === 'string') return { outcome: 'REFUSED', refusal: locked };
+    try {
+      return await this.repository.transaction(async (tx) => {
+        const now = await this.repository.dbNow(tx);
 
-      // D24-03/D24-06: the two human separations, re-checked HERE, inside the
-      // transaction, against locked rows — not merely at the API surface.
-      // `approveEnrollmentRequest` checks them too, but only this check is
-      // taken while nothing can move.
-      if (locked.grant.issuedByUserId === locked.approverUserId) {
-        await this.recordEnrollmentRefusal(tx, input, locked.fingerprint, 'ISSUER_MAY_NOT_APPROVE', now, principal.user.id);
-        return { outcome: 'REFUSED', refusal: 'ISSUER_MAY_NOT_APPROVE' };
-      }
-      if (locked.request.intendedUserId === locked.approverUserId) {
-        await this.recordEnrollmentRefusal(tx, input, locked.fingerprint, 'INTENDED_USER_MAY_NOT_APPROVE', now, principal.user.id);
-        return { outcome: 'REFUSED', refusal: 'INTENDED_USER_MAY_NOT_APPROVE' };
-      }
+        const locked = await this.lockCommitState(tx, input.organisationId, input.enrollmentRequestId, input.challengeId);
+        if (typeof locked === 'string') return { outcome: 'REFUSED', refusal: locked };
+        rolledBack.fingerprint = locked.fingerprint;
 
-      // D24-05, re-run under lock: the key must still import. A registry entry
-      // is only allowed to become CURRENT after the platform provider has
-      // accepted the point.
-      if (!this.keys.isRuntimeValidPublicKey(locked.request.publicKey)) {
-        await this.recordEnrollmentRefusal(tx, input, locked.fingerprint, 'PUBLIC_KEY_NOT_RUNTIME_VALID', now, principal.user.id);
-        return { outcome: 'REFUSED', refusal: 'PUBLIC_KEY_NOT_RUNTIME_VALID' };
-      }
+        // ---- PREVALIDATION (C16-04) ------------------------------------
+        // Everything fallible that can be decided from rows already in hand is
+        // decided HERE, before the first consumption write. Each of these may
+        // still `return` after writing its own refusal audit: that audit is the
+        // refusal's record, it is the only thing this transaction has written,
+        // and committing it is the point.
 
-      // D24-11: both one-shot identities, consumed atomically inside THIS
-      // transaction so the burn and the effect share a fate.
-      const grantConsumption = await this.replay.consume(tx, {
-        organisationId: input.organisationId,
-        ceremony: CEREMONY_BOOTSTRAP_GRANT,
-        replayKey: deviceBootstrapGrantReplayKey({
+        // D24-03/D24-06: the two human separations, re-checked inside the
+        // transaction against LOCKED rows — not merely at the API surface.
+        if (locked.grant.issuedByUserId === locked.approverUserId) {
+          await this.recordEnrollmentRefusal(tx, input, locked.fingerprint, 'ISSUER_MAY_NOT_APPROVE', now, principal.user.id);
+          return { outcome: 'REFUSED', refusal: 'ISSUER_MAY_NOT_APPROVE' };
+        }
+        if (locked.request.intendedUserId === locked.approverUserId) {
+          await this.recordEnrollmentRefusal(tx, input, locked.fingerprint, 'INTENDED_USER_MAY_NOT_APPROVE', now, principal.user.id);
+          return { outcome: 'REFUSED', refusal: 'INTENDED_USER_MAY_NOT_APPROVE' };
+        }
+
+        // D24-05, re-run under lock: the key must still import. A registry
+        // entry is only allowed to become CURRENT after the platform provider
+        // has accepted the point.
+        if (!this.keys.isRuntimeValidPublicKey(locked.request.publicKey)) {
+          await this.recordEnrollmentRefusal(tx, input, locked.fingerprint, 'PUBLIC_KEY_NOT_RUNTIME_VALID', now, principal.user.id);
+          return { outcome: 'REFUSED', refusal: 'PUBLIC_KEY_NOT_RUNTIME_VALID' };
+        }
+
+        // C16-01: THE APPROVAL'S OWN SEMANTICS, RECOMPUTED FROM THE LOCKED
+        // REQUEST. This is the check that makes the régime approval-bound: the
+        // frozen request fingerprint is blind to the régime, so a régime
+        // rewritten behind a standing approval changes nothing the WP-23
+        // fingerprint can see and everything this digest can.
+        const semanticsDigest = approvedEnrollmentSemanticsDigest({
+          enrollmentRequestFingerprint: locked.fingerprint,
+          custody: locked.contractRequest.custody,
+          custodyRegimeId: locked.request.custodyRegimeId,
+        });
+        if (semanticsDigest !== locked.approval.approvedSemanticsDigest) {
+          await this.recordEnrollmentRefusal(tx, input, locked.fingerprint, 'APPROVED_SEMANTICS_MISMATCH', now, principal.user.id);
+          return { outcome: 'REFUSED', refusal: 'APPROVED_SEMANTICS_MISMATCH' };
+        }
+
+        // C16-02: RESOLVE BEFORE BURNING. Both one-shot identities must name
+        // ONE canonical committed outcome, and it must be an outcome the
+        // database can actually produce. This is a pure read; a refusal here is
+        // still pre-write and still returns normally with its own audit.
+        const grantReplayKey = deviceBootstrapGrantReplayKey({
           organisation_id: locked.contractGrant.organisation_id,
           site_id: locked.contractGrant.site_id,
           intended_user_id: locked.contractGrant.intended_user_id,
           grant_id: locked.contractGrant.grant_id,
-        }),
-        statementFingerprint: locked.fingerprint,
-        candidateOutcomeRef: candidateDeviceId,
-        traceId: input.traceId,
-      });
-
-      const challengeConsumption = await this.replay.consume(tx, {
-        organisationId: input.organisationId,
-        ceremony: CEREMONY_POSSESSION_CHALLENGE,
-        replayKey: devicePossessionChallengeReplayKey({
+        });
+        const challengeReplayKey = devicePossessionChallengeReplayKey({
           organisation_id: locked.contractRequest.organisation_id,
           site_id: locked.contractRequest.site_id,
           intended_user_id: locked.contractRequest.intended_user_id,
           enrollment_request_id: locked.contractRequest.enrollment_request_id,
           challenge_id: locked.contractChallenge.challenge_id,
           nonce: locked.contractChallenge.nonce,
-        }),
-        statementFingerprint: locked.fingerprint,
-        candidateOutcomeRef: candidateDeviceId,
-        traceId: input.traceId,
-      });
+        });
 
-      // THE GATE. Every admissibility rule in the ceremony is decided here and
-      // nowhere else in this file.
-      const decision = evaluateDeviceEnrollmentCommit({
-        request: locked.contractRequest,
-        grant: locked.contractGrant,
-        approval: locked.contractApproval,
-        challenge: locked.contractChallenge,
-        possessionVerification: locked.contractVerification,
-        serverSelectedSignatureProfile: SERVER_SELECTED_SIGNATURE_PROFILE,
-        grantConsumption: grantConsumption.consumption,
-        challengeConsumption: challengeConsumption.consumption,
-        // Provenance is not identity: who is authenticated RIGHT NOW is a
-        // separate input from `request.intended_user_id`, and the contract
-        // compares them itself.
-        authenticatedUserId: principal.user.id,
-        now: now.toISOString(),
-      });
-
-      if (decision.decision === 'REFUSE') {
-        if (
-          decision.refusal === 'BOOTSTRAP_GRANT_REUSED' ||
-          decision.refusal === 'CHALLENGE_REUSED' ||
-          decision.refusal === 'BOOTSTRAP_CONSUMPTION_INCONSISTENT' ||
-          decision.refusal === 'CHALLENGE_CONSUMPTION_INCONSISTENT'
-        ) {
-          await this.audit.record(
-            tx,
-            { organisationId: input.organisationId, deviceId: null, actorUserId: principal.user.id, occurredAt: now, traceId: input.traceId },
-            {
-              type: 'REPLAY_CONFLICT',
-              ceremony: CEREMONY_BOOTSTRAP_GRANT,
-              replayIdentityDigest: grantConsumption.replayIdentityDigest,
-              presentedStatementFingerprint: locked.fingerprint,
-              outcome: decision.refusal,
-            },
-          );
+        const resolved = await this.resolveCanonicalEnrollmentOutcome(tx, {
+          organisationId: input.organisationId,
+          enrollmentRequestId: locked.request.id,
+          fingerprint: locked.fingerprint,
+          grantReplayKey,
+          challengeReplayKey,
+          candidateDeviceId,
+        });
+        if (!resolved.resolved) {
+          await this.recordEnrollmentRefusal(tx, input, locked.fingerprint, resolved.refusal, now, principal.user.id);
+          return { outcome: 'REFUSED', refusal: resolved.refusal };
         }
-        await this.recordEnrollmentRefusal(tx, input, locked.fingerprint, decision.refusal, now, principal.user.id);
-        // The refusal is returned from INSIDE the transaction, and the
-        // transaction commits — the refusal audit is the only effect. The
-        // replay rows written above are deliberately kept: an identity
-        // presented with changed semantics has been spent, and rolling that
-        // back would let the same probe run again.
-        return { outcome: 'REFUSED', refusal: decision.refusal };
-      }
 
-      if (decision.decision === 'CONVERGE') {
-        // D24-06: the SAME device identity, never a second. The reference is
-        // the device id the first attempt stored.
-        return { outcome: 'CONVERGED', deviceId: decision.stored_outcome_ref };
-      }
+        // ---- FIRST CONSUMPTION WRITE -----------------------------------
+        // Past this line every refusal THROWS. D24-11: both one-shot
+        // identities, consumed atomically inside THIS transaction so the burn
+        // and the effect share a fate — and now they genuinely do, because a
+        // refusal below aborts the transaction that wrote them.
+        const grantConsumption = await this.replay.consume(tx, {
+          organisationId: input.organisationId,
+          ceremony: CEREMONY_BOOTSTRAP_GRANT,
+          replayKey: grantReplayKey,
+          statementFingerprint: locked.fingerprint,
+          candidateOutcomeRef: resolved.outcomeRef,
+          traceId: input.traceId,
+        });
+        rolledBack.replayIdentityDigest = grantConsumption.replayIdentityDigest;
 
-      return this.performCommit(tx, {
-        input,
-        principal,
-        locked,
-        now,
-        deviceId: candidateDeviceId,
-        fingerprint: decision.enrollment_request_fingerprint,
+        const challengeConsumption = await this.replay.consume(tx, {
+          organisationId: input.organisationId,
+          ceremony: CEREMONY_POSSESSION_CHALLENGE,
+          replayKey: challengeReplayKey,
+          statementFingerprint: locked.fingerprint,
+          candidateOutcomeRef: resolved.outcomeRef,
+          traceId: input.traceId,
+        });
+
+        // THE GATE. Every admissibility rule in the ceremony is decided here
+        // and nowhere else in this file.
+        const decision = evaluateDeviceEnrollmentCommit({
+          request: locked.contractRequest,
+          grant: locked.contractGrant,
+          approval: locked.contractApproval,
+          challenge: locked.contractChallenge,
+          possessionVerification: locked.contractVerification,
+          serverSelectedSignatureProfile: SERVER_SELECTED_SIGNATURE_PROFILE,
+          grantConsumption: grantConsumption.consumption,
+          challengeConsumption: challengeConsumption.consumption,
+          // Provenance is not identity: who is authenticated RIGHT NOW is a
+          // separate input from `request.intended_user_id`, and the contract
+          // compares them itself.
+          authenticatedUserId: principal.user.id,
+          now: now.toISOString(),
+        });
+
+        if (decision.decision === 'REFUSE') {
+          // C16-02: THROWN, never returned. A pre-existing consumption row from
+          // an earlier COMMITTED ceremony survives this rollback because it was
+          // never part of this transaction — a spent identity stays spent. What
+          // does not survive is a row THIS transaction wrote for an effect it
+          // is now refusing to produce.
+          throw new ShieldTransactionRollback(decision.refusal);
+        }
+
+        if (decision.decision === 'CONVERGE') {
+          // D24-06: the SAME device identity, never a second. The reference was
+          // resolved against the device table before either identity was spent,
+          // so this answer names hardware that demonstrably exists.
+          return { outcome: 'CONVERGED', deviceId: decision.stored_outcome_ref };
+        }
+
+        return this.performCommit(tx, {
+          input,
+          principal,
+          locked,
+          now,
+          deviceId: resolved.outcomeRef,
+          fingerprint: decision.enrollment_request_fingerprint,
+        });
       });
-    });
+    } catch (error) {
+      if (!isShieldTransactionRollback(error)) throw error;
+      // The transaction is gone; the trail is not. D24-12 still needs to record
+      // that this ceremony was refused, and it is written here — after the
+      // rollback — so the audit survives while the consumption rows do not.
+      await this.recordRolledBackEnrollmentRefusal(input, error.refusal, principal.user.id, rolledBack);
+      return { outcome: 'REFUSED', refusal: error.refusal };
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -881,7 +1102,7 @@ export class DeviceEnrollmentService {
   private async performCommit(
     tx: Tx,
     context: {
-      input: { organisationId: string; enrollmentRequestId: string; challengeId: string; custodyRegimeId: string | null; traceId: string };
+      input: { organisationId: string; enrollmentRequestId: string; challengeId: string; traceId: string };
       principal: Principal;
       locked: LockedCommitState;
       now: Date;
@@ -925,7 +1146,13 @@ export class DeviceEnrollmentService {
       device_id: deviceId,
       custody: locked.contractRequest.custody,
       assigned_user_id: locked.contractRequest.custody === 'PERSONAL' ? locked.contractRequest.intended_user_id : null,
-      custody_regime_id: locked.contractRequest.custody === 'CONTROLLED_SHARED' ? input.custodyRegimeId : null,
+      // C16-01: THE RÉGIME COMES FROM THE APPROVAL ROW. Not from a commit
+      // parameter (there is none any more), and not from the request either:
+      // the approval is the human decision, and the prevalidation above has
+      // already proved the request still agrees with it. Reading the approval
+      // is what makes "committed under a régime the approver never saw"
+      // unrepresentable rather than merely unlikely.
+      custody_regime_id: locked.approval.approvedCustodyRegimeId,
       associated_site_ids: [locked.contractRequest.site_id],
       associated_at: now.toISOString(),
       released_at: null,
@@ -1135,6 +1362,7 @@ export class DeviceEnrollmentService {
 
     return {
       request,
+      approval,
       grant,
       contractRequest,
       contractGrant: contractGrant.data,
@@ -1175,6 +1403,187 @@ export class DeviceEnrollmentService {
       requested_at: row.requestedAt.toISOString(),
     });
     return parsed.success ? parsed.data : null;
+  }
+
+  // -------------------------------------------------------------------------
+  // C16-01 / C16-02 internals
+  // -------------------------------------------------------------------------
+
+  /**
+   * C16-01: the two custody rules and the catalogue lookup, in one place.
+   *
+   * `null` means the submission's régime is acceptable. Anything else is the
+   * refusal to return verbatim.
+   *
+   * THE TWO RULES ARE THE CONTRACT'S, NOT THIS METHOD'S SHAPE.
+   * `DeviceCustodyAssociationSchema` (C15-08) already refuses a PERSONAL device
+   * carrying a régime and a CONTROLLED_SHARED device carrying an assignee. What
+   * a schema cannot do is refuse a CONTROLLED_SHARED enrollment that names NO
+   * régime — the field is nullable there because a PERSONAL association
+   * legitimately leaves it empty — so the requirement is enforced here, at the
+   * point where custody is actually chosen, and proved by test.
+   *
+   * ISOLATION: absent, foreign-tenant and right-tenant-wrong-site all answer
+   * `CUSTODY_REGIME_NOT_FOUND`. Retirement is reported distinctly, and that is
+   * not an oracle: to reach this line at all the presenter has already proved,
+   * by holding a USABLE bootstrap grant, that they are operating inside this
+   * exact organisation and site.
+   */
+  private async resolveSubmittedCustodyRegime(submission: EnrollmentRequestSubmission): Promise<ShieldRefusalCode | null> {
+    if (submission.custody === 'CONTROLLED_SHARED') {
+      if (submission.custodyRegimeId === null) return 'CUSTODY_REGIME_REQUIRED';
+    } else if (submission.custodyRegimeId !== null) {
+      return 'CUSTODY_REGIME_NOT_PERMITTED';
+    }
+    if (submission.custodyRegimeId === null) return null;
+
+    const regime = await this.repository.findCustodyRegime(submission.organisationId, submission.custodyRegimeId);
+    if (regime === null) return 'CUSTODY_REGIME_NOT_FOUND';
+    // A régime in the right tenant but the WRONG SITE is not a régime this
+    // ceremony may name: custody is a site fact, and widening it silently is
+    // exactly the sort of scope creep the composite keys elsewhere prevent.
+    if (regime.siteId !== submission.siteId) return 'CUSTODY_REGIME_NOT_FOUND';
+    if (regime.retiredAt !== null) return 'CUSTODY_REGIME_RETIRED';
+    return null;
+  }
+
+  /**
+   * C16-02: is this the SAME submission arriving a second time under the same
+   * grant, or a different one?
+   *
+   * Every value a caller controls is compared. The server-derived values —
+   * fingerprint, thumbprint, attestation, timestamps — are deliberately NOT,
+   * because they cannot repeat: `requested_at` and the attestation instant move
+   * every call, so comparing them would make every retry a conflict and the
+   * convergence arm unreachable.
+   */
+  private submissionMatchesRequest(submission: EnrollmentRequestSubmission, row: EnrollmentRequestRow): boolean {
+    return (
+      row.organisationId === submission.organisationId &&
+      row.siteId === submission.siteId &&
+      row.intendedUserId === submission.intendedUserId &&
+      row.custody === submission.custody &&
+      row.custodyRegimeId === submission.custodyRegimeId &&
+      row.publicKey === submission.publicKey &&
+      row.keyStorage === submission.keyStorage &&
+      row.claimedSignatureProfile === submission.claimedSignatureProfile
+    );
+  }
+
+  /**
+   * C16-02 — ONE CEREMONY, ONE COMMITTED OUTCOME, RESOLVED BEFORE ANY BURN.
+   *
+   * Returns the outcome reference BOTH one-shot identities will be consumed
+   * against, or a refusal.
+   *
+   * WHY THIS EXISTS
+   * ---------------
+   * The two identities are spent independently, so they can disagree: a
+   * transaction that crashed between them, a partial retry, a service-bypassing
+   * writer. The old code handed each a FRESHLY MINTED candidate device id and
+   * let the classifier sort it out, which produced two failures at once —
+   *
+   *   * a refused ceremony still committed a FIRST_SEEN row naming a device
+   *     that was never created, so the next exact retry "converged" on nothing;
+   *   * a lagging identity's first-seen row named the RETRY's candidate rather
+   *     than the outcome the first attempt actually produced.
+   *
+   * Resolving first fixes both. If either identity is an exact duplicate, its
+   * stored reference is resolved BY AUTHORITATIVE DATABASE READ to a device
+   * that exists AND whose `enrollment_request_id` is THIS request. Only then is
+   * it used, for BOTH identities, so the lagging first-seen row is written
+   * against the effect that genuinely exists.
+   *
+   * A reference that does not resolve fails closed. That is the whole point:
+   * the alternative is manufacturing a convergence onto hardware the registry
+   * cannot produce, which is worse than refusing an honest retry.
+   */
+  private async resolveCanonicalEnrollmentOutcome(
+    tx: Tx,
+    input: {
+      organisationId: string;
+      enrollmentRequestId: string;
+      fingerprint: string;
+      grantReplayKey: string;
+      challengeReplayKey: string;
+      candidateDeviceId: string;
+    },
+  ): Promise<
+    | { readonly resolved: true; readonly outcomeRef: string }
+    | { readonly resolved: false; readonly refusal: 'REPLAY_OUTCOME_UNRESOLVABLE' | 'REPLAY_OUTCOME_DIVERGED' }
+  > {
+    const peeked = await Promise.all([
+      this.replay.peek(tx, { organisationId: input.organisationId, replayKey: input.grantReplayKey }),
+      this.replay.peek(tx, { organisationId: input.organisationId, replayKey: input.challengeReplayKey }),
+    ]);
+
+    const references = new Set<string>();
+    for (const fact of peeked) {
+      if (fact === null) continue;
+      // A stored fingerprint that differs is REUSED_WITH_CHANGED_SEMANTICS, and
+      // that is the CONTRACT's verdict to reach, not this method's. It is left
+      // alone here so the gate produces the refusal the vocabulary defines.
+      if (fact.statementFingerprint !== input.fingerprint) continue;
+      // C15-R1: a stored row naming no outcome is inconsistent, and again the
+      // contract's `*_CONSUMPTION_INCONSISTENT` verdict is the honest answer.
+      if (fact.storedOutcomeRef === null || fact.storedOutcomeRef.length === 0) continue;
+      references.add(fact.storedOutcomeRef);
+    }
+
+    // Two duplicates telling two different stories about one ceremony.
+    // Converging on either would be picking one at random.
+    if (references.size > 1) return { resolved: false, refusal: 'REPLAY_OUTCOME_DIVERGED' };
+    if (references.size === 0) return { resolved: true, outcomeRef: input.candidateDeviceId };
+
+    const reference = [...references][0] as string;
+    const device = await this.repository.resolveDeviceOutcomeRef(
+      tx,
+      input.organisationId,
+      reference,
+      input.enrollmentRequestId,
+    );
+    if (device === null) return { resolved: false, refusal: 'REPLAY_OUTCOME_UNRESOLVABLE' };
+    return { resolved: true, outcomeRef: device.id };
+  }
+
+  /**
+   * C16-02: the D24-12 record of a refusal whose transaction was ROLLED BACK.
+   *
+   * It runs in its own transaction, after the abort, because the rows the
+   * refused transaction wrote are gone and the audit must not go with them. The
+   * `REPLAY_CONFLICT` event is emitted for exactly the refusals that describe a
+   * spent identity, as before.
+   */
+  private async recordRolledBackEnrollmentRefusal(
+    input: { organisationId: string; enrollmentRequestId: string; traceId: string },
+    refusal: ShieldRefusalCode,
+    actorUserId: string,
+    context: { fingerprint: string | null; replayIdentityDigest: string | null },
+  ): Promise<void> {
+    await this.repository.transaction(async (tx) => {
+      const now = await this.repository.dbNow(tx);
+      if (
+        context.replayIdentityDigest !== null &&
+        context.fingerprint !== null &&
+        (refusal === 'BOOTSTRAP_GRANT_REUSED' ||
+          refusal === 'CHALLENGE_REUSED' ||
+          refusal === 'BOOTSTRAP_CONSUMPTION_INCONSISTENT' ||
+          refusal === 'CHALLENGE_CONSUMPTION_INCONSISTENT')
+      ) {
+        await this.audit.record(
+          tx,
+          { organisationId: input.organisationId, deviceId: null, actorUserId, occurredAt: now, traceId: input.traceId },
+          {
+            type: 'REPLAY_CONFLICT',
+            ceremony: CEREMONY_BOOTSTRAP_GRANT,
+            replayIdentityDigest: context.replayIdentityDigest,
+            presentedStatementFingerprint: context.fingerprint ?? '',
+            outcome: refusal,
+          },
+        );
+      }
+      await this.recordEnrollmentRefusal(tx, input, context.fingerprint, refusal, now, actorUserId);
+    });
   }
 
   private async recordEnrollmentRefusal(

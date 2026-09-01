@@ -25,7 +25,8 @@ import type { Principal } from '../../common/security/principal';
 import { DeviceReplayService } from './device-replay.service';
 import { DeviceSecurityAudit } from './device-security-audit';
 import { P256KeyImporter } from './p256-key.importer';
-import { checkDeviceAuthority } from './shield.authority';
+import { checkGlobalDeviceMutationAuthority } from './shield.authority';
+import { ShieldTransactionRollback, isShieldTransactionRollback } from './shield.rollback';
 import {
   ACTION_DEVICE_KEY_ROTATE,
   CEREMONY_KEY_ROTATION,
@@ -74,6 +75,40 @@ import type {
  * continuity, possession, chronology and convergence. This service assembles
  * the facts, performs the two crypto checks the contract cannot, takes the
  * locks, and applies the effect the contract authorised.
+ *
+ * C16-03 — AN EXACT RETRY CONVERGES; IT DOES NOT REPORT A STALE WORLD
+ * ---------------------------------------------------------------------
+ * `evaluateDeviceKeyRotation` checks STALE_ROTATION at step 3 and consults the
+ * replay fact only at step 5. Once a rotation has LANDED the registry has moved
+ * by definition, so under that ordering every honest retry was answered
+ * STALE_ROTATION. Safe — nothing rotated twice — but not TRUTHFUL: the caller is
+ * told its request was invalidated by a concurrent change when in fact its own
+ * earlier attempt succeeded.
+ *
+ * The contract is frozen and its ordering is not this work package's to change,
+ * so the fix is in the RUNTIME and it is placed BEFORE the evaluator: the
+ * durable replay outcome is resolved first. If the identity is an EXACT
+ * duplicate, the stored reference is read back AUTHORITATIVELY and must resolve
+ * to precisely the committed rotation it claims — the key row exists, is
+ * CURRENT, sits at `proposed_key_version`, carries `proposed_key_id`, belongs to
+ * this device and tenant, and the device's own pointer agrees. Only then does
+ * this service answer CONVERGE, and it answers with the key the REGISTRY holds
+ * rather than the one the request asked for. If the reference does not resolve
+ * to exactly that, it FAILS CLOSED (`ROTATION_OUTCOME_UNRESOLVABLE`) — a
+ * manufactured convergence is worse than an honest refusal.
+ *
+ * Only when the fact is NOT an exact duplicate is the evaluator called, where a
+ * genuinely moved registry still yields STALE_ROTATION exactly as before.
+ *
+ * C16-04 — NO PARTIAL SECURITY-STATE COMMITS
+ * ----------------------------------------
+ * The effect below writes three things: the old key goes ROTATED, the new key
+ * is created, the device pointer advances. The last two are fenced
+ * compare-and-sets, and RETURNING a refusal from one of them committed
+ * everything written before it — two live keys, a device pointing at neither,
+ * and no rotation. Every fallible condition is now prevalidated, and a
+ * post-write CAS failure `throw`s `ShieldTransactionRollback` so Postgres
+ * aborts the whole transaction. The external refusal is produced afterwards.
  *
  * WHY THE FULL `evaluateDeviceRequestProof` IS NOT CALLED FOR CONTINUITY
  * ---------------------------------------------------------------------
@@ -388,17 +423,29 @@ export class DeviceKeyService {
       traceId: string;
     },
   ): Promise<CommitKeyRotationOutcome> {
-    // The new key row's id, minted before the replay consumption so a retry can
-    // converge on the FIRST attempt's outcome rather than rotating twice.
+    // The new key row's id, minted before the replay consumption so it can be
+    // the outcome reference a FIRST attempt stores. A retry never uses it: the
+    // resolution below reads back what actually committed.
     const candidateKeyRowId = randomUUID();
 
-    return this.repository.transaction(async (tx) => {
+    // C16-04: what a ROLLED-BACK transaction still needs to record. Captured in
+    // this closure so it survives the abort that takes the transaction's own
+    // audit rows with it.
+    const replayConflict: { value: { digest: string; refusal: string; deviceId: string; fingerprint: string } | null } = {
+      value: null,
+    };
+
+    try {
+      return await this.repository.transaction(async (tx) => {
       const now = await this.repository.dbNow(tx);
       const locked = await this.lockRotationState(tx, input.organisationId, input.rotationRequestId, input.challengeId);
       if (typeof locked === 'string') return { outcome: 'REFUSED', refusal: locked };
 
       const siteIds = await this.repository.listDeviceSiteIds(input.organisationId, locked.device.id);
-      if (this.authoriseAgainstDeviceSites(principal, input.organisationId, siteIds) !== null) {
+      // C16-06: rotation replaces the ONE credential every site this device
+      // serves depends on, so it needs authority over the whole device — not
+      // over one of the sites it happens to touch.
+      if (checkGlobalDeviceMutationAuthority(principal, ACTION_DEVICE_KEY_ROTATE, input.organisationId, siteIds) !== null) {
         return { outcome: 'REFUSED', refusal: 'ROTATION_REQUEST_NOT_FOUND' };
       }
 
@@ -410,20 +457,47 @@ export class DeviceKeyService {
       // D24-05: the new key must have been imported by the runtime provider.
       const newKeyRuntimeValid = this.keys.isRuntimeValidPublicKey(locked.newPublicKey);
 
+      const replayKey = deviceKeyRotationReplayKey({
+        organisation_id: locked.contractRequest.organisation_id,
+        device_id: locked.contractRequest.device_id,
+        rotation_request_id: locked.contractRequest.rotation_request_id,
+        rotation_challenge_id: locked.contractChallenge.challenge_id,
+        current_key_id: locked.contractRequest.current_key_id,
+        current_key_version: locked.contractRequest.current_key_version,
+        proposed_key_id: locked.contractRequest.proposed_key_id,
+        proposed_key_version: locked.contractRequest.proposed_key_version,
+        nonce: locked.contractChallenge.nonce,
+      });
+
+      // C16-03: THE DURABLE REPLAY OUTCOME IS RESOLVED BEFORE THE EVALUATOR.
+      //
+      // A pure read, taken before anything is written. If this identity has
+      // already been spent on the SAME statement, the rotation it produced is
+      // read back from the registry and this ceremony converges on it — with
+      // the real committed key, not the one the request proposed. If the stored
+      // reference does not resolve to exactly that committed rotation, the
+      // answer is a refusal: convergence is never manufactured.
+      const peeked = await this.replay.peek(tx, { organisationId: input.organisationId, replayKey });
+      if (peeked !== null && peeked.statementFingerprint === locked.fingerprint && peeked.storedOutcomeRef !== null) {
+        const committed = await this.resolveCommittedRotation(tx, locked, peeked.storedOutcomeRef);
+        if (committed === null) return { outcome: 'REFUSED', refusal: 'ROTATION_OUTCOME_UNRESOLVABLE' };
+        return {
+          outcome: 'CONVERGED',
+          deviceId: locked.device.id,
+          storedOutcomeRef: peeked.storedOutcomeRef,
+          // Read back from the REGISTRY. A convergence answer that echoed the
+          // request would be a claim about what the caller asked for rather
+          // than about what the registry holds.
+          toKeyId: committed.keyId,
+          toKeyVersion: committed.keyVersion,
+        };
+      }
+
+      // ---- FIRST CONSUMPTION WRITE. Every refusal past this line THROWS. ---
       const consumption = await this.replay.consume(tx, {
         organisationId: input.organisationId,
         ceremony: CEREMONY_KEY_ROTATION,
-        replayKey: deviceKeyRotationReplayKey({
-          organisation_id: locked.contractRequest.organisation_id,
-          device_id: locked.contractRequest.device_id,
-          rotation_request_id: locked.contractRequest.rotation_request_id,
-          rotation_challenge_id: locked.contractChallenge.challenge_id,
-          current_key_id: locked.contractRequest.current_key_id,
-          current_key_version: locked.contractRequest.current_key_version,
-          proposed_key_id: locked.contractRequest.proposed_key_id,
-          proposed_key_version: locked.contractRequest.proposed_key_version,
-          nonce: locked.contractChallenge.nonce,
-        }),
+        replayKey,
         statementFingerprint: locked.fingerprint,
         candidateOutcomeRef: candidateKeyRowId,
         traceId: input.traceId,
@@ -458,45 +532,45 @@ export class DeviceKeyService {
           decision.refusal === 'ROTATION_CONSUMPTION_INCONSISTENT' ||
           decision.refusal === 'ROTATION_CONSUMPTION_MISBOUND'
         ) {
-          await this.audit.record(
-            tx,
-            { organisationId: input.organisationId, deviceId: locked.device.id, actorUserId: principal.user.id, occurredAt: now, traceId: input.traceId },
-            {
-              type: 'REPLAY_CONFLICT',
-              ceremony: CEREMONY_KEY_ROTATION,
-              replayIdentityDigest: consumption.replayIdentityDigest,
-              presentedStatementFingerprint: locked.fingerprint,
-              outcome: decision.refusal,
-            },
-          );
+          replayConflict.value = {
+            digest: consumption.replayIdentityDigest,
+            refusal: decision.refusal,
+            deviceId: locked.device.id,
+            fingerprint: locked.fingerprint,
+          };
         }
-        return { outcome: 'REFUSED', refusal: decision.refusal };
+        // C16-02/C16-04: THROWN, never returned. The consumption row this
+        // transaction just wrote must not outlive the rotation it claimed, and
+        // a normal return would commit it.
+        throw new ShieldTransactionRollback(decision.refusal);
       }
 
       if (decision.decision === 'CONVERGE') {
-        // A byte-identical retry. NEVER a second rotation: rotating twice
-        // would burn a key version for nothing and leave the device holding a
-        // credential the registry had already retired.
+        // C16-03: UNREACHABLE BY CONSTRUCTION, AND FAIL-CLOSED ANYWAY.
         //
-        // OBSERVED, AND WORTH SAYING PLAINLY: this arm is not reachable once a
-        // rotation has actually LANDED. `evaluateDeviceKeyRotation` evaluates
-        // STALE_ROTATION at step 3 against the re-read registry, and the replay
-        // fact only at step 5 — so a retry after a successful commit finds the
-        // device's current key already advanced and is refused STALE_ROTATION
-        // before convergence is considered. The SAFETY property D24-10A asks
-        // for ("same identity + same fingerprint ... never rotates twice") is
-        // therefore upheld by STALE_ROTATION rather than by convergence, and
-        // the retry mutates nothing either way. The arm is kept because the
-        // contract can return it and a runtime that ignored a verdict it was
-        // handed would be exactly the fall-through C15-R1 removed elsewhere.
-        return { outcome: 'CONVERGED', deviceId: locked.device.id, storedOutcomeRef: decision.stored_outcome_ref };
+        // The contract returns CONVERGE only when the consumption fact is an
+        // EXACT duplicate, and every exact duplicate was already resolved and
+        // answered above, before this identity was consumed. Reaching here
+        // therefore means the store classified a row this transaction only just
+        // inserted as a duplicate — an integrity fault, not a retry. Refusing
+        // is the only honest answer: the alternative is converging on a
+        // reference nothing has verified against the registry, which is exactly
+        // the manufactured convergence C16-03 exists to remove.
+        throw new ShieldTransactionRollback('ROTATION_OUTCOME_UNRESOLVABLE');
       }
 
       // ---- the effect, in one transaction --------------------------------
+      // C16-04: THREE WRITES, ONE FATE. Two of them are fenced
+      // compare-and-sets, and a CAS that reports zero rows means the world
+      // moved between the lock and here. RETURNING a refusal at either of them
+      // used to commit whatever had already been written — an old key marked
+      // ROTATED with no successor, or two live keys and a device pointing at
+      // neither. Both now THROW, so Postgres unwinds the lot.
+      //
       // Old key first, fenced on `status = 'CURRENT'`, so a key that moved
       // between the lock and here cannot be walked backwards into a rotation.
       const superseded = await this.repository.markDeviceKeyRotated(tx, input.organisationId, locked.currentKey.keyId, now);
-      if (superseded !== 1) return { outcome: 'REFUSED', refusal: 'STALE_ROTATION' };
+      if (superseded !== 1) throw new ShieldTransactionRollback('STALE_ROTATION');
 
       await this.repository.createDeviceKey(tx, {
         id: candidateKeyRowId,
@@ -521,7 +595,7 @@ export class DeviceKeyService {
         { keyId: locked.currentKey.keyId, keyVersion: locked.currentKey.keyVersion },
         { keyId: locked.contractRequest.proposed_key_id, keyVersion: locked.contractRequest.proposed_key_version },
       );
-      if (advanced !== 1) return { outcome: 'REFUSED', refusal: 'STALE_ROTATION' };
+      if (advanced !== 1) throw new ShieldTransactionRollback('STALE_ROTATION');
 
       await this.repository.setRotationRequestState(tx, input.organisationId, locked.rotationRequestId, locked.rotationRequestState, ROTATION_STATE_ROTATED);
 
@@ -551,7 +625,31 @@ export class DeviceKeyService {
         toKeyId: locked.contractRequest.proposed_key_id,
         toKeyVersion: locked.contractRequest.proposed_key_version,
       };
-    });
+      });
+    } catch (error) {
+      if (!isShieldTransactionRollback(error)) throw error;
+      // C16-02/C16-04: the transaction is gone; the D24-12 trail is not. The
+      // replay-conflict event is written afterwards, in its own transaction, so
+      // an operator can still see that a spent identity was presented again.
+      if (replayConflict.value !== null) {
+        const conflict = replayConflict.value;
+        await this.repository.transaction(async (tx) => {
+          const at = await this.repository.dbNow(tx);
+          await this.audit.record(
+            tx,
+            { organisationId: input.organisationId, deviceId: conflict.deviceId, actorUserId: principal.user.id, occurredAt: at, traceId: input.traceId },
+            {
+              type: 'REPLAY_CONFLICT',
+              ceremony: CEREMONY_KEY_ROTATION,
+              replayIdentityDigest: conflict.digest,
+              presentedStatementFingerprint: conflict.fingerprint,
+              outcome: conflict.refusal,
+            },
+          );
+        });
+      }
+      return { outcome: 'REFUSED', refusal: error.refusal };
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -720,14 +818,59 @@ export class DeviceKeyService {
     return this.repository.findDeviceKeyByKeyId(device.organisationId, device.currentKeyId);
   }
 
+  /**
+   * C16-03: does this stored outcome reference name the EXACT committed
+   * rotation it claims?
+   *
+   * Every one of the six conditions below is load-bearing, and a convergence
+   * answer is given only when all of them hold:
+   *
+   *   the key row exists                    ... or nothing was committed;
+   *   under this tenant and this device      ... or it is someone else's key;
+   *   carrying the proposed key id           ... or it is a different rotation;
+   *   at the proposed key version            ... or a different version landed;
+   *   with status CURRENT                    ... or it has since been retired
+   *                                              or revoked, and answering
+   *                                              CONVERGE would hand the caller
+   *                                              a credential that is gone;
+   *   and the DEVICE POINTER agrees          ... or the registry itself does
+   *                                              not consider this key current,
+   *                                              which is a half-applied
+   *                                              rotation and not a success.
+   *
+   * `null` means "this does not resolve", and the caller fails closed.
+   */
+  private async resolveCommittedRotation(
+    tx: Tx,
+    locked: LockedRotationState,
+    storedOutcomeRef: string,
+  ): Promise<DeviceKeyRow | null> {
+    const key = await this.repository.findDeviceKeyRowById(tx, locked.device.organisationId, storedOutcomeRef);
+    if (key === null) return null;
+    if (key.deviceId !== locked.device.id) return null;
+    if (key.keyId !== locked.contractRequest.proposed_key_id) return null;
+    if (key.keyVersion !== locked.contractRequest.proposed_key_version) return null;
+    if (key.status !== 'CURRENT') return null;
+    if (locked.device.currentKeyId !== key.keyId) return null;
+    if (locked.device.currentKeyVersion !== key.keyVersion) return null;
+    return key;
+  }
+
+  /**
+   * C16-06: rotation is a GLOBAL physical-device mutation.
+   *
+   * There is one credential, and rotating it at site A rotates it at site B
+   * too. `checkGlobalDeviceMutationAuthority` therefore requires genuine
+   * organisation-wide authority, or authority over EVERY active associated
+   * site; and a device associated with no site at all is reachable only
+   * organisation-wide, where the old code treated it as reachable by anyone
+   * holding the action anywhere.
+   */
   private authoriseAgainstDeviceSites(
     principal: Principal,
     organisationId: string,
     siteIds: string[],
   ): 'DEVICE_NOT_FOUND' | null {
-    if (checkDeviceAuthority(principal, ACTION_DEVICE_KEY_ROTATE, organisationId, null) !== null) return 'DEVICE_NOT_FOUND';
-    if (siteIds.length === 0) return null;
-    const allowed = siteIds.some((siteId) => checkDeviceAuthority(principal, ACTION_DEVICE_KEY_ROTATE, organisationId, siteId) === null);
-    return allowed ? null : 'DEVICE_NOT_FOUND';
+    return checkGlobalDeviceMutationAuthority(principal, ACTION_DEVICE_KEY_ROTATE, organisationId, siteIds);
   }
 }

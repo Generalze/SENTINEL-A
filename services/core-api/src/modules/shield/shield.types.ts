@@ -96,6 +96,72 @@ export const SHIELD_REFUSALS = [
    * transition that was actually evaluated.
    */
   'DEVICE_CREDENTIAL_WITHDRAWN',
+
+  // -------------------------------------------------------------------------
+  // C16-01 — the custody regime is approval-bound
+  // -------------------------------------------------------------------------
+
+  /** CONTROLLED_SHARED custody was requested with no regime. C15-08 requires one. */
+  'CUSTODY_REGIME_REQUIRED',
+  /** PERSONAL custody named a regime. A personal device under a shared regime is an accountability gap. */
+  'CUSTODY_REGIME_NOT_PERMITTED',
+  /**
+   * No regime matches IN THIS ORGANISATION AND AT THIS SITE. Covers absent,
+   * foreign-tenant and right-tenant-wrong-site alike: the isolation rule this
+   * list opens with applies to the regime catalogue too.
+   */
+  'CUSTODY_REGIME_NOT_FOUND',
+  /**
+   * The regime exists at this organisation and site but has been retired.
+   * Reported distinctly from absent because it is NOT an oracle: the presenter
+   * has already proved, by holding a usable bootstrap grant, that they are
+   * operating inside this exact tenant and site.
+   */
+  'CUSTODY_REGIME_RETIRED',
+  /**
+   * C16-01: the approved-semantics digest recomputed from the (locked) request
+   * does not equal the one the approval bound. The custody regime — or the
+   * custody mode, or the request bytes — moved after the human decided.
+   */
+  'APPROVED_SEMANTICS_MISMATCH',
+
+  // -------------------------------------------------------------------------
+  // C16-02 — a replay row may never outlive the effect it claims
+  // -------------------------------------------------------------------------
+
+  /**
+   * A consumption row classified EXACT_DUPLICATE, but its stored outcome
+   * reference does not resolve, BY AUTHORITATIVE DATABASE READ, to a committed
+   * effect belonging to this exact ceremony. Convergence is never manufactured:
+   * the honest answer is that the registry cannot say what the identity was
+   * spent on, and that fails closed.
+   */
+  'REPLAY_OUTCOME_UNRESOLVABLE',
+  /**
+   * The two enrollment replay identities resolve to DIFFERENT committed
+   * outcomes. One ceremony has exactly one outcome; two is an integrity fault,
+   * not a race to arbitrate.
+   */
+  'REPLAY_OUTCOME_DIVERGED',
+  /**
+   * C16-02: a materially different enrollment request was submitted under a
+   * bootstrap grant that already has one. A grant is provenance for ONE
+   * ceremony; two requests behind it would be two approval candidates racing
+   * for a single replay identity.
+   */
+  'ENROLLMENT_REQUEST_CONFLICT',
+
+  // -------------------------------------------------------------------------
+  // C16-03 / C16-04 — rotation convergence and partial-write refusal
+  // -------------------------------------------------------------------------
+
+  /**
+   * The rotation replay identity is an exact duplicate, but the stored outcome
+   * reference does not resolve to the exact committed rotation it claims — the
+   * key row is missing, is not CURRENT, sits at the wrong version, belongs to
+   * another device or tenant, or the device pointer disagrees. Fail closed.
+   */
+  'ROTATION_OUTCOME_UNRESOLVABLE',
 ] as const;
 
 export type ShieldRefusal = (typeof SHIELD_REFUSALS)[number];
@@ -171,7 +237,15 @@ export interface EnrollmentRequestSubmission {
   readonly keyStorage: DeviceKeyStorage;
   /** C15-01: A CLAIM. Bound to the server's resolved profile before any use. */
   readonly claimedSignatureProfile: DeviceSignatureProfile;
-  /** CONTROLLED_SHARED only: the named régime governing hand-over (C15-08). */
+  /**
+   * CONTROLLED_SHARED only, and REQUIRED there (C15-08 / C16-01).
+   *
+   * An id from the SERVER-ISSUED `DeviceCustodyRegime` catalogue, never free
+   * text. It is resolved against this organisation AND this site, and a
+   * retired regime refuses. It arrives HERE, on the request, rather than at
+   * commit, because only a value present at request time can be covered by the
+   * approved-semantics digest the human approval binds.
+   */
   readonly custodyRegimeId: string | null;
   readonly traceId: string;
 }
@@ -179,6 +253,19 @@ export interface EnrollmentRequestSubmission {
 export type CreateEnrollmentRequestOutcome =
   | {
       readonly outcome: 'REQUESTED';
+      readonly enrollmentRequestId: string;
+      readonly requestFingerprint: string;
+      readonly serverSelectedSignatureProfile: DeviceSignatureProfile;
+      readonly attestationOutcome: string;
+    }
+  /**
+   * C16-02: an IDENTICAL repeat submission under a grant that already opened a
+   * request. One grant, one ceremony: the retry converges on the request that
+   * exists rather than opening a second candidate behind the same provenance.
+   * A materially different submission gets `ENROLLMENT_REQUEST_CONFLICT`.
+   */
+  | {
+      readonly outcome: 'CONVERGED';
       readonly enrollmentRequestId: string;
       readonly requestFingerprint: string;
       readonly serverSelectedSignatureProfile: DeviceSignatureProfile;
@@ -259,7 +346,19 @@ export type CommitKeyRotationOutcome =
       readonly toKeyId: string;
       readonly toKeyVersion: number;
     }
-  | { readonly outcome: 'CONVERGED'; readonly deviceId: string; readonly storedOutcomeRef: string }
+  /**
+   * C16-03: an EXACT retry of a rotation that already landed. The identity,
+   * version and key returned are read back from the REGISTRY, not echoed from
+   * the request — the runtime resolves the stored outcome reference to the
+   * committed key row and refuses (never converges) if it does not resolve.
+   */
+  | {
+      readonly outcome: 'CONVERGED';
+      readonly deviceId: string;
+      readonly storedOutcomeRef: string;
+      readonly toKeyId: string;
+      readonly toKeyVersion: number;
+    }
   | ShieldRefused;
 
 // ---------------------------------------------------------------------------
@@ -286,8 +385,8 @@ export type DeclareDeviceDispositionOutcome =
 /**
  * The registry's answer to "what is this device, and may it do new work?".
  *
- * D24-09: `deviceAdmitsNewOperations` consults the DEVICE row and the KEY row
- * INDEPENDENTLY and requires both. Either one saying the credential is gone is
+ * D24-09: `credentialAdmitsNewOperations` consults the DEVICE row and the KEY
+ * row INDEPENDENTLY and requires both. Either one saying the credential is gone is
  * sufficient on its own, and no caller may assume the two moved together — a
  * key declared COMPROMISED before the device row has caught up must already
  * block, and a revoked device with an untouched CURRENT key must block too.
@@ -305,18 +404,40 @@ export interface DeviceStanding {
   readonly currentKeyStatus: DeviceKeyLifecycleState | null;
   readonly currentKeyStorage: DeviceKeyStorage | null;
   readonly currentKeyRevokedAt: Date | null;
+  /**
+   * C16-06: THE SITES THE READER IS ENTITLED TO SEE, not the device's full
+   * list. A site-scoped reader receives the intersection of their granted
+   * scope with the device's active associations; only genuine
+   * organisation-wide authority receives the whole list. Holding one site is
+   * not a way to enumerate the others a device is deployed at.
+   */
   readonly siteIds: readonly string[];
   /** DEVICE-level only. Never the whole answer on its own. */
   readonly deviceLevelWithdrawn: boolean;
   /** KEY-level only. Never the whole answer on its own. */
   readonly keyLevelWithdrawn: boolean;
-  /** Both checks, ANDed. The only value a caller should gate new work on. */
-  readonly admitsNewOperations: boolean;
+  /**
+   * Both CREDENTIAL checks, ANDed — and nothing else (C16-07).
+   *
+   * The name says `credential` because that is all it covers. It is NOT
+   * operational authorisation: a QUARANTINED device with a perfectly healthy
+   * key satisfies it. `DeviceRegistryService.deviceMayAct` is the
+   * purpose-aware question, and even that is not complete authorisation.
+   */
+  readonly credentialAdmitsNewOperations: boolean;
 }
 
 export type ReadDeviceStandingOutcome = { readonly outcome: 'FOUND'; readonly standing: DeviceStanding } | ShieldRefused;
 
 export type ListDevicesOutcome = { readonly outcome: 'FOUND'; readonly devices: readonly DeviceStanding[] } | ShieldRefused;
+
+/**
+ * C16-01: one server-issued custody regime, as defined. The id in the payload
+ * is the SERVER's; nothing a caller sent chose it.
+ */
+export type DefineCustodyRegimeOutcome =
+  | { readonly outcome: 'DEFINED'; readonly custodyRegimeId: string; readonly siteId: string; readonly name: string }
+  | ShieldRefused;
 
 /** D24-07: one append-only observation, as recorded. */
 export type RecordAttestationOutcome =

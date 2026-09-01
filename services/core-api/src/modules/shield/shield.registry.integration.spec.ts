@@ -2,6 +2,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import type { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import {
+  DEVICE_ATTESTATION_UNAVAILABLE_GRACE_MS,
   canonicalDeviceKeyRotationPossessionStatement,
   canonicalDevicePossessionStatement,
   canonicalDeviceRequestProofStatement,
@@ -11,7 +12,7 @@ import {
   type DeviceCustody,
   type DeviceKeyStorage,
 } from '@sentinel/contracts';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { AppModule } from '../../app.module';
 import { buildPrincipal, type Principal } from '../../common/security/principal';
 import { PrismaService } from '../../prisma/prisma.service';
@@ -86,6 +87,13 @@ const fx = {
   commanderApproverA: `${tag}_cmdApproverA`,
   /** A commander whose role is scoped to siteA2 only. */
   commanderSiteA2: `${tag}_cmdSiteA2`,
+  /**
+   * C16-06: a commander holding `site.commander` ORGANISATION-WIDE — a role
+   * assignment with a NULL site id. This is what "genuine organisation-wide
+   * authority" means, and it is deliberately a different fixture from a
+   * commander who merely holds the action at some site.
+   */
+  commanderOrgWideA: `${tag}_cmdOrgWideA`,
   operativeAlpha: `${tag}_opAlpha`,
   operativeBravo: `${tag}_opBravo`,
   operatorA: `${tag}_operatorA`,
@@ -119,6 +127,15 @@ let repository: ShieldRepository;
 let attestation: SettableDeviceAttestationEvaluator;
 let A: TenantFixture;
 let B: TenantFixture;
+/** C16-06: genuine organisation-wide `site.commander`, holding every device.* action. */
+let orgWideCommanderA: Principal;
+/**
+ * C16-05: the human who may restore trust. `site.commander` carries
+ * `device.trust.restore`, and after C16-06 a trust change also needs authority
+ * over the whole device — the devices under restoration test live at siteA1
+ * only, so the siteA1 approver qualifies.
+ */
+let restorer: Principal;
 
 async function seed(): Promise<void> {
   await prisma.organisation.createMany({
@@ -151,6 +168,19 @@ async function seed(): Promise<void> {
     data: users.map((u) => ({ id: u.id, organisationId: u.org, email: `${u.id}@example.invalid`, displayName: u.id, clearance: 5 })),
   });
   await prisma.userRole.createMany({ data: users.map((u) => ({ userId: u.id, role: u.role, siteId: u.site })) });
+
+  // C16-06: the ORG-WIDE commander. `site_id: null` is what makes the
+  // assignment unrestricted, and it is the only thing that does.
+  await prisma.user.create({
+    data: {
+      id: fx.commanderOrgWideA,
+      organisationId: fx.orgA,
+      email: `${fx.commanderOrgWideA}@example.invalid`,
+      displayName: fx.commanderOrgWideA,
+      clearance: 5,
+    },
+  });
+  await prisma.userRole.create({ data: { userId: fx.commanderOrgWideA, role: 'site.commander', siteId: null } });
 }
 
 async function cleanup(): Promise<void> {
@@ -173,6 +203,7 @@ async function cleanup(): Promise<void> {
   await prisma.enrollmentApproval.deleteMany({ where: { organisationId } });
   await prisma.enrollmentRequest.deleteMany({ where: { organisationId } });
   await prisma.enrollmentBootstrapGrant.deleteMany({ where: { organisationId } });
+  await prisma.deviceCustodyRegime.deleteMany({ where: { organisationId } });
   await prisma.userRole.deleteMany({ where: { user: { organisationId } } });
   await prisma.user.deleteMany({ where: { organisationId } });
   await prisma.site.deleteMany({ where: { organisationId } });
@@ -212,6 +243,11 @@ beforeAll(async () => {
     intendedUserId: fx.operativeAlpha,
     intendedUser: principalFor(fx.operativeAlpha, 'field.operative', fx.siteA1, fx.orgA),
   };
+  orgWideCommanderA = buildPrincipal({
+    user: { id: fx.commanderOrgWideA, clearance: 5 },
+    organisation_id: fx.orgA,
+    roles: [{ role: 'site.commander', site_id: null }],
+  });
   B = {
     organisationId: fx.orgB,
     siteId: fx.siteB1,
@@ -220,6 +256,7 @@ beforeAll(async () => {
     intendedUserId: fx.operativeB,
     intendedUser: principalFor(fx.operativeB, 'field.operative', fx.siteB1, fx.orgB),
   };
+  restorer = A.approver;
 }, 120_000);
 
 afterAll(async () => {
@@ -356,7 +393,9 @@ async function commit(prepared: PreparedCeremony): Promise<CommitEnrollmentOutco
     organisationId: prepared.tenant.organisationId,
     enrollmentRequestId: prepared.enrollmentRequestId,
     challengeId: prepared.challengeId,
-    custodyRegimeId: prepared.custodyRegimeId,
+    // C16-01: THERE IS NO `custodyRegimeId` PARAMETER ANY MORE. The régime is
+    // read from the APPROVAL row, so a commit cannot name one the approver
+    // never saw.
     traceId: traceId(),
   });
 }
@@ -463,6 +502,57 @@ async function rotate(
   });
 
   return { outcome, newKeyPair };
+}
+
+/** C16-01: one server-issued custody regime, through the real service. */
+async function defineRegime(issuer: Principal, organisationId: string, siteId: string): Promise<string> {
+  const defined = await enrollment.defineCustodyRegime(issuer, {
+    organisationId,
+    siteId,
+    name: `regime-${randomUUID()}`,
+    traceId: traceId(),
+  });
+  if (defined.outcome !== 'DEFINED') throw new Error(`regime not defined: ${JSON.stringify(defined)}`);
+  return defined.custodyRegimeId;
+}
+
+/**
+ * C16-06: a SECOND active site association for a device.
+ *
+ * Written directly because WP-24 publishes no re-association service — the
+ * multi-site case is a real shape of the schema (`device_site_scope_key` is
+ * per site) and the ABAC rules must hold for it whether or not this work
+ * package exposes a way to create it.
+ */
+async function associateExtraSite(deviceId: string, siteId: string): Promise<void> {
+  const existing = await prisma.deviceSiteScope.findFirstOrThrow({ where: { deviceId } });
+  await prisma.deviceSiteScope.create({
+    data: {
+      organisationId: existing.organisationId,
+      deviceId,
+      siteId,
+      custody: existing.custody,
+      assignedUserId: existing.assignedUserId,
+      custodyRegimeId: existing.custodyRegimeId,
+      associatedAt: new Date(),
+    },
+  });
+}
+
+/**
+ * C16-05: pushes a device's whole attestation history back by `ageMs`.
+ *
+ * The grace is judged against the SERVER clock and the recorded evaluation
+ * instants, and there is no way to move the server clock in a live suite. So
+ * the evidence is aged instead, which exercises the same arithmetic from the
+ * other side and keeps the authoritative clock authoritative.
+ */
+async function ageAttestation(deviceId: string, ageMs: number): Promise<void> {
+  const at = new Date(Date.now() - ageMs);
+  await prisma.deviceAttestationObservation.updateMany({
+    where: { deviceId },
+    data: { evaluatedAt: at, observedAt: at },
+  });
 }
 
 function buildContinuityProof(
@@ -788,11 +878,43 @@ describe('WP-24 Shield device registry (live)', () => {
 
       // The attacker holds the grant secret and generates their own keypair.
       const attackerKey = generateTestDeviceKeyPair();
+
+      // C16-02 STOPS THIS EARLIER THAN IT USED TO. One grant opens exactly one
+      // ceremony, so presenting the stolen secret with a different key is not a
+      // second candidate the commit has to refuse later — it is refused on the
+      // spot, and no second approval can ever be collected behind this grant.
+      expect(
+        await enrollment.createEnrollmentRequest({
+          organisationId: fx.orgA,
+          siteId: fx.siteA1,
+          intendedUserId: fx.operativeAlpha,
+          bootstrapToken: honest.grantToken,
+          custody: 'PERSONAL',
+          publicKey: attackerKey.publicKey,
+          keyStorage: 'HARDWARE_BACKED',
+          claimedSignatureProfile: PROFILE,
+          custodyRegimeId: null,
+          traceId: traceId(),
+        }),
+      ).toEqual({ outcome: 'REFUSED', refusal: 'ENROLLMENT_REQUEST_CONFLICT' });
+
+      // The ORIGINAL C14-02 property is asserted on its own terms, with a
+      // grant the attacker has stolen BEFORE anyone used it. Possession of a
+      // grant plus possession of a key is still not an enrollment: what is
+      // missing is the independent human approval of THIS request's exact
+      // fingerprint, and nothing the attacker holds can produce one.
+      const stolen = await enrollment.issueBootstrapGrant(A.issuer, {
+        organisationId: fx.orgA,
+        siteId: fx.siteA1,
+        intendedUserId: fx.operativeAlpha,
+        traceId: traceId(),
+      });
+      if (stolen.outcome !== 'ISSUED') throw new Error('stolen grant');
       const attackerRequest = await enrollment.createEnrollmentRequest({
         organisationId: fx.orgA,
         siteId: fx.siteA1,
         intendedUserId: fx.operativeAlpha,
-        bootstrapToken: honest.grantToken,
+        bootstrapToken: stolen.token,
         custody: 'PERSONAL',
         publicKey: attackerKey.publicKey,
         keyStorage: 'HARDWARE_BACKED',
@@ -833,7 +955,6 @@ describe('WP-24 Shield device registry (live)', () => {
             organisationId: fx.orgA,
             enrollmentRequestId: attackerRequest.enrollmentRequestId,
             challengeId,
-            custodyRegimeId: null,
             traceId: traceId(),
           }),
           challengeId,
@@ -896,73 +1017,128 @@ describe('WP-24 Shield device registry (live)', () => {
   // -------------------------------------------------------------------------
 
   describe('D24-03a the bootstrap grant is single-use, scoped and burnable', () => {
-    it('a second, DIFFERENT enrollment under one grant refuses and creates no device', async () => {
+    it('C16-02: a second, DIFFERENT enrollment under one grant is refused AT REQUEST TIME', async () => {
       const first = await enrol();
 
-      // A second ceremony under the same grant: same replay identity, DIFFERENT
-      // statement fingerprint (a different key). That is reuse with changed
-      // meaning, and it is a conflict rather than a convergence.
-      const secondKey = generateTestDeviceKeyPair();
+      // Before C16-02 this opened a whole second ceremony behind one grant,
+      // collected its OWN human approval, and was only stopped at commit by the
+      // replay identity. Two approved candidates behind one piece of provenance
+      // is the problem; being refused at commit was the symptom.
       const secondRequest = await enrollment.createEnrollmentRequest({
         organisationId: fx.orgA,
         siteId: fx.siteA1,
         intendedUserId: fx.operativeAlpha,
         bootstrapToken: first.prepared.grantToken,
         custody: 'PERSONAL',
-        publicKey: secondKey.publicKey,
+        publicKey: generateTestDeviceKeyPair().publicKey,
         keyStorage: 'HARDWARE_BACKED',
         claimedSignatureProfile: PROFILE,
         custodyRegimeId: null,
         traceId: traceId(),
       });
-      if (secondRequest.outcome !== 'REQUESTED') throw new Error('second request');
-      const approval = await enrollment.approveEnrollmentRequest(A.approver, {
-        organisationId: fx.orgA,
-        enrollmentRequestId: secondRequest.enrollmentRequestId,
-        expectedRequestFingerprint: secondRequest.requestFingerprint,
-        traceId: traceId(),
-      });
-      expect(approval.outcome).toBe('APPROVED');
-      const challengeId = await issueAndAnswerChallenge(A, secondRequest.enrollmentRequestId, secondRequest.requestFingerprint, secondKey);
+      expect(secondRequest).toEqual({ outcome: 'REFUSED', refusal: 'ENROLLMENT_REQUEST_CONFLICT' });
 
-      const refused = await enrollment.commitEnrollment(A.intendedUser, {
-        organisationId: fx.orgA,
-        enrollmentRequestId: secondRequest.enrollmentRequestId,
-        challengeId,
-        custodyRegimeId: null,
-        traceId: traceId(),
-      });
-      expect(refused).toEqual({ outcome: 'REFUSED', refusal: 'BOOTSTRAP_GRANT_REUSED' });
-
-      // NEVER A SECOND DEVICE.
-      expect(await prisma.device.count({ where: { organisationId: fx.orgA, enrollmentRequestId: secondRequest.enrollmentRequestId } })).toBe(0);
+      // NEVER A SECOND REQUEST, AND NEVER A SECOND DEVICE.
+      expect(await prisma.enrollmentRequest.count({ where: { organisationId: fx.orgA, bootstrapGrantId: first.prepared.grantId } })).toBe(1);
       const grantDevices = await prisma.device.findMany({
         where: { organisationId: fx.orgA, enrollmentRequest: { bootstrapGrantId: first.prepared.grantId } },
       });
       expect(grantDevices.map((row) => row.id)).toEqual([first.deviceId]);
     });
 
-    it('changed semantics behind a spent grant CONFLICTS and mutates nothing', async () => {
+    it('C16-02: an IDENTICAL repeat submission under one grant converges on the existing request', async () => {
+      const prepared = await prepareCeremony();
+
+      const repeat = await enrollment.createEnrollmentRequest({
+        organisationId: fx.orgA,
+        siteId: fx.siteA1,
+        intendedUserId: fx.operativeAlpha,
+        bootstrapToken: prepared.grantToken,
+        custody: 'PERSONAL',
+        publicKey: prepared.keyPair.publicKey,
+        keyStorage: 'HARDWARE_BACKED',
+        claimedSignatureProfile: PROFILE,
+        custodyRegimeId: null,
+        traceId: traceId(),
+      });
+      // A dropped response is a RETRY, not a conflict: it converges on the
+      // request that already exists rather than being told its own earlier
+      // success was an error.
+      expect(repeat.outcome).toBe('CONVERGED');
+      if (repeat.outcome !== 'CONVERGED') throw new Error('unreachable');
+      expect(repeat.enrollmentRequestId).toBe(prepared.enrollmentRequestId);
+      expect(repeat.requestFingerprint).toBe(prepared.requestFingerprint);
+      expect(await prisma.enrollmentRequest.count({ where: { organisationId: fx.orgA, bootstrapGrantId: prepared.grantId } })).toBe(1);
+    });
+
+    it('C16-02: the DATABASE refuses a second request row under one grant', async () => {
+      const prepared = await prepareCeremony();
+      const existing = await prisma.enrollmentRequest.findUniqueOrThrow({ where: { id: prepared.enrollmentRequestId } });
+
+      // No service involved. `enrollment_request_grant_key` is what holds when
+      // the service is bypassed entirely.
+      await expect(
+        prisma.enrollmentRequest.create({
+          data: {
+            organisationId: fx.orgA,
+            siteId: fx.siteA1,
+            intendedUserId: fx.operativeAlpha,
+            bootstrapGrantId: existing.bootstrapGrantId,
+            custody: 'PERSONAL',
+            custodyRegimeId: null,
+            publicKey: generateTestDeviceKeyPair().publicKey,
+            publicKeyThumbprint: 'x'.repeat(64),
+            keyStorage: 'HARDWARE_BACKED',
+            claimedSignatureProfile: PROFILE,
+            serverSelectedSignatureProfile: PROFILE,
+            requestFingerprint: 'y'.repeat(64),
+            approvedSemanticsDigest: 'z'.repeat(64),
+            attestationOutcome: 'UNAVAILABLE',
+            attestationEvaluatedAt: new Date(),
+            attestationReference: null,
+            requestedAt: new Date(),
+            state: 'REQUESTED',
+          },
+        }),
+      ).rejects.toThrow(/enrollment_request_grant_key|Unique constraint/iu);
+    });
+
+    it('changed semantics behind a spent identity CONFLICTS and mutates nothing', async () => {
       const first = await enrol();
       const before = await prisma.deviceNonceConsumption.findFirstOrThrow({
         where: { organisationId: fx.orgA, ceremony: 'BOOTSTRAP_GRANT', storedOutcomeRef: first.deviceId },
       });
 
-      const changed = await prepareCeremonyReusingGrant(first.prepared.grantToken);
+      // With one request per grant, a second ceremony can no longer be built
+      // through the service — so the changed SEMANTICS are injected where the
+      // conflict actually lives: the spent identity is made to record a
+      // different statement fingerprint, exactly as a genuinely different
+      // earlier ceremony would have. This is the D24-11 detection under test,
+      // not the request table.
+      await prisma.deviceNonceConsumption.update({
+        where: { id: before.id },
+        data: { statementFingerprint: `${'0'.repeat(63)}1` },
+      });
+
       const refused = await enrollment.commitEnrollment(A.intendedUser, {
         organisationId: fx.orgA,
-        enrollmentRequestId: changed.enrollmentRequestId,
-        challengeId: changed.challengeId,
-        custodyRegimeId: null,
+        enrollmentRequestId: first.prepared.enrollmentRequestId,
+        // The ceremony's OWN challenge — exactly what an honest retry presents.
+        challengeId: first.prepared.challengeId,
         traceId: traceId(),
       });
       expect(refused).toEqual({ outcome: 'REFUSED', refusal: 'BOOTSTRAP_GRANT_REUSED' });
 
-      // The stored consumption row still points at the FIRST device. A
-      // conflict never rewrites what the identity was spent on.
+      // The stored consumption row still holds what the conflict was detected
+      // against. A conflict never rewrites what the identity was spent on, and
+      // C16-02's rollback did not take the pre-existing row with it: it was
+      // never part of the refused transaction.
       const after = await prisma.deviceNonceConsumption.findUniqueOrThrow({ where: { id: before.id } });
       expect(after.storedOutcomeRef).toBe(first.deviceId);
-      expect(after.statementFingerprint).toBe(before.statementFingerprint);
+      expect(after.statementFingerprint).toBe(`${'0'.repeat(63)}1`);
+
+      // And exactly one device still exists for this ceremony.
+      expect(await prisma.device.count({ where: { organisationId: fx.orgA, enrollmentRequestId: first.prepared.enrollmentRequestId } })).toBe(1);
     });
 
     it('an EXPIRED grant refuses, and the refusal names the grant rather than the clock', async () => {
@@ -1431,7 +1607,7 @@ describe('WP-24 Shield device registry (live)', () => {
       expect(stolenStanding.standing.revocationDisposition).toBe('STOLEN');
       expect(stolenStanding.standing.revokedAt).not.toBeNull();
       expect(stolenStanding.standing.currentKeyStatus).toBe('REVOKED');
-      expect(stolenStanding.standing.admitsNewOperations).toBe(false);
+      expect(stolenStanding.standing.credentialAdmitsNewOperations).toBe(false);
 
       // A stolen credential climbs nowhere.
       expect(
@@ -1495,8 +1671,8 @@ describe('WP-24 Shield device registry (live)', () => {
       if (standing.outcome !== 'FOUND') throw new Error('standing');
       expect(standing.standing.deviceLevelWithdrawn).toBe(false);
       expect(standing.standing.keyLevelWithdrawn).toBe(true);
-      expect(standing.standing.admitsNewOperations).toBe(false);
-      expect(await registry.deviceAdmitsNewOperations(fx.orgA, device.deviceId)).toBe(false);
+      expect(standing.standing.credentialAdmitsNewOperations).toBe(false);
+      expect(await registry.credentialAdmitsNewOperations(fx.orgA, device.deviceId)).toBe(false);
     });
 
     it('DEVICE revocation blocks new operations even before the KEY row catches up', async () => {
@@ -1511,8 +1687,8 @@ describe('WP-24 Shield device registry (live)', () => {
       expect(standing.standing.currentKeyStatus).toBe('CURRENT');
       expect(standing.standing.keyLevelWithdrawn).toBe(false);
       expect(standing.standing.deviceLevelWithdrawn).toBe(true);
-      expect(standing.standing.admitsNewOperations).toBe(false);
-      expect(await registry.deviceAdmitsNewOperations(fx.orgA, device.deviceId)).toBe(false);
+      expect(standing.standing.credentialAdmitsNewOperations).toBe(false);
+      expect(await registry.credentialAdmitsNewOperations(fx.orgA, device.deviceId)).toBe(false);
     });
   });
 
@@ -1734,23 +1910,47 @@ describe('WP-24 Shield device registry (live)', () => {
       const first = await deviceKeys.commitKeyRotation(A.approver, commitArgs);
       expect(first.outcome).toBe('ROTATED');
 
-      // D24-10A asks that the same identity with the same fingerprint "never
-      // rotates twice". It is upheld here by STALE_ROTATION rather than by the
-      // contract's CONVERGE arm, and that is a property of the FROZEN
-      // evaluator's ORDERING rather than a choice this runtime made:
-      // `evaluateDeviceKeyRotation` re-reads the registry and refuses a moved
-      // world at step 3, while the replay fact it would converge on is only
-      // consulted at step 5. Once a rotation has landed the registry HAS moved
-      // by definition, so a retry can never reach convergence. The effect the
-      // rule protects — no second rotation, no burned key version — holds
-      // either way, and it is recorded here rather than papered over.
+      // C16-03: AN EXACT RETRY CONVERGES ON WHAT ACTUALLY COMMITTED.
+      //
+      // It used to answer STALE_ROTATION, because the frozen evaluator checks a
+      // moved registry at step 3 and the replay fact only at step 5 — and once
+      // a rotation lands the registry HAS moved. Safe, but untruthful: the
+      // caller's own earlier attempt succeeded, and it was told a concurrent
+      // change had invalidated its request. The runtime now resolves the
+      // durable replay outcome BEFORE the evaluator, so the honest answer is
+      // reachable without changing the contract.
       const retry = await deviceKeys.commitKeyRotation(A.approver, commitArgs);
-      expect(retry).toEqual({ outcome: 'REFUSED', refusal: 'STALE_ROTATION' });
+      expect(retry.outcome).toBe('CONVERGED');
+      if (retry.outcome !== 'CONVERGED') throw new Error('unreachable');
 
-      // Exactly one new key version exists, and no version was burned twice.
+      // THE KEY RETURNED IS THE ONE ACTUALLY IN THE DATABASE, read back from
+      // the registry rather than echoed from the request.
+      const live = await prisma.deviceKey.findFirstOrThrow({
+        where: { organisationId: fx.orgA, deviceId: device.deviceId, status: 'CURRENT' },
+      });
+      expect(retry.toKeyId).toBe(live.keyId);
+      expect(retry.toKeyVersion).toBe(live.keyVersion);
+      expect(retry.deviceId).toBe(device.deviceId);
+      expect(retry.storedOutcomeRef).toBe(live.id);
+
+      // Exactly one new key version exists, and NO THIRD VERSION was created.
       expect(await prisma.deviceKey.count({ where: { organisationId: fx.orgA, deviceId: device.deviceId } })).toBe(2);
+      expect(await prisma.deviceKey.count({ where: { organisationId: fx.orgA, deviceId: device.deviceId, keyVersion: 3 } })).toBe(0);
       const row = await prisma.device.findUniqueOrThrow({ where: { id: device.deviceId } });
       expect(row.currentKeyVersion).toBe(2);
+
+      // C16-03: and a duplicate whose stored reference does NOT resolve to a
+      // committed rotation fails closed rather than manufacturing convergence.
+      const consumption = await prisma.deviceNonceConsumption.findFirstOrThrow({
+        where: { organisationId: fx.orgA, ceremony: 'KEY_ROTATION', storedOutcomeRef: live.id },
+      });
+      await prisma.deviceNonceConsumption.update({
+        where: { id: consumption.id },
+        data: { storedOutcomeRef: randomUUID() },
+      });
+      const unresolvable = await deviceKeys.commitKeyRotation(A.approver, commitArgs);
+      expect(unresolvable).toEqual({ outcome: 'REFUSED', refusal: 'ROTATION_OUTCOME_UNRESOLVABLE' });
+      expect(await prisma.deviceKey.count({ where: { organisationId: fx.orgA, deviceId: device.deviceId } })).toBe(2);
     });
   });
 
@@ -1939,6 +2139,689 @@ describe('WP-24 Shield device registry (live)', () => {
       expect(untouched.outcome === 'FOUND' && untouched.standing.revocationDisposition).toBeNull();
     });
   });
+
+  // ==========================================================================
+  // C16 CORRECTION BATCH
+  //
+  // Eight blockers found in adversarial review of the WP-24 runtime. Each block
+  // below drives the REAL services against the live stack and asserts the
+  // property that was missing, not merely that the new code runs.
+  // ==========================================================================
+
+  describe('C16-01 the CONTROLLED_SHARED custody regime is approval-bound', () => {
+    it('the regime id is SERVER-generated, and defining one needs device.enrollment.issue at that site', async () => {
+      const defined = await enrollment.defineCustodyRegime(A.issuer, {
+        organisationId: fx.orgA,
+        siteId: fx.siteA1,
+        name: `regime-${randomUUID()}`,
+        traceId: traceId(),
+      });
+      expect(defined.outcome).toBe('DEFINED');
+      if (defined.outcome !== 'DEFINED') throw new Error('unreachable');
+      // A uuid this process never chose. There is no parameter through which
+      // one could have been supplied.
+      expect(defined.custodyRegimeId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u);
+
+      // A field operative holds no device.enrollment.issue at all.
+      expect(
+        await enrollment.defineCustodyRegime(A.intendedUser, {
+          organisationId: fx.orgA,
+          siteId: fx.siteA1,
+          name: `regime-${randomUUID()}`,
+          traceId: traceId(),
+        }),
+      ).toEqual({ outcome: 'REFUSED', refusal: 'NOT_AUTHORISED' });
+
+      // A commander scoped to siteA2 cannot define a regime at siteA1.
+      expect(
+        await enrollment.defineCustodyRegime(principalFor(fx.commanderSiteA2, 'site.commander', fx.siteA2, fx.orgA), {
+          organisationId: fx.orgA,
+          siteId: fx.siteA1,
+          name: `regime-${randomUUID()}`,
+          traceId: traceId(),
+        }),
+      ).toEqual({ outcome: 'REFUSED', refusal: 'SITE_NOT_IN_SCOPE' });
+    });
+
+    it('CONTROLLED_SHARED without a regime refuses; PERSONAL with a regime refuses', async () => {
+      const regime = await defineRegime(A.issuer, fx.orgA, fx.siteA1);
+
+      await expect(prepareCeremony({ custody: 'CONTROLLED_SHARED', custodyRegimeId: null })).rejects.toThrow(
+        /CUSTODY_REGIME_REQUIRED/u,
+      );
+      await expect(prepareCeremony({ custody: 'PERSONAL', custodyRegimeId: regime })).rejects.toThrow(
+        /CUSTODY_REGIME_NOT_PERMITTED/u,
+      );
+    });
+
+    it('a regime from another organisation, another site, or a retired one all refuse', async () => {
+      const foreign = await defineRegime(B.issuer, fx.orgB, fx.siteB1);
+      const wrongSite = await defineRegime(orgWideCommanderA, fx.orgA, fx.siteA2);
+      const retired = await defineRegime(A.issuer, fx.orgA, fx.siteA1);
+      await prisma.deviceCustodyRegime.update({ where: { id: retired }, data: { retiredAt: new Date() } });
+
+      // Another tenant's regime and an invented id are INDISTINGUISHABLE.
+      await expect(prepareCeremony({ custody: 'CONTROLLED_SHARED', custodyRegimeId: foreign })).rejects.toThrow(
+        /CUSTODY_REGIME_NOT_FOUND/u,
+      );
+      await expect(prepareCeremony({ custody: 'CONTROLLED_SHARED', custodyRegimeId: randomUUID() })).rejects.toThrow(
+        /CUSTODY_REGIME_NOT_FOUND/u,
+      );
+      // Right tenant, wrong site: custody is a site fact and does not widen.
+      await expect(prepareCeremony({ custody: 'CONTROLLED_SHARED', custodyRegimeId: wrongSite })).rejects.toThrow(
+        /CUSTODY_REGIME_NOT_FOUND/u,
+      );
+      await expect(prepareCeremony({ custody: 'CONTROLLED_SHARED', custodyRegimeId: retired })).rejects.toThrow(
+        /CUSTODY_REGIME_RETIRED/u,
+      );
+
+      // A régime id is UNTRUSTED INPUT. A value that is not even a uuid must
+      // answer NOT_FOUND like any other absent régime, never surface the
+      // uuid-column comparison as a driver fault: a refusal is data in this
+      // module, and an exception is not a refusal.
+      await expect(prepareCeremony({ custody: 'CONTROLLED_SHARED', custodyRegimeId: "not-a-uuid'; drop" })).rejects.toThrow(
+        /CUSTODY_REGIME_NOT_FOUND/u,
+      );
+    });
+
+    it('a controlled-shared enrollment commits under the regime the APPROVER bound', async () => {
+      const regime = await defineRegime(A.issuer, fx.orgA, fx.siteA1);
+      const device = await enrol({ custody: 'CONTROLLED_SHARED', custodyRegimeId: regime });
+
+      const scope = await prisma.deviceSiteScope.findFirstOrThrow({
+        where: { organisationId: fx.orgA, deviceId: device.deviceId },
+      });
+      expect(scope.custody).toBe('CONTROLLED_SHARED');
+      expect(scope.custodyRegimeId).toBe(regime);
+      // C15-08: a shared device names no permanent assignee.
+      expect(scope.assignedUserId).toBeNull();
+
+      const approval = await prisma.enrollmentApproval.findFirstOrThrow({
+        where: { organisationId: fx.orgA, enrollmentRequestId: device.prepared.enrollmentRequestId },
+      });
+      expect(approval.approvedCustodyRegimeId).toBe(regime);
+      expect(approval.approvedSemanticsDigest).toHaveLength(64);
+    });
+
+    it('THE BLOCKER: a regime mutated after approval refuses the commit and creates no device', async () => {
+      const approved = await defineRegime(A.issuer, fx.orgA, fx.siteA1);
+      const substituted = await defineRegime(A.issuer, fx.orgA, fx.siteA1);
+      const prepared = await prepareCeremony({ custody: 'CONTROLLED_SHARED', custodyRegimeId: approved });
+
+      // A service-bypassing writer — or a later edit — swaps the regime behind
+      // the standing approval. The FROZEN request fingerprint does not move,
+      // because `DeviceEnrollmentRequestSchema` has no regime field at all; if
+      // the approval bound only that fingerprint, this commit would succeed and
+      // the device would be governed by a regime no human ever approved.
+      const before = await prisma.enrollmentRequest.findUniqueOrThrow({ where: { id: prepared.enrollmentRequestId } });
+      await prisma.enrollmentRequest.update({
+        where: { id: prepared.enrollmentRequestId },
+        data: { custodyRegimeId: substituted },
+      });
+      const after = await prisma.enrollmentRequest.findUniqueOrThrow({ where: { id: prepared.enrollmentRequestId } });
+      expect(after.requestFingerprint).toBe(before.requestFingerprint);
+
+      expect(await commit(prepared)).toEqual({ outcome: 'REFUSED', refusal: 'APPROVED_SEMANTICS_MISMATCH' });
+
+      // ZERO DEVICES.
+      expect(await prisma.device.count({ where: { organisationId: fx.orgA, enrollmentRequestId: prepared.enrollmentRequestId } })).toBe(0);
+    });
+  });
+
+  describe('C16-02 a replay row never outlives the effect it claims', () => {
+    it('THE BLOCKER: a refused enrollment leaves ZERO consumption rows', async () => {
+      // A ceremony refused at the gate. The bootstrap issuer commits it, so
+      // `ISSUER_MAY_NOT_APPROVE`... no: that is prevalidated. This one is
+      // refused by the CONTRACT, after both identities have been consumed —
+      // the possession verdict is bound to a key that is not the approved one.
+      const keyPair = generateTestDeviceKeyPair();
+      const attacker = generateTestDeviceKeyPair();
+      const prepared = await prepareCeremony({ keyPair });
+
+      // Answer a FRESH challenge with the attacker's key over the approved
+      // key's statement: a real, recorded `verified: false` verdict.
+      const badChallenge = await issueAndAnswerChallenge(
+        prepared.tenant,
+        prepared.enrollmentRequestId,
+        prepared.requestFingerprint,
+        attacker,
+        keyPair,
+      );
+
+      const before = await prisma.deviceNonceConsumption.count({ where: { organisationId: fx.orgA } });
+      const refused = await enrollment.commitEnrollment(A.intendedUser, {
+        organisationId: fx.orgA,
+        enrollmentRequestId: prepared.enrollmentRequestId,
+        challengeId: badChallenge,
+        traceId: traceId(),
+      });
+      expect(refused.outcome).toBe('REFUSED');
+      if (refused.outcome !== 'REFUSED') throw new Error('unreachable');
+      expect(refused.refusal).toBe('POSSESSION_NOT_PROVEN');
+
+      // THE ASSERTION THAT WAS MISSING. Before C16-02 this transaction
+      // committed two FIRST_SEEN rows naming a device that was never created,
+      // and a later exact retry converged toward it.
+      const after = await prisma.deviceNonceConsumption.count({ where: { organisationId: fx.orgA } });
+      expect(after).toBe(before);
+      expect(await prisma.device.count({ where: { organisationId: fx.orgA, enrollmentRequestId: prepared.enrollmentRequestId } })).toBe(0);
+
+      // The D24-12 trail survives the rollback: the refusal is still recorded.
+      const events = await repository.listSecurityEvents(fx.orgA, null);
+      const refusals = events.filter(
+        (event) =>
+          event.eventType === 'ENROLLMENT_REFUSED' &&
+          (event.payload as { enrollment_request_id?: string }).enrollment_request_id === prepared.enrollmentRequestId,
+      );
+      expect(refusals.length).toBeGreaterThan(0);
+    });
+
+    it('THE BLOCKER: a stored outcome ref pointing at no device refuses rather than converging', async () => {
+      const device = await enrol();
+      const consumption = await prisma.deviceNonceConsumption.findFirstOrThrow({
+        where: { organisationId: fx.orgA, ceremony: 'POSSESSION_CHALLENGE', storedOutcomeRef: device.deviceId },
+      });
+      const phantom = randomUUID();
+      await prisma.deviceNonceConsumption.updateMany({
+        where: { organisationId: fx.orgA, storedOutcomeRef: device.deviceId },
+        data: { storedOutcomeRef: phantom },
+      });
+      expect(consumption.storedOutcomeRef).toBe(device.deviceId);
+
+      const retried = await enrollment.commitEnrollment(A.intendedUser, {
+        organisationId: fx.orgA,
+        enrollmentRequestId: device.prepared.enrollmentRequestId,
+        challengeId: device.prepared.challengeId,
+        traceId: traceId(),
+      });
+      // NEVER a CONVERGED answer naming hardware that does not exist.
+      expect(retried).toEqual({ outcome: 'REFUSED', refusal: 'REPLAY_OUTCOME_UNRESOLVABLE' });
+    });
+
+    it('THE BLOCKER: dual replay identities pointing at DIFFERENT outcomes refuse', async () => {
+      const device = await enrol();
+      const other = await enrol();
+
+      await prisma.deviceNonceConsumption.updateMany({
+        where: { organisationId: fx.orgA, ceremony: 'BOOTSTRAP_GRANT', storedOutcomeRef: device.deviceId },
+        data: { storedOutcomeRef: other.deviceId },
+      });
+
+      const retried = await enrollment.commitEnrollment(A.intendedUser, {
+        organisationId: fx.orgA,
+        enrollmentRequestId: device.prepared.enrollmentRequestId,
+        challengeId: device.prepared.challengeId,
+        traceId: traceId(),
+      });
+      // The store is telling two stories about one ceremony. Converging on
+      // either would hand the caller someone else's enrolment.
+      expect(retried).toEqual({ outcome: 'REFUSED', refusal: 'REPLAY_OUTCOME_DIVERGED' });
+    });
+
+    it('a resolvable exact retry still CONVERGES on the one real device', async () => {
+      const device = await enrol();
+      const retried = await enrollment.commitEnrollment(A.intendedUser, {
+        organisationId: fx.orgA,
+        enrollmentRequestId: device.prepared.enrollmentRequestId,
+        challengeId: device.prepared.challengeId,
+        traceId: traceId(),
+      });
+      expect(retried).toEqual({ outcome: 'CONVERGED', deviceId: device.deviceId });
+      expect(await prisma.device.count({ where: { organisationId: fx.orgA, enrollmentRequestId: device.prepared.enrollmentRequestId } })).toBe(1);
+    });
+  });
+
+  describe('C16-04 no partial security-state commits', () => {
+    it('THE BLOCKER: a failed final pointer CAS leaves the old key CURRENT and no new key row', async () => {
+      const device = await enrol({ attestationOutcome: 'VERIFIED', keyStorage: 'HARDWARE_BACKED' });
+
+      // FAULT INJECTION. The pointer compare-and-set reports zero rows, exactly
+      // as it would if another path had moved the device between the lock and
+      // the write. Before C16-04 the refusal RETURNED, which committed the old
+      // key as ROTATED and the new key as CURRENT — two live keys and a device
+      // pointing at neither.
+      const consumptionsBefore = await prisma.deviceNonceConsumption.count({
+        where: { organisationId: fx.orgA, ceremony: 'KEY_ROTATION' },
+      });
+      const spy = vi.spyOn(repository, 'advanceDeviceCurrentKey').mockResolvedValue(0);
+      let outcome: Awaited<ReturnType<DeviceKeyService['commitKeyRotation']>>;
+      try {
+        outcome = (await rotate(device)).outcome;
+      } finally {
+        spy.mockRestore();
+      }
+      expect(outcome).toEqual({ outcome: 'REFUSED', refusal: 'STALE_ROTATION' });
+
+      const keys = await prisma.deviceKey.findMany({ where: { organisationId: fx.orgA, deviceId: device.deviceId } });
+      expect(keys).toHaveLength(1);
+      expect(keys[0]?.status).toBe('CURRENT');
+      expect(keys[0]?.rotatedAt).toBeNull();
+      const row = await prisma.device.findUniqueOrThrow({ where: { id: device.deviceId } });
+      expect(row.currentKeyId).toBe(device.keyId);
+      expect(row.currentKeyVersion).toBe(1);
+
+      // AND NO PARTIAL-SUCCESS AUDIT EVENT.
+      const events = await repository.listSecurityEvents(fx.orgA, device.deviceId);
+      expect(events.filter((event) => event.eventType === 'KEY_ROTATED')).toHaveLength(0);
+      // The replay identity was not spent either: the consumption row this
+      // transaction wrote went with the rollback.
+      expect(await prisma.deviceNonceConsumption.count({ where: { organisationId: fx.orgA, ceremony: 'KEY_ROTATION' } })).toBe(
+        consumptionsBefore,
+      );
+    });
+
+    it('THE BLOCKER: a failed key withdrawal leaves device trust and revocation untouched', async () => {
+      const device = await enrol({ attestationOutcome: 'VERIFIED', keyStorage: 'HARDWARE_BACKED' });
+
+      const spy = vi.spyOn(repository, 'withdrawDeviceKey').mockResolvedValue(0);
+      let outcome: Awaited<ReturnType<DeviceTrustService['declareDisposition']>>;
+      try {
+        outcome = await trust.declareDisposition(A.approver, {
+          organisationId: fx.orgA,
+          deviceId: device.deviceId,
+          disposition: 'STOLEN',
+          reason: 'fault injection',
+          traceId: traceId(),
+        });
+      } finally {
+        spy.mockRestore();
+      }
+      expect(outcome).toEqual({ outcome: 'REFUSED', refusal: 'DEVICE_CREDENTIAL_WITHDRAWN' });
+
+      // NOTHING MOVED. Before C16-04 the trust change, the transition record
+      // and the device-level revocation had all already been written.
+      const row = await prisma.device.findUniqueOrThrow({ where: { id: device.deviceId } });
+      expect(row.trust).toBe('TRUSTED');
+      expect(row.revokedAt).toBeNull();
+      expect(row.revocationDisposition).toBeNull();
+      const key = await prisma.deviceKey.findFirstOrThrow({ where: { organisationId: fx.orgA, keyId: device.keyId } });
+      expect(key.status).toBe('CURRENT');
+      expect(key.revokedAt).toBeNull();
+      const events = await repository.listSecurityEvents(fx.orgA, device.deviceId);
+      expect(events.filter((event) => event.eventType === 'DEVICE_REVOKED' || event.eventType === 'DEVICE_STOLEN')).toHaveLength(0);
+    });
+  });
+
+  describe('C16-05 attestation ages, and a negative is never un-said', () => {
+    it('THE BLOCKER: recording UNAVAILABLE inside the grace keeps TRUSTED; past it, TRUSTED degrades', async () => {
+      // THE EXACT MILLISECOND BOUNDARY IS ASSERTED IN `attestation.standing.spec.ts`,
+      // against the pure resolver, because only there can it be asserted
+      // honestly. Here the ages are written from THIS PROCESS's clock and
+      // judged against POSTGRES's `clock_timestamp()`, and those are two
+      // different clocks: the container's can sit tens of milliseconds either
+      // side of the host's, and the offset moves. A `grace + 1 ms` fixture is
+      // therefore a coin toss wearing the costume of a precise test — it
+      // failed exactly that way during this batch — so both sides are placed
+      // TEN MINUTES clear of the boundary and this test asserts the BEHAVIOUR:
+      // ageing happens at all, and it happens on the correct side of the
+      // grace. The millisecond is the unit spec's job.
+      const inside = await enrol({ attestationOutcome: 'VERIFIED', keyStorage: 'HARDWARE_BACKED' });
+      expect(inside.trust).toBe('TRUSTED');
+      await ageAttestation(inside.deviceId, DEVICE_ATTESTATION_UNAVAILABLE_GRACE_MS - 600_000);
+      attestation.outcome = 'UNAVAILABLE';
+      await trust.recordAttestationObservation({ organisationId: fx.orgA, deviceId: inside.deviceId, traceId: traceId() });
+      // Ten minutes inside the six-hour grace: still last-known-good, still TRUSTED.
+      expect((await prisma.device.findUniqueOrThrow({ where: { id: inside.deviceId } })).trust).toBe('TRUSTED');
+
+      const outside = await enrol({ attestationOutcome: 'VERIFIED', keyStorage: 'HARDWARE_BACKED' });
+      expect(outside.trust).toBe('TRUSTED');
+      await ageAttestation(outside.deviceId, DEVICE_ATTESTATION_UNAVAILABLE_GRACE_MS + 600_000);
+      attestation.outcome = 'UNAVAILABLE';
+      await trust.recordAttestationObservation({ organisationId: fx.orgA, deviceId: outside.deviceId, traceId: traceId() });
+      // Past the grace the platform can no longer vouch for it. Before C16-05
+      // recording UNAVAILABLE did nothing at all and this device stayed TRUSTED
+      // for ever — the outage never aged into anything.
+      expect((await prisma.device.findUniqueOrThrow({ where: { id: outside.deviceId } })).trust).toBe('DEGRADED');
+      // DEGRADED, not QUARANTINED: an expired attestation is ignorance, and
+      // nothing has accused this device of anything.
+      const transitions = await repository.listTrustTransitions(fx.orgA, outside.deviceId);
+      expect(transitions.at(-1)?.reason).toBe('ATTESTATION_STANDING_EXPIRED');
+    });
+
+    it('THE BLOCKER: VERIFIED -> NEGATIVE -> UNAVAILABLE stays negative until a NEW verified result', async () => {
+      const device = await enrol({ attestationOutcome: 'VERIFIED', keyStorage: 'HARDWARE_BACKED' });
+      expect(device.trust).toBe('TRUSTED');
+
+      attestation.outcome = 'NEGATIVE';
+      await trust.recordAttestationObservation({ organisationId: fx.orgA, deviceId: device.deviceId, traceId: traceId() });
+      expect((await prisma.device.findUniqueOrThrow({ where: { id: device.deviceId } })).trust).toBe('QUARANTINED');
+
+      // The provider then goes down. Before C16-05 the "latest VERIFIED" lookup
+      // rediscovered the pre-negative result and reported LAST_KNOWN_GOOD — the
+      // outage ERASED the negative evidence — so a restoration would find
+      // qualifying evidence where there was none.
+      attestation.outcome = 'UNAVAILABLE';
+      await trust.recordAttestationObservation({ organisationId: fx.orgA, deviceId: device.deviceId, traceId: traceId() });
+
+      const stillRefused = await trust.changeDeviceTrust(restorer, {
+        organisationId: fx.orgA,
+        deviceId: device.deviceId,
+        to: 'TRUSTED',
+        reason: 'attempted restoration during outage',
+        traceId: traceId(),
+      });
+      expect(stillRefused).toEqual({ outcome: 'REFUSED', refusal: 'ATTESTATION_NOT_QUALIFYING' });
+      expect((await prisma.device.findUniqueOrThrow({ where: { id: device.deviceId } })).trust).toBe('QUARANTINED');
+
+      // Only a NEW verified observation lets it climb back.
+      attestation.outcome = 'VERIFIED';
+      await trust.recordAttestationObservation({ organisationId: fx.orgA, deviceId: device.deviceId, traceId: traceId() });
+      const restored = await trust.changeDeviceTrust(restorer, {
+        organisationId: fx.orgA,
+        deviceId: device.deviceId,
+        to: 'TRUSTED',
+        reason: 'restored on fresh evidence',
+        traceId: traceId(),
+      });
+      expect(restored.outcome).toBe('CHANGED');
+    });
+
+    it('THE BLOCKER: a key revoked concurrently with a restoration attempt fails closed', async () => {
+      const device = await enrol({ attestationOutcome: 'VERIFIED', keyStorage: 'HARDWARE_BACKED' });
+      attestation.outcome = 'NEGATIVE';
+      await trust.recordAttestationObservation({ organisationId: fx.orgA, deviceId: device.deviceId, traceId: traceId() });
+      attestation.outcome = 'VERIFIED';
+      await trust.recordAttestationObservation({ organisationId: fx.orgA, deviceId: device.deviceId, traceId: traceId() });
+
+      // The credential is withdrawn between the caller's pre-read and the
+      // decision. The upward transition re-reads and LOCKS the key inside its
+      // own transaction, so it sees the revocation rather than the stale row.
+      await prisma.deviceKey.updateMany({
+        where: { organisationId: fx.orgA, keyId: device.keyId },
+        data: { status: 'REVOKED', revokedAt: new Date(), revocationDisposition: 'STOLEN' },
+      });
+
+      const refused = await trust.changeDeviceTrust(restorer, {
+        organisationId: fx.orgA,
+        deviceId: device.deviceId,
+        to: 'TRUSTED',
+        reason: 'restoration racing a revocation',
+        traceId: traceId(),
+      });
+      expect(refused).toEqual({ outcome: 'REFUSED', refusal: 'CREDENTIAL_REVOKED' });
+      expect((await prisma.device.findUniqueOrThrow({ where: { id: device.deviceId } })).trust).toBe('QUARANTINED');
+    });
+  });
+
+  describe('C16-06 multi-site ABAC does not leak and does not over-reach', () => {
+    it('THE BLOCKER: a reader scoped to site A sees ONLY A on an A+B device', async () => {
+      const device = await enrol();
+      await associateExtraSite(device.deviceId, fx.siteA2);
+
+      const scoped = await registry.readDeviceStanding(A.approver, { organisationId: fx.orgA, deviceId: device.deviceId });
+      expect(scoped.outcome).toBe('FOUND');
+      if (scoped.outcome !== 'FOUND') throw new Error('unreachable');
+      // Holding site A1 is not a way to learn the device is ALSO at A2.
+      expect([...scoped.standing.siteIds].sort()).toEqual([fx.siteA1]);
+
+      const orgWide = await registry.readDeviceStanding(orgWideCommanderA, { organisationId: fx.orgA, deviceId: device.deviceId });
+      expect(orgWide.outcome).toBe('FOUND');
+      if (orgWide.outcome !== 'FOUND') throw new Error('unreachable');
+      expect([...orgWide.standing.siteIds].sort()).toEqual([fx.siteA1, fx.siteA2].sort());
+    });
+
+    it('THE BLOCKER: holding ONE of a devices sites cannot rotate, revoke or change its trust', async () => {
+      const device = await enrol({ attestationOutcome: 'VERIFIED', keyStorage: 'HARDWARE_BACKED' });
+      await associateExtraSite(device.deviceId, fx.siteA2);
+
+      // The commander holds siteA1 only. Rotation replaces the ONE credential
+      // the siteA2 deployment also depends on.
+      expect(
+        await deviceKeys.requestKeyRotation(A.approver, {
+          organisationId: fx.orgA,
+          deviceId: device.deviceId,
+          newPublicKey: generateTestDeviceKeyPair().publicKey,
+          newKeyStorage: 'HARDWARE_BACKED',
+          traceId: traceId(),
+        }),
+      ).toEqual({ outcome: 'REFUSED', refusal: 'DEVICE_NOT_FOUND' });
+
+      expect(
+        await trust.changeDeviceTrust(A.approver, {
+          organisationId: fx.orgA,
+          deviceId: device.deviceId,
+          to: 'OFFLINE',
+          reason: 'partial authority',
+          traceId: traceId(),
+        }),
+      ).toEqual({ outcome: 'REFUSED', refusal: 'DEVICE_NOT_FOUND' });
+
+      expect(
+        await trust.declareDisposition(A.approver, {
+          organisationId: fx.orgA,
+          deviceId: device.deviceId,
+          disposition: 'LOST',
+          reason: 'partial authority',
+          traceId: traceId(),
+        }),
+      ).toEqual({ outcome: 'REFUSED', refusal: 'DEVICE_NOT_FOUND' });
+
+      // AN ORG-WIDE COMMANDER CAN.
+      const rotation = await deviceKeys.requestKeyRotation(orgWideCommanderA, {
+        organisationId: fx.orgA,
+        deviceId: device.deviceId,
+        newPublicKey: generateTestDeviceKeyPair().publicKey,
+        newKeyStorage: 'HARDWARE_BACKED',
+        traceId: traceId(),
+      });
+      expect(rotation.outcome).toBe('REQUESTED');
+      expect(
+        (
+          await trust.changeDeviceTrust(orgWideCommanderA, {
+            organisationId: fx.orgA,
+            deviceId: device.deviceId,
+            to: 'OFFLINE',
+            reason: 'org-wide authority',
+            traceId: traceId(),
+          })
+        ).outcome,
+      ).toBe('CHANGED');
+    });
+
+    it('THE BLOCKER: a device with NO active site scope refuses a site-scoped commander and admits an org-wide one', async () => {
+      const device = await enrol({ attestationOutcome: 'VERIFIED', keyStorage: 'HARDWARE_BACKED' });
+      await prisma.deviceSiteScope.updateMany({
+        where: { organisationId: fx.orgA, deviceId: device.deviceId },
+        data: { releasedAt: new Date() },
+      });
+
+      // The old `siteIds.length === 0 -> authorised` shortcut made an unscoped
+      // device reachable by anyone holding the action anywhere in the tenant.
+      expect(
+        await trust.changeDeviceTrust(A.approver, {
+          organisationId: fx.orgA,
+          deviceId: device.deviceId,
+          to: 'OFFLINE',
+          reason: 'unscoped device',
+          traceId: traceId(),
+        }),
+      ).toEqual({ outcome: 'REFUSED', refusal: 'DEVICE_NOT_FOUND' });
+      expect(
+        (await registry.readDeviceStanding(A.approver, { organisationId: fx.orgA, deviceId: device.deviceId })).outcome,
+      ).toBe('REFUSED');
+
+      expect(
+        (
+          await trust.changeDeviceTrust(orgWideCommanderA, {
+            organisationId: fx.orgA,
+            deviceId: device.deviceId,
+            to: 'OFFLINE',
+            reason: 'unscoped device, org-wide authority',
+            traceId: traceId(),
+          })
+        ).outcome,
+      ).toBe('CHANGED');
+      expect(
+        (await registry.readDeviceStanding(orgWideCommanderA, { organisationId: fx.orgA, deviceId: device.deviceId })).outcome,
+      ).toBe('FOUND');
+    });
+  });
+
+  describe('C16-07 credentialAdmitsNewOperations is not operational authorisation', () => {
+    it('THE BLOCKER: every unhealthy trust state with a HEALTHY key passes the credential check and fails deviceMayAct', async () => {
+      for (const unhealthy of ['QUARANTINED', 'SUSPICIOUS', 'OFFLINE', 'COMPROMISED'] as const) {
+        const device = await enrol({ attestationOutcome: 'VERIFIED', keyStorage: 'HARDWARE_BACKED' });
+        // Trust is moved DIRECTLY so the key stays perfectly healthy: this test
+        // is about the two questions being independent, not about how a device
+        // reaches each state.
+        await prisma.device.update({ where: { id: device.deviceId }, data: { trust: unhealthy } });
+
+        const key = await prisma.deviceKey.findFirstOrThrow({ where: { organisationId: fx.orgA, keyId: device.keyId } });
+        expect(key.status).toBe('CURRENT');
+        expect(key.revokedAt).toBeNull();
+
+        // COMPROMISED is the one state that is ALSO a device-level withdrawal
+        // (D23-05 makes it terminal for the identity), so the credential check
+        // correctly refuses it. The other three are the overclaim C16-07 names.
+        expect(await registry.credentialAdmitsNewOperations(fx.orgA, device.deviceId)).toBe(unhealthy !== 'COMPROMISED');
+
+        // AND NONE OF THEM MAY ACT.
+        expect(await registry.deviceMayAct(fx.orgA, device.deviceId, 'WHISPER_DEVICE_ACTION')).toBe(false);
+        expect(await registry.deviceMayAct(fx.orgA, device.deviceId, 'FIELD_OPERATION')).toBe(false);
+      }
+    });
+
+    it('a TRUSTED device with a healthy key may act for both purposes', async () => {
+      const device = await enrol({ attestationOutcome: 'VERIFIED', keyStorage: 'HARDWARE_BACKED' });
+      expect(device.trust).toBe('TRUSTED');
+      expect(await registry.credentialAdmitsNewOperations(fx.orgA, device.deviceId)).toBe(true);
+      expect(await registry.deviceMayAct(fx.orgA, device.deviceId, 'WHISPER_DEVICE_ACTION')).toBe(true);
+      expect(await registry.deviceMayAct(fx.orgA, device.deviceId, 'FIELD_OPERATION')).toBe(true);
+      // W21-05 mirrored: DEGRADED may work the field and may NOT fire Whisper.
+      await prisma.device.update({ where: { id: device.deviceId }, data: { trust: 'DEGRADED' } });
+      expect(await registry.deviceMayAct(fx.orgA, device.deviceId, 'FIELD_OPERATION')).toBe(true);
+      expect(await registry.deviceMayAct(fx.orgA, device.deviceId, 'WHISPER_DEVICE_ACTION')).toBe(false);
+    });
+  });
+
+  describe('C16-08 registry invariants are enforced by the database', () => {
+    it('THE BLOCKER: a second CURRENT key for one device is rejected by Postgres', async () => {
+      const device = await enrol();
+      await expect(
+        prisma.$executeRawUnsafe(
+          `INSERT INTO device_keys (id, organisation_id, device_id, key_id, key_version, public_key,
+             public_key_thumbprint, signature_profile, key_storage, status, registered_at, updated_at)
+           VALUES ($1::uuid, $2, $3::uuid, $4, $5, $6, $7, $8, $9, 'CURRENT', now(), now())`,
+          randomUUID(),
+          fx.orgA,
+          device.deviceId,
+          `dup-${randomUUID()}`,
+          99,
+          generateTestDeviceKeyPair().publicKey,
+          'a'.repeat(64),
+          PROFILE,
+          'HARDWARE_BACKED',
+        ),
+        // Postgres reports a unique violation on the PARTIAL index by naming
+        // its columns; the raw driver surfaces the message rather than the
+        // index name, so the assertion names what the message actually says.
+      ).rejects.toThrow(/Key \(organisation_id, device_id\)/u);
+    });
+
+    it('THE BLOCKER: a possession verification naming another requests challenge is rejected by Postgres', async () => {
+      const first = await prepareCeremony();
+      const second = await prepareCeremony();
+
+      // A FRESH challenge for `second`, deliberately unanswered: a challenge
+      // that already carries a verdict would hit
+      // `possession_verification_challenge_key` first and prove nothing about
+      // the tuple constraint under test.
+      const spare = await enrollment.issuePossessionChallenge(second.tenant.intendedUser, {
+        organisationId: fx.orgA,
+        enrollmentRequestId: second.enrollmentRequestId,
+        traceId: traceId(),
+      });
+      if (spare.outcome !== 'ISSUED') throw new Error('spare challenge');
+
+      // A verdict for `second`'s challenge, filed against `first`'s request.
+      // No service is involved: this is referential integrity, not a check.
+      await expect(
+        prisma.$executeRawUnsafe(
+          `INSERT INTO device_possession_verifications (id, organisation_id, challenge_id, enrollment_request_id,
+             enrollment_request_fingerprint, public_key_thumbprint, possession_statement_fingerprint,
+             signature_profile, verified, verified_at, updated_at)
+           VALUES ($1::uuid, $2, $3::uuid, $4::uuid, $5, $6, $7, $8, true, now(), now())`,
+          randomUUID(),
+          fx.orgA,
+          spare.challengeId,
+          first.enrollmentRequestId,
+          first.requestFingerprint,
+          'b'.repeat(64),
+          'c'.repeat(64),
+          PROFILE,
+        ),
+      ).rejects.toThrow(/device_possession_verifications_challenge_id_organisation__fkey|foreign key/iu);
+
+      // And the same challenge filed under ANOTHER TENANT is refused too.
+      await expect(
+        prisma.$executeRawUnsafe(
+          `INSERT INTO device_possession_verifications (id, organisation_id, challenge_id, enrollment_request_id,
+             enrollment_request_fingerprint, public_key_thumbprint, possession_statement_fingerprint,
+             signature_profile, verified, verified_at, updated_at)
+           VALUES ($1::uuid, $2, $3::uuid, $4::uuid, $5, $6, $7, $8, true, now(), now())`,
+          randomUUID(),
+          fx.orgB,
+          first.challengeId,
+          first.enrollmentRequestId,
+          first.requestFingerprint,
+          'b'.repeat(64),
+          'c'.repeat(64),
+          PROFILE,
+        ),
+      ).rejects.toThrow(/fkey|foreign key/iu);
+    });
+
+    it('THE BLOCKER: a rotation verification naming an inconsistent challenge/request is rejected by Postgres', async () => {
+      const device = await enrol({ attestationOutcome: 'VERIFIED', keyStorage: 'HARDWARE_BACKED' });
+      const other = await enrol({ attestationOutcome: 'VERIFIED', keyStorage: 'HARDWARE_BACKED' });
+
+      const requestA = await deviceKeys.requestKeyRotation(orgWideCommanderA, {
+        organisationId: fx.orgA,
+        deviceId: device.deviceId,
+        newPublicKey: generateTestDeviceKeyPair().publicKey,
+        newKeyStorage: 'HARDWARE_BACKED',
+        traceId: traceId(),
+      });
+      if (requestA.outcome !== 'REQUESTED') throw new Error('rotation request');
+      const requestB = await deviceKeys.requestKeyRotation(orgWideCommanderA, {
+        organisationId: fx.orgA,
+        deviceId: other.deviceId,
+        newPublicKey: generateTestDeviceKeyPair().publicKey,
+        newKeyStorage: 'HARDWARE_BACKED',
+        traceId: traceId(),
+      });
+      if (requestB.outcome !== 'REQUESTED') throw new Error('rotation request B');
+      const challengeB = await deviceKeys.issueRotationChallenge(orgWideCommanderA, {
+        organisationId: fx.orgA,
+        rotationRequestId: requestB.rotationRequestId,
+        traceId: traceId(),
+      });
+      if (challengeB.outcome !== 'ISSUED') throw new Error('rotation challenge B');
+
+      // Device A's rotation request, device B's challenge. The four-column
+      // composite reference makes the tuple unrepresentable.
+      await expect(
+        prisma.$executeRawUnsafe(
+          `INSERT INTO device_key_rotation_verifications (id, organisation_id, device_id, rotation_request_id,
+             rotation_request_fingerprint, rotation_challenge_id, current_key_id, current_key_version,
+             proposed_key_id, proposed_key_version, new_public_key_thumbprint, signature_profile,
+             canonical_statement_fingerprint, verified, verified_at, updated_at)
+           VALUES ($1::uuid, $2, $3::uuid, $4::uuid, $5, $6::uuid, $7, 1, $8, 2, $9, $10, $11, true, now(), now())`,
+          randomUUID(),
+          fx.orgA,
+          device.deviceId,
+          requestA.rotationRequestId,
+          requestA.rotationRequestFingerprint,
+          challengeB.challengeId,
+          device.keyId,
+          requestA.proposedKeyId,
+          'd'.repeat(64),
+          PROFILE,
+          'e'.repeat(64),
+        ),
+      ).rejects.toThrow(/fkey|foreign key/iu);
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1982,28 +2865,3 @@ async function prepareCeremonyStoppingAtApproval(): Promise<{ enrollmentRequestI
   return { enrollmentRequestId: request.enrollmentRequestId, requestFingerprint: request.requestFingerprint };
 }
 
-/** A fully prepared ceremony that deliberately reuses an already-spent grant. */
-async function prepareCeremonyReusingGrant(token: string): Promise<{ enrollmentRequestId: string; challengeId: string }> {
-  const keyPair = generateTestDeviceKeyPair();
-  const request = await enrollment.createEnrollmentRequest({
-    organisationId: fx.orgA,
-    siteId: fx.siteA1,
-    intendedUserId: fx.operativeAlpha,
-    bootstrapToken: token,
-    custody: 'PERSONAL',
-    publicKey: keyPair.publicKey,
-    keyStorage: 'HARDWARE_BACKED',
-    claimedSignatureProfile: PROFILE,
-    custodyRegimeId: null,
-    traceId: traceId(),
-  });
-  if (request.outcome !== 'REQUESTED') throw new Error('reuse request');
-  await enrollment.approveEnrollmentRequest(A.approver, {
-    organisationId: fx.orgA,
-    enrollmentRequestId: request.enrollmentRequestId,
-    expectedRequestFingerprint: request.requestFingerprint,
-    traceId: traceId(),
-  });
-  const challengeId = await issueAndAnswerChallenge(A, request.enrollmentRequestId, request.requestFingerprint, keyPair);
-  return { enrollmentRequestId: request.enrollmentRequestId, challengeId };
-}

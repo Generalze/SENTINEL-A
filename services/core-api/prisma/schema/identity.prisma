@@ -67,6 +67,8 @@ model Site {
   deviceSiteScopes DeviceSiteScope[]
   deviceBootstrapGrants EnrollmentBootstrapGrant[]
   deviceEnrollmentRequests EnrollmentRequest[]
+  /// C16-01: the server-issued custody-regime catalogue is scoped to one site.
+  deviceCustodyRegimes DeviceCustodyRegime[]
 
   @@unique([id, organisationId], map: "sites_id_organisation_key")
   @@index([organisationId])
@@ -117,6 +119,9 @@ model User {
   deviceBootstrapGrantsIntendedFor EnrollmentBootstrapGrant[] @relation("BootstrapGrantIntendedUser")
   deviceEnrollmentRequests EnrollmentRequest[]
   deviceEnrollmentApprovals EnrollmentApproval[]
+  /// C16-01: the human who DEFINED a custody regime. Provenance, never
+  /// authority — naming a regime grants nothing over any device under it.
+  deviceCustodyRegimesDefined DeviceCustodyRegime[]
 
   @@unique([organisationId, email])
   /// WP-24 / D24-04a: a candidate key, deliberately redundant with the primary

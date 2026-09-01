@@ -297,6 +297,63 @@ model DeviceSiteScope {
   @@map("device_site_scopes")
 }
 
+/// C16-01 - THE SERVER-ISSUED CUSTODY REGIME CATALOGUE.
+///
+/// A CONTROLLED_SHARED device names the regime governing its hand-over
+/// (C15-08). Before this table that name arrived at commit as a caller string,
+/// so a request a human approved for controlled-shared custody could be
+/// committed under a regime the approver never saw - the approval bound the
+/// frozen request fingerprint and the custody MODE, and neither of those
+/// covers the regime. The frozen `DeviceEnrollmentRequestSchema` has no regime
+/// field and WP-23 is closed, so the binding is made WP-24's own: the regime is
+/// a ROW in this table with a SERVER-GENERATED id, it is named on the
+/// enrollment request, and `EnrollmentApproval.approved_semantics_digest`
+/// covers request fingerprint + custody + regime together.
+///
+/// THE ID IS SERVER-GENERATED AND NEVER CALLER-SUPPLIED TEXT. A caller may
+/// present an id; it is resolved against this table, in this tenant, at this
+/// site, and refused if it is absent, foreign or retired.
+///
+/// `retired_at` rather than a delete: a device enrolled under a regime that
+/// later stops being used must still be traceable to the regime that actually
+/// governed it, so retirement stops NEW enrollments and rewrites no history.
+///
+/// LIVE STATE - composite tenant-aware relations, Restrict.
+model DeviceCustodyRegime {
+  /// SERVER-GENERATED. There is no path by which a caller supplies this value.
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  /// A regime governs hand-over AT ONE SITE. A regime is not an
+  /// organisation-wide policy object, because custody is a site fact.
+  siteId String @map("site_id") @db.Text
+
+  /// The operator-facing name. Unique within (tenant, site) so two regimes
+  /// cannot share a name and be confused for one another in an audit.
+  name String @db.Text
+
+  /// PROVENANCE. The human who defined the regime; being named here grants
+  /// nothing over any device governed by it (C14-02).
+  definedByUserId String @map("defined_by_user_id") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  /// Set when the regime stops accepting NEW enrollments. Never a delete.
+  retiredAt DateTime? @map("retired_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  site Site @relation(fields: [siteId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  definedByUser User @relation(fields: [definedByUserId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
+  enrollmentRequests EnrollmentRequest[]
+
+  /// Candidate key so an enrollment request binds to THIS regime UNDER THIS
+  /// TENANT rather than to an id that merely exists somewhere.
+  @@unique([id, organisationId], map: "device_custody_regime_id_organisation_key")
+  @@unique([organisationId, siteId, name], map: "device_custody_regime_name_key")
+  @@index([organisationId, siteId])
+  @@map("device_custody_regimes")
+}
+
 /// One registered credential version. THE FOUR-STATE LIFECYCLE, NOT A BOOLEAN
 /// (D24-01).
 ///
@@ -381,6 +438,25 @@ model DeviceKey {
   /// "Which key of this device is CURRENT" — the hot path of every
   /// verification.
   @@index([organisationId, deviceId, status])
+  /// C16-08 — AT MOST ONE `CURRENT` KEY PER (tenant, device), ENFORCED BY THE
+  /// DATABASE.
+  ///
+  /// PRISMA CANNOT MODEL A PARTIAL UNIQUE INDEX. `@@unique` is unconditional,
+  /// and an unconditional unique on (organisation_id, device_id) would forbid a
+  /// device from ever holding a second key version at all — the opposite of
+  /// what D24-10 requires. So the constraint is expressed in the migration SQL
+  /// and THE SQL IS AUTHORITATIVE:
+  ///
+  ///     CREATE UNIQUE INDEX "device_keys_one_current_key"
+  ///       ON "device_keys"("organisation_id","device_id")
+  ///       WHERE "status" = 'CURRENT';
+  ///
+  /// It is declared here as a comment rather than silently omitted so a reader
+  /// of this file learns the index exists; `prisma migrate diff` will not
+  /// reproduce it, and it must be carried forward by hand if these tables are
+  /// ever regenerated. `findCurrentDeviceKey` RELIES on it rather than letting
+  /// `findFirst` pick a winner out of a set the database has already made a
+  /// singleton.
   @@map("device_keys")
 }
 
@@ -470,6 +546,14 @@ model EnrollmentRequest {
 
   custody String @db.Text
 
+  /// C16-01: CONTROLLED_SHARED ONLY, and REQUIRED there. NULL for PERSONAL.
+  ///
+  /// A foreign key into the server-issued catalogue, not free text, validated
+  /// against the request's OWN organisation and site at creation. It sits on
+  /// the REQUEST rather than arriving at commit because the approval must be
+  /// able to bind it — see `approved_semantics_digest`.
+  custodyRegimeId String? @map("custody_regime_id") @db.Uuid
+
   /// C15-02: THE ACTUAL KEY, in the one canonical representation. Without it
   /// the registry could recognise this device and never verify it.
   publicKey String @map("public_key") @db.Text
@@ -496,6 +580,20 @@ model EnrollmentRequest {
   /// what a human approves — see EnrollmentApproval.
   requestFingerprint String @map("request_fingerprint") @db.Text
 
+  /// C16-01 — THE WP-24-OWNED APPROVED-SEMANTICS DIGEST.
+  ///
+  ///     sha256(canonical JSON {
+  ///       domain: 'sentinel.shield.approved-enrollment-semantics.v1',
+  ///       enrollment_request_fingerprint, custody, custody_regime_id })
+  ///
+  /// The frozen fingerprint above covers `DeviceEnrollmentRequestSchema`, which
+  /// has NO regime field; this digest covers the fingerprint AND the regime, so
+  /// a human approving controlled-shared custody approves the regime too. It is
+  /// stored here so a mutation of the regime after approval is DETECTABLE: the
+  /// commit recomputes this value from the request and requires it to equal the
+  /// one the approval bound.
+  approvedSemanticsDigest String @map("approved_semantics_digest") @db.Text
+
   /// C14-05: VERIFIED | NEGATIVE | INVALID | REVOKED | UNAVAILABLE, and
   /// UNAVAILABLE IS NOT NEGATIVE EVIDENCE. A provider outage is not a
   /// statement about a device.
@@ -518,6 +616,10 @@ model EnrollmentRequest {
   site Site @relation(fields: [siteId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
   intendedUser User @relation(fields: [intendedUserId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
   bootstrapGrant EnrollmentBootstrapGrant @relation(fields: [bootstrapGrantId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  /// C16-01: composite, so a request cannot name another tenant's regime. The
+  /// SITE match is a service check on top: a regime and a request can share a
+  /// tenant and differ in site, and that pairing must refuse too.
+  custodyRegime DeviceCustodyRegime? @relation(fields: [custodyRegimeId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
 
   approvals EnrollmentApproval[]
   possessionChallenges PossessionChallenge[]
@@ -528,6 +630,16 @@ model EnrollmentRequest {
   /// challenge, the verification and the committed Device — binds to THIS
   /// request UNDER THIS TENANT rather than to an id that merely exists.
   @@unique([id, organisationId], map: "enrollment_request_id_organisation_key")
+  /// C16-02 — ONE BOOTSTRAP GRANT SPAWNS AT MOST ONE ENROLLMENT REQUEST.
+  ///
+  /// Without this a single grant could open two requests, each of which could
+  /// collect its OWN human approval, and the two would then race for the one
+  /// replay identity the grant carries — competing approval candidates behind
+  /// one piece of provenance. An identical repeat submission is a RETRY and
+  /// converges on the request that already exists; a materially different one
+  /// is a conflict, and if a writer bypasses the service the DATABASE refuses
+  /// it rather than the service.
+  @@unique([organisationId, bootstrapGrantId], map: "enrollment_request_grant_key")
   /// The commander's work queue: requests awaiting approval in this tenant.
   @@index([organisationId, state])
   @@map("device_enrollment_requests")
@@ -568,6 +680,21 @@ model EnrollmentApproval {
   approvedIntendedUserId String @map("approved_intended_user_id") @db.Text
   approvedCustody String @map("approved_custody") @db.Text
 
+  /// C16-01: THE REGIME THIS HUMAN APPROVED. NULL when the approved custody is
+  /// PERSONAL. Like every other `approved_*` column it is the approval's OWN
+  /// record rather than a live pointer at the request, so the commit can SEE a
+  /// disagreement instead of inheriting one.
+  approvedCustodyRegimeId String? @map("approved_custody_regime_id") @db.Uuid
+
+  /// C16-01 — THE VALUE THE APPROVAL ACTUALLY BINDS.
+  ///
+  /// sha256 over the canonical JSON of the request fingerprint, the custody
+  /// mode and the custody regime together. The commit RECOMPUTES it from the
+  /// (locked) request and requires equality: a regime swapped behind a standing
+  /// approval leaves the frozen fingerprint untouched — the frozen schema has
+  /// no regime field — and is detectable only here.
+  approvedSemanticsDigest String @map("approved_semantics_digest") @db.Text
+
   approvedAt DateTime @map("approved_at") @db.Timestamptz(3)
 
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
@@ -606,7 +733,17 @@ model PossessionChallenge {
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   enrollmentRequest EnrollmentRequest @relation(fields: [enrollmentRequestId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  verifications PossessionVerification[]
 
+  /// C16-08 — the candidate key a PossessionVerification references.
+  ///
+  /// A verification row names a challenge, a request and a tenant. Before this
+  /// key the three were three independent scalars and only a service compared
+  /// them, so a verdict could be written against a challenge belonging to
+  /// ANOTHER request or ANOTHER tenant and the database would accept it. With
+  /// the composite reference below, the inconsistent tuple cannot be stored at
+  /// all: referential integrity, not a duplicated column compared in code.
+  @@unique([id, organisationId, enrollmentRequestId], map: "possession_challenge_request_tuple_key")
   @@index([organisationId, enrollmentRequestId])
   @@map("device_possession_challenges")
 }
@@ -649,6 +786,11 @@ model PossessionVerification {
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   enrollmentRequest EnrollmentRequest @relation(fields: [enrollmentRequestId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  /// C16-08: the DATABASE now holds the verification tuple together. This
+  /// composite reference makes (challenge, request, tenant) consistent by
+  /// construction — a verdict naming a challenge from another request or
+  /// another tenant is a foreign-key violation, not a service oversight.
+  challenge PossessionChallenge @relation(fields: [challengeId, organisationId, enrollmentRequestId], references: [id, organisationId, enrollmentRequestId], onDelete: Restrict, onUpdate: Cascade)
 
   /// ONE VERDICT PER CHALLENGE. A challenge that could accumulate verdicts is
   /// a challenge that can be answered until one of the answers is `true`.
@@ -725,6 +867,9 @@ model DeviceKeyRotationRequest {
   /// Candidate key so the challenge and the verdict bind to THIS proposal
   /// UNDER THIS TENANT.
   @@unique([id, organisationId], map: "rotation_request_id_organisation_key")
+  /// C16-08: the candidate key the CHALLENGE references, so a challenge cannot
+  /// claim a device its own rotation request does not name.
+  @@unique([id, organisationId, deviceId], map: "rotation_request_device_tuple_key")
   /// One proposal per (tenant, device, proposed version). Two concurrent
   /// proposals for the same next version would be two futures for one
   /// credential, and the loser would still hold a signed challenge.
@@ -773,8 +918,15 @@ model DeviceKeyRotationChallenge {
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  rotationRequest DeviceKeyRotationRequest @relation(fields: [rotationRequestId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  /// C16-08: the DEVICE travels inside the reference, so a challenge naming
+  /// device X under a rotation request for device Y cannot be stored.
+  rotationRequest DeviceKeyRotationRequest @relation(fields: [rotationRequestId, organisationId, deviceId], references: [id, organisationId, deviceId], onDelete: Restrict, onUpdate: Cascade)
+  verifications DeviceKeyRotationVerification[]
 
+  /// C16-08: the candidate key a DeviceKeyRotationVerification references, so
+  /// the verdict's (challenge, request, device, tenant) tuple is consistent by
+  /// referential integrity rather than by a service comparing four scalars.
+  @@unique([id, organisationId, rotationRequestId, deviceId], map: "rotation_challenge_tuple_key")
   @@index([organisationId, rotationRequestId])
   @@map("device_key_rotation_challenges")
 }
@@ -819,7 +971,10 @@ model DeviceKeyRotationVerification {
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  rotationRequest DeviceKeyRotationRequest @relation(fields: [rotationRequestId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  rotationRequest DeviceKeyRotationRequest @relation(fields: [rotationRequestId, organisationId, deviceId], references: [id, organisationId, deviceId], onDelete: Restrict, onUpdate: Cascade)
+  /// C16-08: and the challenge, carrying request, device and tenant with it.
+  /// An inconsistent rotation verification tuple is now unrepresentable.
+  rotationChallenge DeviceKeyRotationChallenge @relation(fields: [rotationChallengeId, organisationId, rotationRequestId, deviceId], references: [id, organisationId, rotationRequestId, deviceId], onDelete: Restrict, onUpdate: Cascade)
 
   /// ONE VERDICT PER ROTATION CHALLENGE, for the reason
   /// `possession_verification_challenge_key` gives.
