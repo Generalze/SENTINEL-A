@@ -18,6 +18,10 @@ model Organisation {
   /// composite Site relation entirely under MATCH SIMPLE, so they carry a
   /// direct tenant FK instead.
   whisperSignalVersions WhisperSignalVersion[]
+  /// WP-24 back-relation for the direct tenant FK every Device carries.
+  /// Required by Prisma for the relation declared in shield.prisma; it adds
+  /// no column and no behaviour to Identity.
+  devices Device[]
 
   @@map("organisations")
 }
@@ -57,6 +61,14 @@ model Site {
   /// appears in no site's list, so this is never the set of signals
   /// recognisable AT this site.
   whisperSignalVersions WhisperSignalVersion[]
+  /// WP-24 back-relations. Required by Prisma for the composite
+  /// (site_id, organisation_id) relations declared in shield.prisma; they add
+  /// no column and no behaviour to Identity.
+  deviceSiteScopes DeviceSiteScope[]
+  deviceBootstrapGrants EnrollmentBootstrapGrant[]
+  deviceEnrollmentRequests EnrollmentRequest[]
+  /// C16-01: the server-issued custody-regime catalogue is scoped to one site.
+  deviceCustodyRegimes DeviceCustodyRegime[]
 
   @@unique([id, organisationId], map: "sites_id_organisation_key")
   @@index([organisationId])
@@ -96,7 +108,33 @@ model User {
   organisation Organisation @relation(fields: [organisationId], references: [id])
   roles        UserRole[]
 
+  /// WP-24 back-relations. Required by Prisma for the composite
+  /// (user_id, organisation_id) relations declared in shield.prisma; they add
+  /// no column and no behaviour to Identity. Every one of them is device
+  /// PROVENANCE — being named on a device grants nothing (D24-02, C14-02).
+  devicesEnrolled Device[] @relation("DeviceEnrolledByUser")
+  devicesIntendedFor Device[] @relation("DeviceIntendedUser")
+  deviceSiteScopes DeviceSiteScope[]
+  deviceBootstrapGrantsIssued EnrollmentBootstrapGrant[] @relation("BootstrapGrantIssuedByUser")
+  deviceBootstrapGrantsIntendedFor EnrollmentBootstrapGrant[] @relation("BootstrapGrantIntendedUser")
+  deviceEnrollmentRequests EnrollmentRequest[]
+  deviceEnrollmentApprovals EnrollmentApproval[]
+  /// C16-01: the human who DEFINED a custody regime. Provenance, never
+  /// authority — naming a regime grants nothing over any device under it.
+  deviceCustodyRegimesDefined DeviceCustodyRegime[]
+
   @@unique([organisationId, email])
+  /// WP-24 / D24-04a: a candidate key, deliberately redundant with the primary
+  /// key, added for exactly the reason `sites_id_organisation_key` was added by
+  /// WP-17A. It exists so the device tables can reference the (user,
+  /// organisation) PAIR rather than referencing `id` alone. A plain FK to
+  /// `User.id` would still permit a row claiming `organisation_id = org-A,
+  /// intended_user_id = user-B` where user-B belongs to org-B; the composite
+  /// reference makes the DATABASE reject that, giving section 62.1's tenant
+  /// boundary a defence below the service layer. It introduces no column,
+  /// alters no existing constraint and changes no behaviour: `id` remains the
+  /// primary key and nothing about user identity changes.
+  @@unique([id, organisationId], map: "users_id_organisation_key")
   @@index([organisationId])
   @@map("users")
 }
