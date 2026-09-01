@@ -758,6 +758,32 @@ function evaluateDeviceRequestProofUnderMode(
  * cheapest way to launder a downgraded device would be to disconnect it and
  * reconnect it.
  */
+/**
+ * C15-R2-final: WHAT THE AUTHENTICATION VERDICT IS ABOUT.
+ *
+ * A bare `authenticated: true` is a boolean about nothing. Handed to the queue
+ * decision it says only "some handshake somewhere succeeded" — so a genuine
+ * verdict produced for another context, another operative, another device or
+ * an older key version could be presented alongside a registry record it never
+ * ran against, and the queue would open. That is the same borrowed-verdict
+ * defect C15-03 removed from the possession result, in the one place where the
+ * two decisions are deliberately separated and therefore CAN drift apart.
+ *
+ * Every field here was proven equal to the context's AND the registry's during
+ * authentication, so the binding is a statement the server already established
+ * rather than a new claim. `key_version` is the load-bearing one: it is the
+ * fact most likely to move in the gap between authenticating and examining a
+ * queue, and a rotation in that gap must refuse.
+ */
+export interface DeviceReconnectAuthenticationBinding {
+  readonly organisation_id: string;
+  readonly context_id: string;
+  readonly actor_user_id: string;
+  readonly device_id: string;
+  readonly key_id: string;
+  readonly key_version: number;
+}
+
 export type DeviceReconnectAuthenticationDecision =
   | {
       readonly authenticated: true;
@@ -765,6 +791,8 @@ export type DeviceReconnectAuthenticationDecision =
       readonly fingerprint: string;
       /** The registry's CURRENT trust at the moment authentication succeeded. */
       readonly authenticated_device_trust: DeviceTrust;
+      /** C15-R2-final: exactly WHAT authenticated. Re-checked at queue admission. */
+      readonly binding: DeviceReconnectAuthenticationBinding;
       /**
        * C15-R2: the literal `false` on the SUCCESS arm is the whole ruling.
        * AUTHENTICATION NEVER UNLOCKS A QUEUE. The type gives a caller nothing
@@ -779,6 +807,8 @@ export type DeviceReconnectAuthenticationDecision =
       readonly fingerprint: string;
       readonly stored_outcome_ref: string;
       readonly authenticated_device_trust: DeviceTrust;
+      /** C15-R2-final: a converged retry is bound exactly as a first pass is. */
+      readonly binding: DeviceReconnectAuthenticationBinding;
       /** Still `false`: a converged retry authenticates no differently. */
       readonly queue_examination_permitted: false;
     }
@@ -798,6 +828,20 @@ export function evaluateDeviceReconnectAuthentication(
 ): DeviceReconnectAuthenticationDecision {
   const decision = evaluateDeviceRequestProofUnderMode(input, 'RECONNECT_HANDSHAKE', 'AUTHENTICATION_ONLY');
   if (!decision.admitted) return { authenticated: false, refusal: decision.refusal, queue_examination_permitted: false };
+
+  // C15-R2-final: the verdict says what it is ABOUT. Every field below was
+  // proven equal to the context's and the registry's inside the evaluation
+  // above — identity in step 2, registry and key version in step 3 — so this
+  // records an established fact rather than echoing an unchecked claim.
+  const binding: DeviceReconnectAuthenticationBinding = {
+    organisation_id: input.context.organisation_id,
+    context_id: input.context.context_id,
+    actor_user_id: input.context.actor_user_id,
+    device_id: input.context.device_id,
+    key_id: input.registered.key_id,
+    key_version: input.registered.key_version,
+  };
+
   if (decision.effect === 'CONVERGE_ON_STORED_OUTCOME') {
     return {
       authenticated: true,
@@ -805,6 +849,7 @@ export function evaluateDeviceReconnectAuthentication(
       fingerprint: decision.fingerprint,
       stored_outcome_ref: decision.stored_outcome_ref,
       authenticated_device_trust: input.registered.trust,
+      binding,
       queue_examination_permitted: false,
     };
   }
@@ -813,6 +858,7 @@ export function evaluateDeviceReconnectAuthentication(
     effect: 'PROCEED',
     fingerprint: decision.fingerprint,
     authenticated_device_trust: input.registered.trust,
+    binding,
     queue_examination_permitted: false,
   };
 }
@@ -837,6 +883,17 @@ export const DeviceQueueAdmissionRefusalSchema = z.enum([
   'REGISTRY_IDENTITY_MISMATCH',
   /** The credential was revoked while the device was away (D23-08). */
   'CREDENTIAL_REVOKED',
+  /**
+   * C15-R2-final: the authentication verdict is about a different context,
+   * operative, device, organisation or key than the one being admitted.
+   */
+  'AUTHENTICATION_BINDING_MISMATCH',
+  /**
+   * C15-R2-final: the device's key rotated in the gap between authenticating
+   * and examining the queue. The verdict is genuine and now describes a
+   * credential that no longer exists.
+   */
+  'KEY_VERSION_ROTATED',
 ]);
 export type DeviceQueueAdmissionRefusal = z.infer<typeof DeviceQueueAdmissionRefusalSchema>;
 
@@ -857,14 +914,30 @@ export interface DeviceOfflineQueueAdmissionInput {
   readonly context: AuthenticatedDeviceContext;
   /** The site the queued work belongs to. */
   readonly site_id: string;
-  /** Exactly one purpose per admission, for the C15-04 reason. */
-  readonly queuedPurpose: DeviceRequestPurpose;
 }
+
+/**
+ * C15-R2-final: THE PURPOSE OF A QUEUE ADMISSION IS NOT A PARAMETER.
+ *
+ * This was `queuedPurpose: DeviceRequestPurpose` on the input — a
+ * caller-controlled value, which is the same defect shape C15-04 removed when
+ * it deleted an `allowedPurposes` that defaulted to everything. A caller that
+ * passed `RECONNECT_HANDSHAKE` here would have been asking the widest row in
+ * `DEVICE_PURPOSE_PERMITTED_TRUST` — the row that deliberately admits OFFLINE
+ * and SUSPICIOUS so a dark device can come back — and would have re-opened
+ * precisely the hole the split was made to close.
+ *
+ * There is exactly one question this function answers: may this device's
+ * QUEUED WORK take effect? That is `OFFLINE_SYNC`, permanently. It is a
+ * constant rather than an argument so no caller can widen it, and changing it
+ * is a visible diff that has to argue for itself.
+ */
+export const DEVICE_QUEUE_ADMISSION_PURPOSE = 'OFFLINE_SYNC' as const satisfies DeviceRequestPurpose;
 
 /**
  * C15-R2: WHERE OFFLINE AND SUSPICIOUS ARE ACTUALLY STOPPED.
  *
- * `deviceTrustPermitsPurpose(registered.trust, queuedPurpose)` is the
+ * `deviceTrustPermitsPurpose(registered.trust, DEVICE_QUEUE_ADMISSION_PURPOSE)` is the
  * load-bearing line. `OFFLINE_SYNC` admits TRUSTED and DEGRADED only, so a
  * device that authenticated while registry-OFFLINE — the exact device the old
  * handshake refused outright — authenticates cleanly and is refused HERE,
@@ -881,23 +954,53 @@ export function evaluateDeviceOfflineQueueAdmission(input: DeviceOfflineQueueAdm
 
   // 1. Authentication first. A queue is never examined off an unauthenticated
   //    connection, whatever the registry says about the device.
-  if (!input.authentication.authenticated) return { permitted: false, refusal: 'NOT_AUTHENTICATED' };
+  const authentication = input.authentication;
+  if (!authentication.authenticated) return { permitted: false, refusal: 'NOT_AUTHENTICATED' };
 
   // 2. The record must be ABOUT this device, or it is not evidence here at all.
   if (registered.organisation_id !== context.organisation_id || registered.device_id !== context.device_id) {
     return { permitted: false, refusal: 'REGISTRY_IDENTITY_MISMATCH' };
   }
 
-  // 3. D23-08: a revocation that landed while the device was dark refuses the
+  // 3. C15-R2-final: THE VERDICT MUST BE ABOUT THIS ADMISSION.
+  //
+  //    Splitting authentication from admission created a gap, and a gap is
+  //    somewhere a genuine verdict can be carried in from. Without this, an
+  //    `authenticated: true` produced for another context, operative or device
+  //    could be presented next to a registry record it never ran against —
+  //    borrowing a real handshake to open someone else's queue.
+  const binding = authentication.binding;
+  if (
+    binding.organisation_id !== context.organisation_id ||
+    binding.context_id !== context.context_id ||
+    binding.actor_user_id !== context.actor_user_id ||
+    binding.device_id !== context.device_id ||
+    binding.organisation_id !== registered.organisation_id ||
+    binding.device_id !== registered.device_id ||
+    binding.key_id !== registered.key_id
+  ) {
+    return { permitted: false, refusal: 'AUTHENTICATION_BINDING_MISMATCH' };
+  }
+  //    And the key itself, checked separately so the audit trail distinguishes
+  //    a borrowed verdict from an honest one overtaken by a rotation. D23-09
+  //    already invalidates every context bound to a superseded version; this is
+  //    the same rule at the second decision point, where the registry is read
+  //    again and can legitimately have moved since the handshake.
+  if (binding.key_version !== registered.key_version) {
+    return { permitted: false, refusal: 'KEY_VERSION_ROTATED' };
+  }
+
+  // 4. D23-08: a revocation that landed while the device was dark refuses the
   //    queue wholesale, however old the queued work claims to be.
   if (registered.revoked) return { permitted: false, refusal: 'CREDENTIAL_REVOKED' };
 
-  // 4. The trust gate proper — see the note above.
-  if (!deviceTrustPermitsPurpose(registered.trust, input.queuedPurpose)) {
+  // 5. The trust gate proper — see the note above. The purpose is the constant
+  //    `DEVICE_QUEUE_ADMISSION_PURPOSE`, never a caller's argument.
+  if (!deviceTrustPermitsPurpose(registered.trust, DEVICE_QUEUE_ADMISSION_PURPOSE)) {
     return { permitted: false, refusal: 'DEVICE_TRUST_NOT_PERMITTED' };
   }
 
-  // 5. C15-04: the CURRENT authority of the CURRENT user, skipped during
+  // 6. C15-04: the CURRENT authority of the CURRENT user, skipped during
   //    authentication precisely so it could be asked here, where it belongs.
   if (registered.actor.user_id !== context.actor_user_id) return { permitted: false, refusal: 'ACTOR_AUTHORITY_REMOVED' };
   if (!registered.actor.holds_required_capability) return { permitted: false, refusal: 'ACTOR_AUTHORITY_REMOVED' };

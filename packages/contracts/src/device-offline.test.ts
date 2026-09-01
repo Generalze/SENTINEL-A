@@ -359,11 +359,18 @@ describe('offline admissibility (C14-04 / D23-11 / D23-12)', () => {
 
   it('refuses when the Edge itself has lost trust', () => {
     const target = envelope();
+    // C15-R4-final: the REVOKED case used to set `revoked_at` alongside the
+    // trust state, which now refuses one check earlier and more specifically.
+    // Both are left null here deliberately: EDGE'S OWN TRUST AND ITS KEY'S
+    // WITHDRAWAL ARE DIFFERENT FACTS (D23-10), and this test is about the
+    // first. An Edge principal we have stopped trusting witnesses nothing even
+    // while its key remains perfectly intact.
     for (const edgeTrust of ['SUSPENDED', 'REVOKED'] as const) {
       expect(
         evaluateOfflineOperationAdmissibility(
-          admissibility({ witness: edgeWitness(target, { registeredEdgeKey: edgeKeyRecord({ edge_trust: edgeTrust, revoked_at: edgeTrust === 'REVOKED' ? NOW : null }) }) }),
+          admissibility({ witness: edgeWitness(target, { registeredEdgeKey: edgeKeyRecord({ edge_trust: edgeTrust, revoked_at: null }) }) }),
         ),
+        edgeTrust,
       ).toEqual({ admitted: false, refusal: 'EDGE_NOT_TRUSTED' });
     }
   });
@@ -1040,6 +1047,60 @@ describe('C15-R4 reconciliation is bound to exact tenant, site and key authority
       established_at: iso(-2 * HOUR),
       operation_fingerprint: deviceOfflineOperationFingerprint(offlineStatement(target)),
     });
+  });
+});
+
+describe('C15-R4-final Edge revocation is asked independently of status and trust', () => {
+  it('LOCKED: CURRENT + TRUSTED + revoked_at set is refused — the three facts do not move atomically', () => {
+    // This record PARSES. Unlike the device key record, the Edge schema does
+    // not forbid a withdrawal instant on a CURRENT key, so a revocation that
+    // has landed while the lifecycle state and the trust state have not caught
+    // up is a real, representable row — and every other check passes it.
+    const target = envelope();
+    const stale = edgeKeyRecord({ status: 'CURRENT', edge_trust: 'TRUSTED', revoked_at: iso(-60_000) });
+    expect(EdgeRegistryKeyRecordSchema.safeParse(stale).success).toBe(true);
+    expect(stale.status).toBe('CURRENT');
+    expect(stale.edge_trust).toBe('TRUSTED');
+    expect(
+      evaluateOfflineOperationAdmissibility(
+        admissibility({ lease: expiredLease(), witness: edgeWitness(target, { registeredEdgeKey: stale }) }),
+      ),
+    ).toEqual({ admitted: false, refusal: 'EDGE_CREDENTIAL_REVOKED' });
+  });
+
+  it('names revocation separately from a lifecycle state and from Edge trust', () => {
+    const target = envelope();
+    // A withdrawn key whose trust ALSO says REVOKED still names the revocation,
+    // because that check is asked first and is the more specific fact.
+    expect(
+      evaluateOfflineOperationAdmissibility(
+        admissibility({
+          witness: edgeWitness(target, { registeredEdgeKey: edgeKeyRecord({ edge_trust: 'REVOKED', revoked_at: iso(-60_000) }) }),
+        }),
+      ),
+    ).toEqual({ admitted: false, refusal: 'EDGE_CREDENTIAL_REVOKED' });
+    // A SUSPENDED Edge whose key was never withdrawn is still a trust refusal,
+    // so the new check has not swallowed the old one.
+    expect(
+      evaluateOfflineOperationAdmissibility(
+        admissibility({
+          witness: edgeWitness(target, { registeredEdgeKey: edgeKeyRecord({ edge_trust: 'SUSPENDED', revoked_at: null }) }),
+        }),
+      ),
+    ).toEqual({ admitted: false, refusal: 'EDGE_NOT_TRUSTED' });
+  });
+
+  it('still admits an Edge whose key carries no withdrawal instant', () => {
+    const target = envelope();
+    const clean = edgeKeyRecord({ status: 'CURRENT', edge_trust: 'TRUSTED', revoked_at: null });
+    // `expiredLease()` is the house convention for an Edge-witnessed happy
+    // path: the Edge observed the operation while the lease was still live,
+    // which is precisely what a witness is for.
+    expect(
+      evaluateOfflineOperationAdmissibility(
+        admissibility({ lease: expiredLease(), witness: edgeWitness(target, { registeredEdgeKey: clean }) }),
+      ),
+    ).toMatchObject({ admitted: true, time_basis: 'EDGE_WITNESS' });
   });
 });
 

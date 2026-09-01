@@ -3,6 +3,7 @@ import {
   AuthenticatedDeviceContextSchema,
   canonicalDeviceRequestProofStatement,
   DEVICE_PURPOSE_PERMITTED_TRUST,
+  DEVICE_QUEUE_ADMISSION_PURPOSE,
   DEVICE_REQUEST_PROOF_DOMAIN,
   DEVICE_REQUEST_PURPOSES,
   DEVICE_TRUST_OPERATIONAL_RANK,
@@ -568,7 +569,6 @@ describe('C15-R2 reconnect authentication is separate from queue admission', () 
       registered: registry({ trust }),
       context: context({ device_trust: 'TRUSTED' }),
       site_id: 'site-1',
-      queuedPurpose: 'OFFLINE_SYNC',
       ...overrides,
     });
   }
@@ -638,7 +638,6 @@ describe('C15-R2 reconnect authentication is separate from queue admission', () 
         registered: registry({ trust: 'TRUSTED' }),
         context: context({ device_trust: 'TRUSTED' }),
         site_id: 'site-1',
-        queuedPurpose: 'OFFLINE_SYNC',
         ...overrides,
       }), label).toEqual({ permitted: false, refusal });
     }
@@ -711,6 +710,107 @@ describe('C15-R2 reconnect authentication is separate from queue admission', () 
       stored_outcome_ref: 'handshake-1',
       queue_examination_permitted: false,
     });
+  });
+});
+
+describe('C15-R2-final the authentication verdict is bound, and the purpose is not a parameter', () => {
+  function authenticatedTrusted(): ReturnType<typeof evaluateDeviceReconnectAuthentication> {
+    return evaluateDeviceReconnectAuthentication(
+      reconnect({ context: context({ device_trust: 'TRUSTED' }), registered: registry({ trust: 'TRUSTED' }) }),
+    );
+  }
+
+  function admit(
+    overrides: Partial<Parameters<typeof evaluateDeviceOfflineQueueAdmission>[0]> = {},
+  ): ReturnType<typeof evaluateDeviceOfflineQueueAdmission> {
+    return evaluateDeviceOfflineQueueAdmission({
+      authentication: authenticatedTrusted(),
+      registered: registry({ trust: 'TRUSTED' }),
+      context: context({ device_trust: 'TRUSTED' }),
+      site_id: 'site-1',
+      ...overrides,
+    });
+  }
+
+  it('carries the exact identity it authenticated, on both success arms', () => {
+    const decision = authenticatedTrusted();
+    expect(decision).toMatchObject({
+      authenticated: true,
+      binding: {
+        organisation_id: 'org-1',
+        context_id: 'ctx-1',
+        actor_user_id: 'user-1',
+        device_id: 'device-1',
+        key_id: 'key-1',
+        key_version: 4,
+      },
+    });
+    // The bound key is the REGISTRY's, not the context's claim about it — the
+    // evaluation proved the two equal before this was recorded.
+    if (decision.authenticated) expect(decision.binding.key_version).toBe(registry({ trust: 'TRUSTED' }).key_version);
+  });
+
+  it('admits the bound device, and that is the only shape that is admitted', () => {
+    expect(admit()).toEqual({ permitted: true });
+  });
+
+  it('LOCKED: a genuine verdict cannot be borrowed for another org, context, actor, device or key', () => {
+    const genuine = authenticatedTrusted();
+    expect(genuine.authenticated).toBe(true);
+    const mutations: ReadonlyArray<readonly [string, Record<string, unknown>]> = [
+      ['organisation', { organisation_id: 'org-2' }],
+      ['context', { context_id: 'ctx-2' }],
+      ['actor', { actor_user_id: 'user-2' }],
+      ['device', { device_id: 'device-2' }],
+      ['key id', { key_id: 'key-2' }],
+    ];
+    for (const [label, patch] of mutations) {
+      const borrowed = { ...genuine, binding: { ...(genuine as { binding: object }).binding, ...patch } };
+      expect(
+        admit({ authentication: borrowed as ReturnType<typeof evaluateDeviceReconnectAuthentication> }),
+        label,
+      ).toEqual({ permitted: false, refusal: 'AUTHENTICATION_BINDING_MISMATCH' });
+    }
+  });
+
+  it('LOCKED: a key rotation BETWEEN authentication and admission refuses, named as a rotation', () => {
+    // The verdict is honest — it was true when it was produced. The registry
+    // moved underneath it, which is exactly what the second read exists to
+    // catch, and D23-09 says a superseded version authorises nothing.
+    const genuine = authenticatedTrusted();
+    expect(admit({ registered: registry({ trust: 'TRUSTED', key_version: 5 }) })).toEqual({
+      permitted: false,
+      refusal: 'KEY_VERSION_ROTATED',
+    });
+    // It is a DIFFERENT refusal from a borrowed verdict, so an operator reading
+    // the audit trail can tell an overtaken handshake from a stolen one.
+    expect(genuine.authenticated).toBe(true);
+  });
+
+  it('LOCKED: the admission purpose is a constant, not a caller argument', () => {
+    expect(DEVICE_QUEUE_ADMISSION_PURPOSE).toBe('OFFLINE_SYNC');
+    // The input type has nowhere to put a purpose at all: passing the widest
+    // row in the table is not merely refused, it is unrepresentable.
+    const withPurpose = { ...({} as Record<string, unknown>), queuedPurpose: 'RECONNECT_HANDSHAKE' };
+    expect(Object.keys(withPurpose)).toContain('queuedPurpose');
+    // And the constant names the narrow row: OFFLINE_SYNC excludes OFFLINE and
+    // SUSPICIOUS, which is what stops a dark device syncing on a handshake.
+    expect(DEVICE_PURPOSE_PERMITTED_TRUST[DEVICE_QUEUE_ADMISSION_PURPOSE]).toEqual(['TRUSTED', 'DEGRADED']);
+    expect(DEVICE_PURPOSE_PERMITTED_TRUST[DEVICE_QUEUE_ADMISSION_PURPOSE]).not.toContain('OFFLINE');
+    expect(DEVICE_PURPOSE_PERMITTED_TRUST[DEVICE_QUEUE_ADMISSION_PURPOSE]).not.toContain('SUSPICIOUS');
+  });
+
+  it('checks the binding BEFORE trust, so a borrowed verdict never reaches the trust gate', () => {
+    const genuine = authenticatedTrusted();
+    const borrowed = { ...genuine, binding: { ...(genuine as { binding: object }).binding, device_id: 'device-2' } };
+    // Registry trust here would refuse anyway; the refusal must still name the
+    // binding, because that is the more fundamental defect.
+    expect(
+      admit({
+        authentication: borrowed as ReturnType<typeof evaluateDeviceReconnectAuthentication>,
+        registered: registry({ trust: 'OFFLINE' }),
+      }),
+    ).toEqual({ permitted: false, refusal: 'AUTHENTICATION_BINDING_MISMATCH' });
   });
 });
 

@@ -616,6 +616,11 @@ export const DeviceOfflineAdmissibilityRefusalSchema = z.enum([
   'DEVICE_KEY_NOT_USABLE',
   /** C15-R4: the witnessing Edge belongs to a different tenant entirely. */
   'EDGE_ORGANISATION_MISMATCH',
+  /**
+   * C15-R4-final: the Edge key carries a withdrawal instant, whatever its
+   * lifecycle state and whatever Edge's trust says.
+   */
+  'EDGE_CREDENTIAL_REVOKED',
   /** C15-R4: the witnessing Edge is not entitled to the site this operation belongs to. */
   'EDGE_SITE_NOT_AUTHORISED',
   /** C15-05: this one-shot identity was already spent on different bytes. */
@@ -843,6 +848,22 @@ export function evaluateOfflineOperationAdmissibility(input: DeviceOfflineAdmiss
       !deviceKeyStatePermitsHistoricalVerification(witness.registeredEdgeKey.status)
     ) {
       return { admitted: false, refusal: 'EDGE_KEY_NOT_USABLE' };
+    }
+    // C15-R4-final: REVOCATION IS ITS OWN FACT, ASKED ON ITS OWN.
+    //
+    // The three facts above — lifecycle `status`, `edge_trust`, and this
+    // withdrawal instant — are written by different operations and, unlike the
+    // device record, this schema does not forbid `revoked_at` on a CURRENT
+    // key. So a record reading CURRENT + TRUSTED + `revoked_at` set is
+    // PARSEABLE, and every check before this one passes it: a key we have
+    // withdrawn would witness an operation because two of its three fields had
+    // not caught up yet.
+    //
+    // Nothing here assumes those three move together. Any one of them saying
+    // the credential is gone is sufficient on its own, and each is asked
+    // independently so the audit trail names which one spoke.
+    if (witness.registeredEdgeKey.revoked_at !== null) {
+      return { admitted: false, refusal: 'EDGE_CREDENTIAL_REVOKED' };
     }
     if (witness.registeredEdgeKey.edge_trust !== 'TRUSTED') return { admitted: false, refusal: 'EDGE_NOT_TRUSTED' };
     const edgeProfileBinding = bindClaimedSignatureProfile(
