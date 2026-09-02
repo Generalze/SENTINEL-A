@@ -2,10 +2,7 @@ import { Module } from '@nestjs/common';
 import { PrismaModule } from '../../prisma/prisma.module';
 import { ShieldModule } from '../shield/shield.module';
 import { AndroidKeyAttestationVerifier } from './android-key-attestation.verifier';
-import {
-  ANDROID_ATTESTATION_TRUST_MATERIAL,
-  UnconfiguredAndroidAttestationTrustMaterial,
-} from './android-attestation.trust-material';
+import { ANDROID_ATTESTATION_TRUST_MATERIAL_PROVIDER } from './android-attestation.configured-trust-material';
 import { CommandEnrollmentController } from './command-enrollment.controller';
 import { DeviceEnrollmentIngressRepository } from './device-enrollment-ingress.repository';
 import { DeviceEnrollmentIngressService } from './device-enrollment-ingress.service';
@@ -69,6 +66,23 @@ import { MobileEnrollmentController } from './mobile-enrollment.controller';
  * Supplying the real Google roots is a deployment act and part of what D26-10's
  * physical-device acceptance has to demonstrate.
  *
+ * C18-01 — AND THERE IS NOW SOMETHING TO SUPPLY THEM TO.
+ *
+ * The token below binds `ConfiguredAndroidAttestationTrustMaterial` whenever
+ * trust-material CONFIGURATION IS PRESENT, and falls back to the unconfigured
+ * provider only when it is absent entirely. Before that this module hard-bound
+ * the unconfigured class, which meant "supplying anchors is a deployment act"
+ * described nothing a deployment could actually do: the sole route to
+ * `VERIFIED` was a Vitest `.overrideProvider(...)`, so the exact candidate SHA
+ * could not have performed its own physical-device acceptance without a
+ * test-only edit. The configured provider is reachable by SETTING
+ * CONFIGURATION and by nothing else, which is what makes D26-10's acceptance an
+ * acceptance of the code that ships.
+ *
+ * Missing, partial, unparseable or stale material still answers `UNAVAILABLE`.
+ * See `android-attestation.configured-trust-material.ts` for the four rules and
+ * for the exact keys a deployment must set.
+ *
  * NO BACKGROUND SCHEDULER (D25-08, still binding). Every expiry this module
  * enforces — the attestation challenge, the revocation snapshot's freshness — is
  * a comparison taken at request time. No job, no sweeper, no timer, and no new
@@ -87,10 +101,9 @@ import { MobileEnrollmentController } from './mobile-enrollment.controller';
     DeviceEnrollmentIngressRepository,
     AndroidKeyAttestationVerifier,
     DeviceEnrollmentIngressService,
-    {
-      provide: ANDROID_ATTESTATION_TRUST_MATERIAL,
-      useClass: UnconfiguredAndroidAttestationTrustMaterial,
-    },
+    // C18-01: configuration decides, and the UNCONFIGURED provider is still the
+    // default. See `android-attestation.configured-trust-material.ts`.
+    ANDROID_ATTESTATION_TRUST_MATERIAL_PROVIDER,
   ],
   exports: [DeviceEnrollmentIngressService, DeviceEnrollmentIngressRepository],
 })

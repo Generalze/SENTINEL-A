@@ -125,6 +125,34 @@ function unsignedIntegerBytes(value: number): Buffer {
 // The KeyDescription
 // ---------------------------------------------------------------------------
 
+/**
+ * Where ONE AuthorizationList entry is emitted.
+ *
+ * `hardwareEnforced` is `KeyDescription.teeEnforced` — what the TEE or StrongBox
+ * itself enforces. `softwareEnforced` is what the Android PLATFORM asserts. They
+ * are two different claimants, and Android's own schema decides which tag
+ * belongs to which; see `android-key-attestation.verifier.ts` step 11 for why
+ * the distinction carries the whole hardware argument.
+ */
+export type AuthorizationListPlacement = 'softwareEnforced' | 'hardwareEnforced' | 'both';
+
+/**
+ * A hardware property this builder can be told to MISPLACE.
+ *
+ * Every one of these is something StrongBox actually enforces, so a genuine
+ * certificate carries it in `hardwareEnforced`. Placing one in
+ * `softwareEnforced` is how a spec asks "would the verifier accept the operating
+ * system's word for a hardware fact?" — and the answer must be no.
+ */
+export type HardwareEnforcedProperty =
+  | 'purpose'
+  | 'algorithm'
+  | 'keySize'
+  | 'ecCurve'
+  | 'noAuthRequired'
+  | 'origin'
+  | 'rootOfTrust';
+
 export interface KeyDescriptionOptions {
   attestationVersion?: number;
   attestationSecurityLevel?: number;
@@ -145,29 +173,96 @@ export interface KeyDescriptionOptions {
   packageName?: string;
   /** Raw digest bytes; the verifier compares their lowercase hex. */
   signingDigest?: Buffer;
+  /**
+   * Where `attestationApplicationId` [709] goes. DEFAULTS TO `softwareEnforced`,
+   * which is where Android puts it: KeyMint's `Tag.aidl` states that
+   * `ATTESTATION_APPLICATION_ID` cannot be hardware-enforced, because the
+   * PLATFORM collects it and hands it to the secure implementation. A spec may
+   * override this to prove the verifier refuses the impossible layout.
+   */
+  applicationIdIn?: AuthorizationListPlacement;
+  /**
+   * Hardware properties to emit in `softwareEnforced` INSTEAD of
+   * `hardwareEnforced`. The resulting certificate is one in which the operating
+   * system asserts a property only the secure hardware can honestly assert.
+   */
+  hardwarePropertiesInSoftwareEnforced?: readonly HardwareEnforcedProperty[];
 }
 
 export const TEST_PACKAGE_NAME = 'com.sentinel.field';
 export const TEST_SIGNING_DIGEST = createHash('sha256').update('wp26-test-signing-identity').digest();
 
+/** One AuthorizationList entry, with its tag and the list(s) it belongs in. */
+interface AuthorizationEntry {
+  readonly tag: number;
+  readonly encoded: Buffer;
+  readonly placement: AuthorizationListPlacement;
+}
+
+/**
+ * Builds a `KeyDescription` SHAPED BY ANDROID'S SCHEMA, not by this repository's
+ * parser (C18-02).
+ *
+ *     softwareEnforced   attestationApplicationId — the package name and the
+ *                        signing-certificate digests. The Android PLATFORM
+ *                        collects these; KeyMint's `Tag.aidl` records that
+ *                        `ATTESTATION_APPLICATION_ID` cannot be
+ *                        hardware-enforced.
+ *
+ *     hardwareEnforced   algorithm, keySize, ecCurve, purpose, origin,
+ *                        noAuthRequired and rootOfTrust — the properties the
+ *                        TEE or StrongBox itself enforces and can vouch for.
+ *
+ * The previous fixture put EVERYTHING in `teeEnforced`, the application id
+ * included, and the verifier read it from there. That layout does not occur on
+ * a real device: a genuine StrongBox certificate would have been REFUSED for a
+ * missing application identity, and the "happy path" test was proving the
+ * parser correct against data designed around the parser. Both were corrected
+ * together.
+ */
 export function buildKeyDescription(options: KeyDescriptionOptions): Buffer {
   const attestationApplicationId = der.sequence(
     der.set(der.sequence(der.octetString(Buffer.from(options.packageName ?? TEST_PACKAGE_NAME, 'utf8')), der.integer(1))),
     der.set(der.octetString(options.signingDigest ?? TEST_SIGNING_DIGEST)),
   );
 
-  // The AuthorizationList's members are strictly ASCENDING by tag — the
-  // production reader refuses anything else, and a real list is emitted that way.
-  const teeEntries: Buffer[] = [];
-  teeEntries.push(der.contextExplicit(1, der.set(...(options.purposes ?? [ANDROID_KEY_PURPOSE_SIGN]).map((p) => der.integer(p)))));
-  teeEntries.push(der.contextExplicit(2, der.integer(options.algorithm ?? ANDROID_KEY_ALGORITHM_EC)));
-  teeEntries.push(der.contextExplicit(3, der.integer(options.keySize ?? ANDROID_KEY_SIZE_P256)));
-  teeEntries.push(der.contextExplicit(10, der.integer(options.ecCurve ?? ANDROID_EC_CURVE_P256)));
-  if (options.includeNoAuthRequired ?? true) teeEntries.push(der.contextExplicit(503, der.null()));
-  teeEntries.push(der.contextExplicit(702, der.integer(options.origin ?? ANDROID_KEY_ORIGIN_GENERATED)));
+  const misplaced = new Set<HardwareEnforcedProperty>(options.hardwarePropertiesInSoftwareEnforced ?? []);
+  const placementOf = (property: HardwareEnforcedProperty): AuthorizationListPlacement =>
+    misplaced.has(property) ? 'softwareEnforced' : 'hardwareEnforced';
+
+  const entries: AuthorizationEntry[] = [];
+  entries.push({
+    tag: 1,
+    encoded: der.contextExplicit(1, der.set(...(options.purposes ?? [ANDROID_KEY_PURPOSE_SIGN]).map((p) => der.integer(p)))),
+    placement: placementOf('purpose'),
+  });
+  entries.push({
+    tag: 2,
+    encoded: der.contextExplicit(2, der.integer(options.algorithm ?? ANDROID_KEY_ALGORITHM_EC)),
+    placement: placementOf('algorithm'),
+  });
+  entries.push({
+    tag: 3,
+    encoded: der.contextExplicit(3, der.integer(options.keySize ?? ANDROID_KEY_SIZE_P256)),
+    placement: placementOf('keySize'),
+  });
+  entries.push({
+    tag: 10,
+    encoded: der.contextExplicit(10, der.integer(options.ecCurve ?? ANDROID_EC_CURVE_P256)),
+    placement: placementOf('ecCurve'),
+  });
+  if (options.includeNoAuthRequired ?? true) {
+    entries.push({ tag: 503, encoded: der.contextExplicit(503, der.null()), placement: placementOf('noAuthRequired') });
+  }
+  entries.push({
+    tag: 702,
+    encoded: der.contextExplicit(702, der.integer(options.origin ?? ANDROID_KEY_ORIGIN_GENERATED)),
+    placement: placementOf('origin'),
+  });
   if (options.includeRootOfTrust ?? true) {
-    teeEntries.push(
-      der.contextExplicit(
+    entries.push({
+      tag: 704,
+      encoded: der.contextExplicit(
         704,
         der.sequence(
           der.octetString(Buffer.alloc(32, 0x11)),
@@ -176,11 +271,29 @@ export function buildKeyDescription(options: KeyDescriptionOptions): Buffer {
           der.octetString(Buffer.alloc(32, 0x22)),
         ),
       ),
-    );
+      placement: placementOf('rootOfTrust'),
+    });
   }
   if (options.includeApplicationId ?? true) {
-    teeEntries.push(der.contextExplicit(709, der.octetString(attestationApplicationId)));
+    entries.push({
+      tag: 709,
+      encoded: der.contextExplicit(709, der.octetString(attestationApplicationId)),
+      // ANDROID'S ANSWER, not this parser's convenience. See the header.
+      placement: options.applicationIdIn ?? 'softwareEnforced',
+    });
   }
+
+  // The AuthorizationList's members are strictly ASCENDING by tag — the
+  // production reader refuses anything else, and a real list is emitted that
+  // way. Sorting here rather than relying on push order keeps that true however
+  // an entry was placed.
+  const listFor = (which: 'softwareEnforced' | 'hardwareEnforced'): Buffer =>
+    der.sequence(
+      ...entries
+        .filter((entry) => entry.placement === which || entry.placement === 'both')
+        .sort((left, right) => left.tag - right.tag)
+        .map((entry) => entry.encoded),
+    );
 
   return der.sequence(
     der.integer(options.attestationVersion ?? 4),
@@ -189,11 +302,9 @@ export function buildKeyDescription(options: KeyDescriptionOptions): Buffer {
     der.enumerated(options.keymasterSecurityLevel ?? ANDROID_SECURITY_LEVEL_STRONGBOX),
     der.octetString(options.challenge),
     der.octetString(Buffer.alloc(0)),
-    // softwareEnforced: deliberately EMPTY. The verifier reads `teeEnforced`
-    // only, and a fixture that populated the software list would make it easy to
-    // write a test that passes for the wrong reason.
-    der.sequence(),
-    der.sequence(...teeEntries),
+    // softwareEnforced FIRST, then teeEnforced — the schema's own order.
+    listFor('softwareEnforced'),
+    listFor('hardwareEnforced'),
   );
 }
 
@@ -302,6 +413,19 @@ export interface SyntheticChainOptions {
   /** Use a caller-supplied root, e.g. to build a chain to an UNPINNED root. */
   rootKeyPair?: TestKeyPair;
   rootCommonName?: string;
+  /**
+   * C18-04. Basic Constraints on the INTERMEDIATE — the certificate that signs
+   * the leaf. Defaults to `true`, which is what a real issuer carries. Set it
+   * `false` to build a chain in which every signature verifies and every name
+   * matches, but the issuer was never authorised to be a CA.
+   */
+  intermediateIsCertificateAuthority?: boolean;
+  /**
+   * C18-04. Basic Constraints on the LEAF. Defaults to `false`, which is what an
+   * end-entity attested key carries. Set it `true` to build a leaf claiming
+   * issuing authority it has no business holding.
+   */
+  leafIsCertificateAuthority?: boolean;
 }
 
 export interface SyntheticChain {
@@ -358,7 +482,7 @@ export function buildSyntheticChain(options: SyntheticChainOptions): SyntheticCh
     serial: intermediateSerial,
     notBefore,
     notAfter,
-    isCertificateAuthority: true,
+    isCertificateAuthority: options.intermediateIsCertificateAuthority ?? true,
   });
 
   const keyDescription = buildKeyDescription({ challenge: options.challenge, ...options.keyDescription });
@@ -370,7 +494,7 @@ export function buildSyntheticChain(options: SyntheticChainOptions): SyntheticCh
     serial: leafSerial,
     notBefore,
     notAfter,
-    isCertificateAuthority: false,
+    isCertificateAuthority: options.leafIsCertificateAuthority ?? false,
     extraExtensions: options.omitAttestationExtension === true ? [] : [attestationExtension(keyDescription)],
   });
 

@@ -1,6 +1,7 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import {
+  DeviceKeyStorageSchema,
   deriveP256PublicKeyThumbprint,
   type DeviceCustody,
   type DeviceKeyStorage,
@@ -275,6 +276,62 @@ export class DeviceEnrollmentIngressService {
       return { outcome: 'REFUSED' };
     }
 
+    // THE MATERIAL CONTENT OF THIS SUBMISSION, AS ONE VALUE (C18-03).
+    //
+    // Computed BEFORE the challenge is spent, because it is what the spend is
+    // recorded against and what a later retry is compared to. Every input that
+    // could make two submissions different ceremonies is in it; nothing that
+    // varies between two honest retries of the same submission is.
+    const submissionFingerprint = enrollmentSubmissionFingerprint({
+      organisationId: input.organisationId,
+      siteId: grant.siteId,
+      intendedUserId: grant.intendedUserId,
+      bootstrapGrantId: grant.grantId,
+      attestationChallengeId: challenge.id,
+      publicKey: input.publicKey,
+      claimedSignatureProfile: input.claimedSignatureProfile,
+      custody: input.custody,
+      custodyRegimeId: input.custodyRegimeId,
+      certificateChainBase64: input.certificateChainBase64,
+    });
+
+    // ---- C18-03: A SUCCESSFUL REQUEST SURVIVES A LOST RESPONSE ------------
+    //
+    // THE FAILURE THIS CLOSES. Shield creates the enrollment request, the HTTP
+    // response is lost on the way back to the phone, the phone retries the
+    // byte-identical submission — and, because the challenge is spent, is told
+    // `ATTESTATION_CHALLENGE_ALREADY_CONSUMED` and never learns its own request
+    // id or fingerprint. The ceremony is then unfinishable: the operative
+    // cannot read a fingerprint to a commander, and a request nobody can name
+    // sits in the queue. Shield already established the opposite doctrine one
+    // layer down — an identical repeat under one grant CONVERGES on the request
+    // that exists — and this restores it at the ingress.
+    //
+    // SPENDING A CHALLENGE ON AN ATTEMPT IS STILL RIGHT AND IS UNCHANGED. What
+    // is wrong is treating an exact retry of an already-SUCCESSFUL request as
+    // another attempt. So this is not a relaxation of the one-shot rule; it is a
+    // read of durable state that PROVES the attempt already happened and already
+    // produced a specific answer.
+    //
+    // IT IS AUTHORITATIVE OR IT REFUSES. `CONVERGED` requires that the server's
+    // own row records BOTH that this exact submission spent this challenge AND
+    // the complete outcome it produced. Any of: no recorded fingerprint, a
+    // different fingerprint, a partially recorded outcome — fails closed. The
+    // answer is served entirely from recorded state: NO second artifact, NO
+    // second Shield request, NO re-verification, and no expiry is extended.
+    //
+    // IT IS CHECKED BEFORE THE EXPIRY BOUND, deliberately. The expiry governs
+    // whether a NEW attempt may proceed; it has no business erasing the record
+    // of one that already succeeded. A retry that arrives 121 seconds late is
+    // still asking about a request that exists, and answering it creates
+    // nothing.
+    if (challenge.consumedAt !== null) {
+      const resolved = resolveRecordedSubmission(challenge, submissionFingerprint);
+      if (resolved !== null) return resolved;
+      this.refused('ATTESTATION_CHALLENGE_ALREADY_CONSUMED', input.traceId, null);
+      return { outcome: 'REFUSED' };
+    }
+
     const now = await this.repository.now();
     // EXCLUSIVE boundary, evaluated at REQUEST TIME. There is no expiry
     // scheduler anywhere in this module (D25-08).
@@ -282,14 +339,17 @@ export class DeviceEnrollmentIngressService {
       this.refused('ATTESTATION_CHALLENGE_EXPIRED', input.traceId, null);
       return { outcome: 'REFUSED' };
     }
-    if (challenge.consumedAt !== null) {
-      this.refused('ATTESTATION_CHALLENGE_ALREADY_CONSUMED', input.traceId, null);
-      return { outcome: 'REFUSED' };
-    }
 
     // ONE-SHOT, AS A DATABASE FACT. The read above is a courtesy that produces a
-    // clear refusal; THIS is the check that holds when two submissions race.
-    const claimed = await this.repository.consumeAttestationChallenge(input.organisationId, challenge.id, now);
+    // clear refusal; THIS is the check that holds when two submissions race. The
+    // same statement records WHICH submission spent it, so the row can never say
+    // "consumed" without saying by what.
+    const claimed = await this.repository.consumeAttestationChallenge(
+      input.organisationId,
+      challenge.id,
+      now,
+      submissionFingerprint,
+    );
     if (!claimed) {
       this.refused('ATTESTATION_CHALLENGE_ALREADY_CONSUMED', input.traceId, null);
       return { outcome: 'REFUSED' };
@@ -359,6 +419,25 @@ export class DeviceEnrollmentIngressService {
       this.refused('SHIELD_REFUSED_REQUEST', input.traceId, created.refusal);
       return { outcome: 'REFUSED' };
     }
+
+    // C18-03: THE RECEIPT, written only once a request actually exists.
+    //
+    // Recorded AFTER Shield answered, so the row can only ever describe an
+    // outcome that really happened. A crash between the consume above and this
+    // write leaves the challenge spent with no recorded outcome, and a retry
+    // then FAILS CLOSED — which is correct: the server cannot prove what
+    // happened, so it must not claim to know. Write-once at the database level,
+    // and its result is deliberately not acted on: the request exists either
+    // way, and failing a real success over a bookkeeping row would be the wrong
+    // trade.
+    await this.repository.recordEnrollmentOutcome({
+      organisationId: input.organisationId,
+      challengeId: challenge.id,
+      enrollmentRequestId: created.enrollmentRequestId,
+      enrollmentRequestFingerprint: created.requestFingerprint,
+      attestationOutcome: created.attestationOutcome,
+      keyStorage,
+    });
 
     return {
       outcome: created.outcome,
@@ -504,4 +583,158 @@ export class DeviceEnrollmentIngressService {
         (shieldRefusal === null ? '' : ` shield_refusal=${shieldRefusal}`),
     );
   }
+}
+
+/**
+ * ===========================================================================
+ * C18-03 — THE SUBMISSION FINGERPRINT, AND WHAT IT IS FOR.
+ * ===========================================================================
+ *
+ * ONE VALUE THAT ANSWERS "IS THIS THE SAME SUBMISSION?"
+ *
+ * A consumed attestation challenge may only produce `CONVERGED` when the server
+ * can prove that THIS EXACT submission already produced THAT EXACT enrollment
+ * request. This digest is the "exact submission" half of that proof, and its
+ * membership is chosen by one question: could two submissions differing in this
+ * field be two different ceremonies? If yes, it is in.
+ *
+ *     the tenant, site and intended user     whose ceremony this is
+ *     the bootstrap grant                    what a commander authorised
+ *     the attestation challenge              which freshness value was answered
+ *     the submitted public key               WHICH KEY is being enrolled
+ *     the certificate chain, as submitted    the attestation artifact itself
+ *     custody + régime + claimed profile     the terms the request is opened on
+ *
+ * The chain is digested AS SUBMITTED — the base64 text, not the decoded bytes —
+ * so the fingerprint names exactly what arrived, for the reason the verifier's
+ * own chain hash gives: a re-encoding is a different submission and must not be
+ * mistaken for a retry of this one.
+ *
+ * WHAT IS DELIBERATELY ABSENT: the trace id, the bootstrap TOKEN, any clock, any
+ * server-generated id. An honest retry re-sends the same body with a new trace
+ * id, so anything varying between two identical retries would make every retry
+ * look like a new ceremony and defeat the whole mechanism. The token is absent
+ * for a different reason — the same one `device-security-audit.ts` keeps it out
+ * of a log line: a one-shot secret has no business entering a value that will be
+ * stored and compared. The grant ID it authorises is in the digest instead, and
+ * the token itself has already been proved by `presentBootstrapGrantForCeremony`
+ * before this is computed.
+ *
+ * THIS IS NOT A CREDENTIAL AND NOT A SUBSTITUTE FOR ONE. Presenting a matching
+ * fingerprint authorises nothing: it is only ever read AFTER the session has
+ * been equality-bound, the grant has been presented, and the challenge has been
+ * proved to belong to that grant, site and intended user. It answers "same or
+ * different", and nothing else.
+ *
+ * Every field is LENGTH-PREFIXED and labelled, so no two distinct submissions
+ * can produce one digest by concatenation — the discipline the verifier's chain
+ * hash uses, applied to a wider structure.
+ */
+function enrollmentSubmissionFingerprint(input: {
+  organisationId: string;
+  siteId: string;
+  intendedUserId: string;
+  bootstrapGrantId: string;
+  attestationChallengeId: string;
+  publicKey: string;
+  claimedSignatureProfile: string;
+  custody: string;
+  custodyRegimeId: string | null;
+  certificateChainBase64: readonly string[];
+}): string {
+  const digest = createHash('sha256');
+  const field = (label: string, value: string): void => {
+    digest.update(label, 'utf8');
+    digest.update('=');
+    digest.update(String(Buffer.byteLength(value, 'utf8')));
+    digest.update('.');
+    digest.update(value, 'utf8');
+    digest.update('|');
+  };
+
+  // A VERSION TAG, first. When the membership above changes, this changes with
+  // it, so a receipt written by an older server can never be matched by a
+  // fingerprint a newer one computed over different fields.
+  field('v', 'wp26.enrollment-submission.v1');
+  field('org', input.organisationId);
+  field('site', input.siteId);
+  field('user', input.intendedUserId);
+  field('grant', input.bootstrapGrantId);
+  field('challenge', input.attestationChallengeId);
+  field('key', input.publicKey);
+  field('profile', input.claimedSignatureProfile);
+  field('custody', input.custody);
+  // Presence and value separately: `null` and a régime id are different
+  // submissions, and an encoding in which one could be read as the other would
+  // be an encoding in which they could converge on each other.
+  field('regime_present', input.custodyRegimeId === null ? '0' : '1');
+  field('regime', input.custodyRegimeId ?? '');
+  field('chain_length', String(input.certificateChainBase64.length));
+  for (const [index, certificate] of input.certificateChainBase64.entries()) {
+    field(`chain_${index}`, certificate);
+  }
+  return digest.digest('hex');
+}
+
+/**
+ * C18-03 — THE RECORDED OUTCOME OF A CONSUMED CHALLENGE, OR `null`.
+ *
+ * FAIL CLOSED IS THE DEFAULT AND EVERY BRANCH BELOW RETURNS TO IT.
+ *
+ * `null` means "this server cannot prove what that challenge produced", and the
+ * caller turns that into the ordinary refusal. It is returned for a consumed
+ * challenge that recorded no submission fingerprint, one whose fingerprint is
+ * for a DIFFERENT submission (a retry with another public key, another custody,
+ * another chain), and one whose recorded outcome is incomplete — which is what a
+ * crash between the consume and the receipt leaves behind.
+ *
+ * There is no path here that reconstructs, re-derives or infers an outcome. It
+ * either reads four recorded values and echoes them, or it declines.
+ *
+ * The comparison is a plain string equality and that is correct: both sides are
+ * server-computed digests of data the server already holds, neither is a secret,
+ * and there is no secret to leak through its timing. What an attacker would need
+ * in order to reach this comparison at all is the intended user's live session,
+ * the grant secret and the challenge id — at which point they are not guessing
+ * a fingerprint, they are replaying a submission they already have.
+ */
+function resolveRecordedSubmission(
+  challenge: {
+    consumedAt: Date | null;
+    submissionFingerprint: string | null;
+    enrollmentRequestId: string | null;
+    enrollmentRequestFingerprint: string | null;
+    attestationOutcome: string | null;
+    keyStorage: string | null;
+  },
+  submissionFingerprint: string,
+): SubmitEnrollmentRequestOutcome | null {
+  if (challenge.consumedAt === null) return null;
+  if (challenge.submissionFingerprint === null) return null;
+  if (challenge.submissionFingerprint !== submissionFingerprint) return null;
+
+  const { enrollmentRequestId, enrollmentRequestFingerprint, attestationOutcome, keyStorage } = challenge;
+  if (
+    enrollmentRequestId === null ||
+    enrollmentRequestFingerprint === null ||
+    attestationOutcome === null ||
+    keyStorage === null
+  ) {
+    return null;
+  }
+  // The stored key storage is re-parsed against the frozen contract rather than
+  // cast. A column is a string; `DeviceKeyStorage` is a closed vocabulary, and a
+  // value that is not in it is a row this code did not write.
+  const storage = DeviceKeyStorageSchema.safeParse(keyStorage);
+  if (!storage.success) return null;
+
+  return {
+    // WP-24's convergence arm, reached for WP-24's reason: the ceremony already
+    // happened, and the client is being told what it already achieved.
+    outcome: 'CONVERGED',
+    enrollmentRequestId,
+    requestFingerprint: enrollmentRequestFingerprint,
+    attestationOutcome,
+    keyStorage: storage.data,
+  };
 }

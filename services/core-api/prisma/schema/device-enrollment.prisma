@@ -189,6 +189,55 @@ model DeviceAttestationChallenge {
   /// with a new challenge, which is exactly what D26-04A prescribes.
   consumedAt DateTime? @map("consumed_at") @db.Timestamptz(3)
 
+  // -------------------------------------------------------------------------
+  // C18-03 — THE DURABLE RECEIPT FOR ONE SUBMISSION.
+  //
+  // A successful enrollment request must be able to survive a LOST RESPONSE.
+  // Shield creates the request, the HTTP response never arrives, the phone
+  // retries the identical submission — and before these columns existed it was
+  // told `ATTESTATION_CHALLENGE_ALREADY_CONSUMED` and never learned its own
+  // request id or fingerprint. That regresses the convergence doctrine Shield
+  // itself established for a repeated submission under one grant.
+  //
+  // Spending a challenge on an ATTEMPT is still right and is unchanged. What is
+  // added is the ability to PROVE that a particular consumed challenge already
+  // produced a particular enrollment request, so an exact retry can be answered
+  // with that request rather than with a refusal.
+  //
+  // EVERY ONE OF THESE FAILS CLOSED. They are nullable, they are never cleared,
+  // and a consumed challenge whose outcome is not fully recorded resolves to
+  // NOTHING — the retry refuses. Nothing here un-consumes a challenge, extends
+  // an expiry, or authorises a second attempt.
+  // -------------------------------------------------------------------------
+
+  /// WHICH submission spent this challenge. A digest over the whole material
+  /// content of the submission — the grant, this challenge, the public key, the
+  /// attestation chain as submitted, and the custody terms — stamped in the SAME
+  /// fenced update that stamps `consumed_at`, so it is never possible for the
+  /// row to say "consumed" without saying by what.
+  ///
+  /// A retry whose fingerprint differs in ANY of those is a DIFFERENT ceremony
+  /// wearing a spent challenge, and refuses.
+  submissionFingerprint String? @map("submission_fingerprint") @db.Text
+
+  /// The enrollment request this submission produced, AS RECORDED. A plain
+  /// column with no foreign key, following this file's historical-artefact rule:
+  /// the ingress may not couple its own lifecycle to a Shield table, and it may
+  /// not read one either (D26-09). What it may do is remember the answer Shield
+  /// gave it.
+  enrollmentRequestId String? @map("enrollment_request_id") @db.Uuid
+  /// The fingerprint the operative must be able to read back — it is the value
+  /// the independent commander will be asked to confirm out of band, and a
+  /// ceremony where the two humans cannot compare the same value is a ceremony
+  /// in which the approval means less.
+  enrollmentRequestFingerprint String? @map("enrollment_request_fingerprint") @db.Text
+  /// The SERVER's attestation verdict for this submission, echoed on the retry
+  /// so the answer is byte-identical rather than merely equivalent.
+  attestationOutcome String? @map("attestation_outcome") @db.Text
+  /// The key storage the server DERIVED from that verdict (D26-02). Recorded,
+  /// never claimed.
+  keyStorage String? @map("key_storage") @db.Text
+
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 

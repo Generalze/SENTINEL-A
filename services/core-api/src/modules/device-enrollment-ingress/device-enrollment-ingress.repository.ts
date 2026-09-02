@@ -94,6 +94,11 @@ export class DeviceEnrollmentIngressRepository {
     issuedAt: Date;
     expiresAt: Date;
     consumedAt: Date | null;
+    submissionFingerprint: string | null;
+    enrollmentRequestId: string | null;
+    enrollmentRequestFingerprint: string | null;
+    attestationOutcome: string | null;
+    keyStorage: string | null;
   } | null> {
     return this.prisma.deviceAttestationChallenge.findFirst({
       where: { id: challengeId, organisationId },
@@ -107,6 +112,14 @@ export class DeviceEnrollmentIngressRepository {
         issuedAt: true,
         expiresAt: true,
         consumedAt: true,
+        // C18-03: the durable receipt. Selected here so the ONE read the service
+        // already performs can also answer "did this exact submission already
+        // succeed?", rather than a second query racing the first.
+        submissionFingerprint: true,
+        enrollmentRequestId: true,
+        enrollmentRequestFingerprint: true,
+        attestationOutcome: true,
+        keyStorage: true,
       },
     });
   }
@@ -124,11 +137,57 @@ export class DeviceEnrollmentIngressRepository {
    * verification that then failed does not hand the value back — the phone
    * discards the unfinished key and restarts with a fresh challenge, which is
    * what D26-04A prescribes.
+   *
+   * C18-03: `submissionFingerprint` is stamped BY THE SAME STATEMENT. The row
+   * can therefore never say "consumed" without saying by WHAT, which is what
+   * makes lost-response resolution a proof rather than a guess — and it costs
+   * nothing, because the winning update is the one that already had to happen.
    */
-  async consumeAttestationChallenge(organisationId: string, challengeId: string, at: Date): Promise<boolean> {
+  async consumeAttestationChallenge(
+    organisationId: string,
+    challengeId: string,
+    at: Date,
+    submissionFingerprint: string,
+  ): Promise<boolean> {
     const result = await this.prisma.deviceAttestationChallenge.updateMany({
       where: { id: challengeId, organisationId, consumedAt: null },
-      data: { consumedAt: at },
+      data: { consumedAt: at, submissionFingerprint },
+    });
+    return result.count === 1;
+  }
+
+  /**
+   * Records the enrollment request ONE consumed challenge produced (C18-03).
+   *
+   * WRITE-ONCE, AS A DATABASE FACT. The `enrollmentRequestId: null` predicate
+   * makes this a fenced update exactly as `consumeAttestationChallenge` is: the
+   * outcome of a challenge is written by the submission that reached it, once,
+   * and no later call can rewrite what an earlier one recorded. That matters
+   * because the recorded outcome is what a retry is answered FROM — a mutable
+   * receipt would be a receipt an attacker could aim.
+   *
+   * It writes only to the challenge's OWN row and only to columns that were
+   * NULL. It does not touch `consumed_at`, `expires_at`, or any Shield table.
+   * The return value is deliberately ignored by the caller: the request already
+   * exists either way, and failing the ceremony because a receipt could not be
+   * written would trade a real success for a bookkeeping error.
+   */
+  async recordEnrollmentOutcome(input: {
+    organisationId: string;
+    challengeId: string;
+    enrollmentRequestId: string;
+    enrollmentRequestFingerprint: string;
+    attestationOutcome: string;
+    keyStorage: string;
+  }): Promise<boolean> {
+    const result = await this.prisma.deviceAttestationChallenge.updateMany({
+      where: { id: input.challengeId, organisationId: input.organisationId, enrollmentRequestId: null },
+      data: {
+        enrollmentRequestId: input.enrollmentRequestId,
+        enrollmentRequestFingerprint: input.enrollmentRequestFingerprint,
+        attestationOutcome: input.attestationOutcome,
+        keyStorage: input.keyStorage,
+      },
     });
     return result.count === 1;
   }

@@ -318,7 +318,21 @@ interface SubmittedRequest {
   chain: SyntheticChain;
   deviceKeyPair: TestKeyPair;
   canonicalPublicKey: string;
+  /**
+   * THE EXACT BODY THAT WAS POSTED.
+   *
+   * Kept so C18-03's regressions can replay a submission BYTE FOR BYTE — a
+   * lost-response retry is the same body arriving twice, and a helper that
+   * rebuilt the chain would be testing a different submission each time and
+   * could never prove convergence.
+   */
+  body: Record<string, unknown>;
   result: HttpResult;
+}
+
+/** Posts an already-built enrollment-request body. The replay path. */
+async function postEnrollmentRequest(body: Record<string, unknown>, session = fx.opAlpha): Promise<HttpResult> {
+  return post(`${INGRESS}/requests`, body, asSession(session));
 }
 
 async function submitEnrollmentRequest(
@@ -340,6 +354,9 @@ async function submitEnrollmentRequest(
     leafSerial?: number;
     notBefore?: Date;
     notAfter?: Date;
+    /** C18-04: Basic Constraints, so a chain of perfect signatures can still lack authority. */
+    intermediateIsCertificateAuthority?: boolean;
+    leafIsCertificateAuthority?: boolean;
   } = {},
 ): Promise<SubmittedRequest> {
   const deviceKeyPair = options.deviceKeyPair ?? generateEcKeyPair();
@@ -352,27 +369,25 @@ async function submitEnrollmentRequest(
     leafSerial: options.leafSerial,
     notBefore: options.notBefore,
     notAfter: options.notAfter,
+    intermediateIsCertificateAuthority: options.intermediateIsCertificateAuthority,
+    leafIsCertificateAuthority: options.leafIsCertificateAuthority,
   });
   const canonicalPublicKey = canonicalPublicKeyOf(deviceKeyPair);
-  const result = await post(
-    `${INGRESS}/requests`,
-    {
-      organisation_id: fx.orgA,
-      site_id: fx.siteA1,
-      intended_user_id: fx.opAlpha,
-      bootstrap_token: token,
-      attestation_challenge_id: challengeId,
-      public_key: canonicalPublicKey,
-      claimed_signature_profile: PROFILE,
-      custody: 'PERSONAL',
-      custody_regime_id: null,
-      certificate_chain: chain.chainBase64,
-    },
-    asSession(options.session ?? fx.opAlpha),
-  );
-  return { chain, deviceKeyPair, canonicalPublicKey, result };
+  const body: Record<string, unknown> = {
+    organisation_id: fx.orgA,
+    site_id: fx.siteA1,
+    intended_user_id: fx.opAlpha,
+    bootstrap_token: token,
+    attestation_challenge_id: challengeId,
+    public_key: canonicalPublicKey,
+    claimed_signature_profile: PROFILE,
+    custody: 'PERSONAL',
+    custody_regime_id: null,
+    certificate_chain: chain.chainBase64,
+  };
+  const result = await postEnrollmentRequest(body, options.session ?? fx.opAlpha);
+  return { chain, deviceKeyPair, canonicalPublicKey, body, result };
 }
-
 /** Grant -> attestation challenge -> request, the three steps every test needs. */
 async function openCeremony(
   options: Parameters<typeof submitEnrollmentRequest>[3] = {},
@@ -1098,4 +1113,287 @@ describe('WP-26/D26-04B the raw certificate chain never leaves the restricted st
       expect(sent).not.toContain(needle);
     }
   }, 180_000);
+});
+
+// ===========================================================================
+// 7. C18-02 — THE TWO ENFORCEMENT LISTS MEAN DIFFERENT THINGS
+// ===========================================================================
+
+describe('WP-26/C18-02 softwareEnforced and hardwareEnforced are not interchangeable', () => {
+  /**
+   * WHAT WAS WRONG, AND WHY IT MATTERED MORE THAN A PARSER BUG.
+   *
+   * The verifier read `attestationApplicationId` out of `teeEnforced`. Android's
+   * KeyMint `Tag.aidl` states that `ATTESTATION_APPLICATION_ID` CANNOT be
+   * hardware-enforced: the platform collects the calling package's identity and
+   * hands it to the secure implementation, which cannot verify it and therefore
+   * never enforces it. It appears in `softwareEnforced` on every real device.
+   *
+   * So a genuine StrongBox certificate would have been REFUSED for a missing
+   * application identity, and the ONLY thing the old verifier accepted was a
+   * synthetic fixture built to match its own mistake. The suite was proving the
+   * parser correct against data designed around the parser — which is the exact
+   * failure mode a fixture is supposed to guard against. The fixture is now
+   * shaped by Android's schema, and these three tests pin BOTH directions so it
+   * cannot drift back.
+   */
+  it('the application id in softwareEnforced ONLY, everything else in hardwareEnforced — VERIFIED', async () => {
+    const ceremony = await openCeremony({
+      keyDescription: { applicationIdIn: 'softwareEnforced' },
+    });
+    expect(ceremony.submitted.result.status).toBe(201);
+    expect(ceremony.submitted.result.body.attestation_outcome).toBe('VERIFIED');
+    expect(ceremony.submitted.result.body.key_storage).toBe('HARDWARE_BACKED');
+
+    const artifact = await artifactFor(ceremony.challengeId);
+    expect(artifact.outcomeReason).toBe('VERIFIED');
+    // The artifact records WHAT WAS COMPARED. A row that stored NULL here would
+    // be recording this parser's mistake rather than the certificate's content.
+    expect(artifact.attestationPackageName).toBe(TEST_PACKAGE_NAME);
+    expect(artifact.attestationSigningDigest).toBe(TEST_SIGNING_DIGEST.toString('hex'));
+  }, 120_000);
+
+  it('the application id in hardwareEnforced ONLY does NOT satisfy the identity requirement', async () => {
+    // The impossible layout. It is refused rather than accepted-as-stricter,
+    // because a field has exactly one authoritative source and reading it from
+    // a second list would mean two spellings of one certificate both work.
+    const ceremony = await openCeremony({
+      keyDescription: { applicationIdIn: 'hardwareEnforced' },
+    });
+    expect(ceremony.submitted.result.body.attestation_outcome).toBe('NEGATIVE');
+    expect(ceremony.submitted.result.body.key_storage).toBe('SOFTWARE');
+    const artifact = await artifactFor(ceremony.challengeId);
+    expect(artifact.outcomeReason).toBe('APPLICATION_IDENTITY_MISSING');
+    expect(artifact.attestationPackageName).toBeNull();
+  }, 120_000);
+
+  it.each([
+    ['origin', 'KEY_ORIGIN_NOT_GENERATED'],
+    ['purpose', 'KEY_PURPOSE_NOT_SIGN'],
+    ['ecCurve', 'KEY_ALGORITHM_NOT_P256_EC'],
+    ['rootOfTrust', 'ROOT_OF_TRUST_MISSING'],
+  ] as const)(
+    'a hardware property (%s) present ONLY in softwareEnforced is not accepted as hardware-enforced',
+    async (property, expectedReason) => {
+      // The fail-OPEN direction, and the one that would matter in the field: the
+      // operating system asserting a property only the secure hardware can
+      // honestly assert. `softwareEnforced` is signed by the same attestation
+      // key and is perfectly real — it is simply not a statement by the TEE.
+      const ceremony = await openCeremony({
+        keyDescription: { hardwarePropertiesInSoftwareEnforced: [property] },
+      });
+      expect(ceremony.submitted.result.body.attestation_outcome).toBe('NEGATIVE');
+      expect(ceremony.submitted.result.body.key_storage).toBe('SOFTWARE');
+      const artifact = await artifactFor(ceremony.challengeId);
+      expect(artifact.outcomeReason).toBe(expectedReason);
+    },
+    120_000,
+  );
+});
+
+// ===========================================================================
+// 8. C18-04 — SIGNATURES ARE NOT AUTHORITY
+// ===========================================================================
+
+describe('WP-26/C18-04 the chain must prove CA authority, not only signatures', () => {
+  it('an intermediate with CA=false fails, even though every signature and name matches', async () => {
+    // The chain below is cryptographically perfect: pinned root -> intermediate
+    // -> StrongBox leaf, every `checkIssued` true, every `verify` true, every
+    // validity window open, nothing revoked. The ONE thing wrong with it is that
+    // the intermediate was never authorised to be a CA — which is the classic
+    // path-validation break: an end-entity certificate legitimately signed by a
+    // real CA, then used to mint further certificates for anything at all.
+    const ceremony = await openCeremony({ intermediateIsCertificateAuthority: false });
+    expect(ceremony.submitted.result.body.attestation_outcome).toBe('NEGATIVE');
+    const artifact = await artifactFor(ceremony.challengeId);
+    expect(artifact.outcomeReason).toBe('CHAIN_ISSUER_NOT_CERTIFICATE_AUTHORITY');
+  }, 120_000);
+
+  it('a leaf claiming CA=true fails', async () => {
+    // The mirror image. The attested key is an end-entity key; a leaf claiming
+    // issuing authority is refused rather than merely disregarded.
+    const ceremony = await openCeremony({ leafIsCertificateAuthority: true });
+    expect(ceremony.submitted.result.body.attestation_outcome).toBe('NEGATIVE');
+    const artifact = await artifactFor(ceremony.challengeId);
+    expect(artifact.outcomeReason).toBe('LEAF_IS_CERTIFICATE_AUTHORITY');
+  }, 120_000);
+
+  it('the honest chain — CA intermediate, non-CA leaf — still passes', async () => {
+    // The other half of the pair. A constraint that refuses everything is not a
+    // constraint, it is an outage.
+    const ceremony = await openCeremony();
+    expect(ceremony.submitted.result.body.attestation_outcome).toBe('VERIFIED');
+    expect((await artifactFor(ceremony.challengeId)).outcomeReason).toBe('VERIFIED');
+  }, 120_000);
+});
+
+// ===========================================================================
+// 9. C18-03 — A SUCCESSFUL REQUEST SURVIVES A LOST RESPONSE
+// ===========================================================================
+
+describe('WP-26/C18-03 an exact retry of a SUCCESSFUL submission converges', () => {
+  /** Every artifact row and enrollment request this grant produced. */
+  async function ledgerFor(grantId: string, challengeId: string) {
+    const artifacts = await prisma.androidKeyAttestationArtifact.findMany({
+      where: { organisationId: fx.orgA, attestationChallengeId: challengeId },
+    });
+    const requests = await prisma.enrollmentRequest.findMany({
+      where: { organisationId: fx.orgA, bootstrapGrantId: grantId },
+    });
+    return { artifacts, requests };
+  }
+
+  it('the byte-identical retry returns CONVERGED, the same ids, ONE artifact and ONE request', async () => {
+    // THE SCENARIO. Shield created the request, the HTTP response was lost, the
+    // phone re-sent the identical submission. Before C18-03 it was told
+    // `ATTESTATION_CHALLENGE_ALREADY_CONSUMED` and never learned its own request
+    // id or fingerprint — so the operative could not read a fingerprint to a
+    // commander and the ceremony was unfinishable.
+    const ceremony = await openCeremony();
+    expect(ceremony.submitted.result.status).toBe(201);
+    expect(ceremony.submitted.result.body.outcome).toBe('REQUESTED');
+
+    const before = await ledgerFor(ceremony.grantId, ceremony.challengeId);
+    expect(before.artifacts).toHaveLength(1);
+    expect(before.requests).toHaveLength(1);
+    const challengeBefore = await prisma.deviceAttestationChallenge.findFirstOrThrow({ where: { id: ceremony.challengeId } });
+
+    const retry = await postEnrollmentRequest(ceremony.submitted.body);
+    expect(retry.status).toBe(201);
+    expect(retry.body.outcome).toBe('CONVERGED');
+    // THE SAME ANSWER, not an equivalent one.
+    expect(retry.body.enrollment_request_id).toBe(ceremony.submitted.result.body.enrollment_request_id);
+    expect(retry.body.request_fingerprint).toBe(ceremony.submitted.result.body.request_fingerprint);
+    expect(retry.body.attestation_outcome).toBe(ceremony.submitted.result.body.attestation_outcome);
+    expect(retry.body.key_storage).toBe(ceremony.submitted.result.body.key_storage);
+
+    // NOTHING WAS CREATED. The retry is served entirely from recorded state: no
+    // second verification, no second artifact, no second Shield request.
+    const after = await ledgerFor(ceremony.grantId, ceremony.challengeId);
+    expect(after.artifacts.map((row) => row.id)).toEqual(before.artifacts.map((row) => row.id));
+    expect(after.requests.map((row) => row.id)).toEqual(before.requests.map((row) => row.id));
+
+    // AND NOTHING ON THE CHALLENGE ROW MOVED. A convergence is a READ: no expiry
+    // is extended, the consume instant is not re-stamped, and the receipt is not
+    // rewritten. `recordEnrollmentOutcome` is write-once at the database level,
+    // so even a path that tried could not.
+    const challengeAfter = await prisma.deviceAttestationChallenge.findFirstOrThrow({ where: { id: ceremony.challengeId } });
+    expect(challengeAfter.expiresAt.getTime()).toBe(challengeBefore.expiresAt.getTime());
+    expect(challengeAfter.consumedAt?.getTime()).toBe(challengeBefore.consumedAt?.getTime());
+    expect(challengeAfter.consumedAt).not.toBeNull();
+    expect(challengeAfter.enrollmentRequestId).toBe(challengeBefore.enrollmentRequestId);
+
+    // The ceremony still finishes normally from the converged answer.
+    const enrollmentRequestId = retry.body.enrollment_request_id as string;
+    const fingerprint = retry.body.request_fingerprint as string;
+    expect((await approve(enrollmentRequestId, fingerprint)).status).toBe(201);
+    const finished = await proveAndCommit(
+      enrollmentRequestId,
+      fingerprint,
+      ceremony.submitted.deviceKeyPair,
+      ceremony.submitted.canonicalPublicKey,
+    );
+    expect(finished.commit.body.outcome).toBe('COMMITTED');
+  }, 180_000);
+
+  it('a retry with a DIFFERENT public key under the same consumed challenge is refused', async () => {
+    const ceremony = await openCeremony();
+    expect(ceremony.submitted.result.status).toBe(201);
+    const before = await ledgerFor(ceremony.grantId, ceremony.challengeId);
+
+    // Changed semantics under a consumed challenge is exactly what the one-shot
+    // rule exists to stop: a second ceremony wearing a spent challenge.
+    const attacker = generateEcKeyPair();
+    const refused = await postEnrollmentRequest({
+      ...ceremony.submitted.body,
+      public_key: canonicalPublicKeyOf(attacker),
+    });
+    expect(refused.status).toBe(403);
+
+    const after = await ledgerFor(ceremony.grantId, ceremony.challengeId);
+    expect(after.artifacts).toHaveLength(before.artifacts.length);
+    expect(after.requests).toHaveLength(before.requests.length);
+  }, 120_000);
+
+  it('a retry with DIFFERENT custody under the same consumed challenge is refused', async () => {
+    const ceremony = await openCeremony();
+    expect(ceremony.submitted.result.status).toBe(201);
+    const refused = await postEnrollmentRequest({
+      ...ceremony.submitted.body,
+      custody: 'CONTROLLED_SHARED',
+    });
+    expect(refused.status).toBe(403);
+    const after = await ledgerFor(ceremony.grantId, ceremony.challengeId);
+    expect(after.requests).toHaveLength(1);
+  }, 120_000);
+
+  it('a retry with a DIFFERENT certificate chain under the same consumed challenge is refused', async () => {
+    const ceremony = await openCeremony();
+    expect(ceremony.submitted.result.status).toBe(201);
+    const other = buildSyntheticChain({
+      challenge: Buffer.from(ceremony.challengeValue, 'base64url'),
+      leafKeyPair: ceremony.submitted.deviceKeyPair,
+      rootKeyPair: pinnedRootKeyPair,
+    });
+    const refused = await postEnrollmentRequest({
+      ...ceremony.submitted.body,
+      certificate_chain: other.chainBase64,
+    });
+    expect(refused.status).toBe(403);
+  }, 120_000);
+
+  it('a consumed challenge whose recorded outcome does not resolve FAILS CLOSED', async () => {
+    // THE CRASH WINDOW, MADE EXPLICIT. The challenge is spent by the ATTEMPT,
+    // and the receipt is written only once Shield has actually answered. A
+    // process that died in between leaves a consumed challenge that cannot
+    // prove what it produced — and a server that cannot prove it must not claim
+    // to know. Simulated here by erasing the recorded outcome, which is exactly
+    // the state that window leaves behind.
+    const ceremony = await openCeremony();
+    expect(ceremony.submitted.result.status).toBe(201);
+    await prisma.deviceAttestationChallenge.update({
+      where: { id: ceremony.challengeId },
+      data: {
+        enrollmentRequestId: null,
+        enrollmentRequestFingerprint: null,
+        attestationOutcome: null,
+        keyStorage: null,
+      },
+    });
+
+    const retry = await postEnrollmentRequest(ceremony.submitted.body);
+    expect(retry.status).toBe(403);
+    expect(retry.body.error).toBe('DEVICE_ENROLLMENT_REFUSED');
+  }, 120_000);
+
+  it('a consumed challenge with NO recorded submission fingerprint fails closed too', async () => {
+    // The other half of the same guarantee: `CONVERGED` requires the row to say
+    // BOTH what spent the challenge AND what it produced. A row missing the
+    // first cannot prove that THIS submission is the one that succeeded.
+    const ceremony = await openCeremony();
+    expect(ceremony.submitted.result.status).toBe(201);
+    await prisma.deviceAttestationChallenge.update({
+      where: { id: ceremony.challengeId },
+      data: { submissionFingerprint: null },
+    });
+    const retry = await postEnrollmentRequest(ceremony.submitted.body);
+    expect(retry.status).toBe(403);
+  }, 120_000);
+
+  it('the receipt records what happened, and a refused submission still consumed the challenge', async () => {
+    // A submission that Shield refused, or that the verifier judged NEGATIVE,
+    // still spends the challenge — that is unchanged and it is the point of a
+    // nonce. What C18-03 adds is only that a SUCCESS can be re-read.
+    const ceremony = await openCeremony({
+      keyDescription: { attestationSecurityLevel: ANDROID_SECURITY_LEVEL_TRUSTED_ENVIRONMENT },
+    });
+    const challenge = await prisma.deviceAttestationChallenge.findFirstOrThrow({ where: { id: ceremony.challengeId } });
+    expect(challenge.consumedAt).not.toBeNull();
+    expect(challenge.submissionFingerprint).not.toBeNull();
+    // A NEGATIVE verdict is still a request that exists, so it is still
+    // convergeable — the receipt records the verdict, it does not gate on it.
+    expect(challenge.enrollmentRequestId).toBe(ceremony.submitted.result.body.enrollment_request_id);
+    expect(challenge.attestationOutcome).toBe(ceremony.submitted.result.body.attestation_outcome);
+    expect(challenge.keyStorage).toBe(ceremony.submitted.result.body.key_storage);
+  }, 120_000);
 });

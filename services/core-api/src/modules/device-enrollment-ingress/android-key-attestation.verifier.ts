@@ -44,12 +44,17 @@ import {
  *                                                   trusted because the device
  *                                                   supplied one
  *     no certificate expired / not yet valid
+ *     every non-leaf certificate is a CA           C18-04: "B signed A" is not
+ *     and the leaf is NOT a CA                     "B was authorised to issue A"
  *     revocation CHECKED, and not revoked
  *     attestationChallenge === the exact server challenge bytes
  *     leaf public key      === the submitted P-256 public key
  *     attestationSecurityLevel AND keymasterSecurityLevel === StrongBox (2)
  *     algorithm EC / P-256, purpose SIGN, origin GENERATED
+ *       — read from teeEnforced, because StrongBox enforces these
  *     the expected Sentinel Android package + signing identity
+ *       — read from softwareEnforced, because Android's KeyMint `Tag.aidl`
+ *         states ATTESTATION_APPLICATION_ID cannot be hardware-enforced (C18-02)
  *     acceptable verified-boot / device-lock state
  *
  * Anything short of that is NOT VERIFIED. In particular a TEE certificate —
@@ -94,6 +99,8 @@ export type AndroidAttestationRefusalReason =
   | 'CERTIFICATE_UNPARSEABLE'
   | 'CHAIN_LINK_NOT_ISSUED_BY_NEXT'
   | 'CHAIN_SIGNATURE_INVALID'
+  | 'CHAIN_ISSUER_NOT_CERTIFICATE_AUTHORITY'
+  | 'LEAF_IS_CERTIFICATE_AUTHORITY'
   | 'CHAIN_NOT_ANCHORED_TO_PINNED_ROOT'
   | 'CERTIFICATE_NOT_YET_VALID'
   | 'CERTIFICATE_EXPIRED'
@@ -292,7 +299,34 @@ export class AndroidKeyAttestationVerifier {
       if (input.now.getTime() >= notAfter) return refuse('NEGATIVE', 'CERTIFICATE_EXPIRED');
     }
 
-    // ---- 3. the chain links --------------------------------------------
+    // ---- 3. CA AUTHORITY, BEFORE ANY SIGNATURE IS TRUSTED (C18-04) ------
+    //
+    // "B signed A" is not "B was allowed to sign A". An X.509 signature is
+    // mathematics; the AUTHORITY to act as an issuer is an assertion of the
+    // Basic Constraints extension, and a chain that verifies cryptographically
+    // while stepping through a certificate that was never authorised to be a CA
+    // is exactly the shape of a classic path-validation break — an end-entity
+    // certificate legitimately signed by a real CA, then used to mint further
+    // certificates for anything at all.
+    //
+    // `X509Certificate.ca` is the PLATFORM's reading of Basic Constraints,
+    // used rather than extending this module's bespoke DER reader for the
+    // reason that reader's own header gives about signatures: OpenSSL already
+    // decodes this correctly, and a second implementation is a second thing to
+    // be wrong. A certificate with no Basic Constraints extension at all reads
+    // as `false`, which is the fail-closed answer.
+    //
+    // The LEAF is the mirror-image requirement. The attested key is an
+    // end-entity key; a leaf claiming `CA=true` is claiming issuing authority
+    // for a key whose whole purpose is to sign device statements, and is
+    // refused rather than merely disregarded.
+    const leafCertificate = chain[0] as X509Certificate;
+    if (leafCertificate.ca) return refuse('NEGATIVE', 'LEAF_IS_CERTIFICATE_AUTHORITY');
+    for (let index = 1; index < chain.length; index += 1) {
+      if (!(chain[index] as X509Certificate).ca) return refuse('NEGATIVE', 'CHAIN_ISSUER_NOT_CERTIFICATE_AUTHORITY');
+    }
+
+    // ---- 4. the chain links --------------------------------------------
     // Each certificate must be issued by, and signed by, the next one along.
     // `checkIssued` compares the names and the authority key identifier;
     // `verify` is the cryptography. Both, because a name match without a
@@ -311,7 +345,7 @@ export class AndroidKeyAttestationVerifier {
       if (!signatureValid) return refuse('NEGATIVE', 'CHAIN_SIGNATURE_INVALID');
     }
 
-    // ---- 4. THE ANCHOR --------------------------------------------------
+    // ---- 5. THE ANCHOR --------------------------------------------------
     // The top of the SUBMITTED chain must either BE a pinned anchor, or be
     // signed by one. Nothing else counts. A self-signed root the device brought
     // with it satisfies step 3 perfectly and dies here, which is the whole
@@ -328,7 +362,7 @@ export class AndroidKeyAttestationVerifier {
     });
     if (!anchored) return refuse('NEGATIVE', 'CHAIN_NOT_ANCHORED_TO_PINNED_ROOT');
 
-    // ---- 5. revocation --------------------------------------------------
+    // ---- 6. revocation --------------------------------------------------
     // The snapshot's freshness was established before this method was entered,
     // so an absence here genuinely means "not revoked according to something we
     // still trust" rather than "we did not look".
@@ -337,7 +371,7 @@ export class AndroidKeyAttestationVerifier {
       if (entry !== undefined) return refuse('REVOKED', 'CERTIFICATE_REVOKED');
     }
 
-    // ---- 6. the attestation extension ----------------------------------
+    // ---- 7. the attestation extension ----------------------------------
     const leaf = chain[0] as X509Certificate;
     const leafDer = chainDer[0] as Buffer;
     const extensionValue = findCertificateExtension(leafDer, ANDROID_KEY_ATTESTATION_EXTENSION_OID);
@@ -349,7 +383,7 @@ export class AndroidKeyAttestationVerifier {
     // see WHAT the device asserted as well as that it was refused.
     const claims = flattenClaims(description);
 
-    // ---- 7. the challenge ----------------------------------------------
+    // ---- 8. the challenge ----------------------------------------------
     // D26-04A. The bytes inside the certificate must be the bytes the server
     // chose before the key existed. `timingSafeEqual` is used even though this
     // value is not a secret: a length-and-content comparison written by hand is
@@ -363,7 +397,7 @@ export class AndroidKeyAttestationVerifier {
       return refuse('NEGATIVE', 'ATTESTATION_CHALLENGE_MISMATCH', claims);
     }
 
-    // ---- 8. the key ------------------------------------------------------
+    // ---- 9. the key ------------------------------------------------------
     // The certificate must attest to THE KEY BEING ENROLLED. Comparing the full
     // SubjectPublicKeyInfo rather than the bare point means the algorithm and
     // the named curve are part of the comparison.
@@ -375,7 +409,7 @@ export class AndroidKeyAttestationVerifier {
     }
     if (!leafSpki.equals(input.submittedPublicKeySpkiDer)) return refuse('NEGATIVE', 'LEAF_KEY_NOT_SUBMITTED_KEY', claims);
 
-    // ---- 9. StrongBox, and only StrongBox -------------------------------
+    // ---- 10. StrongBox, and only StrongBox -------------------------------
     // D26-03A: a certificate saying TEE is NEVER promoted into the StrongBox
     // profile. Both levels are required, and they are checked SEPARATELY so the
     // reason names which one disagreed.
@@ -386,11 +420,45 @@ export class AndroidKeyAttestationVerifier {
       return refuse('NEGATIVE', 'KEYMASTER_SECURITY_LEVEL_NOT_STRONGBOX', claims);
     }
 
-    // ---- 10. the key authorisations, from teeEnforced ONLY --------------
-    // `softwareEnforced` is what the ANDROID OS asserts; `teeEnforced` is what
-    // the secure hardware asserts. Only the second is evidence about hardware,
-    // and reading a value out of the first because the second lacked it would be
-    // accepting the operating system's word for a hardware property.
+    // ---- 11. the key authorisations, FROM THE LIST ANDROID PUTS THEM IN --
+    //
+    // THE TWO LISTS ARE TWO DIFFERENT CLAIMANTS, AND THAT IS THE WHOLE POINT
+    // (C18-02).
+    //
+    //     teeEnforced / hardwareEnforced   what the TEE or StrongBox itself
+    //                                      enforces. This is the ONLY list that
+    //                                      is evidence ABOUT HARDWARE.
+    //     softwareEnforced                 what the ANDROID PLATFORM asserts.
+    //                                      Real, recorded, signed by the same
+    //                                      attestation key — but asserted by
+    //                                      software, so it can never carry a
+    //                                      hardware guarantee.
+    //
+    // So the split below is NOT "read everything from the hardware list because
+    // that is stricter". It is "read each field from the list Android actually
+    // populates for it", and getting that backwards is a defect in EITHER
+    // direction:
+    //
+    //   * reading a HARDWARE property (origin, purpose, ecCurve, rootOfTrust)
+    //     out of `softwareEnforced` because the hardware list lacked it would be
+    //     accepting the operating system's word for a hardware fact — the
+    //     fail-open direction;
+    //
+    //   * reading `attestationApplicationId` out of `hardwareEnforced` is the
+    //     fail-CLOSED direction, and it is what this verifier did until C18-02.
+    //     KeyMint's `Tag.aidl` records that `ATTESTATION_APPLICATION_ID` cannot
+    //     be hardware-enforced: the platform collects the calling package's
+    //     identity and hands it to the secure implementation, which has no way
+    //     to verify it and therefore never enforces it. A GENUINE StrongBox
+    //     certificate puts it in `softwareEnforced` — so the old reader would
+    //     have refused every real device for a missing application identity,
+    //     and the only thing it accepted was a synthetic fixture built to match
+    //     the reader. The fixture in `android-attestation.test-support.ts` is
+    //     now shaped by Android's schema instead, and the regressions in the
+    //     Crucible pin both directions.
+    //
+    // Nothing is read from BOTH lists and nothing falls back from one to the
+    // other. A field has exactly one authoritative source.
     const authorizations = description.teeEnforced;
     if (
       authorizations.algorithm !== ANDROID_KEY_ALGORITHM_EC ||
@@ -408,7 +476,7 @@ export class AndroidKeyAttestationVerifier {
     // secure hardware, so the non-exportability guarantee never held for it.
     if (authorizations.origin !== ANDROID_KEY_ORIGIN_GENERATED) return refuse('NEGATIVE', 'KEY_ORIGIN_NOT_GENERATED', claims);
 
-    // ---- 11. device state ----------------------------------------------
+    // ---- 12. device state ----------------------------------------------
     const rootOfTrust = authorizations.rootOfTrust;
     if (rootOfTrust === null) return refuse('NEGATIVE', 'ROOT_OF_TRUST_MISSING', claims);
     if (!rootOfTrust.deviceLocked) return refuse('NEGATIVE', 'DEVICE_NOT_LOCKED', claims);
@@ -416,11 +484,19 @@ export class AndroidKeyAttestationVerifier {
       return refuse('NEGATIVE', 'VERIFIED_BOOT_STATE_UNACCEPTABLE', claims);
     }
 
-    // ---- 12. the application identity -----------------------------------
-    // Both halves are SERVER configuration. A package name a device could
-    // choose is not a package name, and a signing identity a device could
-    // choose is not a signing identity.
-    const application = authorizations.attestationApplicationId;
+    // ---- 13. the application identity, FROM softwareEnforced ------------
+    //
+    // Read from `softwareEnforced` because that is where Android puts it — see
+    // step 11's header. It is still worth something despite being
+    // software-asserted: it is inside a structure signed by the attestation key,
+    // so a device cannot alter it after the fact, and the platform that
+    // collected it is the same platform whose verified-boot state step 12 has
+    // already required.
+    //
+    // Both halves it is compared AGAINST are SERVER configuration. A package
+    // name a device could choose is not a package name, and a signing identity a
+    // device could choose is not a signing identity.
+    const application = description.softwareEnforced.attestationApplicationId;
     if (application === null) return refuse('NEGATIVE', 'APPLICATION_IDENTITY_MISSING', claims);
     if (!application.packageNames.includes(material.expectedPackageName)) {
       return refuse('NEGATIVE', 'APPLICATION_PACKAGE_UNEXPECTED', claims);
@@ -476,8 +552,18 @@ function decodeStrictBase64(value: string): Buffer | null {
   return decoded.toString('base64') === value ? decoded : null;
 }
 
+/**
+ * The recorded claims, each taken from the list Android populates it in.
+ *
+ * Same split as step 11 and for the same reason (C18-02): the hardware scalars
+ * come from `teeEnforced`, the application identity from `softwareEnforced`. An
+ * artifact row that recorded the application identity from the hardware list
+ * would record `NULL` for every genuine device, which would make the column a
+ * record of this parser's mistake rather than of what the certificate said.
+ */
 function flattenClaims(description: AndroidKeyDescription): AndroidAttestationClaims {
   const tee = description.teeEnforced;
+  const application = description.softwareEnforced.attestationApplicationId;
   return {
     attestationVersion: description.attestationVersion,
     attestationSecurityLevel: description.attestationSecurityLevel,
@@ -490,8 +576,8 @@ function flattenClaims(description: AndroidKeyDescription): AndroidAttestationCl
     noAuthRequired: tee.noAuthRequired,
     verifiedBootState: tee.rootOfTrust?.verifiedBootState ?? null,
     deviceLocked: tee.rootOfTrust?.deviceLocked ?? null,
-    attestationPackageName: tee.attestationApplicationId?.packageNames[0] ?? null,
-    attestationSigningDigest: tee.attestationApplicationId?.signatureDigests[0] ?? null,
+    attestationPackageName: application?.packageNames[0] ?? null,
+    attestationSigningDigest: application?.signatureDigests[0] ?? null,
   };
 }
 

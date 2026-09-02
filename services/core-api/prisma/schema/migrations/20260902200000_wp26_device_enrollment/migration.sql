@@ -14,6 +14,20 @@
 --     authority without the one-shot grant secret, the intended user's
 --     independent session, the StrongBox private key and an independent
 --     commander's approval of the exact request fingerprint.
+--
+--     C18-03 — IT IS ALSO THE DURABLE RECEIPT FOR ONE SUBMISSION.
+--     `submission_fingerprint` is stamped IN THE SAME FENCED UPDATE that
+--     consumes the challenge, so the row records WHICH submission spent it;
+--     `enrollment_request_id`, `enrollment_request_fingerprint`,
+--     `attestation_outcome` and `key_storage` are written afterwards, only on
+--     a submission that actually reached a Shield enrollment request. Together
+--     they let an exact retry of an ALREADY SUCCESSFUL submission converge on
+--     the request it already produced, instead of being told its own success
+--     was a replay and losing the request id forever. All five are NULLABLE
+--     and all five fail CLOSED: a consumed challenge with no recorded outcome
+--     resolves to nothing and refuses. Spending a challenge on an ATTEMPT is
+--     unchanged — this adds no second attempt, extends no expiry and
+--     un-consumes nothing.
 --   * `android_key_attestation_artifacts` — the D26-04B restricted provider
 --     record. A HISTORICAL ARTEFACT with no lifecycle foreign key at all, per
 --     the WP-17A doctrine `shield.prisma` applies to `device_security_events`
@@ -57,6 +71,11 @@ CREATE TABLE "device_attestation_challenges" (
     "issued_at" TIMESTAMPTZ(3) NOT NULL,
     "expires_at" TIMESTAMPTZ(3) NOT NULL,
     "consumed_at" TIMESTAMPTZ(3),
+    "submission_fingerprint" TEXT,
+    "enrollment_request_id" UUID,
+    "enrollment_request_fingerprint" TEXT,
+    "attestation_outcome" TEXT,
+    "key_storage" TEXT,
     "created_at" TIMESTAMPTZ(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updated_at" TIMESTAMPTZ(3) NOT NULL,
 

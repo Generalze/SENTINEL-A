@@ -67,6 +67,83 @@ export const envSchema = z.object({
     })
     .default('info'),
   DEV_AUTH_ENABLED: booleanFromEnvString.default(false),
+  // -------------------------------------------------------------------------
+  // WP-26/D26-04B/C18-01 — ANDROID KEY ATTESTATION TRUST MATERIAL.
+  //
+  // THE ONLY WAY A DEPLOYMENT CAN EVER REACH `VERIFIED`, AND IT IS A
+  // DEPLOYMENT ACT.
+  //
+  // Every key below is OPTIONAL and every one of them defaults to ABSENT, not
+  // to a value. That is deliberate and it is the security property: a wrong
+  // pinned root is worse than a missing one, because a missing one fails closed
+  // (`UNAVAILABLE`, the device enrols DEGRADED and can never be TRUSTED) and a
+  // wrong one fails open. There is no shipped default anywhere in this
+  // repository for any of them, and the real Google hardware-attestation roots
+  // are NOT committed here — a deployment supplies them.
+  //
+  // A `.default(...)` on any key in this block would be a silent substitution
+  // and must never be added. `min(1)` rather than a bare string so that an
+  // empty value is a CONFIGURATION ERROR at boot rather than a mystery
+  // `UNAVAILABLE` in production.
+  //
+  // The keys are validated for SHAPE here and for MEANING in
+  // `modules/device-enrollment-ingress/android-attestation.configured-trust-material.ts`,
+  // which parses every anchor, refuses partial material, and returns
+  // "unconfigured" — never a smaller anchor set — when anything is wrong.
+  // -------------------------------------------------------------------------
+  /**
+   * The PINNED trust anchors. One or more certificates, as concatenated PEM
+   * blocks or as base64 DER separated by commas or whitespace.
+   *
+   * A ROOT IS NEVER TRUSTED BECAUSE THE DEVICE SUPPLIED IT. This is where the
+   * server's own answer comes from, and the verifier compares against it rather
+   * than discovering an anchor in the submitted chain.
+   */
+  ANDROID_ATTESTATION_TRUST_ANCHORS: z.string().min(1, 'ANDROID_ATTESTATION_TRUST_ANCHORS must not be empty').optional(),
+  /** Names the anchor set a verdict was reached against. Recorded on every artifact. */
+  ANDROID_ATTESTATION_TRUST_ANCHOR_SET_VERSION: z
+    .string()
+    .min(1, 'ANDROID_ATTESTATION_TRUST_ANCHOR_SET_VERSION must not be empty')
+    .optional(),
+  /**
+   * Google's certificate status list, verbatim, as JSON:
+   * `{"entries": {"<serial>": {"status": "REVOKED", "reason": "KEY_COMPROMISE"}}}`.
+   *
+   * REQUIRED WHENEVER ANCHORS ARE SUPPLIED. "Not revoked" is a conjunct of
+   * VERIFIED, and a deployment that has not looked cannot assert it — anchors
+   * with no revocation data is PARTIAL material and stays `UNAVAILABLE`.
+   */
+  ANDROID_ATTESTATION_REVOCATION_SNAPSHOT: z
+    .string()
+    .min(1, 'ANDROID_ATTESTATION_REVOCATION_SNAPSHOT must not be empty')
+    .optional(),
+  ANDROID_ATTESTATION_REVOCATION_SNAPSHOT_VERSION: z
+    .string()
+    .min(1, 'ANDROID_ATTESTATION_REVOCATION_SNAPSHOT_VERSION must not be empty')
+    .optional(),
+  /**
+   * When the snapshot above was OBTAINED, ISO-8601. Freshness is CHECKED, not
+   * assumed: past `ANDROID_ATTESTATION_REVOCATION_SNAPSHOT_MAX_AGE_MS` the
+   * material is stale and the verdict is `UNAVAILABLE`, never "assume not
+   * revoked". A deployment that pins this to a constant is a deployment that
+   * stops being able to say VERIFIED a day later, which is the intended
+   * behaviour.
+   */
+  ANDROID_ATTESTATION_REVOCATION_SNAPSHOT_FETCHED_AT: z
+    .string()
+    .min(1, 'ANDROID_ATTESTATION_REVOCATION_SNAPSHOT_FETCHED_AT must not be empty')
+    .optional(),
+  /** The Sentinel Android package the leaf must attest to, e.g. `com.sentinel.field`. */
+  ANDROID_ATTESTATION_PACKAGE_NAME: z.string().min(1, 'ANDROID_ATTESTATION_PACKAGE_NAME must not be empty').optional(),
+  /**
+   * Allowed signing-certificate digests: SHA-256, hex, one or more, separated by
+   * commas or whitespace. Any one may match — a release key and an upgrade key
+   * are both legitimate identities for one application.
+   */
+  ANDROID_ATTESTATION_SIGNING_DIGESTS: z
+    .string()
+    .min(1, 'ANDROID_ATTESTATION_SIGNING_DIGESTS must not be empty')
+    .optional(),
   /**
    * C13-01: there is deliberately NO patrol sweep interval key here.
    *
