@@ -1,4 +1,4 @@
-import type { DeviceKeyStorage } from '@sentinel/contracts';
+import type { DeviceAttestationOutcome, DeviceKeyStorage } from '@sentinel/contracts';
 
 /**
  * WP-26 device enrollment ingress result types.
@@ -19,6 +19,31 @@ import type { DeviceKeyStorage } from '@sentinel/contracts';
  */
 export interface IngressRefused {
   readonly outcome: 'REFUSED';
+}
+
+/**
+ * C18-R1 — COMPLETION IS UNKNOWN, WHICH IS NOT THE SAME AS REFUSED.
+ *
+ * THE WP-20 RELIABILITY VOCABULARY, APPLIED WHERE IT BELONGS. Sentinel reserves
+ * `UNKNOWN` for "this may well have succeeded and the server cannot yet prove
+ * it" — as distinct from `REFUSED`, which is terminal and says "this did not
+ * happen and will not". Before C18-R1 the ingress collapsed both into a refusal,
+ * and that collapse was actively harmful: a client told REFUSED correctly
+ * concludes the ceremony is dead and throws away the grant, the challenge and
+ * the key it needs to converge on the request the server had in fact created.
+ *
+ * IT CARRIES NOTHING. No reason, no id, no fingerprint, no secret — the same
+ * construction as [IngressRefused], for the same D25-13 reason: a shape with
+ * nowhere to put a detail cannot leak one. The precise reason goes to the
+ * internal reason log inside the service.
+ *
+ * WHAT THE CLIENT IS EXPECTED TO DO WITH IT: retain the ceremony material in
+ * memory and RETRY THE EXACT SUBMISSION. An exact retry either converges (the
+ * receipt is now complete) or is answered UNKNOWN again. It never creates a
+ * second request and never creates a second artifact.
+ */
+export interface IngressCompletionUnknown {
+  readonly outcome: 'UNKNOWN';
 }
 
 /**
@@ -60,6 +85,10 @@ export type IssueAttestationChallengeOutcome =
  *
  * THE RAW CERTIFICATE CHAIN IS NOT HERE, AND CANNOT BE. Nothing in this type,
  * and nothing on any route in this module, can carry it.
+ *
+ * C18-R1: there are now FOUR arms, not three. `UNKNOWN` is the answer to a
+ * submission whose completion the server cannot prove either way — see
+ * [IngressCompletionUnknown].
  */
 export type SubmitEnrollmentRequestOutcome =
   | {
@@ -67,8 +96,18 @@ export type SubmitEnrollmentRequestOutcome =
       readonly outcome: 'REQUESTED' | 'CONVERGED';
       readonly enrollmentRequestId: string;
       readonly requestFingerprint: string;
-      /** VERIFIED | NEGATIVE | INVALID | REVOKED | UNAVAILABLE, as the server concluded. */
-      readonly attestationOutcome: string;
+      /**
+       * C18-R2: THE CONTRACT TYPE, NOT A STRING.
+       *
+       * VERIFIED | NEGATIVE | INVALID | REVOKED | UNAVAILABLE, as the server
+       * concluded. It was `string` until C18-R2, which meant a value re-read
+       * from a database column could be echoed onto this surface without ever
+       * having been checked against the closed vocabulary it claims to be in.
+       * Typing the boundary is stronger than remembering to check it: every
+       * producer of this arm must now hold a value the contract admits.
+       */
+      readonly attestationOutcome: DeviceAttestationOutcome;
       readonly keyStorage: DeviceKeyStorage;
     }
+  | IngressCompletionUnknown
   | IngressRefused;

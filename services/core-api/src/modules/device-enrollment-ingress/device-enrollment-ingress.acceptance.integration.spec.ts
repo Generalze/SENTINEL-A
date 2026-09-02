@@ -1308,7 +1308,13 @@ describe('WP-26/C18-03 an exact retry of a SUCCESSFUL submission converges', () 
       ...ceremony.submitted.body,
       public_key: canonicalPublicKeyOf(attacker),
     });
+    // C18-R1: TERMINAL, and it must stay terminal. A changed key under a spent
+    // challenge is not an ambiguous outcome the client should retry — it is a
+    // SECOND ceremony wearing a spent nonce, which is the exact thing the
+    // one-shot rule exists to stop. It must never soften to 409/UNKNOWN.
     expect(refused.status).toBe(403);
+    expect(refused.status).not.toBe(409);
+    expect(refused.body.error).toBe('DEVICE_ENROLLMENT_REFUSED');
 
     const after = await ledgerFor(ceremony.grantId, ceremony.challengeId);
     expect(after.artifacts).toHaveLength(before.artifacts.length);
@@ -1322,7 +1328,10 @@ describe('WP-26/C18-03 an exact retry of a SUCCESSFUL submission converges', () 
       ...ceremony.submitted.body,
       custody: 'CONTROLLED_SHARED',
     });
+    // C18-R1: terminal, never UNKNOWN. Changed CUSTODY is changed terms.
     expect(refused.status).toBe(403);
+    expect(refused.status).not.toBe(409);
+    expect(refused.body.error).toBe('DEVICE_ENROLLMENT_REFUSED');
     const after = await ledgerFor(ceremony.grantId, ceremony.challengeId);
     expect(after.requests).toHaveLength(1);
   }, 120_000);
@@ -1339,18 +1348,38 @@ describe('WP-26/C18-03 an exact retry of a SUCCESSFUL submission converges', () 
       ...ceremony.submitted.body,
       certificate_chain: other.chainBase64,
     });
+    // C18-R1: terminal, never UNKNOWN. Changed CHAIN is changed evidence.
     expect(refused.status).toBe(403);
+    expect(refused.status).not.toBe(409);
+    expect(refused.body.error).toBe('DEVICE_ENROLLMENT_REFUSED');
   }, 120_000);
 
-  it('a consumed challenge whose recorded outcome does not resolve FAILS CLOSED', async () => {
-    // THE CRASH WINDOW, MADE EXPLICIT. The challenge is spent by the ATTEMPT,
-    // and the receipt is written only once Shield has actually answered. A
-    // process that died in between leaves a consumed challenge that cannot
-    // prove what it produced — and a server that cannot prove it must not claim
-    // to know. Simulated here by erasing the recorded outcome, which is exactly
-    // the state that window leaves behind.
+  it('a consumed challenge whose receipt is INCOMPLETE answers UNKNOWN, not a refusal', async () => {
+    // ==================================================================
+    // C18-R1 — THE CRASH/IN-FLIGHT WINDOW, AND WHY IT IS NOT A REFUSAL.
+    // ==================================================================
+    //
+    // The challenge is spent by the ATTEMPT, and the receipt is written only
+    // once Shield has actually answered. A process that died in between — or a
+    // winner still working — leaves a consumed challenge whose recorded
+    // fingerprint PROVES this submission spent it but whose outcome is not yet
+    // recorded. Simulated here by erasing the receipt while KEEPING the
+    // submission fingerprint, which is exactly the state that window leaves
+    // behind.
+    //
+    // Before C18-R1 that answered the ordinary 403, which is a terminal answer
+    // for a non-terminal fact: the client concludes the ceremony is dead and
+    // destroys the grant, the challenge and the key that convergence needs.
+    // `UNKNOWN` is the WP-20 word for "may well have succeeded, cannot yet be
+    // proven", and it is what the server must say.
     const ceremony = await openCeremony();
     expect(ceremony.submitted.result.status).toBe(201);
+    const requestId = ceremony.submitted.result.body.enrollment_request_id as string;
+    const fingerprint = ceremony.submitted.result.body.request_fingerprint as string;
+    const outcome = ceremony.submitted.result.body.attestation_outcome as string;
+    const storage = ceremony.submitted.result.body.key_storage as string;
+    const before = await ledgerFor(ceremony.grantId, ceremony.challengeId);
+
     await prisma.deviceAttestationChallenge.update({
       where: { id: ceremony.challengeId },
       data: {
@@ -1361,10 +1390,176 @@ describe('WP-26/C18-03 an exact retry of a SUCCESSFUL submission converges', () 
       },
     });
 
-    const retry = await postEnrollmentRequest(ceremony.submitted.body);
-    expect(retry.status).toBe(403);
-    expect(retry.body.error).toBe('DEVICE_ENROLLMENT_REFUSED');
+    const unknown = await postEnrollmentRequest(ceremony.submitted.body);
+    expect(unknown.status).toBe(409);
+    expect(unknown.body.error).toBe('DEVICE_ENROLLMENT_COMPLETION_UNKNOWN');
+    // IT CARRIES NOTHING. No id, no fingerprint, no verdict, no reason — the
+    // client learns only that it must retry the exact submission.
+    expect(unknown.body.enrollment_request_id).toBeUndefined();
+    expect(unknown.body.request_fingerprint).toBeUndefined();
+    expect(unknown.body.outcome).toBeUndefined();
+    expect(unknown.text).not.toContain(requestId);
+    expect(unknown.text).not.toContain(fingerprint);
+
+    // AND IT CREATED NOTHING. `UNKNOWN` is served from recorded state exactly as
+    // `CONVERGED` is: no re-verification, no second artifact, no second Shield
+    // request. It is returned before any of that code can run.
+    const after = await ledgerFor(ceremony.grantId, ceremony.challengeId);
+    expect(after.artifacts.map((row) => row.id)).toEqual(before.artifacts.map((row) => row.id));
+    expect(after.requests.map((row) => row.id)).toEqual(before.requests.map((row) => row.id));
+
+    // AND IT IS RECOVERABLE. Once the receipt is complete — which is what the
+    // real in-flight winner does a moment later — the SAME retry converges.
+    await prisma.deviceAttestationChallenge.update({
+      where: { id: ceremony.challengeId },
+      data: {
+        enrollmentRequestId: requestId,
+        enrollmentRequestFingerprint: fingerprint,
+        attestationOutcome: outcome,
+        keyStorage: storage,
+      },
+    });
+    const converged = await postEnrollmentRequest(ceremony.submitted.body);
+    expect(converged.status).toBe(201);
+    expect(converged.body.outcome).toBe('CONVERGED');
+    expect(converged.body.enrollment_request_id).toBe(requestId);
   }, 120_000);
+
+  it('a malformed persisted attestation outcome can NEVER produce CONVERGED', async () => {
+    // ==================================================================
+    // C18-R2 — THE STORED VERDICT IS PARSED, NOT ECHOED.
+    // ==================================================================
+    //
+    // The resolver re-parsed `keyStorage` against its frozen contract and took
+    // `attestationOutcome` from the database as an arbitrary string, returning
+    // it straight to the client and typing the surface field as `string`. That
+    // contradicted C18-03's own rule that an outcome the server cannot resolve
+    // fails closed: a corrupted or hand-edited column could put a value outside
+    // the closed vocabulary onto the wire under a CONVERGED answer.
+    //
+    // It is a TERMINAL refusal rather than `UNKNOWN`, and the distinction is
+    // deliberate: the receipt WAS written, so there is nothing in flight and
+    // nothing to wait for. Answering `UNKNOWN` would invite a client to retry
+    // forever against a row that can never resolve.
+    const ceremony = await openCeremony();
+    expect(ceremony.submitted.result.status).toBe(201);
+    const before = await ledgerFor(ceremony.grantId, ceremony.challengeId);
+
+    for (const forged of ['TOTALLY_VERIFIED', 'verified', 'VERIFIED ', '', 'null']) {
+      await prisma.deviceAttestationChallenge.update({
+        where: { id: ceremony.challengeId },
+        data: { attestationOutcome: forged },
+      });
+      const retry = await postEnrollmentRequest(ceremony.submitted.body);
+      expect(retry.status, `stored outcome '${forged}'`).toBe(403);
+      expect(retry.body.error).toBe('DEVICE_ENROLLMENT_REFUSED');
+      expect(retry.body.outcome).not.toBe('CONVERGED');
+      // The forged value never reaches the wire either.
+      if (forged.trim().length > 0) expect(retry.text).not.toContain(forged.trim());
+    }
+
+    // The same guarantee for the OTHER re-parsed column, so neither is the only
+    // one holding the line.
+    await prisma.deviceAttestationChallenge.update({
+      where: { id: ceremony.challengeId },
+      data: { attestationOutcome: 'VERIFIED', keyStorage: 'STRONGBOX_OBVIOUSLY' },
+    });
+    const storageRetry = await postEnrollmentRequest(ceremony.submitted.body);
+    expect(storageRetry.status).toBe(403);
+
+    const after = await ledgerFor(ceremony.grantId, ceremony.challengeId);
+    expect(after.artifacts.map((row) => row.id)).toEqual(before.artifacts.map((row) => row.id));
+    expect(after.requests.map((row) => row.id)).toEqual(before.requests.map((row) => row.id));
+  }, 180_000);
+
+  it('two SIMULTANEOUS identical submissions produce ONE request and ONE artifact, and the loser never gets a terminal refusal', async () => {
+    // ==================================================================
+    // C18-R1 — THE FENCED CONSUME'S LOSER IS ANSWERED, NOT REFUSED.
+    // ==================================================================
+    //
+    // Two byte-identical submissions in flight at once is the ordinary shape of
+    // a phone retrying because it believes the first was lost. Exactly one wins
+    // the fenced consume. The loser is asking about the SAME submission the
+    // winner is committing, so before C18-R1 it received a flat 403 — and a
+    // client acting correctly on a 403 destroys the material it needs.
+    //
+    // WHAT THE RACE CAN LEGITIMATELY PRODUCE, AND WHAT IT MAY NEVER PRODUCE.
+    // The loser's answer depends on how far the winner has got: `409 UNKNOWN`
+    // while the receipt is still incomplete, `201 CONVERGED` once it is. Both
+    // are correct and which one occurs is genuine timing, so this asserts the
+    // invariants rather than the timing: the loser is NEVER 403, NEVER creates a
+    // second request and NEVER creates a second artifact, and a later exact
+    // retry always converges on the one request that exists. The deterministic
+    // pin for `UNKNOWN` itself is the incomplete-receipt test above, which
+    // reproduces the losing state exactly.
+    const grant = await issueGrant();
+    const challenge = await requestAttestationChallenge(grant.token);
+    expect(challenge.status).toBe(201);
+    const challengeId = challenge.body.attestation_challenge_id as string;
+    const challengeValue = challenge.body.challenge as string;
+
+    // ONE body, posted twice at once. Built here rather than through
+    // `submitEnrollmentRequest` so both calls carry the identical bytes.
+    const deviceKeyPair = generateEcKeyPair();
+    const chain = buildSyntheticChain({
+      challenge: Buffer.from(challengeValue, 'base64url'),
+      leafKeyPair: deviceKeyPair,
+      rootKeyPair: pinnedRootKeyPair,
+    });
+    const body: Record<string, unknown> = {
+      organisation_id: fx.orgA,
+      site_id: fx.siteA1,
+      intended_user_id: fx.opAlpha,
+      bootstrap_token: grant.token,
+      attestation_challenge_id: challengeId,
+      public_key: canonicalPublicKeyOf(deviceKeyPair),
+      claimed_signature_profile: PROFILE,
+      custody: 'PERSONAL',
+      custody_regime_id: null,
+      certificate_chain: chain.chainBase64,
+    };
+
+    const [first, second] = await Promise.all([postEnrollmentRequest(body), postEnrollmentRequest(body)]);
+    const statuses = [first.status, second.status].sort((a, b) => a - b);
+
+    // Exactly one winner, and the loser is never told the ceremony is dead.
+    const winners = [first, second].filter((r) => r.status === 201 && r.body.outcome === 'REQUESTED');
+    expect(winners, `statuses ${JSON.stringify(statuses)}`).toHaveLength(1);
+    for (const answer of [first, second]) {
+      expect(answer.status, `a racing submission was told the ceremony is dead: ${answer.text}`).not.toBe(403);
+      expect([201, 409]).toContain(answer.status);
+      if (answer.status === 409) expect(answer.body.error).toBe('DEVICE_ENROLLMENT_COMPLETION_UNKNOWN');
+      if (answer.status === 201) expect(['REQUESTED', 'CONVERGED']).toContain(answer.body.outcome);
+    }
+
+    // THE ROW COUNTS. One challenge, one artifact, one enrollment request — the
+    // whole point of the fence, and untouched by the loser's answer.
+    const artifacts = await prisma.androidKeyAttestationArtifact.findMany({
+      where: { organisationId: fx.orgA, attestationChallengeId: challengeId },
+    });
+    const requests = await prisma.enrollmentRequest.findMany({
+      where: { organisationId: fx.orgA, bootstrapGrantId: grant.grantId },
+    });
+    expect(artifacts).toHaveLength(1);
+    expect(requests).toHaveLength(1);
+
+    // AND THE LOSER CONVERGES LATER. The receipt is complete by now, so the
+    // identical retry gets the winner's ids — never a second request.
+    const later = await postEnrollmentRequest(body);
+    expect(later.status).toBe(201);
+    expect(later.body.outcome).toBe('CONVERGED');
+    expect(later.body.enrollment_request_id).toBe(winners[0]?.body.enrollment_request_id);
+    expect(later.body.request_fingerprint).toBe(winners[0]?.body.request_fingerprint);
+
+    const artifactsAfter = await prisma.androidKeyAttestationArtifact.findMany({
+      where: { organisationId: fx.orgA, attestationChallengeId: challengeId },
+    });
+    const requestsAfter = await prisma.enrollmentRequest.findMany({
+      where: { organisationId: fx.orgA, bootstrapGrantId: grant.grantId },
+    });
+    expect(artifactsAfter).toHaveLength(1);
+    expect(requestsAfter).toHaveLength(1);
+  }, 240_000);
 
   it('a consumed challenge with NO recorded submission fingerprint fails closed too', async () => {
     // The other half of the same guarantee: `CONVERGED` requires the row to say
@@ -1377,7 +1572,13 @@ describe('WP-26/C18-03 an exact retry of a SUCCESSFUL submission converges', () 
       data: { submissionFingerprint: null },
     });
     const retry = await postEnrollmentRequest(ceremony.submitted.body);
+    // C18-R1: TERMINAL, and deliberately not UNKNOWN. The fingerprint is stamped
+    // by the SAME fenced statement that consumes the challenge, so a consumed row
+    // without one is not a row this code wrote — there is nothing in flight to
+    // wait for, and nothing a retry could ever resolve.
     expect(retry.status).toBe(403);
+    expect(retry.status).not.toBe(409);
+    expect(retry.body.error).toBe('DEVICE_ENROLLMENT_REFUSED');
   }, 120_000);
 
   it('the receipt records what happened, and a refused submission still consumed the challenge', async () => {

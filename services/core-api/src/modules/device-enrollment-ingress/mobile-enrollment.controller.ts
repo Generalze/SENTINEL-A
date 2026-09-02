@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { BadRequestException, Body, Controller, ForbiddenException, Inject, Post, Req } from '@nestjs/common';
+import { BadRequestException, Body, ConflictException, Controller, ForbiddenException, Inject, Post, Req } from '@nestjs/common';
 import { z } from 'zod';
 import { DeviceCustodySchema, DeviceSignatureProfileSchema } from '@sentinel/contracts';
 import { requirePrincipal, type RequestWithPrincipal } from '../../common/security/principal';
@@ -68,6 +68,15 @@ import { DeviceEnrollmentIngressService } from './device-enrollment-ingress.serv
  * verdict was positive, which the client needs in order to tell its operative
  * that the device is not supported; it learns no detail of WHY.
  *
+ * C18-R1 CARVES OUT EXACTLY ONE NON-TERMINAL ANSWER, AND NOTHING ELSE.
+ *
+ * `409 DEVICE_ENROLLMENT_COMPLETION_UNKNOWN` on the request route, for the one
+ * state in which the server has ALREADY RECORDED that this exact submission
+ * spent this challenge but cannot yet prove what it produced. It is still a
+ * single byte-identical answer with no reason in it; what it adds is the one
+ * distinction a correct client cannot function without — retry this, versus
+ * this is dead. Every other refusal on every route stays 403.
+ *
  * REST ONLY (D25-10, still binding). There is no device WebSocket path here.
  *
  * THIS IS NOT PROOF C (D26-08). A server that can enrol a physical device is not
@@ -77,7 +86,7 @@ import { DeviceEnrollmentIngressService } from './device-enrollment-ingress.serv
  */
 
 /**
- * THE THREE EXTERNAL ANSWERS, AS CONSTANTS.
+ * THE EXTERNAL ANSWERS, AS CONSTANTS.
  *
  * Constants rather than inline strings so that "every refusal, whatever caused
  * it, is byte-identical" is a fact about one value rather than a fact about
@@ -86,6 +95,32 @@ import { DeviceEnrollmentIngressService } from './device-enrollment-ingress.serv
  */
 const EXTERNAL_REFUSED = 'DEVICE_ENROLLMENT_REFUSED';
 const EXTERNAL_MALFORMED = 'DEVICE_ENROLLMENT_MALFORMED';
+
+/**
+ * C18-R1 — THE ONE ANSWER THAT IS NEITHER SUCCESS NOR TERMINAL REFUSAL.
+ *
+ * 409 Conflict, and deliberately not 403. The whole point of the correction is
+ * that a client can TELL THE DIFFERENCE between "this ceremony is dead, destroy
+ * your grant" and "your submission may already have succeeded; retry the exact
+ * same body". Collapsing the second into the identical 403 is precisely the
+ * defect: a client that cannot distinguish them must assume the worse one, and
+ * assuming the worse one destroys the material the convergence path needs.
+ *
+ * IT IS NOT A CRACK IN THE D25-13 DISCIPLINE. It carries no secret, no id, no
+ * fingerprint, no verdict and no reason — the service's `UNKNOWN` arm has
+ * nowhere to put any of them — and it is not an oracle: reaching it at all
+ * requires the intended user's live session, the grant secret, the challenge id
+ * and a submission whose fingerprint the server has ALREADY RECORDED as the one
+ * that spent that challenge. A caller who can produce that is replaying their
+ * own submission, and learns only what they already did. The precise reason goes
+ * to the internal reason log, as every other reason on this surface does.
+ *
+ * 409 rather than 202 or 503 because the resource state is genuinely
+ * indeterminate rather than accepted-and-pending or unavailable, and rather than
+ * 425/408 because nothing here is about a clock. One status, chosen once, used
+ * consistently.
+ */
+const EXTERNAL_COMPLETION_UNKNOWN = 'DEVICE_ENROLLMENT_COMPLETION_UNKNOWN';
 
 /** Bounded, so an unbounded string cannot reach a digest or a database column. */
 const boundedId = z.string().min(1).max(256);
@@ -233,6 +268,8 @@ export class MobileEnrollmentController {
       traceId: traceIdOf(req),
     });
     if (outcome.outcome === 'REFUSED') throw new ForbiddenException(EXTERNAL_REFUSED);
+    // C18-R1: distinct, non-2xx, and NOT terminal. See EXTERNAL_COMPLETION_UNKNOWN.
+    if (outcome.outcome === 'UNKNOWN') throw new ConflictException(EXTERNAL_COMPLETION_UNKNOWN);
     return {
       outcome: outcome.outcome,
       enrollment_request_id: outcome.enrollmentRequestId,

@@ -66,6 +66,14 @@ import java.util.concurrent.Executors
  * as it has been presented for the last time or the ceremony fails terminally.
  * `BootstrapTokenNeverPersistedSourceTest` fails the build if any of that stops
  * being true.
+ *
+ * C18-R1 QUALIFIES "PRESENTED FOR THE LAST TIME", AND NOTHING ELSE. When the
+ * submission's outcome cannot be PROVEN — the server's own `409`, a transport
+ * failure, a 5xx, an unreadable success — the grant, the attestation challenge
+ * and the generated key are RETAINED IN MEMORY so the exact submission can be
+ * retried and converge. Retention is in memory for the life of the ceremony and
+ * nothing else changes: the grant still never reaches persistent storage, and
+ * the source scan above still proves it.
  * ============================================================================
  */
 class MainActivity : AppCompatActivity() {
@@ -272,15 +280,63 @@ class MainActivity : AppCompatActivity() {
                 attestationChallengeId = currentChallenge.attestationChallengeId,
                 generated = currentKey,
             )
-            // PRESENTED FOR THE LAST TIME, EITHER WAY. Nothing after this point
-            // in the ceremony needs the grant, so it comes off the screen
-            // whether the request was accepted or refused.
+            // ============================================================
+            // C18-R1 — THE GRANT IS RELEASED ONLY ON AN AUTHORITATIVE ANSWER.
+            // ============================================================
             //
-            // Honest about the limit: a Kotlin String cannot be wiped, only
-            // dereferenced, so what this achieves is that no live reference to
-            // the secret is held by the UI or by this closure once the request
-            // is made. Zeroing would need a CharArray all the way through
-            // OkHttp, which is not a promise this harness can keep.
+            // THE DEFECT THIS REPLACES. This step used to clear the grant
+            // UNCONDITIONALLY, before the result was even inspected. That is
+            // wrong for one specific and entirely ordinary case: the POST
+            // reached the server, the server created the enrollment request,
+            // and the RESPONSE was lost on the way back. `SentinelHttp` reports
+            // that as status 0, exactly as it reports a request that never
+            // left. Clearing there destroys the grant, and the grant is one of
+            // the three things — with the challenge and the generated key —
+            // that the server's convergence path requires in order to hand this
+            // client back the request id and fingerprint it already earned. A
+            // client that discards them turns a SUCCEEDED ceremony into an
+            // unfinishable one.
+            //
+            // THE RULE:
+            //
+            //   OK (REQUESTED or CONVERGED)  the server named the request.
+            //                                Release the grant; nothing after
+            //                                this point in the ceremony needs
+            //                                it.
+            //
+            //   TERMINAL REFUSAL             the server evaluated this
+            //                                submission and declined it.
+            //                                Release the grant: it is spent,
+            //                                and nothing is gained by leaving a
+            //                                secret on screen.
+            //
+            //   COMPLETION UNKNOWN           RETAIN the grant, the challenge and
+            //   (409, status 0, 5xx,         the generated key, in memory, and
+            //    an unreadable 2xx)          tell the operative to retry THE
+            //                                EXACT SAME submission.
+            //
+            // RETENTION IS IN LIVE MEMORY ONLY, AND THAT PART OF C18-05 STAYS
+            // CLOSED. The grant is held where it already was — the masked,
+            // save-disabled, autofill-excluded input — for the life of this
+            // ceremony. It reaches no persistence API here or anywhere else,
+            // and `BootstrapTokenNeverPersistedSourceTest` fails the build if
+            // that ever stops being true. `challenge` and `generated` are
+            // likewise ordinary in-memory fields and are deliberately NOT
+            // cleared on this path.
+            //
+            // Honest about the limit, unchanged: a Kotlin String cannot be
+            // wiped, only dereferenced, so clearing achieves that no live
+            // reference to the secret is held by the UI or by this closure.
+            // Zeroing would need a CharArray all the way through OkHttp, which
+            // is not a promise this harness can keep.
+            if (result.isCompletionUnknown) {
+                log(result.describe())
+                log("COMPLETION UNKNOWN: the server may already have created this enrollment request.")
+                log("the bootstrap grant, the challenge and the generated key are RETAINED in memory.")
+                log("press step 2 again to retry the EXACT same submission; an identical retry converges.")
+                return@background
+            }
+            // Authoritative from here: a parsed success, or a terminal refusal.
             clearBootstrapToken()
             if (!result.isOk) {
                 log(result.describe())

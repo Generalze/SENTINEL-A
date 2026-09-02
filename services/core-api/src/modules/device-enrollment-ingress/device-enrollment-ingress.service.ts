@@ -1,8 +1,10 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { createHash, randomBytes } from 'node:crypto';
 import {
+  DeviceAttestationOutcomeSchema,
   DeviceKeyStorageSchema,
   deriveP256PublicKeyThumbprint,
+  type DeviceAttestationOutcome,
   type DeviceCustody,
   type DeviceKeyStorage,
   type DeviceSignatureProfile,
@@ -325,11 +327,18 @@ export class DeviceEnrollmentIngressService {
     // of one that already succeeded. A retry that arrives 121 seconds late is
     // still asking about a request that exists, and answering it creates
     // nothing.
+    //
+    // C18-R1 — AND AN AMBIGUOUS ONE IS `UNKNOWN`, NOT A REFUSAL.
+    //
+    // The three-way answer below replaces a two-way one that conflated "this is
+    // not about your submission" with "your submission may well have succeeded
+    // and this server cannot yet prove it". Only the first is terminal. The
+    // second is `UNKNOWN`, served from recorded state exactly as `CONVERGED`
+    // is — no mutation, no re-verification, no second artifact, no second
+    // Shield request — because it is returned from here, before any of that
+    // work exists.
     if (challenge.consumedAt !== null) {
-      const resolved = resolveRecordedSubmission(challenge, submissionFingerprint);
-      if (resolved !== null) return resolved;
-      this.refused('ATTESTATION_CHALLENGE_ALREADY_CONSUMED', input.traceId, null);
-      return { outcome: 'REFUSED' };
+      return this.answerRecordedSubmission(challenge, submissionFingerprint, input.traceId);
     }
 
     const now = await this.repository.now();
@@ -350,9 +359,31 @@ export class DeviceEnrollmentIngressService {
       now,
       submissionFingerprint,
     );
+    // C18-R1 — THE LOSER OF THE RACE IS ANSWERED FROM THE SAME RESOLVER.
+    //
+    // Losing the fence means somebody else consumed this challenge between the
+    // read above and this statement. Before C18-R1 that was an unconditional
+    // refusal, which is wrong for the case that actually happens: two
+    // byte-identical submissions in flight at once — one phone retrying because
+    // it believes the first was lost. The loser is asking about the SAME
+    // submission the winner is committing, so it gets the same three-way answer
+    // as any other consumed challenge: `UNKNOWN` while the winner's receipt is
+    // still incomplete, `CONVERGED` once it is, and a terminal refusal if the
+    // row says the challenge was spent by something else.
+    //
+    // The re-read is the ONLY extra work, and it creates nothing. Reaching this
+    // point cannot have produced an artifact or a Shield request: both happen
+    // strictly below.
     if (!claimed) {
-      this.refused('ATTESTATION_CHALLENGE_ALREADY_CONSUMED', input.traceId, null);
-      return { outcome: 'REFUSED' };
+      const recorded = await this.repository.findAttestationChallenge(input.organisationId, challenge.id);
+      if (recorded === null) {
+        // The row vanished between two reads inside one request. Nothing in
+        // this module deletes a challenge, so this is not a state this code can
+        // reason about — fail closed.
+        this.refused('ATTESTATION_CHALLENGE_DISAPPEARED', input.traceId, null);
+        return { outcome: 'REFUSED' };
+      }
+      return this.answerRecordedSubmission(recorded, submissionFingerprint, input.traceId);
     }
 
     // D24-05's runtime crypto boundary, reused rather than reimplemented. A
@@ -439,13 +470,76 @@ export class DeviceEnrollmentIngressService {
       keyStorage,
     });
 
+    // C18-R2 — THE VERDICT IS PARSED AT THE BOUNDARY THAT PUBLISHES IT.
+    //
+    // Shield still types `attestationOutcome` as `string`, because its own
+    // column is one. `DeviceAttestationOutcome` is a CLOSED vocabulary, and the
+    // ingress is the surface that hands the value to a client and stores it in
+    // a receipt a later retry will be answered FROM — so it is parsed here,
+    // once, against the frozen contract.
+    //
+    // IT IS PARSED AFTER THE RECEIPT IS WRITTEN, deliberately. The receipt must
+    // record what actually happened, including a value this server then refuses
+    // to publish; and the retry path resolves such a row to a TERMINAL refusal,
+    // so the live answer and the recorded answer agree. In a healthy server this
+    // cannot fire at all — Shield's producer is the evaluator's
+    // `DeviceAttestationEvidence`, whose outcome is contract-parsed before it
+    // ever reaches here — and it fails closed rather than widening the surface
+    // type to whatever a future producer emits.
+    const publishedOutcome = DeviceAttestationOutcomeSchema.safeParse(created.attestationOutcome);
+    if (!publishedOutcome.success) {
+      this.refused('SHIELD_ATTESTATION_OUTCOME_NOT_IN_CONTRACT', input.traceId, null);
+      return { outcome: 'REFUSED' };
+    }
+
     return {
       outcome: created.outcome,
       enrollmentRequestId: created.enrollmentRequestId,
       requestFingerprint: created.requestFingerprint,
-      attestationOutcome: created.attestationOutcome,
+      attestationOutcome: publishedOutcome.data,
       keyStorage,
     };
+  }
+
+  /**
+   * C18-R1 — ONE CONSUMED CHALLENGE, THREE POSSIBLE ANSWERS.
+   *
+   * The single place the resolver's verdict is turned into an outcome and an
+   * internal reason line, so both call sites — the courtesy read and the loser
+   * of the fenced consume — answer identically. Two call sites that agreed only
+   * by review would be two call sites that eventually did not.
+   *
+   * IT MUTATES NOTHING AND CALLS NOTHING. It reads a row this service already
+   * holds and returns. That is what makes `UNKNOWN` safe to hand out: it costs
+   * exactly one refusal-log line, and it can no more create a second artifact or
+   * a second Shield request than `CONVERGED` can.
+   */
+  private answerRecordedSubmission(
+    challenge: RecordedSubmissionRow,
+    submissionFingerprint: string,
+    traceId: string,
+  ): SubmitEnrollmentRequestOutcome {
+    const resolved = resolveRecordedSubmission(challenge, submissionFingerprint);
+    if (resolved.resolution === 'CONVERGED') {
+      return {
+        // WP-24's convergence arm, reached for WP-24's reason: the ceremony
+        // already happened, and the client is being told what it achieved.
+        outcome: 'CONVERGED',
+        enrollmentRequestId: resolved.enrollmentRequestId,
+        requestFingerprint: resolved.requestFingerprint,
+        attestationOutcome: resolved.attestationOutcome,
+        keyStorage: resolved.keyStorage,
+      };
+    }
+    if (resolved.resolution === 'UNKNOWN') {
+      // The reason goes to the internal log with the trace id, exactly as every
+      // refusal reason does. The CLIENT is told only that completion is unknown;
+      // `IngressCompletionUnknown` has nowhere to put a reason.
+      this.unresolved(resolved.reason, traceId);
+      return { outcome: 'UNKNOWN' };
+    }
+    this.refused(resolved.reason, traceId, null);
+    return { outcome: 'REFUSED' };
   }
 
   // -------------------------------------------------------------------------
@@ -583,6 +677,19 @@ export class DeviceEnrollmentIngressService {
         (shieldRefusal === null ? '' : ` shield_refusal=${shieldRefusal}`),
     );
   }
+
+  /**
+   * C18-R1 — the internal line for an UNRESOLVED completion.
+   *
+   * Separate from [refused] because it is a different fact and an operator must
+   * be able to tell them apart: a refusal says the ceremony did not happen, this
+   * says the server cannot yet prove whether it did. Same construction, same
+   * guarantee — a reason code and a trace id, and no parameter through which a
+   * secret could travel.
+   */
+  private unresolved(reason: string, traceId: string): void {
+    this.logger.warn(`device-enrollment-ingress completion unknown: reason=${reason} trace_id=${traceId}`);
+  }
 }
 
 /**
@@ -677,19 +784,101 @@ function enrollmentSubmissionFingerprint(input: {
 }
 
 /**
- * C18-03 — THE RECORDED OUTCOME OF A CONSUMED CHALLENGE, OR `null`.
+ * C18-03/C18-R1 — THE RECORDED STATE OF A CONSUMED CHALLENGE, AS A ROW SHAPE.
  *
- * FAIL CLOSED IS THE DEFAULT AND EVERY BRANCH BELOW RETURNS TO IT.
+ * The exact columns the resolver reads, named once so the two call sites and the
+ * resolver cannot drift apart. It is a subset of what
+ * `findAttestationChallenge` selects; nothing here is a secret, and the raw
+ * certificate chain is not among them and could not be — no read path in this
+ * module can load it.
+ */
+interface RecordedSubmissionRow {
+  readonly consumedAt: Date | null;
+  readonly submissionFingerprint: string | null;
+  readonly enrollmentRequestId: string | null;
+  readonly enrollmentRequestFingerprint: string | null;
+  readonly attestationOutcome: string | null;
+  readonly keyStorage: string | null;
+}
+
+/**
+ * C18-R1 — WHAT A CONSUMED CHALLENGE SAYS ABOUT ONE SUBMISSION. THREE ANSWERS.
  *
- * `null` means "this server cannot prove what that challenge produced", and the
- * caller turns that into the ordinary refusal. It is returned for a consumed
- * challenge that recorded no submission fingerprint, one whose fingerprint is
- * for a DIFFERENT submission (a retry with another public key, another custody,
- * another chain), and one whose recorded outcome is incomplete — which is what a
- * crash between the consume and the receipt leaves behind.
+ * `reason` on the two non-converged arms is for the INTERNAL log only. The
+ * caller writes it beside a trace id and returns a shape with nowhere to put it,
+ * so it cannot travel outward (D25-13).
+ */
+type RecordedSubmissionResolution =
+  | {
+      readonly resolution: 'CONVERGED';
+      readonly enrollmentRequestId: string;
+      readonly requestFingerprint: string;
+      readonly attestationOutcome: DeviceAttestationOutcome;
+      readonly keyStorage: DeviceKeyStorage;
+    }
+  | { readonly resolution: 'UNKNOWN'; readonly reason: string }
+  | { readonly resolution: 'REFUSED'; readonly reason: string };
+
+/**
+ * ===========================================================================
+ * C18-03/C18-R1 — THE RECORDED OUTCOME OF A CONSUMED CHALLENGE.
+ * ===========================================================================
+ *
+ * THE RULE, IN FULL:
+ *
+ *     consumed, recorded fingerprint MATCHES the computed one
+ *         receipt complete AND every stored field valid      -> CONVERGED
+ *         receipt incomplete (any receipt field still null)   -> UNKNOWN
+ *     consumed, recorded fingerprint DIFFERS                  -> REFUSED
+ *     consumed, NO recorded fingerprint                       -> REFUSED
+ *
+ * WHY `UNKNOWN` EXISTS, AND WHY IT IS NOT A REFUSAL (C18-R1).
+ *
+ * Until C18-R1 this function answered `CONVERGED` or `null`, and `null` became
+ * the ordinary refusal. That conflated two facts a client must act on
+ * differently. A REFUSAL is terminal: this ceremony did not happen and will not,
+ * so the client should destroy its grant and start again. An incomplete receipt
+ * means the opposite — this exact submission DID spend this challenge, so it is
+ * probably mid-flight or was interrupted after Shield answered, and the request
+ * it created may exist under an id neither side has yet exchanged. Telling that
+ * client "refused" is what makes the ceremony unfinishable: it discards the
+ * grant, the challenge and the key that are the only way to reach the
+ * convergence C18-03 built. `UNKNOWN` is the WP-20 reliability vocabulary's word
+ * for exactly this, and it is what this returns.
+ *
+ * IT IS STILL FAIL-CLOSED. `UNKNOWN` claims NOTHING. It does not say a request
+ * exists, does not name one, and carries no id, no fingerprint and no verdict —
+ * a client that receives it knows only that it must retry the exact submission
+ * and cannot yet proceed. The only state that produces it is one where the
+ * recorded fingerprint ALREADY PROVES this submission spent this challenge.
+ *
+ * A CONSUMED ROW WITH NO RECORDED FINGERPRINT IS STILL TERMINAL, and the reason
+ * is structural rather than a policy choice: the fingerprint is stamped by the
+ * SAME FENCED STATEMENT that consumes the challenge
+ * (`consumeAttestationChallenge` sets `consumed_at` and `submission_fingerprint`
+ * in one conditional update), so the row can never say "consumed" without saying
+ * by what. A consumed row without one is therefore not a row this code wrote,
+ * and a server that cannot recognise its own writing must not treat the row as
+ * evidence that anything of its own succeeded.
+ *
+ * A DIFFERENT FINGERPRINT IS TERMINAL FOR THE ONE-SHOT RULE'S OWN REASON: a
+ * changed key, custody, régime or chain under a spent challenge is a SECOND
+ * ceremony wearing a spent nonce, which is precisely what a nonce exists to
+ * stop. It is not ambiguous and it must never be softened to `UNKNOWN`.
+ *
+ * A STORED VALUE OUTSIDE ITS CONTRACT IS TERMINAL TOO (C18-R2). `keyStorage` was
+ * already re-parsed against `DeviceKeyStorageSchema` rather than cast;
+ * `attestationOutcome` was not, and was returned from the database as an
+ * arbitrary string — which contradicted C18-03's own rule that an outcome the
+ * server cannot resolve fails closed. Both are now parsed. A present-but-invalid
+ * value is NOT "incomplete": the receipt was written, so there is nothing more
+ * to wait for, and answering `UNKNOWN` would invite a retry loop against a row
+ * that will never resolve. It fails closed, terminally, and the same value seen
+ * live on the write path refuses in the same way.
  *
  * There is no path here that reconstructs, re-derives or infers an outcome. It
- * either reads four recorded values and echoes them, or it declines.
+ * either reads four recorded values, proves each against its contract and echoes
+ * them, or it declines.
  *
  * The comparison is a plain string equality and that is correct: both sides are
  * server-computed digests of data the server already holds, neither is a secret,
@@ -699,20 +888,25 @@ function enrollmentSubmissionFingerprint(input: {
  * a fingerprint, they are replaying a submission they already have.
  */
 function resolveRecordedSubmission(
-  challenge: {
-    consumedAt: Date | null;
-    submissionFingerprint: string | null;
-    enrollmentRequestId: string | null;
-    enrollmentRequestFingerprint: string | null;
-    attestationOutcome: string | null;
-    keyStorage: string | null;
-  },
+  challenge: RecordedSubmissionRow,
   submissionFingerprint: string,
-): SubmitEnrollmentRequestOutcome | null {
-  if (challenge.consumedAt === null) return null;
-  if (challenge.submissionFingerprint === null) return null;
-  if (challenge.submissionFingerprint !== submissionFingerprint) return null;
+): RecordedSubmissionResolution {
+  // Not consumed at all. Neither call site can reach this — one tests
+  // `consumedAt !== null` first, the other only runs when a fenced update found
+  // no unconsumed row — and it fails closed anyway rather than trusting that.
+  if (challenge.consumedAt === null) {
+    return { resolution: 'REFUSED', reason: 'RECORDED_SUBMISSION_NOT_CONSUMED' };
+  }
+  if (challenge.submissionFingerprint === null) {
+    return { resolution: 'REFUSED', reason: 'CONSUMED_WITHOUT_RECORDED_FINGERPRINT' };
+  }
+  if (challenge.submissionFingerprint !== submissionFingerprint) {
+    return { resolution: 'REFUSED', reason: 'CONSUMED_BY_A_DIFFERENT_SUBMISSION' };
+  }
 
+  // Past this line the row PROVES that this exact submission spent this exact
+  // challenge. What remains is whether the server can also prove what it
+  // produced.
   const { enrollmentRequestId, enrollmentRequestFingerprint, attestationOutcome, keyStorage } = challenge;
   if (
     enrollmentRequestId === null ||
@@ -720,21 +914,30 @@ function resolveRecordedSubmission(
     attestationOutcome === null ||
     keyStorage === null
   ) {
-    return null;
+    // The receipt is written only after Shield has answered, so this is the
+    // window in which the winner is still working — or died between the consume
+    // and the receipt. Either way the answer is the same and it is not a
+    // refusal: retry this exact submission.
+    return { resolution: 'UNKNOWN', reason: 'RECEIPT_INCOMPLETE' };
   }
-  // The stored key storage is re-parsed against the frozen contract rather than
-  // cast. A column is a string; `DeviceKeyStorage` is a closed vocabulary, and a
-  // value that is not in it is a row this code did not write.
+  // The stored values are re-parsed against the frozen contracts rather than
+  // cast. A column is a string; `DeviceKeyStorage` and `DeviceAttestationOutcome`
+  // are closed vocabularies, and a value that is not in one is a row this code
+  // did not write.
   const storage = DeviceKeyStorageSchema.safeParse(keyStorage);
-  if (!storage.success) return null;
+  if (!storage.success) {
+    return { resolution: 'REFUSED', reason: 'RECORDED_KEY_STORAGE_NOT_IN_CONTRACT' };
+  }
+  const outcome = DeviceAttestationOutcomeSchema.safeParse(attestationOutcome);
+  if (!outcome.success) {
+    return { resolution: 'REFUSED', reason: 'RECORDED_ATTESTATION_OUTCOME_NOT_IN_CONTRACT' };
+  }
 
   return {
-    // WP-24's convergence arm, reached for WP-24's reason: the ceremony already
-    // happened, and the client is being told what it already achieved.
-    outcome: 'CONVERGED',
+    resolution: 'CONVERGED',
     enrollmentRequestId,
     requestFingerprint: enrollmentRequestFingerprint,
-    attestationOutcome,
+    attestationOutcome: outcome.data,
     keyStorage: storage.data,
   };
 }

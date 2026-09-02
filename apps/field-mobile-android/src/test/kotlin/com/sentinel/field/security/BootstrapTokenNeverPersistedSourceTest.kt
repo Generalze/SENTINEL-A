@@ -190,19 +190,118 @@ class BootstrapTokenNeverPersistedSourceTest {
     }
 
     /**
-     * The submit step clears UNCONDITIONALLY — before the response is even
-     * inspected — because the grant is one-shot and the server has seen it
-     * either way. A clear that only ran on success would leave the secret on
-     * screen in exactly the case where something has already gone wrong.
+     * ========================================================================
+     * C18-R1 — CLEARED ON AN AUTHORITATIVE OUTCOME, RETAINED ON AN UNPROVEN ONE.
+     * ========================================================================
+     *
+     * THIS TEST PREVIOUSLY ENFORCED THE DEFECT, and saying so plainly is the
+     * point of this comment. It required the submit step to clear the grant
+     * BEFORE the result was inspected, on the argument that "the server has seen
+     * it either way". That argument is true about the grant and false about the
+     * ceremony. `SentinelHttp` reports every transport failure as status 0, and
+     * that bucket contains the case where the POST arrived, the server created
+     * the enrollment request, and the RESPONSE was lost coming back. Clearing
+     * there destroys the grant, the challenge and the key that the server's
+     * convergence path needs, and turns a ceremony that SUCCEEDED into one
+     * nobody can finish. A test that pinned that ordering pinned the bug.
+     *
+     * THE CORRECTED RULE, which is what the three assertions below prove:
+     *
+     *   * the unknown branch is taken FIRST, and it returns without clearing;
+     *   * every clear in the function is reached only after that branch;
+     *   * the unknown branch clears nothing at all — not the grant, and not the
+     *     challenge or the generated key, which are the other two things an
+     *     exact retry needs.
+     *
+     * What has NOT changed, and is asserted everywhere else in this file: the
+     * grant still never reaches a persistence API. Retention is in live memory,
+     * in the masked, save-disabled input it was typed into, for the life of the
+     * ceremony.
      */
     @Test
-    fun `the submit step clears the grant before it branches on the result`() {
+    fun `the submit step retains the grant when completion cannot be proven`() {
+        val body = functionBody(mainActivity(), "runSubmitRequest")
+
+        val unknownBranch = body.indexOf("if (result.isCompletionUnknown)")
+        assertTrue(
+            "runSubmitRequest must branch on the unproven outcome before it releases anything",
+            unknownBranch >= 0,
+        )
+
+        // The unknown branch runs to its own `return@background` and everything
+        // between the two is what it does. Nothing in it may release material.
+        val unknownBranchEnd = body.indexOf("return@background", unknownBranch)
+        assertTrue("the unknown branch does not return", unknownBranchEnd > unknownBranch)
+        val unknownBranchBody = body.substring(unknownBranch, unknownBranchEnd)
+        for (destructive in listOf("clearBootstrapToken()", "challenge = null", "generated = null", "keys.deleteKey()")) {
+            assertFalse(
+                "the unknown branch must retain the ceremony material, but it runs '$destructive'",
+                unknownBranchBody.contains(destructive),
+            )
+        }
+
+        // EVERY clear in this function is downstream of the unknown branch, so
+        // there is no ordering in which an unproven outcome reaches one.
+        val clears = indicesOf(body, "clearBootstrapToken()")
+        assertTrue("runSubmitRequest does not clear the grant at all", clears.isNotEmpty())
+        for (clear in clears) {
+            assertTrue(
+                "runSubmitRequest clears the grant at $clear, before the unproven outcome is handled",
+                clear > unknownBranch,
+            )
+        }
+    }
+
+    /**
+     * The other half of the same rule: an AUTHORITATIVE answer — a parsed
+     * success, or a terminal refusal — does release the grant. A client that
+     * retained it forever would leave a one-shot secret on screen long after
+     * anything could use it, which is the failure the original test was
+     * defending against and which the correction must not reintroduce.
+     */
+    @Test
+    fun `the submit step clears the grant on an authoritative outcome`() {
         val body = functionBody(mainActivity(), "runSubmitRequest")
         val cleared = body.indexOf("clearBootstrapToken()")
-        val branched = body.indexOf("if (!result.isOk)")
+        val branchedOnSuccess = body.indexOf("if (!result.isOk)")
         assertTrue("runSubmitRequest does not clear the grant", cleared >= 0)
-        assertTrue("runSubmitRequest does not branch on the result", branched >= 0)
-        assertTrue("the grant is cleared only on one branch", cleared < branched)
+        assertTrue("runSubmitRequest does not branch on success", branchedOnSuccess >= 0)
+        // Cleared once the outcome is known to be authoritative, and BEFORE the
+        // success/refusal split — so the terminal refusal arm cannot forget to.
+        assertTrue("the grant is not cleared on the terminal-refusal arm", cleared < branchedOnSuccess)
+    }
+
+    /**
+     * The distinction the activity branches on must be a real one the transport
+     * layer can produce, not a predicate that is always false. This pins the
+     * ceremony's own classification: the server's 409 and a status-0 transport
+     * failure both become the unproven outcome, and a plain 4xx does not.
+     */
+    @Test
+    fun `the ceremony classifies an unproven submission separately from a refusal`() {
+        val ceremony = codeOf(mainSources().single { it.name == "EnrollmentCeremony.kt" })
+        assertTrue(
+            "the ceremony must name the server's non-terminal status",
+            ceremony.contains("COMPLETION_UNKNOWN = 409"),
+        )
+        assertTrue(
+            "the ceremony must produce the unproven outcome",
+            ceremony.contains("CeremonyStep.completionUnknown("),
+        )
+        assertTrue(
+            "only a 4xx that is not the unknown status may be a terminal refusal",
+            ceremony.contains("answer.status in 400..499 && answer.status != COMPLETION_UNKNOWN"),
+        )
+    }
+
+    private fun indicesOf(haystack: String, needle: String): List<Int> {
+        val out = mutableListOf<Int>()
+        var at = haystack.indexOf(needle)
+        while (at >= 0) {
+            out.add(at)
+            at = haystack.indexOf(needle, at + needle.length)
+        }
+        return out
     }
 
     @Test

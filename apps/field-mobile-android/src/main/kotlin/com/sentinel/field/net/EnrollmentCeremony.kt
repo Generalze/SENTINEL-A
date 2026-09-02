@@ -61,6 +61,17 @@ class EnrollmentCeremony(
 
     companion object {
         private const val INGRESS = "/api/v1/device-enrollment"
+
+        /**
+         * C18-R1 — the server's non-terminal answer on the request route.
+         *
+         * `409 DEVICE_ENROLLMENT_COMPLETION_UNKNOWN`: the server has recorded
+         * that this exact submission spent this challenge, and cannot yet prove
+         * what it produced. It is the ONE status on this surface that is neither
+         * a success nor terminal, and the client's whole obligation on seeing it
+         * is to keep its ceremony material and retry the identical body.
+         */
+        private const val COMPLETION_UNKNOWN = 409
     }
 
     /** Phase 0's answer, carried forward to key generation. */
@@ -154,6 +165,19 @@ class EnrollmentCeremony(
     // Crossing A — the public key and the attestation evidence
     // -----------------------------------------------------------------------
 
+    /**
+     * ONE SUBMISSION, AND THREE KINDS OF ANSWER (C18-R1).
+     *
+     * This is the only crossing whose failure can be AMBIGUOUS, because it is
+     * the only one that CREATES something on the server. Everything before it is
+     * a read or a local key generation; everything after it names an enrollment
+     * request that already exists and can simply be asked about again. So this is
+     * where the distinction between "it did not happen" and "it may have
+     * happened" has to be drawn, and it is drawn here rather than in the caller
+     * so that no button handler can get it wrong.
+     *
+     * See [classifySubmission] for the rule and its reasoning.
+     */
     fun submitEnrollmentRequest(
         sessionUserId: String,
         organisationId: String,
@@ -185,17 +209,79 @@ class EnrollmentCeremony(
                 }
             },
         )
+        return classifySubmission(answer)
+    }
+
+    /**
+     * ============================================================================
+     * C18-R1 — WHAT THE CLIENT MAY CONCLUDE FROM ONE ANSWER TO CROSSING A.
+     * ============================================================================
+     *
+     *     a parsed 2xx                        -> OK. The server named the
+     *                                            request; the outcome field says
+     *                                            REQUESTED or CONVERGED, and
+     *                                            both are authoritative.
+     *
+     *     4xx other than 409                  -> REFUSED, and TERMINAL. The
+     *                                            server evaluated this
+     *                                            submission and declined it: a
+     *                                            dead grant, a foreign tenant, a
+     *                                            changed key under a spent
+     *                                            challenge, a malformed body.
+     *                                            Nothing was created and nothing
+     *                                            will be.
+     *
+     *     409                                 -> COMPLETION UNKNOWN, said by the
+     *                                            server itself.
+     *
+     *     status 0                            -> COMPLETION UNKNOWN. `SentinelHttp`
+     *                                            reports EVERY transport failure
+     *                                            as 0, and that bucket contains
+     *                                            the case this correction is
+     *                                            about: the POST arrived, the
+     *                                            server committed, and the
+     *                                            RESPONSE was lost. From here a
+     *                                            lost request and a lost response
+     *                                            are the same event, so the
+     *                                            client must assume the one that
+     *                                            costs it nothing to assume.
+     *
+     *     5xx                                 -> COMPLETION UNKNOWN. A server
+     *                                            that failed mid-request may have
+     *                                            failed AFTER creating the
+     *                                            enrollment request — that exact
+     *                                            window is what the server's own
+     *                                            incomplete-receipt state
+     *                                            describes.
+     *
+     *     2xx whose body did not parse        -> COMPLETION UNKNOWN. The server
+     *                                            evidently succeeded at
+     *                                            something; this client simply
+     *                                            cannot read what.
+     *
+     * THE ASYMMETRY IS DELIBERATE AND IT IS THE WHOLE CORRECTION. Treating an
+     * unknown as a refusal destroys recovery material and makes a SUCCEEDED
+     * ceremony unfinishable. Treating an unknown as a retryable unknown costs one
+     * repeated request, which the server answers from recorded state and which
+     * creates no second request and no second artifact. The two mistakes are not
+     * comparable, so the fallthrough is UNKNOWN, not REFUSED.
+     */
+    private fun classifySubmission(answer: SentinelHttp.Answer): CeremonyStep<SubmittedRequest> {
         val body = answer.body
-        if (!answer.ok || body == null) return refusal(answer)
-        return CeremonyStep.ok(
-            SubmittedRequest(
-                outcome = body.text("outcome"),
-                enrollmentRequestId = body.text("enrollment_request_id"),
-                requestFingerprint = body.text("request_fingerprint"),
-                attestationOutcome = body.text("attestation_outcome"),
-                keyStorage = body.text("key_storage"),
-            ),
-        )
+        if (answer.ok && body != null) {
+            return CeremonyStep.ok(
+                SubmittedRequest(
+                    outcome = body.text("outcome"),
+                    enrollmentRequestId = body.text("enrollment_request_id"),
+                    requestFingerprint = body.text("request_fingerprint"),
+                    attestationOutcome = body.text("attestation_outcome"),
+                    keyStorage = body.text("key_storage"),
+                ),
+            )
+        }
+        val terminal = answer.status in 400..499 && answer.status != COMPLETION_UNKNOWN
+        if (terminal) return refusal(answer)
+        return CeremonyStep.completionUnknown(answer.status, answer.text)
     }
 
     // -----------------------------------------------------------------------
