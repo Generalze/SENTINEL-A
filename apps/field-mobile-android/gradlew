@@ -1,0 +1,49 @@
+#!/bin/sh
+#
+# ============================================================================
+# MINIMAL GRADLE WRAPPER LAUNCHER — and an honest note about what it is not.
+#
+# The canonical `gradlew` shipped by `gradle wrapper` is a much larger script
+# (Cygwin/MSYS path translation, Darwin handling, JVM option splitting via
+# `xargs`). This is NOT a copy of it recalled from memory, because a
+# half-remembered launcher is exactly the kind of thing that appears to work
+# and then fails in one environment nobody tested.
+#
+# What this file does is the ONE thing every version of that script ultimately
+# does: run `org.gradle.wrapper.GradleWrapperMain` from the wrapper jar.
+#
+# `gradle/wrapper/gradle-wrapper.jar` IS NOT COMMITTED. It is a binary this
+# repository's author could not produce offline, and inventing binary content
+# is not an option. `.github/workflows/android.yml` therefore installs Gradle
+# 8.7 with `gradle/actions/setup-gradle` and runs `gradle wrapper` FIRST, which
+# materialises the jar AND replaces this file and `gradlew.bat` with the
+# official generated launchers before any build runs.
+#
+# To use the wrapper locally, do the same once:
+#
+#     gradle wrapper
+#
+# ============================================================================
+set -e
+
+APP_HOME=$(cd -- "$(dirname -- "$0")" > /dev/null && pwd -P)
+WRAPPER_JAR="$APP_HOME/gradle/wrapper/gradle-wrapper.jar"
+
+if [ ! -f "$WRAPPER_JAR" ]; then
+    echo "gradle-wrapper.jar is not present at $WRAPPER_JAR." >&2
+    echo "It is deliberately not committed. Run 'gradle wrapper' once in this" >&2
+    echo "directory with Gradle 8.7 installed to generate it, or invoke Gradle" >&2
+    echo "directly. See the comment at the top of this script." >&2
+    exit 1
+fi
+
+if [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java" ]; then
+    JAVACMD="$JAVA_HOME/bin/java"
+else
+    JAVACMD=java
+fi
+
+exec "$JAVACMD" \
+    -classpath "$WRAPPER_JAR" \
+    org.gradle.wrapper.GradleWrapperMain \
+    "$@"

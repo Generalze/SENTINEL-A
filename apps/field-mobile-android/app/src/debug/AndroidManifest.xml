@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    DEBUG ONLY.
+
+    The core-api this client talks to runs on plaintext HTTP in a developer's
+    compose stack, and a foundation client that could not reach it would be a
+    foundation for nothing. So cleartext is permitted HERE, in the debug
+    manifest, and NOWHERE else: a release build inherits the platform default
+    and cannot open a plaintext connection at all.
+
+    This is not the same as saying the transport is adequate. Physical device
+    acceptance (D26-10) is performed against a real deployment, and the moment
+    this client speaks to one it speaks TLS.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application android:usesCleartextTraffic="true" />
+</manifest>

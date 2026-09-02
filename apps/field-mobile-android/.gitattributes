@@ -1,0 +1,4 @@
+gradlew text eol=lf
+gradlew.bat text eol=crlf
+*.kts text eol=lf
+*.kt text eol=lf

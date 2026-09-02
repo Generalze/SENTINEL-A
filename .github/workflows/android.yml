@@ -1,0 +1,118 @@
+#
+# WP-26 / D26-10 — THE SECOND REQUIRED WORKFLOW.
+#
+# "The Android project stays in the monorepo, outside pnpm, with its own
+#  required workflow that compiles, lints and runs Kotlin/JVM client tests AT
+#  THE EXACT CANDIDATE SHA. Sentinel's normal CI remains separately required."
+#
+# The consequence the gate ruling states explicitly, restated here so nobody has
+# to go and find it: the pnpm workspace test count STOPS BEING A COMPLETE
+# MEASURE of the system. The gate reads two numbers — `ci.yml` and this file —
+# and a green on one is not a green on the other. `ci.yml` is untouched by this
+# work package.
+#
+# THERE IS NO EMULATOR HERE, AND THERE IS NOT GOING TO BE ONE.
+#
+#     "An emulator is not a hardware test. It cannot establish that a private
+#      key lived in a physical StrongBox, and WP-26 will not present one as if
+#      it could."
+#
+# What this workflow establishes is that the client BUILDS, that it LINTS, and
+# that its pure-Kotlin security logic — the DER to IEEE P1363 conversion, the
+# low-S canonicalisation, the canonical JSON, the four signed statements, the
+# absence of any private-key export path — is correct on the JVM. The third
+# evidence class, PHYSICAL DEVICE ACCEPTANCE on genuine StrongBox hardware, is
+# performed by a human and is required to close WP-26. It cannot run here, and
+# a job that looked as though it had run it would be manufacturing evidence.
+#
+name: Android CI
+
+on:
+  push:
+  pull_request:
+
+# Least privilege. This workflow reads a checkout and writes an artifact; it
+# needs nothing else.
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: apps/field-mobile-android
+
+jobs:
+  android:
+    name: build, lint, unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # D26-10: AT THE EXACT CANDIDATE SHA. `actions/checkout` defaults to the
+      # ephemeral MERGE commit on a pull_request, which is not the revision
+      # anybody is being asked to approve; this pins the head commit itself.
+      - name: Check out the candidate revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Report the revision under test
+        run: |
+          echo "workflow ref:  ${{ github.ref }}"
+          echo "candidate SHA: $(git rev-parse HEAD)"
+
+      - name: Set up JDK 17 (temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up the Android SDK
+        uses: android-actions/setup-android@v3
+
+      # Installed explicitly rather than relied upon. The runner image's SDK
+      # contents change over time, and "the platform happened to be there" is
+      # not a property a required workflow should depend on.
+      - name: Install the platform and build tools this project pins
+        run: |
+          sdkmanager --install "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+          build-root-directory: apps/field-mobile-android
+
+      # `gradle/wrapper/gradle-wrapper.jar` IS NOT COMMITTED — see the note at
+      # the top of `gradlew`. Generating it here from the pinned
+      # `gradle-wrapper.properties` also VERIFIES that file: a properties file
+      # naming a distribution that does not exist fails at this step rather
+      # than silently never being used.
+      - name: Materialise the Gradle wrapper
+        run: |
+          gradle wrapper --gradle-version 8.7
+          chmod +x ./gradlew
+          ./gradlew --version
+
+      - name: Assemble (debug)
+        run: ./gradlew --no-daemon --stacktrace :app:assembleDebug
+
+      - name: Android Lint
+        run: ./gradlew --no-daemon --stacktrace :app:lintDebug
+
+      # The evidence that actually covers the security-critical logic.
+      - name: Kotlin/JVM unit tests
+        run: ./gradlew --no-daemon --stacktrace :app:testDebugUnitTest
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-reports
+          path: |
+            apps/field-mobile-android/app/build/reports/
+          if-no-files-found: warn
+          retention-days: 7

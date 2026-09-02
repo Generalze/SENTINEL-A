@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Deliberately minimal. D26-06: "minimal is the operative word; this is a
+    foundation for a proof, not a product." A few inputs, a button per ceremony
+    step in the one order D26-04A permits, and a log that shows exactly what the
+    server answered.
+-->
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <EditText
+            android:id="@+id/inputBaseUrl"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="@string/hint_base_url"
+            android:importantForAutofill="no"
+            android:inputType="textUri"
+            android:text="@string/default_base_url" />
+
+        <EditText
+            android:id="@+id/inputSessionUser"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="@string/hint_session_user"
+            android:importantForAutofill="no"
+            android:inputType="text" />
+
+        <EditText
+            android:id="@+id/inputOrganisation"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="@string/hint_organisation"
+            android:importantForAutofill="no"
+            android:inputType="text" />
+
+        <EditText
+            android:id="@+id/inputSite"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="@string/hint_site"
+            android:importantForAutofill="no"
+            android:inputType="text" />
+
+        <EditText
+            android:id="@+id/inputBootstrapToken"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="@string/hint_bootstrap_token"
+            android:importantForAutofill="no"
+            android:inputType="text" />
+
+        <EditText
+            android:id="@+id/inputDevice"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="@string/hint_device"
+            android:importantForAutofill="no"
+            android:inputType="text" />
+
+        <Button
+            android:id="@+id/buttonChallengeAndGenerate"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/action_challenge_and_generate" />
+
+        <Button
+            android:id="@+id/buttonSubmitRequest"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/action_submit_request" />
+
+        <Button
+            android:id="@+id/buttonProveAndCommit"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/action_prove_and_commit" />
+
+        <Button
+            android:id="@+id/buttonEstablishContext"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/action_establish_context" />
+
+        <Button
+            android:id="@+id/buttonFieldState"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/action_field_state" />
+
+        <Button
+            android:id="@+id/buttonDiscardKey"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/action_discard_key" />
+
+        <Button
+            android:id="@+id/buttonClearLog"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/action_clear_log" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingTop="16dp"
+            android:text="@string/label_log"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/textLog"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:textIsSelectable="true"
+            android:textSize="12sp" />
+
+    </LinearLayout>
+
+</ScrollView>
