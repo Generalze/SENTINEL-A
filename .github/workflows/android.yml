@@ -105,14 +105,14 @@ jobs:
       # worse: they LOOKED like a wrapper without being one. `setup-gradle`
       # provisions the exact pinned Gradle, and `gradle` is invoked directly.
       - name: Assemble (debug)
-        run: gradle --no-daemon --stacktrace :app:assembleDebug
+        run: gradle --no-daemon --stacktrace assembleDebug
 
       - name: Android Lint
-        run: gradle --no-daemon --stacktrace :app:lintDebug
+        run: gradle --no-daemon --stacktrace lintDebug
 
       # The evidence that actually covers the security-critical logic.
       - name: Kotlin/JVM unit tests
-        run: gradle --no-daemon --stacktrace :app:testDebugUnitTest
+        run: gradle --no-daemon --stacktrace testDebugUnitTest
 
       - name: Upload reports
         if: always()
@@ -120,6 +120,6 @@ jobs:
         with:
           name: android-reports
           path: |
-            apps/field-mobile-android/app/build/reports/
+            apps/field-mobile-android/build/reports/
           if-no-files-found: warn
           retention-days: 7

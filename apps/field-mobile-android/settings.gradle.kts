@@ -25,5 +25,6 @@ dependencyResolutionManagement {
     }
 }
 
+// Single project (see build.gradle.kts): there is no `include` to honour,
+// so a settings file that is ignored costs nothing.
 rootProject.name = "sentinel-field-mobile"
-include(":app")
