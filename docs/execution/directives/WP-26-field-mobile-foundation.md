@@ -1,7 +1,7 @@
 # WP-26 — Field Mobile Foundation
 
-**Status:** DIRECTIVE / DESIGN GO. **Implementation HOLD** pending the gate on
-this document.
+**Status:** DESIGN PASSED with an addendum (CTO gate, 2026-09-02).
+**IMPLEMENTATION GO.**
 **Base:** `572ab324d0d21de60c6192234599f028d6497f0a` (the WP-25 merge commit).
 **Branch:** `wp-26-field-mobile-foundation`.
 **Execution repository:** `Generalze/SENTINEL-A`. The original repository
@@ -158,28 +158,24 @@ inverted.
 The CTO ruled this and it is correct: prove one genuine hardware-backed client
 path before earning any cross-platform abstraction.
 
-**Recommendation: Android, with StrongBox-backed keys and Android Key
-Attestation.** The argument is specific and it is about evidence, not
-familiarity:
+**Selected: Android, with StrongBox-backed keys and Android Key Attestation.**
 
-```text
-Android Key Attestation produces an X.509 CERTIFICATE CHAIN, rooted in a
-Google hardware root, that cryptographically asserts THIS KEY was generated
-in hardware, is non-exportable, and carries the security level
-(TEE vs StrongBox) plus the app identity it was bound to.
+> **The rationale first written here was factually wrong and has been struck.**
+> It claimed iOS had no equivalent server-verifiable per-key hardware
+> attestation. Apple App Attest **does** generate a hardware-based key whose
+> private key resides in the Secure Enclave, and the server validates an
+> attestation object carrying a certificate chain rooted in Apple's App Attest
+> root. See **D26-03A** in the gate addendum for the corrected argument, which
+> selects Android on how directly StrongBox Key Attestation maps onto
+> Sentinel's P-256 hardware-key model and on the hardware security level and
+> key authorisations it exposes — not on any absence in iOS.
 
-iOS App Attest attests THE APP. Secure Enclave keys have no equivalent
-per-key attestation chain a server can verify offline.
-```
+StrongBox guarantees ECDSA P-256 — the profile WP-23 versioned forward to in
+C14-01 precisely because the mainstream keystores guarantee it.
 
-Sentinel's requirement is "prove this private key lives in hardware", and only
-one of those two answers that question directly. StrongBox additionally
-guarantees ECDSA P-256 — the profile WP-23 versioned forward to in C14-01
-precisely because the mainstream keystores guarantee it.
-
-iOS is not abandoned; it is sequenced. The abstractions for a second platform
-should be earned by a second platform, not designed in advance for one that has
-not been built.
+iOS is not abandoned; it is **sequenced**. The abstractions for a second
+platform should be earned by a second platform, not designed in advance for one
+that has not been built.
 
 ---
 
@@ -322,3 +318,222 @@ Each changes the shape of the work, so none is decided here.
    transcribe. **My recommendation: the phone submits**, because attestation
    evidence is a certificate chain, not something a human transcribes, and the
    security property is carried by the approval, not by the transport.
+
+---
+
+# Gate addendum - CTO rulings
+
+The five questions are ruled, and two corrections are locked. These are not
+re-litigated during implementation.
+
+| Question | Ruling |
+|---|---|
+| Mobile CI | **Option B, tightened.** In-repo, outside pnpm, its own required Android workflow. **No emulator is accepted as proof of hardware.** |
+| Verify Key Attestation | **REQUIRED in WP-26** - transport-only is insufficient. |
+| Kotlin vs cross-platform | **Native Kotlin.** No Flutter, React Native or platform-channel abstraction. |
+| Ingress placement | **Dedicated new module.** Shield keeps zero controllers. |
+| Who submits | **The phone**, under the intended user's session plus the grant. |
+
+## D26-03A - the Android choice stands; my iOS rationale was wrong
+
+Android + StrongBox + Key Attestation remains the WP-26 reference platform, but
+the reason I gave was factually incorrect and is withdrawn. Apple App Attest
+**does** generate a hardware-based key whose private key resides in the Secure
+Enclave, and the server validates an attestation object carrying a certificate
+chain rooted in Apple's App Attest root. iOS is not a platform without
+server-verifiable hardware attestation.
+
+The corrected rationale:
+
+> Android is chosen first because StrongBox Key Attestation maps most directly
+> onto Sentinel's current P-256 hardware-key model and exposes the hardware
+> security level - TEE versus StrongBox - and the key authorisations the Shield
+> verifier needs. iOS remains a legitimate future hardware-attested platform and
+> is deferred for SEQUENCING, not because it lacks hardware-backed attestation.
+
+**StrongBox is required, with no silent fallback.** Android exposes
+`FEATURE_STRONGBOX_KEYSTORE`, and a StrongBox request can fail with
+`StrongBoxUnavailableException`; falling back to TEE is an application choice,
+and Sentinel does not make it silently on its first high-assurance path. A
+device without usable StrongBox is reported **unsupported** for the WP-26
+reference path. It never quietly becomes equivalent hardware, and a certificate
+saying TEE is never promoted into the StrongBox profile.
+
+## D26-04A - the server nonce must come BEFORE key generation
+
+This is the correction that matters, and the draft sequence was wrong.
+
+Android Key Attestation is produced **when the key is generated**:
+`setAttestationChallenge()` places the relying party's challenge inside the
+attestation certificate, precisely so the key can be shown to have been created
+in response to a specific request. A server that does not compare that value
+against its own challenge can be handed an old certificate. My sequence had the
+phone generate a key and then submit it, which is replayable.
+
+The corrected bridge inserts a phase before the enrollment request:
+
+```text
+COMMANDER issues the bootstrap grant (org + site + intended user)
+   |
+PHONE + INTENDED-USER SESSION presents the grant
+   |
+SERVER ISSUES AN ATTESTATION CHALLENGE        <- new phase
+   random server nonce, bound durably to organisation, site, intended user,
+   bootstrap grant, challenge id, issued_at / expires_at.  ZERO DEVICE AUTHORITY
+   |
+PHONE generates a StrongBox P-256 key WITH THAT EXACT CHALLENGE
+   private key never leaves StrongBox; obtains the Key Attestation chain
+   |
+PHONE ENROLLMENT REQUEST
+   intended-user session · the same grant · the challenge id ·
+   the public key · the certificate chain
+   |
+SERVER VERIFIER  ->  a SERVER-owned attestation verdict and reference
+   |
+SHIELD CREATES THE REQUEST, whose fingerprint binds that verdict
+   |
+INDEPENDENT COMMANDER APPROVAL (Command-side, never the phone)
+   |
+POSSESSION CHALLENGE  ->  StrongBox signs  ->  server verifies
+   |
+FINAL SHIELD ENROLLMENT COMMIT  ->  REGISTERED DEVICE
+```
+
+This aligns with WP-24 rather than fighting it: the enrollment request
+fingerprint already binds the server's attestation result, and the approval
+already means the commander approved the key, custody and attestation evidence
+as evaluated at that instant.
+
+Locked properties of the attestation challenge:
+
+```text
+owned by            the WP-26 enrollment ingress
+entropy             >= 256 bits of SERVER randomness
+is it a secret?     NO - a freshness value, never a credential
+expires_at          exclusive boundary
+maximum lifetime    120 seconds
+cannot outlive      the bootstrap grant
+raw bootstrap token NEVER embedded in a certificate
+```
+
+An expired challenge means the unfinished key is discarded and the attestation
+step restarts. An old attestation is not accepted merely because the grant
+still has time left. This needs durable persistence - see D26-11.
+
+## D26-04B - a real Android verifier, and honest trust material
+
+A narrow Android Key Attestation provider is authorised. This is not a
+reopening of WP-24: that work package built the seam and returned `UNAVAILABLE`
+precisely until a real provider existed.
+
+My "offline X.509 verification" phrasing was also incomplete. Chain
+cryptography and extension parsing are local; a trustworthy production verdict
+must additionally check **revocation**, and there are currently two valid Google
+trust anchors, including a newer root signing chains from 2026-02-01.
+
+```text
+Google trust anchors    pinned/versioned SERVER configuration
+                        never accepted because the device supplied a root
+revocation information  server-owned provider input, bounded freshness
+                        unavailable or stale  -> UNAVAILABLE
+                        never "assume not revoked"
+provider outage         -> UNAVAILABLE
+                        never NEGATIVE merely because Google is unreachable
+                        never VERIFIED from stale or absent evidence
+```
+
+No uncontrolled background scheduler (D25-08 still binds). A request-time
+adapter or an explicitly refreshed bounded cache is acceptable.
+
+The minimum **VERIFIED** profile for WP-26: StrongBox, P-256, the exact server
+attestation challenge, a valid certificate chain to a pinned Google root, no
+revoked certificate, the leaf key equal to the submitted public key, the
+expected Sentinel Android package and signing identity, and acceptable verified
+boot / device-lock state.
+
+### The raw evidence does not enter the frozen contracts
+
+The Shield seam deliberately has nowhere to put a vendor blob:
+`DeviceAttestationEvaluationInput` carries organisation, optional identifiers,
+the public-key thumbprint and server time - not a certificate chain - and
+`EnrollmentRequestSubmission` has no attestation blob either. **That is not a
+gap to fix by stuffing a base64 chain into a frozen contract or an audit
+payload.**
+
+WP-26 adds a restricted server-side provider record instead:
+
+```text
+AndroidKeyAttestationArtifact
+  artifact_id (server generated) · organisation_id · bootstrap_grant_id
+  attestation_challenge_id · public_key_thumbprint · certificate_chain_hash
+  verifier_version · trust_anchor_set_version · revocation_snapshot_version
+  parsed security claims · evaluation outcome · evaluated_at
+```
+
+The raw chain may live in that restricted store. It never appears in an audit
+payload, in a request fingerprint as raw bytes, in a general application log, or
+in a client-readable registry response. Shield receives only the server-owned
+opaque reference and the verdict. The evaluator input may be extended with a
+**server-owned artifact reference** - a runtime seam extension, never a new
+client authority field.
+
+## D26-09 - the ingress owns both sides
+
+Shield has no HTTP controller at all, which means there is today no route for
+commander bootstrap issuance or commander approval either - not just for the
+phone. The new module owns transport for both sides while Shield stays
+internal:
+
+```text
+DeviceEnrollmentIngressModule
+
+  MobileEnrollmentController      attestation challenge · enrollment request ·
+                                  possession challenge · possession response
+  CommandEnrollmentController     bootstrap grant issue/revoke ·
+                                  pending enrollment read ·
+                                  approve the exact request fingerprint
+```
+
+Both call existing Shield services; neither writes Shield tables directly.
+
+**The mobile controller is never `@Public()`** - C17-01's ruling, inherited. The
+intended user's ordinary authenticated session is required independently, and it
+is equality-bound to the grant's intended user, organisation and site before
+anything enters Shield. Internally `createEnrollmentRequest()` takes no
+Principal because WP-24 had no transport at all; the network ingress is where
+that binding is made, which strengthens WP-24's posture rather than redefining
+its rules. The commander still cannot approve through the mobile surface.
+
+## D26-10 - three independent evidence classes
+
+The Android project stays in the monorepo, outside pnpm, with its own required
+workflow that compiles, lints and runs Kotlin/JVM client tests **at the exact
+candidate SHA**. Sentinel's normal CI remains separately required.
+
+**An emulator is not a hardware test.** It cannot establish that a private key
+lived in a physical StrongBox, and WP-26 will not present one as if it could.
+
+```text
+SERVER CI                 migrations · lint · typecheck · all suites · Proof A
+ANDROID CI                Android build · lint · unit/security client tests
+PHYSICAL DEVICE ACCEPTANCE
+    genuine supported Android hardware · StrongBox available ·
+    server-issued challenge · key attests as StrongBox ·
+    private key non-exportable · commander-approved enrollment ·
+    WP-25 context establishment ·
+    at least one approved Field operation signed by the physical key
+```
+
+Physical-device acceptance is **required to close WP-26**, and is still **not
+Proof C**.
+
+## D26-11 - migration budget
+
+```text
+WP-25 canonical total   22
+WP-26                   +1
+candidate total         23
+```
+
+One migration, covering the attestation challenge and the restricted
+attestation artifact. No historical migration is edited.
