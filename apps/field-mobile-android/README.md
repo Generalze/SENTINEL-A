@@ -100,7 +100,7 @@ would be decorative.
 ## Layout
 
 ```text
-app/src/main/kotlin/com/sentinel/field/
+src/main/kotlin/com/sentinel/field/
   security/   CanonicalJson          pure Kotlin, no Android imports
               CanonicalSignature     pure Kotlin, no Android imports
               CanonicalPublicKey     pure Kotlin, no Android imports
@@ -110,12 +110,69 @@ app/src/main/kotlin/com/sentinel/field/
   net/        SentinelHttp           OkHttp transport, session header only
               EnrollmentCeremony     the five enrollment crossings, in order
               GatewaySession         WP-25 establishment + the three operations
+              FieldReads             the four ordinary authenticated READ routes
+              FieldViews             their response shapes, read out by name
+  store/      KeyValueStore          the one way anything reaches disk
+              ClientState            the six ids this app may remember
+              ClientStateStore       the allowlist and the refusals, pure Kotlin
+              EncryptedClientState   the Android half; policy-free adapter
   ui/         MainActivity           a few buttons and a log, deliberately
 ```
 
 The split is the point: everything security-critical except the keystore calls
 themselves is pure Kotlin, so the CI unit tests cover real logic rather than
-covering nothing.
+covering nothing. `store/` follows the same rule — the RULES about what may be
+persisted are pure Kotlin and JVM-tested; only the encrypted file itself needs a
+device.
+
+---
+
+## The D26-06 surface
+
+| Capability | Route | How |
+|---|---|---|
+| Current identity | `GET /api/v1/field/state/mine` | session |
+| Assignments (read) | `GET /api/v1/field/assignments/mine` | session |
+| Assignment accept / decline | `POST …/device-gateway/operations/assignments/{id}/{accept\|decline}` | hardware-signed |
+| Field state | `POST …/device-gateway/operations/field-state` | hardware-signed |
+| Messages (read) | `GET /api/v1/field-messages/incidents/{incidentId}/mine` | session |
+| Message acknowledgement | `POST …/device-gateway/operations/messages/{id}/acknowledge` | hardware-signed |
+| Patrol runs (read) | `GET /api/v1/patrol/runs` | session |
+
+READS use the ordinary authenticated human routes and carry the session only —
+reading produces no effect to attribute to a device, and WP-25 exposes no read
+operation to invent one through. The three EFFECT operations, and only those,
+go through the gateway with a fresh hardware signature over a fresh one-shot
+nonce.
+
+PATROL IS READ ONLY, and that is not an oversight: the gateway has no patrol
+write. There is no start, no abandon and no checkpoint verification here.
+
+ROLES ARE NOT DISPLAYED, because no route this client may call reports them —
+the core API has no `/me`, and the user, site and organisation listings are
+gated on admin actions a `field.operative` does not hold. The screen says so
+rather than printing a role list it decided for itself.
+
+THERE IS NO OFFLINE QUEUE. WP-29 owns queueing. A failed operation fails.
+
+---
+
+## Secure local storage, and the one secret on the screen
+
+Client state — the enrolled device id, the last established context id and its
+expiry, and the last identity the server reported — is held in
+`EncryptedSharedPreferences` under a keystore-held master key. Six keys, on an
+allowlist, and no method that takes a caller-chosen key. If the encrypted store
+cannot be opened the app remembers nothing; it never falls back to plaintext.
+
+THE BOOTSTRAP GRANT IS NEVER PERSISTED. It is masked in the input
+(`textPassword`), excluded from view-state save/restore (`saveEnabled="false"`)
+and from autofill, and cleared as soon as it has been presented for the last
+time or the ceremony fails terminally.
+`BootstrapTokenNeverPersistedSourceTest` fails the build if any of that stops
+being true. The honest limit: a Kotlin String cannot be wiped, only
+dereferenced, so what is established is that nothing holds a live reference and
+nothing writes it anywhere.
 
 ---
 
@@ -134,7 +191,16 @@ covering nothing.
 | `androidx.lifecycle:lifecycle-runtime-ktx` | 2.7.0 |
 | `com.squareup.okhttp3:okhttp` | 4.12.0 |
 | `org.jetbrains.kotlinx:kotlinx-serialization-json` | 1.6.3 |
+| `androidx.security:security-crypto` | 1.1.0-alpha06 |
 | `junit:junit` | 4.13.2 |
+
+`security-crypto` is an alpha, stated plainly. It is the version in general use
+for `EncryptedSharedPreferences` and the first line carrying the `MasterKey`
+API. The alternative — plain preferences wrapped by a keystore AES/GCM key of
+our own — would put `Cipher.getInstance` and a second `KeyGenParameterSpec` into
+this application, both of which `NoPrivateKeyExportSourceTest` refuses on sight;
+weakening that gate to make room for hand-rolled storage encryption would trade
+a proven property for an unproven one.
 
 ## The Gradle wrapper
 

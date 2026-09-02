@@ -1,9 +1,27 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
     Deliberately minimal. D26-06: "minimal is the operative word; this is a
-    foundation for a proof, not a product." A few inputs, a button per ceremony
-    step in the one order D26-04A permits, and a log that shows exactly what the
-    server answered.
+    foundation for a proof, not a product." Inputs, a button per operation, and
+    a log that shows exactly what the server answered.
+
+    Two sections, and the split is the security story:
+
+      * THE CEREMONY, in the one order D26-04A permits. The ordering IS the
+        security property, so a UI that let a user do step 2 before step 1 would
+        be hiding it.
+
+      * THE FIELD CLIENT — the D26-06 surface. Its READS go to the ordinary
+        authenticated human routes and carry only the session. Its three EFFECT
+        buttons go through the WP-25 gateway and each one mints a fresh hardware
+        signature over a fresh one-shot nonce. There is no offline queue behind
+        any of them: WP-29 owns queueing, and here a failed operation simply
+        fails.
+
+    THE BOOTSTRAP GRANT FIELD IS THE ONE SECRET ON THIS SCREEN. It is masked
+    (textPassword), it is excluded from view state save/restore
+    (saveEnabled="false"), it is excluded from autofill, and it is cleared by
+    the activity the moment the enrollment request has been presented or the
+    ceremony fails terminally. It is never written to storage of any kind.
 -->
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
@@ -55,7 +73,8 @@
             android:layout_height="wrap_content"
             android:hint="@string/hint_bootstrap_token"
             android:importantForAutofill="no"
-            android:inputType="text" />
+            android:inputType="textPassword"
+            android:saveEnabled="false" />
 
         <EditText
             android:id="@+id/inputDevice"
@@ -64,6 +83,13 @@
             android:hint="@string/hint_device"
             android:importantForAutofill="no"
             android:inputType="text" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingTop="16dp"
+            android:text="@string/label_ceremony"
+            android:textStyle="bold" />
 
         <Button
             android:id="@+id/buttonChallengeAndGenerate"
@@ -89,11 +115,91 @@
             android:layout_height="wrap_content"
             android:text="@string/action_establish_context" />
 
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingTop="16dp"
+            android:text="@string/label_reads"
+            android:textStyle="bold" />
+
+        <EditText
+            android:id="@+id/inputIncident"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="@string/hint_incident"
+            android:importantForAutofill="no"
+            android:inputType="text" />
+
+        <Button
+            android:id="@+id/buttonIdentity"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/action_identity" />
+
+        <Button
+            android:id="@+id/buttonAssignments"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/action_assignments" />
+
+        <Button
+            android:id="@+id/buttonMessages"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/action_messages" />
+
+        <Button
+            android:id="@+id/buttonPatrolRuns"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/action_patrol_runs" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingTop="16dp"
+            android:text="@string/label_operations"
+            android:textStyle="bold" />
+
+        <EditText
+            android:id="@+id/inputAssignment"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="@string/hint_assignment"
+            android:importantForAutofill="no"
+            android:inputType="text" />
+
+        <EditText
+            android:id="@+id/inputMessage"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="@string/hint_message"
+            android:importantForAutofill="no"
+            android:inputType="text" />
+
         <Button
             android:id="@+id/buttonFieldState"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="@string/action_field_state" />
+
+        <Button
+            android:id="@+id/buttonAcceptAssignment"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/action_accept_assignment" />
+
+        <Button
+            android:id="@+id/buttonDeclineAssignment"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/action_decline_assignment" />
+
+        <Button
+            android:id="@+id/buttonAcknowledgeMessage"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/action_acknowledge_message" />
 
         <Button
             android:id="@+id/buttonDiscardKey"

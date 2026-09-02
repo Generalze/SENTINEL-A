@@ -120,5 +120,29 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
 
+    /*
+     * D26-06 secure local storage. `EncryptedSharedPreferences` and its
+     * keystore-held master key, and NOTHING hand-rolled.
+     *
+     * The alternative — plain preferences wrapped by an AndroidKeystore AES/GCM
+     * key of our own — would put `Cipher.getInstance` and a second
+     * `KeyGenParameterSpec` into this application, both of which
+     * `NoPrivateKeyExportSourceTest` refuses on sight. That test's value is
+     * precisely that the app holds ONE key spec and no cipher primitives, so a
+     * private-key export path cannot be assembled quietly; weakening it to make
+     * room for hand-rolled storage encryption would trade a proven property for
+     * an unproven one.
+     *
+     * IT IS AN ALPHA AND THAT IS STATED PLAINLY. `1.1.0-alpha06` is the version
+     * in general use for this class and the first line to carry the `MasterKey`
+     * API used here (the 1.0.0 line predates it). Verified published on Google's
+     * Maven: the .pom, .aar and .module all resolve, and its three transitive
+     * dependencies — androidx.annotation 1.1.0, androidx.collection 1.1.0 and
+     * com.google.crypto.tink:tink-android 1.8.0 — resolve from the repositories
+     * already declared in `settings.gradle`. Pinned exactly, like everything
+     * else here.
+     */
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
+
     testImplementation("junit:junit:4.13.2")
 }

@@ -2,6 +2,7 @@ package com.sentinel.field.net
 
 import java.util.concurrent.TimeUnit
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
 import okhttp3.MediaType.Companion.toMediaType
@@ -115,9 +116,63 @@ class SentinelHttp(
         }
     }
 
+    /**
+     * One HTTP answer to a READ, whose top level may be a JSON object OR a JSON
+     * array.
+     *
+     * The human read surfaces return bare arrays (`FieldAssignmentView[]`,
+     * `IncidentFieldMessageView[]`, `PatrolRunView[]`), so [Answer] — which
+     * models an object body and is what every SIGNED exchange uses — cannot
+     * carry them. Kept as a separate type rather than widening [Answer]:
+     * nothing on the signing path should acquire the ability to hold an array
+     * it did not expect.
+     */
+    data class Reply(
+        val status: Int,
+        val element: JsonElement?,
+        val text: String,
+    ) {
+        val ok: Boolean get() = status in 200..299
+    }
+
+    /**
+     * A GET carrying the human session, and nothing else.
+     *
+     * THE READ SURFACES ARE THE ORDINARY AUTHENTICATED HUMAN ROUTES. Reading is
+     * not an effect, so it does not go through the WP-25 gateway and it carries
+     * no hardware signature — the server answers according to the SESSION's
+     * §62 authority, exactly as it would for the same person in Command web.
+     * Only the three effect operations (field state, assignment accept/decline,
+     * message acknowledgement) are signed by the device, because only those
+     * change something.
+     */
+    fun get(path: String, sessionUserId: String): Reply {
+        val request = Request.Builder()
+            .url(baseUrl.trimEnd('/') + path)
+            .addHeader(SESSION_HEADER, sessionUserId)
+            .addHeader("accept", "application/json")
+            .get()
+            .build()
+        return try {
+            client.newCall(request).execute().use { response ->
+                val text = response.body?.string() ?: ""
+                Reply(response.code, parseElementOrNull(text), text)
+            }
+        } catch (error: Exception) {
+            Reply(0, null, "transport failure: ${error.javaClass.simpleName}: ${error.message ?: "no detail"}")
+        }
+    }
+
     private fun parseObjectOrNull(text: String): JsonObject? =
         try {
             JSON.parseToJsonElement(text).jsonObject
+        } catch (error: Exception) {
+            null
+        }
+
+    private fun parseElementOrNull(text: String): JsonElement? =
+        try {
+            JSON.parseToJsonElement(text)
         } catch (error: Exception) {
             null
         }
