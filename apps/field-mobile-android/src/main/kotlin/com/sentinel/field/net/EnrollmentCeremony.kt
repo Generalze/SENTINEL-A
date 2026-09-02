@@ -124,15 +124,37 @@ class EnrollmentCeremony(
                 put("bootstrap_token", bootstrapToken)
             },
         )
+        // C18-R3: PHASE 0 PROBES THE GRANT; IT DOES NOT SPEND IT.
+        //
+        // Shield is explicit that a correctly scoped presentation neither
+        // consumes nor modifies the bootstrap grant — only a WRONG-CONTEXT
+        // probe burns it. So a transport failure, a 5xx or an unreadable
+        // success here says nothing authoritative about the grant, and
+        // destroying it on that basis costs the operative a commander-issued
+        // credential for no security gain. Only an AUTHORITATIVE refusal — the
+        // server reached, and answering 4xx — is terminal.
+        //
+        // An unobserved challenge created just before a lost response confers
+        // no device authority. It simply expires, and a later valid
+        // presentation obtains another one.
         val body = answer.body
-        if (!answer.ok || body == null) return refusal(answer)
-        return CeremonyStep.ok(
-            AttestationChallenge(
-                attestationChallengeId = body.text("attestation_challenge_id"),
-                challenge = body.text("challenge"),
-                expiresAt = body.text("expires_at"),
-            ),
-        )
+        if (!answer.ok || body == null) {
+            val terminal = answer.status in 400..499
+            return if (terminal) refusal(answer) else CeremonyStep.completionUnknown(answer.status, answer.text)
+        }
+        val issued =
+            try {
+                AttestationChallenge(
+                    attestationChallengeId = body.text("attestation_challenge_id"),
+                    challenge = body.text("challenge"),
+                    expiresAt = body.text("expires_at"),
+                )
+            } catch (unreadable: Exception) {
+                // Same reasoning as C18-R1A: a success we cannot read is not a
+                // refusal, and the grant is not spent by a phase-0 probe.
+                return CeremonyStep.completionUnknown(answer.status, "unreadable challenge body")
+            }
+        return CeremonyStep.ok(issued)
     }
 
     // -----------------------------------------------------------------------
@@ -269,15 +291,35 @@ class EnrollmentCeremony(
     private fun classifySubmission(answer: SentinelHttp.Answer): CeremonyStep<SubmittedRequest> {
         val body = answer.body
         if (answer.ok && body != null) {
-            return CeremonyStep.ok(
-                SubmittedRequest(
-                    outcome = body.text("outcome"),
-                    enrollmentRequestId = body.text("enrollment_request_id"),
-                    requestFingerprint = body.text("request_fingerprint"),
-                    attestationOutcome = body.text("attestation_outcome"),
-                    keyStorage = body.text("key_storage"),
-                ),
-            )
+            // C18-R1A: THE EXTRACTION IS THE PART THAT CAN FAIL.
+            //
+            // This method already claimed that an unreadable 2xx becomes
+            // COMPLETION_UNKNOWN, and it did not: `text()` throws when a field
+            // is missing, null or the wrong shape, so a malformed success
+            // ESCAPED the classifier entirely rather than being classified.
+            // That is the same defect C18-R1 corrected one layer out — an
+            // answer whose completion cannot be proved was being turned into
+            // something other than "unknown".
+            //
+            // Only the extraction is wrapped. A `catch` around the whole branch
+            // would swallow failures from the caller too, and the point here is
+            // to classify ONE thing: whether this response can be read as the
+            // outcome it claims to be.
+            val submitted =
+                try {
+                    SubmittedRequest(
+                        outcome = body.text("outcome"),
+                        enrollmentRequestId = body.text("enrollment_request_id"),
+                        requestFingerprint = body.text("request_fingerprint"),
+                        attestationOutcome = body.text("attestation_outcome"),
+                        keyStorage = body.text("key_storage"),
+                    )
+                } catch (unreadable: Exception) {
+                    // The server may well have committed. We cannot tell from
+                    // here, so this is UNKNOWN and the ceremony material is kept.
+                    return CeremonyStep.completionUnknown(answer.status, "unreadable success body")
+                }
+            return CeremonyStep.ok(submitted)
         }
         val terminal = answer.status in 400..499 && answer.status != COMPLETION_UNKNOWN
         if (terminal) return refusal(answer)

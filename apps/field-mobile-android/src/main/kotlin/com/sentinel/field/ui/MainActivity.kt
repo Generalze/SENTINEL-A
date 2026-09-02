@@ -219,11 +219,25 @@ class MainActivity : AppCompatActivity() {
                 intendedUserId = session,
                 bootstrapToken = bootstrapToken,
             )
+            if (issued.isCompletionUnknown) {
+                // C18-R3: PHASE 0 PROBES THE GRANT; IT DOES NOT SPEND IT.
+                //
+                // A transport failure, a 5xx or an unreadable success says
+                // nothing authoritative about the grant, and clearing it here
+                // destroyed a commander-issued credential for no security gain.
+                // A challenge that was issued just before a lost response
+                // confers no device authority and simply expires.
+                log(issued.describe())
+                log("CHALLENGE OUTCOME UNKNOWN: the grant is NOT spent by this step.")
+                log("the bootstrap grant is RETAINED. press step 1 again to obtain a fresh challenge.")
+                return@background
+            }
             if (!issued.isOk) {
                 log(issued.describe())
-                // A refused challenge is terminal for this grant: it is one-shot
-                // and the server has now seen it. Nothing is gained by keeping
-                // the secret on screen.
+                // An AUTHORITATIVE refusal is terminal for this grant: the
+                // server was reached and answered, and a wrong-context probe
+                // burns the grant server-side (D24-03a). Nothing is gained by
+                // keeping the secret on screen.
                 clearBootstrapToken()
                 return@background
             }
@@ -331,9 +345,20 @@ class MainActivity : AppCompatActivity() {
             // is not a promise this harness can keep.
             if (result.isCompletionUnknown) {
                 log(result.describe())
+                // C18-R1B: DO NOT PROMISE THAT A RETRY CONVERGES.
+                //
+                // The server answers UNKNOWN whenever the submission
+                // fingerprint matches but the receipt is incomplete, and that
+                // state can also come from a process death immediately after
+                // the fenced consume — not only from a worker still finishing.
+                // The resolver deliberately performs no recovery work, so such
+                // an UNKNOWN can PERSIST. Telling the operative it converges
+                // would send them into a silent retry loop.
                 log("COMPLETION UNKNOWN: the server may already have created this enrollment request.")
                 log("the bootstrap grant, the challenge and the generated key are RETAINED in memory.")
-                log("press step 2 again to retry the EXACT same submission; an identical retry converges.")
+                log("press step 2 again to retry the EXACT same submission.")
+                log("if it stays UNKNOWN: STOP and escalate. do NOT discard this material,")
+                log("and do NOT start a replacement ceremony, until server state is resolved.")
                 return@background
             }
             // Authoritative from here: a parsed success, or a terminal refusal.

@@ -21,15 +21,21 @@ import type { DeviceEnrollmentIngressRepository } from './device-enrollment-ingr
  * unconditional refusal; it now leads to the same three-way answer as the
  * first, and the whole point of the correction is what the loser is told.
  *
- * THAT WINDOW CANNOT BE OPENED HONESTLY OVER HTTP ON ONE NODE PROCESS. Two
- * genuinely simultaneous POSTs do not interleave inside it: the winner's
- * certificate-chain verification is synchronous work on the single event loop,
- * so the loser's request is not even parsed until the winner has finished, and
- * it converges through the FIRST door instead. The acceptance suite asserts
- * exactly that — one request, one artifact, never a terminal refusal — and it
- * is a true and useful fact, but it is not this branch. A regression that
- * claimed to cover this branch by racing two HTTP calls would be a regression
- * that passes without ever executing the line it names.
+ * TWO HTTP POSTS DO NOT RELIABLY OPEN THAT WINDOW ON ONE NODE PROCESS, and
+ * three instrumented runs of the acceptance race produced `[201, 201]` every
+ * time: the winner's certificate-chain verification is synchronous work on the
+ * single event loop, so the loser tends not to be parsed until the winner has
+ * finished, and it converges through the FIRST door instead.
+ *
+ * That is a statement about RELIABILITY, not impossibility — a correction the
+ * CTO made to an earlier, stronger claim of mine, and it is right. Asynchronous
+ * database awaits DO occur before the synchronous verification, so the
+ * interleaving is not ruled out by construction; it simply cannot be depended
+ * on. The acceptance suite therefore keeps the HTTP race for its real
+ * end-to-end invariants — one request, one artifact, never a terminal refusal —
+ * and this spec is what actually proves the branch, because a regression that
+ * claimed branch coverage merely because two POSTs were launched concurrently
+ * would be a regression that can pass without executing the line it names.
  *
  * SO THIS DRIVES THE SERVICE DIRECTLY, WITH THE FENCE FORCED TO LOSE. Nothing
  * here stubs a security decision: the fakes are a grant that is usable, a clock,
