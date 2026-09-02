@@ -1,0 +1,432 @@
+// SENTINEL Authenticated Device Gateway (WP-25, architecture sections 61, 62,
+// 62.1). Owned exclusively by services/core-api/src/modules/device-gateway.
+// This file is PERSISTENCE ONLY: every rule it serves is already frozen in
+// packages/contracts/src/device-identity.ts, device-signature.ts and
+// device-request-proof.ts, and every registry fact it names is owned by
+// prisma/schema/shield.prisma. Nothing here re-states a rule the contracts own
+// or a fact the registry owns; these tables exist so the gateway's ceremony
+// state, its issued scope statements and its security audit are DURABLE.
+//
+// THE INVARIANT THIS SCHEMA EXISTS TO HOLD
+// ----------------------------------------
+//
+//     USER AUTHORITY
+//            +
+//     DEVICE IDENTITY
+//            +
+//     CURRENT DEVICE TRUST
+//            +
+//     SITE / CONTEXT AUTHORITY
+//
+//     must remain INDEPENDENT facts.
+//
+// shield.prisma's header states it for the registry; the gateway is where the
+// three are brought into one request, so it is where they are most easily
+// collapsed by accident. The shapes below are chosen so that a query CANNOT
+// collapse them. Nothing in this file is a credential, nothing in it is a
+// secret, and nothing in it answers an authorisation question on its own.
+//
+// THERE IS NO DEVICE BEARER TOKEN IN THIS FILE (D25-01)
+// -----------------------------------------------------
+// `AuthenticatedDeviceContext` is a SCOPE STATEMENT, not a credential. It
+// carries no token, no secret and no authorization field, and the frozen
+// contract already makes that structural. Holding a context id proves nothing:
+// it says what a device WOULD be entitled to IF the hardware were present.
+// Every device-authenticated request therefore carries a FRESH signed
+// DeviceRequestProof, and a context id presented without one is refused. That
+// is why the columns below can be read, copied or leaked wholesale without
+// conferring any authority — and why none of them may ever be treated as
+// though they did.
+//
+// THE LIVE / HISTORY SPLIT (the WP-17A rule, applied to WP-25)
+// ------------------------------------------------------------
+// The doctrine header of prisma/schema/field.prisma states the locked ruling,
+// shield.prisma applies it to the registry, and this file applies it again.
+// Tables are divided by what they ASSERT.
+//
+//   CEREMONY STATE and LIVE STATE
+//     DeviceContextEstablishmentChallenge, AuthenticatedDeviceContextRecord,
+//     AuthenticatedDeviceContextSite.
+//
+//     These assert something true *right now* — "this establishment ceremony
+//     is in flight", "this context is open against this device and this key
+//     version", "this context is bound to this site" — so every Site, User and
+//     Device they name must exist and must belong to the same organisation.
+//     Each such reference is COMPOSITE, over the (id, organisation_id)
+//     candidate keys `sites_id_organisation_key` (WP-17A),
+//     `users_id_organisation_key` (WP-24/D24-04a) and
+//     `devices_id_organisation_key` (WP-24), rather than a plain FK to `id`. A
+//     plain FK would still admit a row pairing one tenant's organisation with
+//     another tenant's site, user or device; the composite reference makes the
+//     DATABASE reject it.
+//
+//     Every one of them is onDelete: Restrict. A site's, a user's or a
+//     device's lifecycle must never silently delete the record of a context
+//     Sentinel issued, because a context row that vanishes does not become a
+//     closed context — it becomes a context the gateway can no longer make a
+//     statement about.
+//
+//   HISTORICAL ARTEFACT
+//     DeviceGatewayOperationEvent carries NO Site, User, Device or context
+//     foreign key AT ALL, per the historical-artefact rule the WP-17A header
+//     states and shield.prisma applies to DeviceSecurityEvent,
+//     DeviceTrustTransition, DeviceAttestationObservation and
+//     DeviceNonceConsumption. Its identifiers are the identifiers AS RECORDED
+//     at the moment of the event and they must stay that way. `Cascade` would
+//     let a lifecycle erase the record of what the gateway DECIDED about an
+//     incoming request — forbidden by section 61. `Restrict` would mean a site
+//     or a device could never be removed once a single request had ever been
+//     refused, silently inventing a retirement policy this work package has no
+//     mandate to decide. Integrity comes from the write-time check instead.
+//
+// NOTHING IN THIS FILE EVER CASCADES.
+//
+// THERE IS NO GATEWAY REPLAY TABLE HERE, DELIBERATELY
+// ---------------------------------------------------
+// WP-25 reuses Shield's `DeviceNonceConsumption` with a new `ceremony` value.
+// That table already holds the whole doctrine — the enforced
+// `(organisation_id, replay_identity_digest)` key, the statement fingerprint
+// compared-not-keyed, the stored outcome reference an EXACT_DUPLICATE
+// converges on, and the rule that a consumed identity is never deleted because
+// deleting it RE-ADMITS the nonce it retired. A second replay subsystem beside
+// it would be two implementations of one security decision, which is precisely
+// the duplication the CTO rejected: the failure mode is not that the copy is
+// wrong on the day it is written, it is that the two drift and only one of
+// them is the one an auditor reads.
+//
+// See docs/execution/directives/WP-25-authenticated-device-gateway.md for the
+// governing directive (D25-01, D25-02, D25-03A, D25-04A, D25-10..D25-16) and
+// the WP-23 contracts for every vocabulary this file stores.
+//
+// A NOTE ON ENUM COLUMNS. Operation kind, event type, outcome, refusal reason
+// and close reason are stored as TEXT, not as Postgres enum types, for the
+// reason shield.prisma and whisper.prisma both state: the vocabularies and
+// their transition tables are owned by the frozen contracts and versioned in
+// reviewable code, not in a database type whose every addition would be a
+// migration. The contract is the authority; the column is storage.
+
+// ===========================================================================
+// CEREMONY STATE
+// ===========================================================================
+
+/// The D25-03A pre-context establishment challenge. ONE-SHOT, SHORT-LIVED,
+/// AND NOT A SECRET.
+///
+/// `id` IS the `establishment_id` — not a surrogate key beside one. There is
+/// exactly one identifier for an establishment ceremony and the server owns
+/// it.
+///
+/// WHY THIS TABLE EXISTS AT ALL. The frozen `DeviceRequestProof` is bound to a
+/// `context_id`, and its evaluator takes an `AuthenticatedDeviceContext` — so
+/// requiring an issued context in order to obtain the FIRST context is
+/// circular. The ceremony breaks the circle without a bearer bootstrap: the
+/// server, from its own state only, proposes a context id and a nonce; the
+/// device signs a proof over the exact challenge at purpose
+/// RECONNECT_HANDSHAKE; the server reconstructs an IN-MEMORY candidate context
+/// from SERVER facts purely so the frozen evaluator has something to judge.
+/// The candidate is never returned to the client and is accepted nowhere else.
+///
+/// THIS IS NOT A SECRET, AND NOTHING MAY EVER TREAT IT AS ONE.
+///
+/// Steal every column in this table — `id`, `proposed_context_id`, `nonce`,
+/// the device id, the key id, the key version, the site — and you have ZERO
+/// device authority. Issuance still requires BOTH the registered private key,
+/// which never leaves the hardware and is never stored anywhere in this
+/// schema, AND the independent current human session, which this row cannot
+/// manufacture. The nonce is server-generated so the device never chooses what
+/// it is asked to sign; it is not a password, and reading it grants nothing.
+///
+/// It is one-shot and short-lived (D25-12:
+/// DEVICE_CONTEXT_ESTABLISHMENT_MAX_AGE_MS = 120_000, evaluated at request
+/// time, with no expiry scheduler) because a one-shot identity is CHEAPER TO
+/// REASON ABOUT than a secret — not because it is one. A ceremony that can be
+/// used exactly once has no interesting theft story to analyse; a secret does.
+///
+/// CEREMONY STATE — composite tenant-aware relations, Restrict. See this
+/// file's header.
+model DeviceContextEstablishmentChallenge {
+  /// The `establishment_id` itself.
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+
+  /// The context id the server PROPOSES. It becomes
+  /// `AuthenticatedDeviceContextRecord.id` if and only if the ceremony
+  /// completes. Until then NO CONTEXT HAS BEEN ISSUED and no device authority
+  /// exists — the device signs this value so that the proof it produces is
+  /// bound to the context that will be minted, and to no other.
+  proposedContextId String @map("proposed_context_id") @db.Uuid
+
+  /// The human session the establishment was requested UNDER. This is a
+  /// binding, never a grant: being named here confers nothing, and the actor's
+  /// current authority is re-read at commit like every other current fact
+  /// (D25-02).
+  actorUserId String @map("actor_user_id") @db.Text
+
+  deviceId String @map("device_id") @db.Uuid
+  siteId String @map("site_id") @db.Text
+
+  /// The registry key this ceremony is pinned to. RESOLVED FROM THE REGISTRY,
+  /// never taken from the request — there is no parameter through which a
+  /// caller could supply a key. A rotation between issuance and use is refused
+  /// by the frozen evaluator as `KEY_VERSION_ROTATED`.
+  keyId String @map("key_id") @db.Text
+  keyVersion Int @map("key_version")
+
+  /// SERVER-generated. The device never chooses what it is asked to sign.
+  /// Not a secret; see this model's header.
+  nonce String @db.Text
+
+  issuedAt DateTime @map("issued_at") @db.Timestamptz(3)
+  /// Exclusive boundary, per the existing WP-23/WP-24 doctrine.
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(3)
+
+  /// NULL while the ceremony stands. Stamped in the SAME transaction that
+  /// mints the context, which is what makes the challenge one-shot in fact and
+  /// not merely by intention. It is never cleared: a spent ceremony does not
+  /// become unspent.
+  consumedAt DateTime? @map("consumed_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  /// Composite, over `users_id_organisation_key`, `devices_id_organisation_key`
+  /// and `sites_id_organisation_key`: the database itself rejects a challenge
+  /// pairing org-A with an actor, a device or a site belonging to org-B.
+  /// Restrict, per this file's header.
+  actorUser User @relation(fields: [actorUserId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  device Device @relation(fields: [deviceId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  site Site @relation(fields: [siteId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
+  issuedContexts AuthenticatedDeviceContextRecord[]
+
+  /// ONE PROPOSED CONTEXT ID PER TENANT. The proposed id is what the device
+  /// signs and what the minted context will be called, so two live challenges
+  /// proposing the same id would be two ceremonies competing to define one
+  /// context.
+  @@unique([organisationId, proposedContextId], map: "device_context_establishment_proposed_context_key")
+  /// Candidate key, deliberately redundant with the primary key — it is what
+  /// `AuthenticatedDeviceContextRecord` references, so an issued context binds
+  /// to THIS ceremony UNDER THIS TENANT rather than to an id that merely
+  /// exists. Same technique, same reason, as `sites_id_organisation_key`.
+  @@unique([id, organisationId], map: "device_context_establishment_id_organisation_key")
+  @@map("device_context_establishment_challenges")
+}
+
+// ===========================================================================
+// LIVE STATE
+// ===========================================================================
+
+/// ONE ISSUED `AuthenticatedDeviceContext`, as server state.
+///
+/// `id` IS the `context_id`. There is exactly one identifier for a context and
+/// the server owns every field of it (D25-03A): nothing in this row was
+/// proposed by the device.
+///
+/// PERSISTED, AND STILL NOT A CREDENTIAL. It is persisted for the reason
+/// D25-10 rules — immediate server-side invalidation and an audit trail, so
+/// revocation during a live session is OBSERVABLE rather than inferred — not
+/// because presenting the row means anything. A context id presented without a
+/// matching fresh possession proof is refused POSSESSION_NOT_PROVEN, and the
+/// `context_id` is safe to expose precisely because it authorises nothing
+/// (D25-13).
+///
+/// `device_trust` DELIBERATELY HAS NO COLUMN HERE.
+///
+/// The frozen contract requires the field on the in-memory context and copies
+/// it at issuance, but it is HISTORICAL ISSUANCE STATE: what Sentinel thought
+/// of this hardware at the instant the context was minted. Every operation
+/// uses CURRENT Shield standing, read now, through WP-24's effective-standing
+/// helper — so an attestation that ages out mid-context degrades the answer on
+/// the very next request rather than at the end of the context's life (D25-04).
+/// Persisting the issuance-time value in this table would put a stale
+/// authority-shaped word next to a live context row and invite exactly one
+/// mistake: someone reading it as the answer. If the issuance-time standing is
+/// ever needed for audit, it belongs in a DeviceGatewayOperationEvent payload,
+/// where nothing can mistake it for live state.
+///
+/// A context is bound to ONE key id + key version; a rotation invalidates
+/// every context issued against the superseded version, which the frozen
+/// evaluator already enforces as `KEY_VERSION_ROTATED`. That is why both
+/// columns are here and why neither is nullable.
+///
+/// LIVE STATE — composite tenant-aware relations, Restrict.
+model AuthenticatedDeviceContextRecord {
+  /// The `context_id` itself.
+  id String @id @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+
+  /// The human session this context was issued ALONGSIDE. A BINDING, NEVER A
+  /// GRANT (C14-02): this column is not consulted to answer a live
+  /// authorisation question, and a context naming an actor does not give that
+  /// actor anything. Both principals are re-established independently on every
+  /// request by `evaluateDeviceOperationPrincipals`, which refuses when either
+  /// side is missing — a strong device proof may never paper over an absent
+  /// session.
+  actorUserId String @map("actor_user_id") @db.Text
+
+  deviceId String @map("device_id") @db.Uuid
+
+  keyId String @map("key_id") @db.Text
+  keyVersion Int @map("key_version")
+
+  issuedAt DateTime @map("issued_at") @db.Timestamptz(3)
+  /// Exclusive boundary. DEVICE_CONTEXT_MAX_LIFETIME_MS = 300_000 (D25-12),
+  /// evaluated at request time; there is no expiry scheduler, per D25-08's
+  /// constraint against new background schedulers.
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(3)
+
+  /// NULL while the context is open. Server-side invalidation lands HERE, and
+  /// it is one of two independent bounds on the exposure window — the other
+  /// being that the registry is re-read on every single request, so a
+  /// revocation, a quarantine, a key rotation or a withdrawn entitlement takes
+  /// effect on the NEXT request regardless of what this column says. An open
+  /// context is not a grant (D25-04).
+  closedAt DateTime? @map("closed_at") @db.Timestamptz(3)
+  /// Why it closed, from the gateway's own vocabulary. NULL while open.
+  closeReason String? @map("close_reason") @db.Text
+
+  /// The ceremony this context came out of, so an issued context can always be
+  /// traced back to the exact challenge and the exact human session that
+  /// stood behind it.
+  establishmentId String @map("establishment_id") @db.Uuid
+
+  /// The trace of the issuance request, for the audit join. Non-semantic and
+  /// never an authorisation input.
+  issuanceTraceId String @map("issuance_trace_id") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  /// Composite, over `users_id_organisation_key` and
+  /// `devices_id_organisation_key`. Restrict, per this file's header.
+  actorUser User @relation(fields: [actorUserId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  device Device @relation(fields: [deviceId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  /// Composite: a context may not be attached to another tenant's ceremony.
+  establishment DeviceContextEstablishmentChallenge @relation(fields: [establishmentId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
+  /// The authoritative site binding. See AuthenticatedDeviceContextSite.
+  sites AuthenticatedDeviceContextSite[]
+
+  /// ONE CONTEXT PER ESTABLISHMENT CEREMONY, enforced BELOW the service layer,
+  /// for exactly the reason D24-06 gives `devices_enrollment_request_key`. The
+  /// issuance transaction re-reads and stamps `consumed_at` on the challenge,
+  /// and that is what makes the normal path sound. This constraint is what
+  /// makes it sound anyway when the normal path is not taken: a duplicate
+  /// commit CANNOT mint a second context off one ceremony. "One-shot" is then
+  /// a database fact rather than a service intention.
+  @@unique([organisationId, establishmentId], map: "authenticated_device_context_establishment_key")
+  /// Candidate key, referenced by AuthenticatedDeviceContextSite so a site
+  /// binding attaches to THIS context UNDER THIS TENANT.
+  @@unique([id, organisationId], map: "authenticated_device_context_id_organisation_key")
+  @@map("authenticated_device_contexts")
+}
+
+/// THE AUTHORITATIVE SITE BINDING OF AN ISSUED CONTEXT — one row per site.
+///
+/// A CHILD TABLE, NOT A STRING ARRAY, and the difference is the whole point. A
+/// `site_ids String[]` column would let a context name a site that does not
+/// exist, or a real site in ANOTHER TENANT, and the database would store it
+/// happily; nothing below the service layer could tell the difference. Here
+/// each binding is a composite foreign key over `sites_id_organisation_key`,
+/// so the site binding of a context is REFERENTIALLY REAL: an unresolvable or
+/// cross-tenant site is not a bad row, it is an impossible one.
+///
+/// This is still not authority. It records the sites the context was issued
+/// FOR; whether the human may act at one of them is answered on every request
+/// from CURRENT actor/site entitlement, and whether the device may is answered
+/// from CURRENT registry scope. Neither question is answered from this table.
+///
+/// LIVE STATE — composite tenant-aware relations, Restrict.
+model AuthenticatedDeviceContextSite {
+  id String @id @default(uuid()) @db.Uuid
+
+  contextId String @map("context_id") @db.Uuid
+  organisationId String @map("organisation_id") @db.Text
+  siteId String @map("site_id") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  /// Composite on both sides: the tenant of the context and the tenant of the
+  /// site must be the same tenant, and the database enforces it. Restrict —
+  /// this file never cascades, and a site's lifecycle must not silently erase
+  /// the record of what a context was scoped to.
+  context AuthenticatedDeviceContextRecord @relation(fields: [contextId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  site Site @relation(fields: [siteId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
+  /// One binding per (context, site). A repeated write converges instead of
+  /// widening the context by duplication.
+  @@unique([contextId, siteId], map: "authenticated_device_context_site_key")
+  @@map("authenticated_device_context_sites")
+}
+
+// ===========================================================================
+// HISTORICAL ARTEFACT — append-only
+// ===========================================================================
+
+/// ONE THING THE GATEWAY DID, as observed. APPEND-ONLY.
+///
+/// This is the internal side of D25-13's refusal boundary. Externally, a
+/// foreign-tenant device, a nonexistent device, a foreign context, a
+/// nonexistent context and a device not usable by this actor or site all shape
+/// the SAME external refusal, so the boundary is not an enumeration oracle.
+/// The PRECISE security reason and the trace id are appended here, where an
+/// operator can read them and an attacker cannot.
+///
+/// NO LIFECYCLE FOREIGN KEY AT ALL — not to Site, User, Device, or even to the
+/// context this row names. That is the WP-17A historical-artefact rule
+/// shield.prisma applies to DeviceSecurityEvent, and the reasoning is
+/// unchanged: `Cascade` would let a lifecycle erase the record of what the
+/// gateway decided, and `Restrict` would invent a retirement policy this work
+/// package has no mandate to decide. The identifiers below are the identifiers
+/// AS RECORDED at the moment of the event.
+///
+/// WHAT MAY NEVER ENTER `payload` (D25-13). The payload is ALLOWLISTED at the
+/// write site — it is built from named fields, never by spreading a request —
+/// and it may NEVER contain a raw signature, a private key, a session
+/// credential, a bearer-like secret, or a nonce. Not the device nonce, not the
+/// establishment nonce, not any one-shot value: an audit table is read by more
+/// people, for longer, than anything else in the system, and a replay identity
+/// sitting in one is a replay identity that has left the security boundary.
+/// The `context_id` IS safe to record, precisely because it authorises nothing.
+model DeviceGatewayOperationEvent {
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+
+  /// NULLABLE plain columns, all four. A refusal can legitimately precede — or
+  /// entirely lack — a resolved context, device, actor or operation: an
+  /// unparseable envelope names none of them, and an establishment refusal
+  /// happens before any context exists. Recording the event is not optional
+  /// just because the request never got far enough to identify itself.
+  contextId String? @map("context_id") @db.Uuid
+  deviceId String? @map("device_id") @db.Uuid
+  actorUserId String? @map("actor_user_id") @db.Text
+  /// FIELD_STATE_UPDATE | ASSIGNMENT_ACCEPT | ASSIGNMENT_DECLINE |
+  /// INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE (D25-11). The ROUTE chooses this and
+  /// the purpose; neither is caller-controlled security input.
+  operationKind String? @map("operation_kind") @db.Text
+
+  eventType String @map("event_type") @db.Text
+  /// The gateway's own outcome vocabulary, stored as TEXT per this file's
+  /// header.
+  outcome String @db.Text
+  /// The PRECISE internal reason, NULL when the outcome is not a refusal. It
+  /// is deliberately richer than anything the caller was told.
+  refusalReason String? @map("refusal_reason") @db.Text
+
+  payload Json @default("{}")
+
+  occurredAt DateTime @map("occurred_at") @db.Timestamptz(3)
+  traceId String @map("trace_id") @db.Text
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  /// "Show me every refusal of this kind in this tenant" — the event-type
+  /// sweep.
+  @@index([organisationId, eventType, occurredAt])
+  /// "Show me everything this device ever attempted through the gateway."
+  @@index([organisationId, deviceId, occurredAt])
+  @@map("device_gateway_operation_events")
+}

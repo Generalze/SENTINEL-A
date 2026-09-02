@@ -510,3 +510,98 @@ B. an approved initial domain surface has no safe transaction-aware seam,
    and using it would require duplicating or reinterpreting that domain's
    security logic.
 ```
+
+---
+
+## D25-16 - External transaction composition (CTO ruling, STOP condition B)
+
+STOP condition B fired correctly: all three approved surfaces own their own
+transaction boundary and exposed no external-tx seam, so D25-02's COMMIT
+TOGETHER was unimplementable without either modifying them or duplicating their
+rules. The CTO authorised **Option 1**; the WP-20 recovery lifecycle and a scope
+retarget were both rejected.
+
+Cross-module orchestration requires a transaction-composition seam. That is not
+ownership leakage:
+
+```text
+Device Gateway owns   orchestration, authentication, replay,
+                      the final cross-domain transaction
+Field owns            Field semantics
+Field Messaging owns  acknowledgement semantics
+Shield owns           registry / trust semantics
+```
+
+The established shape, one internal implementation and no duplicated logic:
+
+```ts
+async operation(..., tx?: Prisma.TransactionClient) {
+  const execute = async (db: Prisma.TransactionClient) => { /* unchanged */ };
+  return tx ? execute(tx) : this.prisma.$transaction(execute);
+}
+```
+
+Shield's exported `Tx` alias is NOT imported into Field or Field Messaging -
+Shield does not own the generic database transaction type. `Prisma.TransactionClient`
+is used directly.
+
+### The exact permitted seams, and nothing else
+
+```text
+FieldService.recordState(..., tx?)            FieldRepository.recordState(..., tx?)
+FieldService.transitionAssignment(..., tx?)   FieldRepository.transitionAssignment(..., tx?)
+                                              FieldRepository.siteExistsInOrganisation(..., tx?)
+FieldMessagingService.acknowledge(..., tx?)   FieldMessagingRepository.acknowledge(..., tx?)
+```
+
+`siteExistsInOrganisation` matters: `recordState` performs that check BEFORE
+entering its repository transaction, so on the gateway path it must run in the
+SAME transaction or WP-25 retains a check-to-commit race.
+
+Existing human callers supply no `tx` and their behaviour is unchanged. The
+gateway calls domain SERVICES, never Field repositories directly.
+
+**Still prohibited:** the gateway copying a transition rule, writing a Field row
+directly, reconstructing DELIVERED -> ACKNOWLEDGED itself, or creating Field
+audit/outbox rows itself.
+
+### D25-16A - the acknowledgement recipient row must be locked
+
+Assignment transition is already fenced with `SELECT ... FOR UPDATE` before it
+evaluates status. `FieldMessagingRepository.acknowledge()` is not: it reads the
+recipient through the message relation, checks state, then updates. Two valid
+acknowledgements with different idempotency identities could both observe
+DELIVERED before either commits.
+
+WP-25 adds a second authenticated ingress to that transition, so the race is
+fixed rather than carried forward. Inside the acknowledgement transaction the
+recipient row is locked `FOR UPDATE` and its state re-read authoritatively
+before the domain idempotency check, the duplicate check, the DELIVERED
+requirement and the transition. **This is not a new delivery rule** - it makes
+the existing rule serializable. The human path gets the same protection.
+
+### D25-16B - the downstream idempotency identity is SERVER-derived
+
+A device must not be able to choose a gateway replay identity of A and a domain
+idempotency key of B: two security identities could then collide at the domain
+layer, or one signed operation be represented by unrelated downstream
+identities. The domain `idempotency_key` is derived server-side, under its own
+domain separator, over:
+
+```text
+WP25-GATEWAY-DOMAIN-IDEMPOTENCY-v1
+organisation_id . context_id . actor_user_id . device_id
+key_id . key_version . operation_kind . target_type . target_id
+device nonce . payload_digest
+```
+
+canonicalised with the same discipline as the gateway statement and encoded as
+lowercase SHA-256 hex, which fits every existing 256-character domain bound.
+
+```text
+same signed operation      -> same downstream identity
+different signed semantics -> different downstream identity
+```
+
+The device never gets a second idempotency namespace with which to weaken the
+gateway's replay decision.

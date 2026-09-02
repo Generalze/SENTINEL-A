@@ -208,6 +208,16 @@ model Device {
   keys DeviceKey[]
   keyRotationRequests DeviceKeyRotationRequest[]
 
+  /// WP-25 back-relations. Required by Prisma for the composite
+  /// (device_id, organisation_id) relations declared in device-gateway.prisma.
+  /// They add no column and no behaviour to Shield, and the direction of
+  /// ownership is unchanged: the GATEWAY references the registry, never the
+  /// reverse, and no gateway row is ever consulted to answer "what does
+  /// Sentinel currently think of this hardware". That question is still
+  /// answered here, from current trust, on every request.
+  contextEstablishmentChallenges DeviceContextEstablishmentChallenge[]
+  authenticatedContexts AuthenticatedDeviceContextRecord[]
+
   /// Candidate key, deliberately redundant with the primary key — it is what
   /// every child table in this file references, so a child binds to THIS
   /// device UNDER THIS TENANT rather than to an id that merely exists. Same

@@ -730,8 +730,15 @@ export class ShieldRepository {
     return tx.device.create({ data: input });
   }
 
-  async findDevice(organisationId: string, deviceId: string): Promise<DeviceRow | null> {
-    return this.prisma.device.findFirst({ where: { id: deviceId, organisationId } });
+  /**
+   * WP-25/D25-16: `tx` is an internal composition seam, not a widened API. The
+   * gateway's final effect transaction re-reads this row AFTER locking it and
+   * must see the transaction's own view, not a second connection's. Existing
+   * callers pass nothing and reach exactly the query they always did.
+   */
+  async findDevice(organisationId: string, deviceId: string, tx?: Tx): Promise<DeviceRow | null> {
+    const db: Tx = tx ?? this.prisma;
+    return db.device.findFirst({ where: { id: deviceId, organisationId } });
   }
 
   async findDeviceByEnrollmentRequest(tx: Tx, organisationId: string, enrollmentRequestId: string): Promise<DeviceRow | null> {
@@ -833,8 +840,10 @@ export class ShieldRepository {
     return tx.deviceKey.create({ data: input });
   }
 
-  async findDeviceKeyByKeyId(organisationId: string, keyId: string): Promise<DeviceKeyRow | null> {
-    return this.prisma.deviceKey.findFirst({ where: { organisationId, keyId } });
+  /** WP-25/D25-16: the same internal composition seam as `findDevice`. */
+  async findDeviceKeyByKeyId(organisationId: string, keyId: string, tx?: Tx): Promise<DeviceKeyRow | null> {
+    const db: Tx = tx ?? this.prisma;
+    return db.deviceKey.findFirst({ where: { organisationId, keyId } });
   }
 
   /**
@@ -1231,17 +1240,28 @@ export class ShieldRepository {
   async readAttestationEvidence(
     organisationId: string,
     deviceId: string,
+    tx?: Tx,
   ): Promise<{
     latest: { outcome: string; evaluatedAt: Date } | null;
     decisive: { outcome: string; evaluatedAt: Date } | null;
     now: Date;
   }> {
-    return this.transaction(async (tx) => {
-      const now = await this.dbNow(tx);
-      const latest = await this.latestAttestationObservation(tx, organisationId, deviceId);
-      const decisive = await this.latestDecisiveAttestation(tx, organisationId, deviceId);
+    // WP-25/D25-16: the same internal composition seam the two finders carry.
+    // Opening a NESTED transaction from inside the gateway's final effect
+    // transaction would read the evidence on a second connection, outside the
+    // very snapshot and the very locks the D25-04A fence rests on — so when a
+    // transaction is supplied the reads join it instead of starting their own.
+    const read = async (db: Tx): Promise<{
+      latest: { outcome: string; evaluatedAt: Date } | null;
+      decisive: { outcome: string; evaluatedAt: Date } | null;
+      now: Date;
+    }> => {
+      const now = await this.dbNow(db);
+      const latest = await this.latestAttestationObservation(db, organisationId, deviceId);
+      const decisive = await this.latestDecisiveAttestation(db, organisationId, deviceId);
       return { latest, decisive, now };
-    });
+    };
+    return tx ? read(tx) : this.transaction(read);
   }
 
   /**

@@ -314,6 +314,24 @@ export class FieldMessagingRepository {
    * Advances ONE recipient's delivery state. Acknowledgement is attributable to
    * a named recipient only; there is deliberately no path here for an oversight
    * reader, because an oversight reader has no recipient row to advance.
+   *
+   * WP-25/D25-16: the optional `tx` is an internal COMPOSITION SEAM, not a
+   * public API concern. The acknowledgement logic below is unchanged and this
+   * remains the only implementation of DELIVERED -> ACKNOWLEDGED; the seam
+   * exists so an orchestrator that must commit this transition together with
+   * its own rows can supply the transaction rather than reconstruct the rule.
+   * Existing human callers supply nothing and are unaffected.
+   *
+   * WP-25/D25-16A: the recipient row is now locked `FOR UPDATE` and its state
+   * RE-READ under that lock before any decision is taken. This is NOT a new
+   * delivery rule — the rule is C8-01's, unchanged — it makes the existing
+   * rule SERIALIZABLE. Before, this method read the recipient through the
+   * message relation, checked its state and updated, with nothing holding the
+   * row: two acknowledgements carrying DIFFERENT idempotency identities could
+   * both observe DELIVERED before either committed, and both would transition,
+   * writing two timeline entries and two outbox rows for one transition.
+   * Assignment transition has been fenced this way since WP-16; this is the
+   * same fence, and the human path gets it too.
    */
   async acknowledge(
     organisationId: string,
@@ -322,18 +340,34 @@ export class FieldMessagingRepository {
     idempotencyKey: string,
     siteScope: SiteScope,
     requiredState: string,
+    tx?: Prisma.TransactionClient,
   ): Promise<AcknowledgeResult> {
-    return this.prisma.$transaction(async (tx) => {
-      const message = await tx.incidentFieldMessage.findFirst({
+    const execute = async (db: Prisma.TransactionClient): Promise<AcknowledgeResult> => {
+      const message = await db.incidentFieldMessage.findFirst({
         where: { id: messageId, organisationId, ...siteScopeWhere(siteScope) },
         include: withRecipients,
       });
       if (!message) return { kind: 'not_recipient' };
 
-      const recipient = message.recipients.find((row) => row.recipientUserId === recipientUserId);
-      if (!recipient) return { kind: 'not_recipient' };
+      const named = message.recipients.find((row) => row.recipientUserId === recipientUserId);
+      if (!named) return { kind: 'not_recipient' };
 
-      const duplicate = await tx.incidentFieldMessageActionIdempotency.findUnique({
+      // D25-16A: lock THIS recipient row, then re-read. Prisma's query API
+      // cannot express `SELECT ... FOR UPDATE`, so the lock is raw — the same
+      // technique field.repository.ts and patrol.repository.ts already use.
+      // The scoped resolution above stays where it is: locking is a
+      // concurrency fence, never an entitlement check, and a caller with no
+      // claim on this row must still be refused by scope, not by a lock.
+      await db.$queryRaw(Prisma.sql`SELECT id FROM incident_field_message_recipients WHERE id = ${named.id}::uuid FOR UPDATE`);
+
+      // The authoritative state, read AFTER the lock. Everything below decides
+      // on `locked`, never on the pre-lock read: a value observed before the
+      // fence is exactly the stale read this correction exists to eliminate.
+      const current = await db.incidentFieldMessage.findUniqueOrThrow({ where: { id: messageId }, include: withRecipients });
+      const locked = current.recipients.find((row) => row.recipientUserId === recipientUserId);
+      if (!locked) return { kind: 'not_recipient' };
+
+      const duplicate = await db.incidentFieldMessageActionIdempotency.findUnique({
         where: {
           messageId_recipientUserId_action_idempotencyKey: {
             messageId,
@@ -343,44 +377,45 @@ export class FieldMessagingRepository {
           },
         },
       });
-      if (duplicate) return { kind: 'duplicate', message };
-      if (recipient.deliveryState === 'ACKNOWLEDGED') return { kind: 'duplicate', message };
+      if (duplicate) return { kind: 'duplicate', message: current };
+      if (locked.deliveryState === 'ACKNOWLEDGED') return { kind: 'duplicate', message: current };
 
       // C8-01: acknowledgement may ONLY advance a row that transport evidence
       // already moved to DELIVERED. Acknowledging a REQUESTED row is refused
       // here without mutating anything — a human acknowledgement must never
       // manufacture the transport evidence that should have preceded it.
-      if (recipient.deliveryState !== requiredState) return { kind: 'conflict', currentState: recipient.deliveryState };
+      if (locked.deliveryState !== requiredState) return { kind: 'conflict', currentState: locked.deliveryState };
 
       const at = new Date();
-      await tx.incidentFieldMessageRecipient.update({
-        where: { id: recipient.id },
+      await db.incidentFieldMessageRecipient.update({
+        where: { id: locked.id },
         // deliveredAt is deliberately NOT written here: it belongs to the
         // transport-evidence step and must keep its own timestamp.
         data: { deliveryState: 'ACKNOWLEDGED', acknowledgedAt: at },
       });
-      await tx.incidentFieldMessageActionIdempotency.create({
+      await db.incidentFieldMessageActionIdempotency.create({
         data: { messageId, recipientUserId, action: 'acknowledge', idempotencyKey },
       });
-      await tx.incidentTimelineEntry.create({
+      await db.incidentTimelineEntry.create({
         data: {
-          incidentId: message.incidentId,
+          incidentId: current.incidentId,
           kind: TIMELINE_MESSAGE_ACKNOWLEDGED,
           actorUserId: recipientUserId,
           payload: { incident_field_message_id: messageId, acknowledged_at: at.toISOString() },
         },
       });
-      await tx.incidentFieldMessageOutbox.create({
+      await db.incidentFieldMessageOutbox.create({
         data: {
-          organisationId: message.organisationId,
-          siteId: message.siteId,
+          organisationId: current.organisationId,
+          siteId: current.siteId,
           recipientUserId,
-          payload: { kind: 'incident_field_message.updated', incident_id: message.incidentId, message_id: messageId },
+          payload: { kind: 'incident_field_message.updated', incident_id: current.incidentId, message_id: messageId },
         },
       });
 
-      const refreshed = await tx.incidentFieldMessage.findUniqueOrThrow({ where: { id: messageId }, include: withRecipients });
+      const refreshed = await db.incidentFieldMessage.findUniqueOrThrow({ where: { id: messageId }, include: withRecipients });
       return { kind: 'acknowledged', message: refreshed };
-    });
+    };
+    return tx ? execute(tx) : this.prisma.$transaction(execute);
   }
 }

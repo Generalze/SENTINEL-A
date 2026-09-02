@@ -69,6 +69,13 @@ model Site {
   deviceEnrollmentRequests EnrollmentRequest[]
   /// C16-01: the server-issued custody-regime catalogue is scoped to one site.
   deviceCustodyRegimes DeviceCustodyRegime[]
+  /// WP-25 back-relations. Required by Prisma for the composite
+  /// (site_id, organisation_id) relations declared in device-gateway.prisma;
+  /// they add no column and no behaviour to Identity. Neither is authority: a
+  /// site named by a device context grants nothing, and every site question is
+  /// still answered from current entitlement.
+  deviceContextEstablishmentChallenges DeviceContextEstablishmentChallenge[]
+  authenticatedDeviceContextSites AuthenticatedDeviceContextSite[]
 
   @@unique([id, organisationId], map: "sites_id_organisation_key")
   @@index([organisationId])
@@ -122,6 +129,17 @@ model User {
   /// C16-01: the human who DEFINED a custody regime. Provenance, never
   /// authority — naming a regime grants nothing over any device under it.
   deviceCustodyRegimesDefined DeviceCustodyRegime[]
+
+  /// WP-25 back-relations. Required by Prisma for the composite
+  /// (actor_user_id, organisation_id) relations declared in
+  /// device-gateway.prisma; they add no column and no behaviour to Identity.
+  /// Both are BINDINGS, NEVER GRANTS (C14-02/D25-01): being named on an
+  /// establishment challenge or an issued device context confers no site
+  /// scope, no action and no device authority. Every authorisation is still
+  /// answered from the current authenticated principal and their current
+  /// entitlement, re-read on every request.
+  deviceContextEstablishmentChallenges DeviceContextEstablishmentChallenge[]
+  authenticatedDeviceContexts AuthenticatedDeviceContextRecord[]
 
   @@unique([organisationId, email])
   /// WP-24 / D24-04a: a candidate key, deliberately redundant with the primary

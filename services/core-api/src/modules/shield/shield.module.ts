@@ -69,6 +69,20 @@ import { ShieldRepository } from './shield.repository';
     DeviceKeyService,
     { provide: DEVICE_ATTESTATION_EVALUATOR, useClass: UnavailableDeviceAttestationEvaluator },
   ],
-  exports: [ShieldRepository, DeviceRegistryService, DeviceEnrollmentService, DeviceTrustService, DeviceKeyService, P256KeyImporter],
+  // WP-25/D25-10: `DeviceReplayService` is exported so the device gateway can
+  // consume Shield's ONE anti-replay store with a new `ceremony` value rather
+  // than building a second replay subsystem beside it. It is the store, not a
+  // decision: it classifies and never rules, so exporting it hands out no
+  // authority. Everything else already had to be exported for WP-24's own
+  // acceptance suite.
+  exports: [
+    ShieldRepository,
+    DeviceRegistryService,
+    DeviceEnrollmentService,
+    DeviceTrustService,
+    DeviceKeyService,
+    DeviceReplayService,
+    P256KeyImporter,
+  ],
 })
 export class ShieldModule {}
