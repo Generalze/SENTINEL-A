@@ -24,6 +24,17 @@ plugins {
     id("org.jetbrains.kotlin.plugin.serialization") version "1.9.24"
 }
 
+/**
+ * One piece of signing material, from a Gradle property or the environment.
+ *
+ * Neither source is a file in this repository, and that is the point: the
+ * keystore, its passwords and the alias are supplied by whoever performs the
+ * acceptance run and are never committed. `.gitignore` refuses the keystore
+ * shapes as a second line of defence.
+ */
+fun signingMaterial(gradleProperty: String, environmentVariable: String): String? =
+    (project.findProperty(gradleProperty) as String?) ?: System.getenv(environmentVariable)
+
 android {
     namespace = "com.sentinel.field"
     compileSdk = 34
@@ -53,10 +64,61 @@ android {
         versionName = "0.1.0-wp26"
     }
 
+    /*
+     * THE ACCEPTANCE SIGNING IDENTITY.
+     *
+     * The physical-device acceptance proves, among other things, that the app
+     * holding the StrongBox key IS Sentinel Field — by package name AND by the
+     * SHA-256 of the certificate that signed the APK. That check is only worth
+     * anything if the signing identity is STABLE and DELIBERATE.
+     *
+     * A debug APK is signed with an auto-generated debug keystore. Its
+     * fingerprint differs between machines and can be regenerated at any time,
+     * so configuring the server to trust it would either fail on the next build
+     * or pin a key nobody controls. Neither is acceptable for the identity that
+     * decides whether hardware is trusted.
+     *
+     * So the material is supplied at BUILD TIME and never committed: a Gradle
+     * property or an environment variable, resolved below. Absent, there is no
+     * `acceptance` config at all and `assembleDebug` is unaffected — which is
+     * what hosted CI builds, and CI holds no signing key.
+     *
+     * The private key never reaches Sentinel. The server is configured with the
+     * PUBLIC certificate fingerprint only.
+     */
+    val acceptanceStoreFile = signingMaterial("sentinelAcceptanceStoreFile", "SENTINEL_ACCEPTANCE_STORE_FILE")
+    val acceptanceStorePassword = signingMaterial("sentinelAcceptanceStorePassword", "SENTINEL_ACCEPTANCE_STORE_PASSWORD")
+    val acceptanceKeyAlias = signingMaterial("sentinelAcceptanceKeyAlias", "SENTINEL_ACCEPTANCE_KEY_ALIAS")
+    val acceptanceKeyPassword = signingMaterial("sentinelAcceptanceKeyPassword", "SENTINEL_ACCEPTANCE_KEY_PASSWORD")
+    val acceptanceSigningConfigured =
+        acceptanceStoreFile != null &&
+            acceptanceStorePassword != null &&
+            acceptanceKeyAlias != null &&
+            acceptanceKeyPassword != null
+
+    signingConfigs {
+        if (acceptanceSigningConfigured) {
+            create("acceptance") {
+                storeFile = file(acceptanceStoreFile!!)
+                storePassword = acceptanceStorePassword
+                keyAlias = acceptanceKeyAlias
+                keyPassword = acceptanceKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            // Only when the material is present. There is deliberately NO
+            // fallback to the debug key: an acceptance APK signed by a key the
+            // server was not configured for would fail the identity check for a
+            // reason that looks like a device fault, and one silently signed by
+            // a debug key is worse — it would be a build nobody could vouch for.
+            if (acceptanceSigningConfigured) {
+                signingConfig = signingConfigs.getByName("acceptance")
+            }
         }
     }
 
@@ -145,4 +207,34 @@ dependencies {
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
     testImplementation("junit:junit:4.13.2")
+}
+
+
+/*
+ * A RELEASE BUILD WITHOUT AN ACCEPTANCE IDENTITY FAILS LOUDLY.
+ *
+ * Without this, `assembleRelease` would quietly produce an UNSIGNED APK, and an
+ * unsigned APK cannot be installed or attested — the failure would surface much
+ * later, on the phone, as something that looks unrelated. Failing here names
+ * the actual cause.
+ *
+ * `assembleDebug` is untouched, so hosted CI, which holds no signing key,
+ * builds exactly as before.
+ */
+tasks.matching { it.name.startsWith("assemble") && it.name.contains("Release") }.configureEach {
+    doFirst {
+        val configured =
+            signingMaterial("sentinelAcceptanceStoreFile", "SENTINEL_ACCEPTANCE_STORE_FILE") != null &&
+                signingMaterial("sentinelAcceptanceStorePassword", "SENTINEL_ACCEPTANCE_STORE_PASSWORD") != null &&
+                signingMaterial("sentinelAcceptanceKeyAlias", "SENTINEL_ACCEPTANCE_KEY_ALIAS") != null &&
+                signingMaterial("sentinelAcceptanceKeyPassword", "SENTINEL_ACCEPTANCE_KEY_PASSWORD") != null
+        if (!configured) {
+            throw GradleException(
+                "A release build needs the Sentinel acceptance signing identity. " +
+                    "Set sentinelAcceptanceStoreFile / StorePassword / KeyAlias / KeyPassword " +
+                    "(or SENTINEL_ACCEPTANCE_STORE_FILE / _STORE_PASSWORD / _KEY_ALIAS / _KEY_PASSWORD). " +
+                    "See README.md, 'Physical-device acceptance'. Refusing to produce an unsigned APK.",
+            )
+        }
+    }
 }

@@ -246,3 +246,20 @@ header outright. This client inherits that weakness exactly and adds none of its
 own: there is no device token, no device session cookie and no header this
 client sends that any controller reads as a device credential (D25-01). When
 real authentication replaces that guard, one constant in `SentinelHttp` changes.
+
+## Physical-device acceptance
+
+The full procedure — Google trust anchors, revocation snapshot, the acceptance
+signing identity and the exact fingerprint format the server expects — is in
+[`docs/execution/WP-26-PHYSICAL-ACCEPTANCE-RUNBOOK.md`](../../docs/execution/WP-26-PHYSICAL-ACCEPTANCE-RUNBOOK.md).
+
+Two things worth knowing before you start:
+
+* `assembleDebug` needs nothing and is what hosted CI builds. `assembleRelease`
+  **fails loudly** without the acceptance signing identity rather than emitting
+  an unsigned APK or quietly falling back to the debug key — a debug key's
+  fingerprint differs between machines, so pinning it server-side would break on
+  the next build.
+* The server compares **lowercase hex SHA-256 with no separators**. `keytool`
+  prints uppercase with colons. Normalise it, or acceptance fails in a way that
+  reads like a device fault.
