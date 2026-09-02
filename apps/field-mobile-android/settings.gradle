@@ -1,0 +1,31 @@
+/*
+ * WP-26 — the Android client, deliberately OUTSIDE the pnpm workspace.
+ *
+ * D26-10: the project stays in the monorepo so the single-boundary discipline
+ * holds, but carries NO `package.json`, so `pnpm-workspace.yaml`'s `apps/*`
+ * glob does not match it. The gate therefore reads TWO numbers — Sentinel's CI
+ * and `android.yml` — and a green on one is not a green on the other.
+ *
+ * GROOVY, NOT KOTLIN DSL, AND ON PURPOSE. The `.kts` form of this file was not
+ * being applied on CI: Gradle reported the root project as the directory name,
+ * and the AGP plugin marker then could not resolve because the repositories
+ * below were never registered. Groovy is the most broadly handled settings
+ * form, and the point of this file is to be read.
+ */
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = 'sentinel-field-mobile'

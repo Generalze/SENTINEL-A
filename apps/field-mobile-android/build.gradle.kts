@@ -1,68 +1,27 @@
 /*
- * Root build script.
+ * WP-26 Field Mobile Foundation — the Android client.
  *
- * Every plugin version is PINNED to an exact, published coordinate. Nothing
- * here resolves a range, a `+`, or a snapshot: this machine has no JDK, no
- * Gradle and no Android SDK, so the only verification this project gets is
- * hosted CI, and a build that resolves differently on two days is a build that
- * cannot be audited.
+ * A CONVENTIONAL single-project Android build. Three CI attempts failed on
+ * plugin resolution, and they shared one cause: Gradle named the root project
+ * after the DIRECTORY, which is what it does when the settings file is not
+ * applied — so `pluginManagement { repositories { google() } }` never applied
+ * either, and the very first failure (an unresolvable AGP plugin MARKER) was
+ * that same bug wearing a different message. The settings file is now Groovy,
+ * the most broadly handled form, and everything here is the ordinary shape an
+ * Android project has: `plugins {}` first, versions pinned, repositories in
+ * settings.
  *
- *   Gradle                       8.7        (gradle/wrapper/gradle-wrapper.properties)
- *   Android Gradle Plugin        8.3.2      (requires Gradle >= 8.4, JDK 17)
- *   Kotlin                       1.9.24
- *   kotlinx-serialization        1.6.3      (matches Kotlin 1.9.x)
+ * Every version is an exact, published coordinate. Nothing resolves a range, a
+ * `+` or a snapshot: this machine has no JDK, no Gradle and no Android SDK, so
+ * hosted CI is the only verification this project gets, and a build that
+ * resolves differently on two days is a build that cannot be audited.
+ *
+ *   Gradle 8.7 · AGP 8.3.2 (needs Gradle >= 8.4, JDK 17) · Kotlin 1.9.24
  */
-/*
- * WP-26 CI FIX: `buildscript` classpath rather than the plugins DSL.
- *
- * The first CI run failed resolving the plugin MARKER artifact
- * `com.android.application:com.android.application.gradle.plugin:8.3.2`,
- * even though `google()` is declared in `pluginManagement`. The marker is a
- * tiny redirect POM and is a separate coordinate from the plugin itself.
- * Declaring the real library on the buildscript classpath resolves
- * `com.android.tools.build:gradle`, which is unambiguously published on
- * `google()`, and removes the marker from the picture entirely.
- *
- * The versions are still pinned to the exact same values; only the resolution
- * path changed.
- */
-buildscript {
-    repositories {
-        google()
-        mavenCentral()
-    }
-    dependencies {
-        classpath("com.android.tools.build:gradle:8.3.2")
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.24")
-        classpath("org.jetbrains.kotlin:kotlin-serialization:1.9.24")
-    }
-}
-
-/*
- * WP-26 CI FIX 2 — SINGLE-PROJECT BUILD.
- *
- * This was a root build plus an `:app` subproject. On CI, Gradle reported
- * `Root project 'field-mobile-android'` — the DIRECTORY name — and could not
- * find `:app`, which is what happens when `settings.gradle.kts` is not taking
- * effect. The file is present, byte-identical to the local copy, has no BOM,
- * and sits in the invocation directory, so the reason was not visible from
- * here and this machine has no Gradle to reproduce it with.
- *
- * Rather than guess a third time at settings resolution, the build no longer
- * DEPENDS on it: one project, sources at `src/`, repositories declared on the
- * project itself. If the settings file is honoured, nothing changes; if it is
- * ignored, the build still resolves everything it needs. A build whose
- * correctness turns on a file being read is a build that fails obscurely.
- */
-repositories {
-    google()
-    mavenCentral()
-}
-
 plugins {
-    id("com.android.application")
-    id("org.jetbrains.kotlin.android")
-    id("org.jetbrains.kotlin.plugin.serialization")
+    id("com.android.application") version "8.3.2"
+    id("org.jetbrains.kotlin.android") version "1.9.24"
+    id("org.jetbrains.kotlin.plugin.serialization") version "1.9.24"
 }
 
 android {
