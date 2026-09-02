@@ -69,6 +69,36 @@ export interface DeviceAttestationEvaluationInput {
   readonly publicKeyThumbprint: string;
   /** The authoritative server clock, as an ISO-8601 instant. */
   readonly now: string;
+  /**
+   * WP-26/D26-04B — A SERVER-OWNED REFERENCE TO A SERVER-OWNED EVALUATION.
+   *
+   * THIS IS NOT A CLIENT AUTHORITY FIELD, AND IT CANNOT BECOME ONE.
+   *
+   * The seam still carries no vendor blob and no verdict: D23-14's rule is
+   * intact, and a structure with nowhere to put a raw attestation token still
+   * cannot leak one into a fingerprint or an audit row. What this field carries
+   * is an OPAQUE HANDLE the SERVER minted, naming a restricted provider record
+   * the SERVER wrote after verifying a certificate chain itself. There is no
+   * HTTP field, no contract member and no client-reachable path that sets it.
+   *
+   * `null` is the ordinary value and means "no server evaluation accompanies
+   * this subject". Every caller that predates WP-26 passes `null`, and an
+   * implementation must answer `null` exactly as it would have answered before
+   * the field existed — `UnavailableDeviceAttestationEvaluator` does.
+   *
+   * An implementation that resolves a reference MUST re-bind it to this input's
+   * `organisationId` and `publicKeyThumbprint` before believing it, and MUST
+   * treat an unresolvable reference as `UNAVAILABLE` rather than as evidence of
+   * anything. A handle that cannot be resolved is not a statement about a
+   * device.
+   *
+   * The SEMANTICS of this interface are unchanged (D26-04B permits extending
+   * the runtime seam and forbids changing what it means): an evaluator is still
+   * asked what the platform thinks of one piece of hardware right now, it still
+   * returns the frozen `DeviceAttestationEvidence`, and `UNAVAILABLE` is still
+   * not device evidence.
+   */
+  readonly attestationArtifactRef: string | null;
 }
 
 /**

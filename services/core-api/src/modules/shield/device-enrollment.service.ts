@@ -27,6 +27,7 @@ import {
   type DeviceEnrollmentApproval,
   type DeviceEnrollmentBootstrapGrant,
   type DeviceEnrollmentRequest,
+  type DeviceKeyStorage,
   type DevicePossessionChallenge,
   type DevicePossessionVerificationResult,
 } from '@sentinel/contracts';
@@ -35,12 +36,13 @@ import { DEVICE_ATTESTATION_EVALUATOR, type DeviceAttestationEvaluator } from '.
 import { DeviceReplayService } from './device-replay.service';
 import { DeviceSecurityAudit } from './device-security-audit';
 import { P256KeyImporter } from './p256-key.importer';
-import { checkDeviceAuthority } from './shield.authority';
+import { checkDeviceAuthority, readableSiteIds } from './shield.authority';
 import { ShieldTransactionRollback, isShieldTransactionRollback } from './shield.rollback';
 import { approvedEnrollmentSemanticsDigest } from './shield.semantics';
 import {
   ACTION_DEVICE_ENROLLMENT_APPROVE,
   ACTION_DEVICE_ENROLLMENT_ISSUE,
+  ACTION_DEVICE_REGISTRY_READ,
   BOOTSTRAP_TOKEN_DIGEST_ALGORITHM,
   BOOTSTRAP_TOKEN_ENTROPY_BYTES,
   CEREMONY_BOOTSTRAP_GRANT,
@@ -66,6 +68,9 @@ import type {
   EnrollmentRequestSubmission,
   IssueBootstrapGrantOutcome,
   IssuePossessionChallengeOutcome,
+  ListPendingEnrollmentsOutcome,
+  PresentBootstrapGrantOutcome,
+  ReadIntendedUserEnrollmentOutcome,
   RevokeBootstrapGrantOutcome,
   ShieldRefusalCode,
   VerifyPossessionOutcome,
@@ -369,34 +374,48 @@ export class DeviceEnrollmentService {
   // -------------------------------------------------------------------------
 
   /**
-   * Opens an enrollment against a presented bootstrap grant.
+   * WP-26/D26-04A — PRESENTING A BOOTSTRAP GRANT, EXTRACTED SO THERE IS ONE OF IT.
    *
-   * There is no `Principal` parameter, deliberately. This is the DEVICE
-   * speaking, and D24-02's third rule is that a device presenting a grant is
-   * not a human performing a §62 action. The grant is provenance; the human
-   * authority in this ceremony is the SEPARATE approval in step 3, which is
-   * exactly the separation C14-02 exists to create. (There is still no
-   * transport for this: D24-13 forbids one, and WP-25 owns it.)
+   * This is the first half of `createEnrollmentRequest` verbatim: digest the
+   * presented token, resolve it BY DIGEST ALONE across organisations, apply
+   * D24-03a's PROBE RULE (a grant presented in an organisation, site or
+   * intended-user context it was not issued for BURNS, and raises
+   * `BOOTSTRAP_REPLAY_REFUSED`, because a probe is not a typo), and then let
+   * `classifyDeviceBootstrapGrant` — not this service — decide whether what is
+   * left is USABLE.
    *
-   * D24-03a's PROBE RULE is enforced here. A grant presented in an
-   * organisation, site or intended-user context it was not issued for BURNS —
-   * `consumed_at` is stamped and `BOOTSTRAP_REPLAY_REFUSED` is written —
-   * because a probe is not a typo, and a grant that survives being probed is a
-   * grant an attacker may keep trying against every tenant in turn.
+   * It was extracted rather than reimplemented because WP-26 introduces a
+   * SECOND moment at which a grant is presented: the attestation challenge must
+   * be bound to the grant it belongs to, and that binding happens BEFORE the
+   * phone has generated a key (D26-04A). Two implementations of the probe rule
+   * would be two chances to get it wrong, and only one of them would be the one
+   * an auditor reads. There is exactly one, and both callers use it.
+   *
+   * PRESENTING IS NOT CONSUMING. The grant is `single_use` and is spent by the
+   * COMMIT, inside the transaction that creates the device. Presenting it here
+   * — twice, or ten times — moves nothing and grants nothing; what a
+   * presentation can do is BURN a grant that was presented in the wrong
+   * context, which is a defence rather than a side effect.
    */
-  async createEnrollmentRequest(submission: EnrollmentRequestSubmission): Promise<CreateEnrollmentRequestOutcome> {
-    const digest = this.digestBootstrapToken(submission.bootstrapToken);
+  private async presentBootstrapGrant(input: {
+    organisationId: string;
+    siteId: string;
+    intendedUserId: string;
+    bootstrapToken: string;
+    traceId: string;
+  }): Promise<{ presented: true; grant: BootstrapGrantRow } | { presented: false; refusal: ShieldRefusalCode }> {
+    const digest = this.digestBootstrapToken(input.bootstrapToken);
 
     // Looked up by DIGEST ALONE, across organisations, and the repository
     // explains why: scoping the lookup to the presented organisation would
     // make the probe undetectable rather than impossible.
     const grant = await this.repository.findBootstrapGrantByTokenDigest(digest);
-    if (grant === null) return { outcome: 'REFUSED', refusal: 'BOOTSTRAP_GRANT_NOT_FOUND' };
+    if (grant === null) return { presented: false, refusal: 'BOOTSTRAP_GRANT_NOT_FOUND' };
 
     const contextMatches =
-      grant.organisationId === submission.organisationId &&
-      grant.siteId === submission.siteId &&
-      grant.intendedUserId === submission.intendedUserId;
+      grant.organisationId === input.organisationId &&
+      grant.siteId === input.siteId &&
+      grant.intendedUserId === input.intendedUserId;
 
     if (!contextMatches) {
       await this.repository.transaction(async (tx) => {
@@ -407,18 +426,18 @@ export class DeviceEnrollmentService {
           // The event is filed under the grant's OWN organisation, not the one
           // it was presented in. An attacker must not be able to write rows
           // into a tenant they merely named.
-          { organisationId: grant.organisationId, deviceId: null, actorUserId: null, occurredAt: now, traceId: submission.traceId },
+          { organisationId: grant.organisationId, deviceId: null, actorUserId: null, occurredAt: now, traceId: input.traceId },
           {
             type: 'BOOTSTRAP_REPLAY_REFUSED',
             grantId: grant.id,
             refusal: 'BOOTSTRAP_CONTEXT_MISMATCH',
-            presentedOrganisationId: submission.organisationId,
-            presentedSiteId: submission.siteId,
-            presentedIntendedUserId: submission.intendedUserId,
+            presentedOrganisationId: input.organisationId,
+            presentedSiteId: input.siteId,
+            presentedIntendedUserId: input.intendedUserId,
           },
         );
       });
-      return { outcome: 'REFUSED', refusal: 'BOOTSTRAP_CONTEXT_MISMATCH' };
+      return { presented: false, refusal: 'BOOTSTRAP_CONTEXT_MISMATCH' };
     }
 
     // The grant's own standing, decided by the CONTRACT. Revoked, consumed,
@@ -441,11 +460,82 @@ export class DeviceEnrollmentService {
       consumed_at: grant.consumedAt === null ? null : grant.consumedAt.toISOString(),
       revoked_at: grant.revokedAt === null ? null : grant.revokedAt.toISOString(),
     });
-    if (!contractGrant.success) return { outcome: 'REFUSED', refusal: 'MALFORMED_CONTRACT_STRUCTURE' };
+    if (!contractGrant.success) return { presented: false, refusal: 'MALFORMED_CONTRACT_STRUCTURE' };
     const standingNow = await this.repository.now();
     if (classifyDeviceBootstrapGrant(contractGrant.data, standingNow.toISOString()) !== 'USABLE') {
-      return { outcome: 'REFUSED', refusal: 'BOOTSTRAP_GRANT_UNUSABLE' };
+      return { presented: false, refusal: 'BOOTSTRAP_GRANT_UNUSABLE' };
     }
+
+
+    return { presented: true, grant };
+  }
+
+  /**
+   * WP-26/D26-04A — THE PUBLIC PRESENTATION, for the enrollment ingress.
+   *
+   * It answers ONE question — "is this token a grant that is usable RIGHT NOW
+   * for exactly this organisation, site and intended user?" — and returns the
+   * grant's identity and its expiry so the ingress can CLAMP an attestation
+   * challenge to it. A challenge must never outlive the grant it belongs to,
+   * and the ingress cannot enforce that without knowing when the grant dies.
+   *
+   * IT GRANTS NOTHING AND CHANGES NOTHING (D24-03). No device authority, no
+   * session, no approval, no consumption. The only state it can move is
+   * D24-03a's probe burn, which is inherited unchanged from
+   * `presentBootstrapGrant`.
+   *
+   * There is no `Principal` parameter for the reason `createEnrollmentRequest`
+   * has none: this is the DEVICE speaking, and a device presenting a grant is
+   * not a human performing a §62 action. The HUMAN half is bound at the
+   * network ingress, where the intended user's live session is equality-bound
+   * to the grant's organisation, site and intended user before this is ever
+   * called (D26-09) — which strengthens WP-24's posture rather than redefining
+   * its rules.
+   */
+  async presentBootstrapGrantForCeremony(input: {
+    organisationId: string;
+    siteId: string;
+    intendedUserId: string;
+    bootstrapToken: string;
+    traceId: string;
+  }): Promise<PresentBootstrapGrantOutcome> {
+    const presented = await this.presentBootstrapGrant(input);
+    if (!presented.presented) return { outcome: 'REFUSED', refusal: presented.refusal };
+    return {
+      outcome: 'USABLE',
+      grantId: presented.grant.id,
+      siteId: presented.grant.siteId,
+      intendedUserId: presented.grant.intendedUserId,
+      expiresAt: presented.grant.expiresAt,
+    };
+  }
+
+  /**
+   * Opens an enrollment against a presented bootstrap grant.
+   *
+   * There is no `Principal` parameter, deliberately. This is the DEVICE
+   * speaking, and D24-02's third rule is that a device presenting a grant is
+   * not a human performing a §62 action. The grant is provenance; the human
+   * authority in this ceremony is the SEPARATE approval in step 3, which is
+   * exactly the separation C14-02 exists to create. (There is still no
+   * transport for this: D24-13 forbids one, and WP-25 owns it.)
+   *
+   * D24-03a's PROBE RULE is enforced here. A grant presented in an
+   * organisation, site or intended-user context it was not issued for BURNS —
+   * `consumed_at` is stamped and `BOOTSTRAP_REPLAY_REFUSED` is written —
+   * because a probe is not a typo, and a grant that survives being probed is a
+   * grant an attacker may keep trying against every tenant in turn.
+   */
+  async createEnrollmentRequest(submission: EnrollmentRequestSubmission): Promise<CreateEnrollmentRequestOutcome> {
+    const presented = await this.presentBootstrapGrant({
+      organisationId: submission.organisationId,
+      siteId: submission.siteId,
+      intendedUserId: submission.intendedUserId,
+      bootstrapToken: submission.bootstrapToken,
+      traceId: submission.traceId,
+    });
+    if (!presented.presented) return { outcome: 'REFUSED', refusal: presented.refusal };
+    const grant = presented.grant;
 
     // D24-05: the runtime crypto boundary, BEFORE anything is persisted. A
     // structurally perfect off-curve point parses at every contract boundary in
@@ -502,6 +592,13 @@ export class DeviceEnrollmentService {
       enrollmentRequestId: null,
       publicKeyThumbprint: thumbprint,
       now: requestedAt.toISOString(),
+      // WP-26/D26-04B: the SERVER's own artifact reference, passed straight
+      // through to the seam. This service reads nothing out of it and takes no
+      // decision from it — the evaluator resolves it, re-binds it to this
+      // organisation and this thumbprint, and answers `UNAVAILABLE` if it does
+      // not resolve. `null` (every pre-WP-26 caller) is answered exactly as it
+      // was before the field existed.
+      attestationArtifactRef: submission.attestationArtifactRef,
     });
 
     const enrollmentRequestId = randomUUID();
@@ -773,6 +870,95 @@ export class DeviceEnrollmentService {
       if (!isShieldTransactionRollback(error)) throw error;
       return { outcome: 'REFUSED', refusal: error.refusal };
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // WP-26/D26-09 — the two READS the enrollment ingress needs
+  //
+  // Neither takes an effect. They exist because the WP-26 ingress must never
+  // read a Shield table itself: Shield owns the registry, and a second module
+  // querying `enrollment_requests` directly would be a second place the
+  // isolation rules have to be got right.
+  // -------------------------------------------------------------------------
+
+  /**
+   * What the INTENDED USER of a ceremony may be told about it.
+   *
+   * The binding is `issuePossessionChallenge`'s, verbatim and deliberately: the
+   * caller's organisation must be the request's, and the caller must BE the
+   * intended user. Anything else answers `ENROLLMENT_REQUEST_NOT_FOUND`, which
+   * is also what an invented id answers — a foreign-tenant request, another
+   * operative's request and a request that never existed must be
+   * indistinguishable from outside.
+   *
+   * There is no `device.*` action here for the reason D24-02 gives: a Field
+   * operative's participation in their own device's enrollment is not device
+   * MANAGEMENT authority, and requiring one would be a contradiction. What is
+   * required is that the intended user is the human authenticated right now.
+   */
+  async readIntendedUserEnrollment(
+    principal: Principal,
+    input: { organisationId: string; enrollmentRequestId: string },
+  ): Promise<ReadIntendedUserEnrollmentOutcome> {
+    if (principal.organisation_id !== input.organisationId) {
+      return { outcome: 'REFUSED', refusal: 'ENROLLMENT_REQUEST_NOT_FOUND' };
+    }
+    const request = await this.repository.findEnrollmentRequest(input.organisationId, input.enrollmentRequestId);
+    if (request === null) return { outcome: 'REFUSED', refusal: 'ENROLLMENT_REQUEST_NOT_FOUND' };
+    if (request.intendedUserId !== principal.user.id) return { outcome: 'REFUSED', refusal: 'ENROLLMENT_REQUEST_NOT_FOUND' };
+    return {
+      outcome: 'FOUND',
+      enrollmentRequestId: request.id,
+      siteId: request.siteId,
+      state: request.state,
+      requestFingerprint: request.requestFingerprint,
+      publicKeyThumbprint: request.publicKeyThumbprint,
+      attestationOutcome: request.attestationOutcome,
+    };
+  }
+
+  /**
+   * The COMMANDER's queue: enrollments awaiting a human decision.
+   *
+   * `device.registry.read` at ORGANISATION level opens the question; C16-06's
+   * projection answers it. Genuine organisation-wide authority sees the tenant;
+   * a site-scoped commander sees the intersection with the sites their granting
+   * assignments cover; a principal holding the action at no site sees an empty
+   * list rather than everything.
+   *
+   * The `requestFingerprint` is included because it is the value the approver
+   * must name back — C14-02's whole point is that a human approves a specific
+   * set of bytes and cannot be made to approve a different request that merely
+   * shares an id. The attestation OUTCOME is included for the same reason: it is
+   * part of what is being approved. The raw certificate chain is not, and cannot
+   * be: nothing in Shield can load it.
+   */
+  async listPendingEnrollments(principal: Principal, input: { organisationId: string }): Promise<ListPendingEnrollmentsOutcome> {
+    const refusal = checkDeviceAuthority(principal, ACTION_DEVICE_REGISTRY_READ, input.organisationId, null);
+    if (refusal !== null) return { outcome: 'REFUSED', refusal };
+
+    const siteIds = readableSiteIds(principal, ACTION_DEVICE_REGISTRY_READ);
+    // `[]` is NOT `null`. See `readableSiteIds`: org-wide means "do not narrow",
+    // an empty list means "no site at all" and must return nothing.
+    if (siteIds !== null && siteIds.length === 0) return { outcome: 'FOUND', requests: [] };
+
+    const rows = await this.repository.listPendingEnrollmentRequests(input.organisationId, siteIds);
+    return {
+      outcome: 'FOUND',
+      requests: rows.map((row) => ({
+        enrollmentRequestId: row.id,
+        siteId: row.siteId,
+        intendedUserId: row.intendedUserId,
+        custody: row.custody as DeviceCustody,
+        custodyRegimeId: row.custodyRegimeId,
+        keyStorage: row.keyStorage as DeviceKeyStorage,
+        publicKeyThumbprint: row.publicKeyThumbprint,
+        requestFingerprint: row.requestFingerprint,
+        attestationOutcome: row.attestationOutcome,
+        state: row.state,
+        requestedAt: row.requestedAt,
+      })),
+    };
   }
 
   // -------------------------------------------------------------------------

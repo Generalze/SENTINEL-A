@@ -1,0 +1,342 @@
+// SENTINEL Field mobile enrollment ingress (WP-26, architecture sections 61,
+// 62, 62.1). Owned exclusively by
+// services/core-api/src/modules/device-enrollment-ingress. This file is
+// PERSISTENCE ONLY: every rule it serves is already frozen in
+// packages/contracts/src/device-identity.ts and device-signature.ts, and every
+// registry fact it names is owned by prisma/schema/shield.prisma. Nothing here
+// re-states a rule the contracts own or a fact the registry owns; these two
+// tables exist so the D26-04A attestation ceremony and the D26-04B provider
+// record are DURABLE.
+//
+// THE INVARIANT THIS SCHEMA EXISTS TO HOLD
+// ----------------------------------------
+//
+//     A BOOTSTRAP GRANT CREATES ZERO DEVICE AUTHORITY.
+//
+//     issuer != approver != intended user,
+//     and a human still approves THE EXACT REQUEST FINGERPRINT.
+//
+// shield.prisma states the registry's version of this and device-gateway.prisma
+// states the gateway's. WP-26 is where a PHYSICAL phone first speaks to the
+// server holding a key that is registered nowhere, so it is where the
+// temptation to let the ceremony's own state become a credential is strongest.
+// Neither table below is a credential. Steal every column in both and you hold
+// a freshness value and a record of what a verifier concluded; you hold no
+// device identity, no session, and no approval.
+//
+// THE ATTESTATION CHALLENGE IS NOT A SECRET (D26-04A)
+// ---------------------------------------------------
+// `challenge_value` is >= 256 bits of SERVER randomness, and it exists for one
+// reason: Android Key Attestation is baked in AT KEY GENERATION, so the server
+// nonce must exist BEFORE the phone generates its key. A server that does not
+// compare the value inside the attestation certificate against its own
+// challenge can be handed an old certificate. That makes this column a
+// FRESHNESS VALUE, never a credential — it is returned to the phone in the
+// clear, it is embedded in a certificate the phone then hands back, and
+// possession of it authorises precisely nothing.
+//
+// THE LIVE / HISTORY SPLIT (the WP-17A rule, applied to WP-26)
+// ------------------------------------------------------------
+// The doctrine header of prisma/schema/field.prisma states the locked ruling,
+// shield.prisma applies it to the registry and device-gateway.prisma applies it
+// to the gateway. Tables are divided by what they ASSERT.
+//
+//   CEREMONY STATE
+//     DeviceAttestationChallenge asserts something true *right now* — "this
+//     attestation ceremony is in flight, for this tenant, this site, this
+//     intended user and this bootstrap grant". So every Site, User and grant it
+//     names must exist and must belong to the same organisation. Each reference
+//     is COMPOSITE, over the (id, organisation_id) candidate keys
+//     `sites_id_organisation_key` (WP-17A), `users_id_organisation_key`
+//     (WP-24/D24-04a) and `bootstrap_grant_id_organisation_key` (WP-24), rather
+//     than a plain FK to `id`. A plain FK would still admit a row pairing one
+//     tenant's organisation with another tenant's site, user or grant; the
+//     composite reference makes the DATABASE reject it.
+//
+//     Every one of them is onDelete: Restrict. A grant's, a site's or a user's
+//     lifecycle must never silently delete the record of a challenge Sentinel
+//     issued, because a challenge row that vanishes does not become an expired
+//     challenge — it becomes a challenge the server can no longer make a
+//     statement about, and the one-shot property would be lost with it.
+//
+//   HISTORICAL ARTEFACT
+//     AndroidKeyAttestationArtifact carries NO Site, User, Device, grant or
+//     challenge foreign key AT ALL, per the historical-artefact rule the WP-17A
+//     header states and which shield.prisma applies to DeviceSecurityEvent,
+//     DeviceTrustTransition, DeviceAttestationObservation and
+//     DeviceNonceConsumption, and device-gateway.prisma applies to
+//     DeviceGatewayOperationEvent. Its identifiers are the identifiers AS
+//     RECORDED at the moment the verifier ran. `Cascade` would let a lifecycle
+//     erase the record of what the verifier decided — forbidden by section 61.
+//     `Restrict` would mean a grant could never be removed once a single chain
+//     had ever been evaluated, silently inventing a retirement policy this work
+//     package has no mandate to decide. Integrity comes from the write-time
+//     check instead: the ingress proves the tenant, the site, the user, the
+//     grant and the challenge all agree BEFORE the verifier is invoked.
+//
+// NOTHING IN THIS FILE EVER CASCADES.
+//
+// THE RAW CHAIN IS RESTRICTED, AND THIS IS THE ONLY PLACE IT LIVES (D26-04B)
+// --------------------------------------------------------------------------
+// `DeviceAttestationEvaluationInput` carries an organisation, optional
+// identifiers, a public-key thumbprint and a server instant — not a certificate
+// chain — and `EnrollmentRequestSubmission` has no attestation blob either.
+// That is not a gap to be fixed by stuffing a base64 chain into a frozen
+// contract or an audit payload. `certificate_chain_der` below is the ONE column
+// in Sentinel that holds the raw evidence, and the rule that governs it is
+// absolute:
+//
+//     the raw chain NEVER appears in an audit payload,
+//     NEVER in a request fingerprint as raw bytes,
+//     NEVER in a general application log,
+//     and NEVER in a client-readable response.
+//
+// Shield receives only `artifact_id` — an opaque, server-generated reference —
+// and the verdict. Everything else on this row is a PARSED SCALAR: an integer
+// security level, a boolean device-lock state, a package name. A scalar cannot
+// smuggle a blob.
+//
+// See docs/execution/directives/WP-26-field-mobile-foundation.md for the
+// governing directive (D26-01, D26-02, D26-04A, D26-04B, D26-09, D26-11) and
+// the WP-23 contracts for every vocabulary this file stores.
+//
+// A NOTE ON ENUM COLUMNS. The attestation outcome is stored as TEXT, not as a
+// Postgres enum type, for the reason shield.prisma, device-gateway.prisma and
+// whisper.prisma all state: the vocabulary and its transition table are owned
+// by the frozen contracts and versioned in reviewable code, not in a database
+// type whose every addition would be a migration. The contract is the
+// authority; the column is storage. The Android security levels, key purposes,
+// origins and verified-boot states are stored as the INTEGERS the platform
+// itself defines, because they are the platform's vocabulary and not Sentinel's
+// — translating them into words here would be this file inventing a mapping the
+// verifier would then have to agree with.
+
+// ===========================================================================
+// CEREMONY STATE
+// ===========================================================================
+
+/// The D26-04A pre-key-generation attestation challenge. ONE-SHOT,
+/// SHORT-LIVED, AND NOT A SECRET.
+///
+/// `id` IS the `attestation_challenge_id` — not a surrogate key beside one.
+/// There is exactly one identifier for an attestation ceremony and the server
+/// owns it.
+///
+/// WHY THIS TABLE EXISTS AT ALL. Android Key Attestation is produced WHEN THE
+/// KEY IS GENERATED: `setAttestationChallenge()` places the relying party's
+/// challenge inside the attestation certificate precisely so the key can be
+/// shown to have been created in response to a specific request. A sequence in
+/// which the phone generates a key and then submits it is replayable, because
+/// nothing in the submission distinguishes a certificate minted seconds ago
+/// from one minted last year. So the server issues the nonce FIRST, durably,
+/// and compares it against the value inside the certificate afterwards.
+///
+/// THIS IS NOT A SECRET, AND NOTHING MAY EVER TREAT IT AS ONE.
+///
+/// Steal every column in this table — `id`, `challenge_value`, the site, the
+/// intended user, the grant — and you have ZERO device authority. The
+/// enrollment still requires the one-shot bootstrap grant secret (which is NOT
+/// stored here and is never embedded in a certificate), the intended user's
+/// independent authenticated session, a StrongBox key whose private half never
+/// leaves the hardware, and an independent commander's approval of the exact
+/// request fingerprint.
+///
+/// LIFETIME. `DEVICE_ATTESTATION_CHALLENGE_MAX_AGE_MS` = 120_000, with an
+/// EXCLUSIVE `expires_at` boundary, evaluated at request time — there is no
+/// expiry scheduler, per D25-08's still-binding constraint against new
+/// background schedulers. The window is additionally CLAMPED so a challenge can
+/// never outlive its bootstrap grant: an old attestation is not accepted merely
+/// because the grant still has time left, and a grant that is already dead
+/// cannot mint a challenge at all.
+///
+/// CEREMONY STATE — composite tenant-aware relations, Restrict. See this
+/// file's header.
+model DeviceAttestationChallenge {
+  /// The `attestation_challenge_id` itself.
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  siteId String @map("site_id") @db.Text
+  /// Enrollment provenance, NOT hardware identity (C14-02). The intended user
+  /// is ALSO the human whose live session the ingress equality-binds before
+  /// this row is written — but this column is the record of the binding, never
+  /// the answer to it.
+  intendedUserId String @map("intended_user_id") @db.Text
+  /// The ceremony this challenge belongs to. A challenge is meaningless
+  /// without it: the grant is what a commander authorised, and the challenge is
+  /// only the freshness value inside that authorisation.
+  bootstrapGrantId String @map("bootstrap_grant_id") @db.Uuid
+
+  /// >= 256 bits of SERVER randomness, canonical unpadded base64url.
+  ///
+  /// NOT A SECRET — a freshness value. The phone receives it in the clear, and
+  /// hands it back embedded in a certificate that anyone holding the device
+  /// could read. What it buys is the one property a relying party cannot get
+  /// any other way: proof that THIS key was generated in response to THIS
+  /// request, and not before it.
+  challengeValue String @map("challenge_value") @db.Text
+
+  issuedAt DateTime @map("issued_at") @db.Timestamptz(3)
+  /// EXCLUSIVE boundary, per the existing WP-23/WP-24/WP-25 doctrine, and
+  /// clamped to the bootstrap grant's own expiry. See this model's header.
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(3)
+
+  /// NULL while the challenge stands. Stamped by a fenced conditional update in
+  /// the SAME statement that claims it, which is what makes the challenge
+  /// one-shot IN FACT and not merely by intention. It is never cleared: a spent
+  /// challenge does not become unspent, and a verification that failed does not
+  /// hand the value back — the phone discards the unfinished key and restarts
+  /// with a new challenge, which is exactly what D26-04A prescribes.
+  consumedAt DateTime? @map("consumed_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  /// Composite, over `sites_id_organisation_key`, `users_id_organisation_key`
+  /// and `bootstrap_grant_id_organisation_key`: the database itself rejects a
+  /// challenge pairing org-A with a site, an intended user or a bootstrap grant
+  /// belonging to org-B. Restrict, per this file's header.
+  site Site @relation(fields: [siteId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  intendedUser User @relation("AttestationChallengeIntendedUser", fields: [intendedUserId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  bootstrapGrant EnrollmentBootstrapGrant @relation(fields: [bootstrapGrantId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
+  /// ONE CHALLENGE VALUE PER TENANT. Two live challenges carrying the same
+  /// value would be two ceremonies competing over one attestation certificate,
+  /// and the server would be unable to say which key was generated for which
+  /// request.
+  @@unique([organisationId, challengeValue], map: "device_attestation_challenge_value_key")
+  /// "What attestation ceremonies are outstanding behind this grant." A grant
+  /// may legitimately mint SEVERAL challenges over its life — an expired
+  /// challenge means the phone discards the unfinished key and restarts — so
+  /// this is an index, deliberately not a uniqueness constraint.
+  @@index([organisationId, bootstrapGrantId])
+  @@map("device_attestation_challenges")
+}
+
+// ===========================================================================
+// HISTORICAL ARTEFACT — append-only, and the ONE restricted store
+// ===========================================================================
+
+/// ONE ANDROID KEY ATTESTATION EVALUATION, as performed. APPEND-ONLY.
+///
+/// This is the D26-04B provider record: the server's own account of what it
+/// concluded about one certificate chain, at one instant, against one version
+/// of its trust material. Shield never sees it. Shield receives `artifact_id` —
+/// an opaque server-generated reference that fits the frozen
+/// `DeviceAttestationEvidence.attestation_reference` field — plus the outcome,
+/// and nothing else. A structure with nowhere to put a blob cannot leak one,
+/// and the frozen evidence structure has nowhere to put one.
+///
+/// NO LIFECYCLE FOREIGN KEY AT ALL — not to Site, User, Device, the bootstrap
+/// grant, or even the attestation challenge this row names. That is the WP-17A
+/// historical-artefact rule, and the reasoning is unchanged: `Cascade` would let
+/// a lifecycle erase the record of what the verifier decided, and `Restrict`
+/// would invent a retirement policy this work package has no mandate to decide.
+/// The identifiers below are the identifiers AS RECORDED at the moment of
+/// evaluation.
+///
+/// WHY THE VERSIONS ARE COLUMNS. A verdict is only meaningful relative to the
+/// trust material it was reached against. `verifier_version`,
+/// `trust_anchor_set_version` and `revocation_snapshot_version` are recorded so
+/// that a later reviewer can answer "what did the server know when it said
+/// that?" without guessing. A verdict whose trust material cannot be named is
+/// not evidence; it is an assertion.
+///
+/// WHAT MAY NEVER LEAVE THIS ROW. `certificate_chain_der` is the raw evidence
+/// and it is RESTRICTED: no audit payload, no fingerprint input, no application
+/// log, no client-readable response. Every other column here is a parsed scalar
+/// precisely so that the useful facts can travel without the blob travelling
+/// with them.
+model AndroidKeyAttestationArtifact {
+  /// The `artifact_id` itself — SERVER GENERATED. There is no parameter
+  /// anywhere through which a caller could supply one, for the reason D24-04
+  /// gives the sequence namespace and D24-10A gives a proposed key identity: a
+  /// value a client can choose is a value a client can shape history with.
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+
+  /// AS RECORDED. Plain columns, no foreign key — see this model's header.
+  bootstrapGrantId String @map("bootstrap_grant_id") @db.Uuid
+  attestationChallengeId String @map("attestation_challenge_id") @db.Uuid
+
+  /// The canonical thumbprint of the key this chain was evaluated FOR (C15-02:
+  /// computed from the key, never believed). The evaluator re-binds an incoming
+  /// artifact reference against this column and the organisation, so a
+  /// reference borrowed from another ceremony resolves to nothing.
+  publicKeyThumbprint String @map("public_key_thumbprint") @db.Text
+  /// SHA-256, lowercase hex, over the canonical concatenation of the submitted
+  /// DER certificates. A HANDLE, not the evidence: it lets two submissions be
+  /// compared, and a log or an audit row name a chain, without the bytes.
+  certificateChainHash String @map("certificate_chain_hash") @db.Text
+
+  verifierVersion String @map("verifier_version") @db.Text
+  trustAnchorSetVersion String @map("trust_anchor_set_version") @db.Text
+  revocationSnapshotVersion String @map("revocation_snapshot_version") @db.Text
+
+  // -------------------------------------------------------------------------
+  // PARSED SECURITY CLAIMS — structured scalars, every one of them NULLABLE
+  //
+  // Nullable because a refused evaluation may never have got far enough to read
+  // them: an unparseable chain has no security level, and a chain that failed
+  // to validate has no claims worth recording as though they had been believed.
+  // A NULL here means "not established", never "false".
+  // -------------------------------------------------------------------------
+
+  /// The KeyDescription's own version number.
+  attestationVersion Int? @map("attestation_version")
+  /// 0 = Software, 1 = TrustedEnvironment, 2 = StrongBox. The platform's
+  /// vocabulary, stored as the platform's integers. D26-03A: a certificate
+  /// saying TEE is NEVER promoted into the StrongBox profile.
+  attestationSecurityLevel Int? @map("attestation_security_level")
+  keymasterSecurityLevel Int? @map("keymaster_security_level")
+  /// The teeEnforced authorisation list, read as scalars. `key_purposes` is the
+  /// SET as recorded, sorted ascending, so a purpose the verifier refused is
+  /// still auditable.
+  keyPurposes Int[] @map("key_purposes")
+  keyAlgorithm Int? @map("key_algorithm")
+  keySize Int? @map("key_size")
+  keyEcCurve Int? @map("key_ec_curve")
+  keyOrigin Int? @map("key_origin")
+  noAuthRequired Boolean? @map("no_auth_required")
+  /// RootOfTrust: 0 = Verified, 1 = SelfSigned, 2 = Unverified, 3 = Failed.
+  verifiedBootState Int? @map("verified_boot_state")
+  deviceLocked Boolean? @map("device_locked")
+  /// The AttestationApplicationId, as read from the certificate. It is the
+  /// application identity the chain CLAIMS; the verifier compares it against
+  /// server configuration and this column records what was compared.
+  attestationPackageName String? @map("attestation_package_name")
+  /// SHA-256, lowercase hex, of the signing certificate the package was signed
+  /// with, as carried by the extension.
+  attestationSigningDigest String? @map("attestation_signing_digest")
+
+  /// VERIFIED | NEGATIVE | INVALID | REVOKED | UNAVAILABLE
+  /// (`DeviceAttestationOutcomeSchema`). C14-05's split is frozen and this
+  /// column stores its result, never a re-interpretation of it.
+  outcome String @db.Text
+  /// The verifier's OWN precise reason, from its internal vocabulary. It is
+  /// deliberately richer than anything a caller is ever told: the external
+  /// answer for every refusal is identical, and the reason lives here where an
+  /// operator can read it and an attacker cannot.
+  outcomeReason String @map("outcome_reason") @db.Text
+
+  /// The AUTHORITATIVE SERVER instant the evaluation was performed at, passed
+  /// in from the transaction rather than read from a second clock — the reason
+  /// `DeviceAttestationEvaluator.evaluate` takes `now` as an argument.
+  evaluatedAt DateTime @map("evaluated_at") @db.Timestamptz(3)
+
+  /// THE RESTRICTED COLUMN. The raw submitted chain, as canonical base64 DER,
+  /// one certificate per element, leaf first. See this file's header for the
+  /// four places it may never appear.
+  certificateChainDer String[] @map("certificate_chain_der")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  /// "Show me every evaluation this key was ever the subject of." The
+  /// evaluator's re-binding lookup is by primary key and organisation; this
+  /// index serves review, not the hot path.
+  @@index([organisationId, publicKeyThumbprint])
+  /// "Show me what this ceremony's verifier concluded."
+  @@index([organisationId, attestationChallengeId])
+  @@map("android_key_attestation_artifacts")
+}

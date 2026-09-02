@@ -510,6 +510,31 @@ export class ShieldRepository {
   }
 
   /**
+   * WP-26/D26-09: the enrollments in this tenant that are still awaiting a
+   * human decision, optionally narrowed to the sites a reader may see.
+   *
+   * `siteIds === null` means GENUINE ORGANISATION-WIDE authority and must not
+   * be confused with an empty list, which means "this reader holds the action at
+   * no site" and must return nothing. Collapsing the two is the classic way a
+   * scoped read becomes a tenant-wide one, and `readableSiteIds` returns them as
+   * two different values for exactly that reason (C16-06).
+   *
+   * REQUESTED only. An approved, committed or otherwise advanced ceremony is
+   * not awaiting a decision, and a queue that shows finished work is a queue an
+   * operator stops reading.
+   */
+  async listPendingEnrollmentRequests(organisationId: string, siteIds: string[] | null): Promise<EnrollmentRequestRow[]> {
+    return this.prisma.enrollmentRequest.findMany({
+      where: {
+        organisationId,
+        state: 'REQUESTED',
+        ...(siteIds === null ? {} : { siteId: { in: siteIds } }),
+      },
+      orderBy: { requestedAt: 'asc' },
+    });
+  }
+
+  /**
    * C16-02: THE request a bootstrap grant has already opened, if any.
    *
    * `enrollment_request_grant_key` makes this at most one row, and the service

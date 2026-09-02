@@ -76,6 +76,12 @@ model Site {
   /// still answered from current entitlement.
   deviceContextEstablishmentChallenges DeviceContextEstablishmentChallenge[]
   authenticatedDeviceContextSites AuthenticatedDeviceContextSite[]
+  /// WP-26 back-relation. Required by Prisma for the composite
+  /// (site_id, organisation_id) relation declared in device-enrollment.prisma;
+  /// it adds no column and no behaviour to Identity. An attestation challenge
+  /// naming a site grants nothing at that site (D26-04A): it is a freshness
+  /// value bound to a ceremony, not a scope statement.
+  deviceAttestationChallenges DeviceAttestationChallenge[]
 
   @@unique([id, organisationId], map: "sites_id_organisation_key")
   @@index([organisationId])
@@ -140,6 +146,13 @@ model User {
   /// entitlement, re-read on every request.
   deviceContextEstablishmentChallenges DeviceContextEstablishmentChallenge[]
   authenticatedDeviceContexts AuthenticatedDeviceContextRecord[]
+
+  /// WP-26 back-relation. Required by Prisma for the composite
+  /// (intended_user_id, organisation_id) relation declared in
+  /// device-enrollment.prisma; it adds no column and no behaviour to Identity.
+  /// It is enrollment PROVENANCE, never authority: being the intended user of
+  /// an attestation challenge confers no device, no site scope and no action.
+  deviceAttestationChallenges DeviceAttestationChallenge[] @relation("AttestationChallengeIntendedUser")
 
   @@unique([organisationId, email])
   /// WP-24 / D24-04a: a candidate key, deliberately redundant with the primary

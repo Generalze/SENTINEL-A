@@ -549,6 +549,13 @@ model EnrollmentBootstrapGrant {
   issuedByUser User @relation("BootstrapGrantIssuedByUser", fields: [issuedByUserId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
 
   enrollmentRequests EnrollmentRequest[]
+  /// WP-26 back-relation. Required by Prisma for the composite
+  /// (bootstrap_grant_id, organisation_id) relation declared in
+  /// device-enrollment.prisma. A grant may mint SEVERAL D26-04A attestation
+  /// challenges over its life — an expired challenge means the phone discards
+  /// the unfinished key and starts the attestation step again — and none of
+  /// them extends the grant, moves its expiry or creates any device authority.
+  attestationChallenges DeviceAttestationChallenge[]
 
   /// THE LOOKUP KEY. A presented token is digested and resolved through this
   /// index; the raw value is never compared against anything at rest because

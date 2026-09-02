@@ -21,6 +21,7 @@ import { FieldModule } from './modules/field/field.module';
 import { FieldMessagingModule } from './modules/field-messaging/field-messaging.module';
 import { FieldOfflineModule } from './modules/field-offline/field-offline.module';
 import { PatrolModule } from './modules/patrol/patrol.module';
+import { DeviceEnrollmentIngressModule } from './modules/device-enrollment-ingress/device-enrollment-ingress.module';
 import { DeviceGatewayModule } from './modules/device-gateway/device-gateway.module';
 import { ShieldModule } from './modules/shield/shield.module';
 import { WhisperModule } from './modules/whisper/whisper.module';
@@ -81,6 +82,16 @@ import { WhisperModule } from './modules/whisper/whisper.module';
     // and no authenticated-socket path (D25-01, D25-10). See
     // device-gateway.controller.ts for what the boundary refuses.
     DeviceGatewayModule,
+    // WP-26 Field Mobile Foundation — the device enrollment ingress. It is the
+    // PRE-REGISTRATION surface, and the counterpart to the gateway above: the
+    // gateway serves a device that is already registered, this serves the
+    // ceremony that registers one. Neither route on it is `@Public()` and
+    // neither authenticates the device — a phone holding a key registered
+    // nowhere cannot be authenticated, which is the reason the two-human
+    // ceremony exists rather than a gap in it (D26-01). It also owns the
+    // Command-side transport for bootstrap issuance and approval, so Shield
+    // keeps its property of having zero controllers (D24-13/D26-09).
+    DeviceEnrollmentIngressModule,
   ],
 })
 export class AppModule {}
