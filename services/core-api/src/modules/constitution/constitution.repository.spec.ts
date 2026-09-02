@@ -61,6 +61,8 @@ class FakePrisma {
   transactionDepth = 0;
   sabotageUpdateMany = false;
   createError: unknown = null;
+  /** WP-26: lets a spec model a conflict that CLEARS on the retry, as a real competing boot does. */
+  beforeCreate: (() => void) | null = null;
   private nextId = 0;
 
   readonly constitutionPolicy = {
@@ -80,6 +82,7 @@ class FakePrisma {
     },
 
     create: (args: { data: Omit<Row, 'id' | 'createdAt' | 'activatedAt'> & Partial<Row> }): Promise<Row> => {
+      this.beforeCreate?.();
       if (this.createError !== null) return Promise.reject(this.createError);
       this.nextId += 1;
       const row: Row = {
@@ -178,22 +181,61 @@ describe('ensureBaselineSeeded: the bootstrap exemption', () => {
     expect(prisma.rows[0]?.version).toBe('sentinel-constitution-9.9.9');
   });
 
-  it('treats a concurrent seed (unique violation) as already seeded', async () => {
+  it('WP-26: retries a concurrent seed (unique violation) and succeeds once the winner is visible', async () => {
+    // A unique violation means the winner's row really is committed, so the
+    // retry's opening count observes it and returns without inserting again.
     prisma.createError = new Prisma.PrismaClientKnownRequestError('duplicate version', {
       code: 'P2002',
       clientVersion: 'test',
     });
+    prisma.beforeCreate = () => {
+      prisma.rows.push({
+        id: 'winner',
+        version: 'sentinel-constitution-1.0.0',
+        body: {},
+        contentSha256: 'x'.repeat(64),
+        status: 'active',
+        createdBy: 'system.bootstrap',
+        createdAt: new Date('2026-08-14T09:00:00.000Z'),
+        activatedAt: new Date('2026-08-14T09:00:00.000Z'),
+      } as never);
+    };
 
     await expect(repository.ensureBaselineSeeded()).resolves.toBeUndefined();
+    expect(prisma.rows).toHaveLength(1);
   });
 
-  it('treats a serialisation conflict as already seeded', async () => {
+  it('WP-26: RETRIES a serialisation conflict rather than assuming the winner has committed', async () => {
+    // The old behaviour swallowed the conflict once and returned, reasoning
+    // that another instance had seeded the baseline. A serialization failure
+    // aborts THIS transaction when the conflict is DETECTED, which is not when
+    // the other transaction COMMITS - so returning immediately let `reload()`
+    // read an empty store and throw NoActivePolicyError on a database that was
+    // about to be perfectly well seeded. Any fresh deployment whose replicas
+    // boot together could lose that race.
+    let attempts = 0;
+    prisma.beforeCreate = () => {
+      attempts += 1;
+      // Conflict once, as a competing boot would, then let the retry through.
+      prisma.createError =
+        attempts === 1
+          ? new Prisma.PrismaClientKnownRequestError('write conflict', { code: 'P2034', clientVersion: 'test' })
+          : null;
+    };
+
+    await expect(repository.ensureBaselineSeeded()).resolves.toBeUndefined();
+    expect(attempts).toBeGreaterThan(1);
+  });
+
+  it('WP-26: fails LOUDLY when it cannot make progress, rather than booting unseeded', async () => {
+    // A service that believes it has a constitution and does not is worse than
+    // one that refuses to start.
     prisma.createError = new Prisma.PrismaClientKnownRequestError('write conflict', {
       code: 'P2034',
       clientVersion: 'test',
     });
 
-    await expect(repository.ensureBaselineSeeded()).resolves.toBeUndefined();
+    await expect(repository.ensureBaselineSeeded()).rejects.toThrow('write conflict');
   });
 
   it('propagates any other failure rather than booting on an unseeded store', async () => {

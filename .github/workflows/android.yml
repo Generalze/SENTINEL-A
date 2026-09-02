@@ -86,26 +86,23 @@ jobs:
           gradle-version: '8.7'
           build-root-directory: apps/field-mobile-android
 
-      # `gradle/wrapper/gradle-wrapper.jar` IS NOT COMMITTED — see the note at
-      # the top of `gradlew`. Generating it here from the pinned
-      # `gradle-wrapper.properties` also VERIFIES that file: a properties file
-      # naming a distribution that does not exist fails at this step rather
-      # than silently never being used.
-      - name: Materialise the Gradle wrapper
-        run: |
-          gradle wrapper --gradle-version 8.7
-          chmod +x ./gradlew
-          ./gradlew --version
-
+      # THERE IS NO GRADLE WRAPPER IN THIS PROJECT, DELIBERATELY.
+      #
+      # A wrapper needs `gradle-wrapper.jar`, and this work package was authored
+      # on a machine with no JDK, no Gradle and no Android SDK — so a committed
+      # jar would have been binary content nobody here could produce or verify,
+      # and hand-written launcher scripts standing in for the official ones were
+      # worse: they LOOKED like a wrapper without being one. `setup-gradle`
+      # provisions the exact pinned Gradle, and `gradle` is invoked directly.
       - name: Assemble (debug)
-        run: ./gradlew --no-daemon --stacktrace :app:assembleDebug
+        run: gradle --no-daemon --stacktrace :app:assembleDebug
 
       - name: Android Lint
-        run: ./gradlew --no-daemon --stacktrace :app:lintDebug
+        run: gradle --no-daemon --stacktrace :app:lintDebug
 
       # The evidence that actually covers the security-critical logic.
       - name: Kotlin/JVM unit tests
-        run: ./gradlew --no-daemon --stacktrace :app:testDebugUnitTest
+        run: gradle --no-daemon --stacktrace :app:testDebugUnitTest
 
       - name: Upload reports
         if: always()
