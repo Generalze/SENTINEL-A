@@ -730,8 +730,15 @@ export class ShieldRepository {
     return tx.device.create({ data: input });
   }
 
-  async findDevice(organisationId: string, deviceId: string): Promise<DeviceRow | null> {
-    return this.prisma.device.findFirst({ where: { id: deviceId, organisationId } });
+  /**
+   * WP-25/D25-16: `tx` is an internal composition seam, not a widened API. The
+   * gateway's final effect transaction re-reads this row AFTER locking it and
+   * must see the transaction's own view, not a second connection's. Existing
+   * callers pass nothing and reach exactly the query they always did.
+   */
+  async findDevice(organisationId: string, deviceId: string, tx?: Tx): Promise<DeviceRow | null> {
+    const db: Tx = tx ?? this.prisma;
+    return db.device.findFirst({ where: { id: deviceId, organisationId } });
   }
 
   async findDeviceByEnrollmentRequest(tx: Tx, organisationId: string, enrollmentRequestId: string): Promise<DeviceRow | null> {
@@ -833,8 +840,10 @@ export class ShieldRepository {
     return tx.deviceKey.create({ data: input });
   }
 
-  async findDeviceKeyByKeyId(organisationId: string, keyId: string): Promise<DeviceKeyRow | null> {
-    return this.prisma.deviceKey.findFirst({ where: { organisationId, keyId } });
+  /** WP-25/D25-16: the same internal composition seam as `findDevice`. */
+  async findDeviceKeyByKeyId(organisationId: string, keyId: string, tx?: Tx): Promise<DeviceKeyRow | null> {
+    const db: Tx = tx ?? this.prisma;
+    return db.deviceKey.findFirst({ where: { organisationId, keyId } });
   }
 
   /**
@@ -935,6 +944,48 @@ export class ShieldRepository {
     },
   ): Promise<void> {
     await tx.deviceSiteScope.create({ data: input });
+  }
+
+  /**
+   * WP-25/C17-04 — THE ONE (organisation, device, site) SCOPE ROW A REQUEST
+   * DEPENDS ON, HELD STILL FOR THE DECISION IT FEEDS.
+   *
+   * `listDeviceSiteIds` answers "where is this device deployed?" as an
+   * unlocked list, which is the right shape for a roster read and the WRONG
+   * shape for an authority fence: between reading the list and committing the
+   * effect, a concurrent transaction can release or move the very association
+   * the decision rested on, and nothing would have stopped it.
+   *
+   * `device_site_scope_key` — UNIQUE (organisation_id, device_id, site_id) —
+   * means the tuple this locks is at most one row, so `FOR UPDATE` here is a
+   * lock on the EXACT fact, not on a range. A concurrent release blocks until
+   * the gateway's transaction commits or rolls back; a release that got there
+   * first is already visible and this returns `false`.
+   *
+   * `released_at IS NULL` is part of the predicate rather than a check the
+   * caller applies afterwards, so "no such association" and "an association
+   * that has been released" are one answer, taken by the database.
+   */
+  async lockActiveDeviceSiteScope(tx: Tx, organisationId: string, deviceId: string, siteId: string): Promise<boolean> {
+    if (!isUuid(deviceId)) return false;
+    const rows = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+      SELECT id
+      FROM device_site_scopes
+      WHERE organisation_id = ${organisationId}
+        AND device_id = ${deviceId}::uuid
+        AND site_id = ${siteId}
+        AND released_at IS NULL
+      FOR UPDATE`);
+    return rows.length === 1;
+  }
+
+  /** The unlocked variant of the same question, for a preflight that commits nothing. */
+  async hasActiveDeviceSiteScope(organisationId: string, deviceId: string, siteId: string): Promise<boolean> {
+    const row = await this.prisma.deviceSiteScope.findFirst({
+      where: { organisationId, deviceId, siteId, releasedAt: null },
+      select: { id: true },
+    });
+    return row !== null;
   }
 
   async listDeviceSiteIds(organisationId: string, deviceId: string): Promise<string[]> {
@@ -1231,17 +1282,28 @@ export class ShieldRepository {
   async readAttestationEvidence(
     organisationId: string,
     deviceId: string,
+    tx?: Tx,
   ): Promise<{
     latest: { outcome: string; evaluatedAt: Date } | null;
     decisive: { outcome: string; evaluatedAt: Date } | null;
     now: Date;
   }> {
-    return this.transaction(async (tx) => {
-      const now = await this.dbNow(tx);
-      const latest = await this.latestAttestationObservation(tx, organisationId, deviceId);
-      const decisive = await this.latestDecisiveAttestation(tx, organisationId, deviceId);
+    // WP-25/D25-16: the same internal composition seam the two finders carry.
+    // Opening a NESTED transaction from inside the gateway's final effect
+    // transaction would read the evidence on a second connection, outside the
+    // very snapshot and the very locks the D25-04A fence rests on — so when a
+    // transaction is supplied the reads join it instead of starting their own.
+    const read = async (db: Tx): Promise<{
+      latest: { outcome: string; evaluatedAt: Date } | null;
+      decisive: { outcome: string; evaluatedAt: Date } | null;
+      now: Date;
+    }> => {
+      const now = await this.dbNow(db);
+      const latest = await this.latestAttestationObservation(db, organisationId, deviceId);
+      const decisive = await this.latestDecisiveAttestation(db, organisationId, deviceId);
       return { latest, decisive, now };
-    });
+    };
+    return tx ? read(tx) : this.transaction(read);
   }
 
   /**

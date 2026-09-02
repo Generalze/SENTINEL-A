@@ -1,4 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
+import type { Prisma } from '@prisma/client';
 import {
   DeviceRegistryKeyRecordSchema,
   deviceKeyStatePermitsNewOperations,
@@ -144,9 +145,21 @@ export class DeviceRegistryService {
    * which re-derives the thumbprint from the key and refuses a row whose
    * status and timestamps tell different stories. A registry row that cannot
    * satisfy its own contract is not handed to a verifier.
+   *
+   * WP-25/C17-04: `tx` IS NOT OPTIONAL DECORATION. A caller that has taken the
+   * device and key row locks and then resolves the key OUTSIDE its transaction
+   * is reading a row nothing is holding still — the registry could have rotated
+   * or withdrawn it in the gap, and the decision would commit against a fact
+   * that was already stale when it was read. Every gateway call site inside a
+   * final transaction passes its `tx`; the preflight, which commits nothing,
+   * deliberately does not.
    */
-  async resolveRegistryKeyRecord(organisationId: string, keyId: string): Promise<DeviceRegistryKeyRecord | null> {
-    const key = await this.repository.findDeviceKeyByKeyId(organisationId, keyId);
+  async resolveRegistryKeyRecord(
+    organisationId: string,
+    keyId: string,
+    tx?: Prisma.TransactionClient,
+  ): Promise<DeviceRegistryKeyRecord | null> {
+    const key = await this.repository.findDeviceKeyByKeyId(organisationId, keyId, tx);
     if (key === null) return null;
     const parsed = DeviceRegistryKeyRecordSchema.safeParse({
       schema_version: 1,
@@ -183,11 +196,40 @@ export class DeviceRegistryService {
    * act, and treating "not found" as anything but a refusal would make the
    * whole registry optional.
    */
-  async credentialAdmitsNewOperations(organisationId: string, deviceId: string): Promise<boolean> {
-    const device = await this.repository.findDevice(organisationId, deviceId);
+  async credentialAdmitsNewOperations(organisationId: string, deviceId: string, tx?: Prisma.TransactionClient): Promise<boolean> {
+    const device = await this.repository.findDevice(organisationId, deviceId, tx);
     if (device === null) return false;
-    const key = device.currentKeyId === null ? null : await this.repository.findDeviceKeyByKeyId(organisationId, device.currentKeyId);
+    const key = device.currentKeyId === null ? null : await this.repository.findDeviceKeyByKeyId(organisationId, device.currentKeyId, tx);
     return !this.deviceLevelWithdrawn(device) && !this.keyLevelWithdrawn(key);
+  }
+
+  /**
+   * C16-R5's EFFECTIVE standing, exposed as a VALUE, principal-free.
+   *
+   * WP-25 needs the trust WORD and not merely a boolean: the frozen
+   * `DeviceRegistryFacts.trust` is a `DeviceTrust`, and
+   * `evaluateDeviceOperationPrincipals` takes one too. Before this method the
+   * only way to obtain it from outside was `readDeviceStanding`, which is a
+   * `device.registry.read` PERFORMED BY A PERSON and requires a principal —
+   * and D24-02 is explicit that the gateway resolving a registry record to
+   * authenticate an incoming device is an internal service call and must not
+   * be modelled as one. Minting a synthetic principal to satisfy that guard is
+   * exactly what the ruling forbids.
+   *
+   * It is a one-line delegation to the SAME private resolution `deviceMayAct`
+   * and `buildStanding` use, deliberately: C16-R5's whole point is that there
+   * is ONE canonical effective-standing resolution, so a second caller gets
+   * the same answer rather than a second implementation of it. `null` for an
+   * unknown device, which is the only fail-closed answer — a caller that
+   * cannot find a device has established nothing about its standing.
+   *
+   * WP-25/D25-16: `tx` joins the caller's transaction so the D25-04A fence
+   * reads this under the same locks it re-reads everything else under.
+   */
+  async effectiveDeviceTrust(organisationId: string, deviceId: string, tx?: Prisma.TransactionClient): Promise<DeviceTrust | null> {
+    const device = await this.repository.findDevice(organisationId, deviceId, tx);
+    if (device === null) return null;
+    return this.effectiveDeviceStanding(device, tx);
   }
 
   /**
@@ -216,16 +258,21 @@ export class DeviceRegistryService {
    * must ask this AND the user-authority question AND the site/context
    * question, separately, and require all of them.
    */
-  async deviceMayAct(organisationId: string, deviceId: string, purpose: DeviceRequestPurpose): Promise<boolean> {
-    const device = await this.repository.findDevice(organisationId, deviceId);
+  async deviceMayAct(
+    organisationId: string,
+    deviceId: string,
+    purpose: DeviceRequestPurpose,
+    tx?: Prisma.TransactionClient,
+  ): Promise<boolean> {
+    const device = await this.repository.findDevice(organisationId, deviceId, tx);
     if (device === null) return false;
-    const key = device.currentKeyId === null ? null : await this.repository.findDeviceKeyByKeyId(organisationId, device.currentKeyId);
+    const key = device.currentKeyId === null ? null : await this.repository.findDeviceKeyByKeyId(organisationId, device.currentKeyId, tx);
     if (this.deviceLevelWithdrawn(device) || this.keyLevelWithdrawn(key)) return false;
     // C16-R5: the EFFECTIVE trust, not the persisted column. See
     // `effectiveDeviceStanding` — a device whose attestation aged out of the
     // six-hour grace while nothing was observing it still reads TRUSTED in the
     // database, and reading that column here is what let it keep firing Whisper.
-    return deviceTrustPermitsPurpose(await this.effectiveDeviceStanding(device), purpose);
+    return deviceTrustPermitsPurpose(await this.effectiveDeviceStanding(device, tx), purpose);
   }
 
   /**
@@ -256,14 +303,14 @@ export class DeviceRegistryService {
    * and would race the observation path that owns the durable
    * `TRUSTED -> DEGRADED` transition and its D24-08 record.
    */
-  private async effectiveDeviceStanding(device: DeviceRow): Promise<DeviceTrust> {
+  private async effectiveDeviceStanding(device: DeviceRow, tx?: Prisma.TransactionClient): Promise<DeviceTrust> {
     const persisted = device.trust as DeviceTrust;
     // Only TRUSTED rests on expiring evidence, so only TRUSTED needs the
     // history read. Skipping it elsewhere is not an optimisation dressed as a
     // rule: `effectiveDeviceTrust` returns the persisted value unchanged for
     // every other state, so the read could not change the answer.
     if (persisted !== 'TRUSTED') return persisted;
-    const evidence = await this.repository.readAttestationEvidence(device.organisationId, device.id);
+    const evidence = await this.repository.readAttestationEvidence(device.organisationId, device.id, tx);
     return effectiveDeviceTrust(persisted, resolveAttestationStanding(evidence));
   }
 

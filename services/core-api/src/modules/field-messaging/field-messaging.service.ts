@@ -1,4 +1,5 @@
 import { BadRequestException, ConflictException, ForbiddenException, Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import type { Prisma } from '@prisma/client';
 import { IncidentFieldMessageSchema, MAX_INCIDENT_FIELD_MESSAGE_BODY_BYTES, MAX_INCIDENT_FIELD_MESSAGE_MEDIA_REFS } from '@sentinel/contracts';
 import { z } from 'zod';
 import type { Principal } from '../../common/security/principal';
@@ -39,6 +40,19 @@ function parseOrBadRequest<T>(schema: z.ZodSchema<T>, raw: unknown): T {
 
 function siteAllowed(siteScope: SiteScope, siteId: string): boolean {
   return siteScope.orgWide || siteScope.siteIds.includes(siteId);
+}
+
+/**
+ * WP-25/D25-16: forwards the composition transaction ONLY when there is one.
+ *
+ * Passing an explicit `undefined` would be semantically identical, and that is
+ * not the standard this seam is held to: an existing human caller must reach
+ * the repository with EXACTLY the arguments it always did, so "existing
+ * callers are unchanged" is true at the call boundary and not merely true in
+ * effect.
+ */
+function txArg(tx?: Prisma.TransactionClient): [] | [Prisma.TransactionClient] {
+  return tx === undefined ? [] : [tx];
 }
 
 /**
@@ -217,8 +231,23 @@ export class FieldMessagingService {
     return rows.map(mapMessage);
   }
 
-  /** Only a named recipient may acknowledge, and only for their own delivery row. */
-  async acknowledge(principal: Principal, siteScope: SiteScope, messageId: string, input: AcknowledgeInput): Promise<IncidentFieldMessageView> {
+  /**
+   * Only a named recipient may acknowledge, and only for their own delivery row.
+   *
+   * WP-25/D25-16: `tx` is an internal composition seam, not a public API
+   * concern. An orchestrator that must commit this acknowledgement together
+   * with its own rows supplies its transaction; the recipiency check, the
+   * C8-01 DELIVERED precondition, the idempotency identity and the returned
+   * view are unchanged, and Field Messaging remains the only implementation of
+   * acknowledgement semantics. Existing human callers pass nothing.
+   */
+  async acknowledge(
+    principal: Principal,
+    siteScope: SiteScope,
+    messageId: string,
+    input: AcknowledgeInput,
+    tx?: Prisma.TransactionClient,
+  ): Promise<IncidentFieldMessageView> {
     const result = await this.repository.acknowledge(
       principal.organisation_id,
       messageId,
@@ -226,6 +255,7 @@ export class FieldMessagingService {
       input.idempotency_key,
       siteScope,
       ACKNOWLEDGE_REQUIRES_STATE,
+      ...txArg(tx),
     );
 
     if (result.kind === 'not_recipient') throw new NotFoundException('Message not found');

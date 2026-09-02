@@ -21,6 +21,7 @@ import { FieldModule } from './modules/field/field.module';
 import { FieldMessagingModule } from './modules/field-messaging/field-messaging.module';
 import { FieldOfflineModule } from './modules/field-offline/field-offline.module';
 import { PatrolModule } from './modules/patrol/patrol.module';
+import { DeviceGatewayModule } from './modules/device-gateway/device-gateway.module';
 import { ShieldModule } from './modules/shield/shield.module';
 import { WhisperModule } from './modules/whisper/whisper.module';
 
@@ -73,6 +74,13 @@ import { WhisperModule } from './modules/whisper/whisper.module';
     // incoming physical device, and WP-25 is the work package that lifts that
     // prohibition.
     ShieldModule,
+    // WP-25 Authenticated Device Gateway. THIS is the lift, and it is the FIRST
+    // device-facing HTTP surface in Sentinel. Every effect-causing route it
+    // registers is authenticated by a fresh hardware-signed DeviceRequestProof
+    // and by nothing else: there is no device bearer token, no device session
+    // and no authenticated-socket path (D25-01, D25-10). See
+    // device-gateway.controller.ts for what the boundary refuses.
+    DeviceGatewayModule,
   ],
 })
 export class AppModule {}

@@ -81,9 +81,22 @@ export class FieldRepository {
    * the database, but this runs first: a Field mutation must be refused before
    * the transaction that would write the live row, the history row, the audit
    * row and the outbox row, not by catching a constraint error afterwards.
+   *
+   * WP-25/D25-16: the optional `tx` is an internal COMPOSITION SEAM, not a
+   * public API concern. It exists because `FieldService.recordState` runs this
+   * check BEFORE the write transaction, which is sound for a human caller
+   * whose whole request is that one write, and NOT sound for an orchestrator
+   * that must commit this check together with a downstream effect. Handed a
+   * transaction, the check reads inside it; handed none, it reads exactly as
+   * it always has. Field remains the only implementation of the rule.
+   *
+   * Deliberately NOT wrapped in `this.prisma.$transaction` on the no-`tx`
+   * path: this method has never opened a transaction, and adding one would
+   * change the existing human path rather than leave it byte-identical.
    */
-  async siteExistsInOrganisation(organisationId: string, siteId: string): Promise<boolean> {
-    const site = await this.prisma.site.findFirst({ where: { id: siteId, organisationId }, select: { id: true } });
+  async siteExistsInOrganisation(organisationId: string, siteId: string, tx?: Prisma.TransactionClient): Promise<boolean> {
+    const db: Prisma.TransactionClient = tx ?? this.prisma;
+    const site = await db.site.findFirst({ where: { id: siteId, organisationId }, select: { id: true } });
     return site !== null;
   }
 
@@ -181,17 +194,73 @@ export class FieldRepository {
     return evidence !== null;
   }
 
-  async transitionAssignment(input: TransitionInput): Promise<TransitionResult> {
-    return this.prisma.$transaction(async (tx) => {
-      const found = await tx.fieldAssignment.findFirst({
+  /**
+   * WP-25/D25-02 — THE STATE-UPDATE HALF OF THE B10-02 EVIDENCE PROBE.
+   *
+   * PURE EVIDENCE LOOKUP. It reads the idempotency row and NOTHING else: no
+   * eligibility, no site check, no mutation, and deliberately no read of the
+   * operative's CURRENT state, which is mutable and may have moved on since.
+   *
+   * WHY IT EXISTS. `findTransitionEvidence` and
+   * `IncidentFieldMessageRepository.findAcknowledgeEvidence` already answer
+   * "did this downstream identity commit?" for the other two surfaces, and
+   * WP-20/B10-02 gives the reason both were added: an orchestrator CANNOT
+   * learn that by calling the mutating path again, because the mutating path
+   * would EXECUTE when the answer is "no". For the gateway that is not merely
+   * a false receipt, it is the D25-02 convergence rule inverted — an
+   * EXACT_DUPLICATE whose stored outcome cannot be proved must FAIL CLOSED,
+   * and proving it by re-running `recordState` would create the very effect
+   * whose absence is the thing being detected. State-update was the one
+   * surface with no such probe; this is it, in the identical shape.
+   *
+   * The identity is the state-update idempotency identity exactly
+   * (organisation, site, user, device, key) — the same five columns
+   * `field_state_update_idempotency` is keyed on, so a key can never be
+   * answered across tenants, sites, operatives or devices.
+   */
+  async findStateEvidence(
+    organisationId: string,
+    siteId: string,
+    userId: string,
+    deviceId: string,
+    idempotencyKey: string,
+  ): Promise<boolean> {
+    const evidence = await this.prisma.fieldStateUpdateIdempotency.findUnique({
+      where: {
+        organisationId_siteId_userId_deviceId_idempotencyKey: { organisationId, siteId, userId, deviceId, idempotencyKey },
+      },
+      select: { id: true },
+    });
+    return evidence !== null;
+  }
+
+  /**
+   * WP-25/D25-16: an internal transaction-composition seam.
+   *
+   * The transition logic below is UNCHANGED and is still the only
+   * implementation of the assignment status machine — it has simply been
+   * hoisted into `execute` so it can run either in a transaction this
+   * repository opens (every existing human caller, which supplies no `tx`) or
+   * in one an orchestrator already owns. This is a composition concern, not a
+   * public API concern: nothing about the Field contract, the route shape or
+   * the returned view changes, and no caller may reimplement these rules
+   * outside this method just because it now has a transaction of its own.
+   *
+   * The `SELECT ... FOR UPDATE` fence stays INSIDE `execute`, so it runs in
+   * whichever transaction is in force. A lock taken in a different transaction
+   * from the read-check-write it guards would be decorative.
+   */
+  async transitionAssignment(input: TransitionInput, tx?: Prisma.TransactionClient): Promise<TransitionResult> {
+    const execute = async (db: Prisma.TransactionClient): Promise<TransitionResult> => {
+      const found = await db.fieldAssignment.findFirst({
         where: { id: input.assignmentId, organisationId: input.organisationId, ...siteScopeWhere(input.siteScope) },
         select: { id: true },
       });
       if (!found) return { kind: 'not_found' };
-      await tx.$queryRaw(Prisma.sql`SELECT id FROM field_assignments WHERE id = ${found.id}::uuid FOR UPDATE`);
-      const current = await tx.fieldAssignment.findUniqueOrThrow({ where: { id: found.id } });
+      await db.$queryRaw(Prisma.sql`SELECT id FROM field_assignments WHERE id = ${found.id}::uuid FOR UPDATE`);
+      const current = await db.fieldAssignment.findUniqueOrThrow({ where: { id: found.id } });
       if (input.actorMustBeAssignee && current.assigneeUserId !== input.actorUserId) return { kind: 'forbidden' };
-      const duplicate = await tx.fieldAssignmentActionIdempotency.findUnique({
+      const duplicate = await db.fieldAssignmentActionIdempotency.findUnique({
         where: { assignmentId_action_idempotencyKey: { assignmentId: current.id, action: input.action, idempotencyKey: input.idempotencyKey } },
       });
       if (duplicate) return { kind: 'duplicate', assignment: current };
@@ -200,7 +269,7 @@ export class FieldRepository {
         return { kind: 'conflict', currentStatus: current.status };
       }
       const at = new Date();
-      const updated = await tx.fieldAssignment.update({
+      const updated = await db.fieldAssignment.update({
         where: { id: current.id },
         data: {
           status: input.targetStatus,
@@ -212,11 +281,11 @@ export class FieldRepository {
           ...(input.action === 'cancel' ? { cancelledAt: at } : {}),
         },
       });
-      await tx.fieldAssignmentActionIdempotency.create({
+      await db.fieldAssignmentActionIdempotency.create({
         data: { assignmentId: current.id, action: input.action, idempotencyKey: input.idempotencyKey, actorUserId: input.actorUserId },
       });
       const kind = `FIELD_ASSIGNMENT_${input.targetStatus}`;
-      await tx.fieldAuditLog.create({
+      await db.fieldAuditLog.create({
         data: {
           organisationId: current.organisationId,
           siteId: current.siteId,
@@ -226,7 +295,7 @@ export class FieldRepository {
           payload: { assignment_id: current.id, from_status: current.status, to_status: input.targetStatus, action: input.action },
         },
       });
-      await tx.fieldOutbox.create({
+      await db.fieldOutbox.create({
         data: {
           organisationId: current.organisationId,
           siteId: current.siteId,
@@ -235,12 +304,20 @@ export class FieldRepository {
       });
       this.assertAssignmentContract(updated);
       return { kind: 'updated', assignment: updated };
-    });
+    };
+    return tx ? execute(tx) : this.prisma.$transaction(execute);
   }
 
-  async recordState(input: StateInput): Promise<{ state: FieldOperativeCurrentState; created: boolean }> {
-    return this.prisma.$transaction(async (tx) => {
-      const duplicate = await tx.fieldStateUpdateIdempotency.findUnique({
+  /**
+   * WP-25/D25-16: the same internal composition seam as `transitionAssignment`.
+   * The idempotency read, the history append, the live-state upsert, the audit
+   * row and the outbox row are unchanged and still commit together; only the
+   * question of WHO opened that transaction is now answerable by the caller.
+   * Field remains the sole implementation of state-update semantics.
+   */
+  async recordState(input: StateInput, tx?: Prisma.TransactionClient): Promise<{ state: FieldOperativeCurrentState; created: boolean }> {
+    const execute = async (db: Prisma.TransactionClient): Promise<{ state: FieldOperativeCurrentState; created: boolean }> => {
+      const duplicate = await db.fieldStateUpdateIdempotency.findUnique({
         where: {
           organisationId_siteId_userId_deviceId_idempotencyKey: {
             organisationId: input.organisationId,
@@ -252,12 +329,12 @@ export class FieldRepository {
         },
       });
       if (duplicate) {
-        const current = await tx.fieldOperativeCurrentState.findUniqueOrThrow({
+        const current = await db.fieldOperativeCurrentState.findUniqueOrThrow({
           where: { organisationId_siteId_userId: { organisationId: input.organisationId, siteId: input.siteId, userId: input.actorUserId } },
         });
         return { state: current, created: false };
       }
-      await tx.fieldStateUpdateIdempotency.create({
+      await db.fieldStateUpdateIdempotency.create({
         data: {
           organisationId: input.organisationId,
           siteId: input.siteId,
@@ -266,7 +343,7 @@ export class FieldRepository {
           idempotencyKey: input.idempotencyKey,
         },
       });
-      await tx.fieldOperativeStateHistory.create({
+      await db.fieldOperativeStateHistory.create({
         data: {
           organisationId: input.organisationId,
           siteId: input.siteId,
@@ -281,7 +358,7 @@ export class FieldRepository {
           traceId: input.traceId,
         },
       });
-      const current = await tx.fieldOperativeCurrentState.upsert({
+      const current = await db.fieldOperativeCurrentState.upsert({
         where: { organisationId_siteId_userId: { organisationId: input.organisationId, siteId: input.siteId, userId: input.actorUserId } },
         create: {
           organisationId: input.organisationId,
@@ -307,7 +384,7 @@ export class FieldRepository {
           traceId: input.traceId,
         },
       });
-      await tx.fieldAuditLog.create({
+      await db.fieldAuditLog.create({
         data: {
           organisationId: input.organisationId,
           siteId: input.siteId,
@@ -320,7 +397,7 @@ export class FieldRepository {
       // operative's `state` (COMPROMISED, NEED_SUPPORT, ...) stays out of the
       // outbox payload and is read over REST behind `field.state.read`; the
       // audit row above keeps the full detail.
-      await tx.fieldOutbox.create({
+      await db.fieldOutbox.create({
         data: {
           organisationId: input.organisationId,
           siteId: input.siteId,
@@ -328,7 +405,8 @@ export class FieldRepository {
         },
       });
       return { state: current, created: true };
-    });
+    };
+    return tx ? execute(tx) : this.prisma.$transaction(execute);
   }
 
   /** `assigneeUserId` narrows the read to one operative's own assignments (WP-17/D5). */

@@ -65,6 +65,20 @@ function siteAllowed(siteScope: SiteScope, siteId: string): boolean {
   return siteScope.orgWide || siteScope.siteIds.includes(siteId);
 }
 
+/**
+ * WP-25/D25-16: forwards the composition transaction ONLY when there is one.
+ *
+ * Passing an explicit `undefined` would be semantically identical, and that is
+ * not the standard this seam is held to: an existing human caller must reach
+ * the repository with EXACTLY the arguments it always did, so "existing
+ * callers are unchanged" is true at the call boundary and not merely true in
+ * effect. It is also what keeps the seam invisible to every spec that asserts
+ * on the old call shape.
+ */
+function txArg(tx?: Prisma.TransactionClient): [] | [Prisma.TransactionClient] {
+  return tx === undefined ? [] : [tx];
+}
+
 @Injectable()
 export class FieldService {
   constructor(@Inject(FieldRepository) private readonly repository: FieldRepository) {}
@@ -87,8 +101,8 @@ export class FieldService {
    * identical 404 — the caller must not be able to use this endpoint to learn
    * that some id is a real site somewhere else in the platform.
    */
-  private async assertSiteInOrganisation(organisationId: string, siteId: string): Promise<void> {
-    if (!(await this.repository.siteExistsInOrganisation(organisationId, siteId))) {
+  private async assertSiteInOrganisation(organisationId: string, siteId: string, tx?: Prisma.TransactionClient): Promise<void> {
+    if (!(await this.repository.siteExistsInOrganisation(organisationId, siteId, ...txArg(tx)))) {
       throw new NotFoundException('Site not found');
     }
   }
@@ -179,30 +193,70 @@ export class FieldService {
     return committed ? { committed: true, status: ACTION_TARGETS[action] } : { committed: false };
   }
 
+  /**
+   * WP-25/D25-02 idempotency recovery probe for state updates — the third
+   * member of the WP-20/B10-02 probe family, with the identical argument.
+   *
+   * `recordState` re-checks site scope and site existence and then WRITES when
+   * the key is unknown, so it cannot be used to ask whether a downstream
+   * identity already committed: asking would answer by causing the effect. The
+   * evidence row can be read without touching anything.
+   *
+   * Actor-scoped and device-scoped, matching the state-update idempotency
+   * identity exactly. `principal.organisation_id` binds the tenant and
+   * `principal.user.id` binds the operative, so no caller can probe another
+   * tenant's or another operative's evidence through this method.
+   */
+  async probeStateEvidence(principal: Principal, input: { siteId: string; deviceId: string; idempotencyKey: string }): Promise<boolean> {
+    return this.repository.findStateEvidence(principal.organisation_id, input.siteId, principal.user.id, input.deviceId, input.idempotencyKey);
+  }
+
+  /**
+   * WP-25/D25-16: `tx` is an internal composition seam, not a public API
+   * concern. An orchestrator that must commit this transition together with
+   * its own rows hands its transaction in; every existing human caller passes
+   * nothing and gets exactly the behaviour it always had. The eligibility
+   * rules, the expected-status CAS, the transition table and the `FOR UPDATE`
+   * fence all stay where they are — this service, and the repository beneath
+   * it, remain the only implementation of assignment transition semantics.
+   */
   async transitionAssignment(
     principal: Principal,
     siteScope: SiteScope,
     assignmentId: string,
     action: FieldAssignmentAction,
     input: AssignmentActionInput,
+    tx?: Prisma.TransactionClient,
   ): Promise<FieldAssignmentView> {
-    const result = await this.repository.transitionAssignment({
-      organisationId: principal.organisation_id,
-      assignmentId,
-      actorUserId: principal.user.id,
-      action,
-      expectedStatus: input.expected_status,
-      targetStatus: ACTION_TARGETS[action],
-      idempotencyKey: input.idempotency_key,
-      siteScope,
-      actorMustBeAssignee: action !== 'cancel',
-    });
+    const result = await this.repository.transitionAssignment(
+      {
+        organisationId: principal.organisation_id,
+        assignmentId,
+        actorUserId: principal.user.id,
+        action,
+        expectedStatus: input.expected_status,
+        targetStatus: ACTION_TARGETS[action],
+        idempotencyKey: input.idempotency_key,
+        siteScope,
+        actorMustBeAssignee: action !== 'cancel',
+      },
+      ...txArg(tx),
+    );
     return this.mapTransitionResult(result);
   }
 
-  async recordState(principal: Principal, siteScope: SiteScope, input: StateUpdateInput): Promise<FieldOperativeStateView> {
+  /**
+   * WP-25/D25-16: `tx` is an internal composition seam, not a public API
+   * concern. It is threaded to BOTH the site-existence check and the write,
+   * deliberately: `assertSiteInOrganisation` runs before the write
+   * transaction, so on an orchestrated path the two must share one transaction
+   * or the check-to-commit gap is a real race. Human callers pass no `tx` and
+   * keep the existing ordering unchanged, and Field remains the only
+   * implementation of state-update semantics.
+   */
+  async recordState(principal: Principal, siteScope: SiteScope, input: StateUpdateInput, tx?: Prisma.TransactionClient): Promise<FieldOperativeStateView> {
     if (!siteAllowed(siteScope, input.site_id)) throw new ForbiddenException('Principal is not scoped to this site');
-    await this.assertSiteInOrganisation(principal.organisation_id, input.site_id);
+    await this.assertSiteInOrganisation(principal.organisation_id, input.site_id, tx);
     const sourceAt = new Date(input.source_at);
     const receivedAt = new Date();
     const authoritativeFreshnessMs = Math.max(0, receivedAt.getTime() - sourceAt.getTime());
@@ -221,7 +275,7 @@ export class FieldService {
       idempotencyKey: input.idempotency_key,
     };
     this.repository.validateStateContract(stateInput);
-    const result = await this.repository.recordState(stateInput);
+    const result = await this.repository.recordState(stateInput, ...txArg(tx));
     return mapFieldState(result.state);
   }
 
