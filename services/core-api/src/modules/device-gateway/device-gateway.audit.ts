@@ -96,6 +96,19 @@ export type DeviceGatewayEventInput =
       readonly statementFingerprint: string;
     }
   | {
+      readonly type: 'CONTEXT_CONVERGED';
+      readonly establishmentId: string;
+      readonly siteId: string;
+      readonly keyId: string;
+      readonly keyVersion: number;
+      /** The ALREADY-COMMITTED window, read back. Never recomputed, never extended. */
+      readonly issuedAt: string;
+      readonly expiresAt: string;
+      readonly statementFingerprint: string;
+      /** The stored outcome reference the retry converged ON — the existing context id. */
+      readonly storedOutcomeRef: string;
+    }
+  | {
       readonly type: 'OPERATION_COMMITTED';
       readonly siteId: string;
       readonly targetType: string;
@@ -133,6 +146,7 @@ export const DEVICE_GATEWAY_EVENT_OUTCOME: Readonly<Record<DeviceGatewayEventTyp
   ESTABLISHMENT_CHALLENGE_ISSUED: 'ISSUED',
   ESTABLISHMENT_REFUSED: 'REFUSED',
   CONTEXT_ISSUED: 'ISSUED',
+  CONTEXT_CONVERGED: 'CONVERGED',
   OPERATION_COMMITTED: 'COMMITTED',
   OPERATION_CONVERGED: 'CONVERGED',
   OPERATION_REFUSED: 'REFUSED',
@@ -168,6 +182,17 @@ export function buildDeviceGatewayEventPayload(input: DeviceGatewayEventInput): 
         expires_at: input.expiresAt,
         effective_trust: input.effectiveTrust,
         statement_fingerprint: input.statementFingerprint,
+      };
+    case 'CONTEXT_CONVERGED':
+      return {
+        establishment_id: input.establishmentId,
+        site_id: input.siteId,
+        key_id: input.keyId,
+        key_version: input.keyVersion,
+        issued_at: input.issuedAt,
+        expires_at: input.expiresAt,
+        statement_fingerprint: input.statementFingerprint,
+        stored_outcome_ref: input.storedOutcomeRef,
       };
     case 'OPERATION_COMMITTED':
       return {

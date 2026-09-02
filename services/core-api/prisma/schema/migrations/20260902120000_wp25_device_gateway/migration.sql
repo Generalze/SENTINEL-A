@@ -160,3 +160,37 @@ ALTER TABLE "authenticated_device_context_sites" ADD CONSTRAINT "authenticated_d
 -- AddForeignKey
 ALTER TABLE "authenticated_device_context_sites" ADD CONSTRAINT "authenticated_device_context_sites_site_id_organisation_id_fkey" FOREIGN KEY ("site_id", "organisation_id") REFERENCES "sites"("id", "organisation_id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
+
+-- ===========================================================================
+-- C17-05 — A CONTEXT IS BOUND TO THE EXACT SHIELD KEY, BY THE DATABASE.
+--
+-- `key_id` and `key_version` on the two tables above were plain scalars. Both
+-- objects could therefore exist independently and still disagree: a writer that
+-- bypassed the service layer could persist `device_id = <device A>` beside
+-- `key_id = <device B's key>`, or a key version device A has never held, and
+-- every one of Shield's existing constraints would be satisfied.
+--
+-- Shield has UNIQUE (organisation_id, device_id, key_version) and UNIQUE
+-- (organisation_id, key_id). Neither ties the FULL tuple, so neither can be the
+-- target of a foreign key that says "this key belongs to THIS device at THIS
+-- version". The candidate key below is that target. It is redundant as an
+-- index and load-bearing as a CONSTRAINT: it is what makes the two foreign keys
+-- after it expressible.
+--
+-- THIS IS A FORWARD CONSTRAINT, NOT A REWRITE OF WP-24 HISTORY. It ADDs to
+-- `device_keys`; it edits no historical migration, changes no existing column
+-- and drops nothing. A rotation does not delete the superseded key row (D24-10
+-- moves its status to ROTATED), so contexts pinned to a superseded version
+-- continue to satisfy it — which is exactly the behaviour WP-25 relies on when
+-- it refuses such a context with CONTEXT_KEY_MISMATCH rather than with a
+-- dangling reference.
+-- ===========================================================================
+
+-- AddCandidateKey
+ALTER TABLE "device_keys" ADD CONSTRAINT "device_key_identity_tuple_key" UNIQUE ("organisation_id", "device_id", "key_id", "key_version");
+
+-- AddForeignKey
+ALTER TABLE "device_context_establishment_challenges" ADD CONSTRAINT "device_context_establishment_challenges_organisation_id_de_fkey" FOREIGN KEY ("organisation_id", "device_id", "key_id", "key_version") REFERENCES "device_keys"("organisation_id", "device_id", "key_id", "key_version") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "authenticated_device_contexts" ADD CONSTRAINT "authenticated_device_contexts_organisation_id_device_id_ke_fkey" FOREIGN KEY ("organisation_id", "device_id", "key_id", "key_version") REFERENCES "device_keys"("organisation_id", "device_id", "key_id", "key_version") ON DELETE RESTRICT ON UPDATE CASCADE;

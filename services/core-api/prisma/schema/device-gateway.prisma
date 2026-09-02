@@ -198,6 +198,25 @@ model DeviceContextEstablishmentChallenge {
   device Device @relation(fields: [deviceId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
   site Site @relation(fields: [siteId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
 
+  /// WP-25/C17-05 — THE KEY BINDING, ENFORCED BY POSTGRES.
+  ///
+  /// `keyId` and `keyVersion` above are not free-standing scalars. This
+  /// composite foreign key resolves the FULL tuple
+  /// (organisation, device, key id, key version) against
+  /// `device_key_identity_tuple_key`, so a row naming one device while carrying
+  /// another device's key — or a key version that device has never held — is
+  /// not a bad row, it is an IMPOSSIBLE one. That is the same doctrine the
+  /// composite (id, organisation_id) foreign keys elsewhere in this file apply
+  /// to tenancy, applied to the credential.
+  ///
+  /// ON DELETE RESTRICT, like every other foreign key here: a registry key with
+  /// live gateway state behind it cannot be deleted out from under it. Nothing
+  /// cascades. A ROTATED or REVOKED key row still EXISTS (D24-10 moves status,
+  /// it does not delete), so a superseded context keeps a resolvable binding and
+  /// is refused by the CURRENT-standing checks rather than by a dangling
+  /// reference.
+  registryKey DeviceKey @relation(fields: [organisationId, deviceId, keyId, keyVersion], references: [organisationId, deviceId, keyId, keyVersion], onDelete: Restrict, onUpdate: Cascade)
+
   issuedContexts AuthenticatedDeviceContextRecord[]
 
   /// ONE PROPOSED CONTEXT ID PER TENANT. The proposed id is what the device
@@ -305,6 +324,26 @@ model AuthenticatedDeviceContextRecord {
   device Device @relation(fields: [deviceId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
   /// Composite: a context may not be attached to another tenant's ceremony.
   establishment DeviceContextEstablishmentChallenge @relation(fields: [establishmentId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
+  /// WP-25/C17-05 — THE KEY BINDING, ENFORCED BY POSTGRES.
+  ///
+  /// `keyId` and `keyVersion` above are not free-standing scalars. This
+  /// composite foreign key resolves the FULL tuple
+  /// (organisation, device, key id, key version) against
+  /// `device_key_identity_tuple_key`, so a row naming one device while carrying
+  /// another device's key — or a key version that device has never held — is
+  /// not a bad row, it is an IMPOSSIBLE one. That is the same doctrine the
+  /// composite (id, organisation_id) foreign keys elsewhere in this file apply
+  /// to tenancy, applied to the credential.
+  ///
+  /// ON DELETE RESTRICT, like every other foreign key here: a registry key with
+  /// live gateway state behind it cannot be deleted out from under it. Nothing
+  /// cascades. A ROTATED or REVOKED key row still EXISTS (D24-10 moves status,
+  /// it does not delete), so a superseded context keeps a resolvable binding and
+  /// is refused by the CURRENT-standing checks rather than by a dangling
+  /// reference.
+  registryKey DeviceKey @relation(fields: [organisationId, deviceId, keyId, keyVersion], references: [organisationId, deviceId, keyId, keyVersion], onDelete: Restrict, onUpdate: Cascade)
+
 
   /// The authoritative site binding. See AuthenticatedDeviceContextSite.
   sites AuthenticatedDeviceContextSite[]

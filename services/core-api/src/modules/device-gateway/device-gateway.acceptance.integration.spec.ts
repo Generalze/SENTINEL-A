@@ -595,20 +595,28 @@ async function requestChallenge(
 async function establish(
   device: EnrolledDevice,
   options: { actor?: string; siteId?: string; signer?: TestDeviceKeyPair } = {},
-): Promise<{ challenge: DeviceContextEstablishmentChallengeView; result: HttpResult; context: IssuedContext }> {
+): Promise<{ challenge: DeviceContextEstablishmentChallengeView; result: HttpResult & { proof: Record<string, unknown> }; context: IssuedContext }> {
   const issued = await requestChallenge(device, options);
   expect(issued.status, JSON.stringify(issued.body)).toBe(201);
   const challenge = (issued.body as { challenge: DeviceContextEstablishmentChallengeView }).challenge;
-  const result = await completeEstablishment(challenge, options.signer ?? device.keyPair);
+  const result = await completeEstablishment(challenge, options.signer ?? device.keyPair, { session: options.actor });
   return { challenge, result, context: (result.body as { context: IssuedContext }).context };
 }
 
-/** Step two: the DEVICE signs the digest of the EXACT challenge. */
+/**
+ * Step two: the DEVICE signs the digest of the EXACT challenge, and the SAME
+ * AUTHENTICATED HUMAN who opened the ceremony submits it (C17-01).
+ *
+ * `session` defaults to the actor the challenge is bound to, which is what a
+ * conforming client does. Passing `null` sends NO session header; passing
+ * another user id sends somebody else's live session. Both are refused, and
+ * both have their own test below.
+ */
 async function completeEstablishment(
   challenge: DeviceContextEstablishmentChallengeView,
   signer: TestDeviceKeyPair,
-  overrides: { nonce?: string; trace?: string } = {},
-): Promise<HttpResult> {
+  overrides: { nonce?: string; trace?: string; session?: string | null; proof?: Record<string, unknown>; bodyExtras?: Record<string, unknown> } = {},
+): Promise<HttpResult & { proof: Record<string, unknown> }> {
   const proof = signProof(signer, {
     contextId: challenge.proposed_context_id,
     organisationId: challenge.organisation_id,
@@ -621,11 +629,16 @@ async function completeEstablishment(
     payloadDigest: deviceContextEstablishmentChallengeDigest(challenge),
     nonce: overrides.nonce,
   });
-  return post(
+  const session = overrides.session === undefined ? challenge.actor_user_id : overrides.session;
+  const result = await post(
     `${GATEWAY}/contexts`,
-    { establishment_id: challenge.establishment_id, proof },
-    overrides.trace === undefined ? {} : { 'x-trace-id': overrides.trace },
+    { establishment_id: challenge.establishment_id, proof: overrides.proof ?? proof, ...(overrides.bodyExtras ?? {}) },
+    {
+      ...(overrides.trace === undefined ? {} : { 'x-trace-id': overrides.trace }),
+      ...(session === null ? {} : asSession(session)),
+    },
   );
+  return { ...result, proof: overrides.proof ?? proof };
 }
 
 const ROUTE: Readonly<Record<DeviceGatewayOperationKind, (targetId: string) => string>> = {
@@ -677,6 +690,14 @@ interface OperationRequest {
   /** A proof built elsewhere, presented here — the cross-purpose replay cases. */
   proof?: Record<string, unknown>;
   trace?: string;
+  /**
+   * C17-01: the authenticated human on the request.
+   *
+   * Defaults to the operative the context is bound to — what a conforming
+   * client sends. `null` sends NO session header at all; another user id sends
+   * somebody else's live session.
+   */
+  session?: string | null;
 }
 
 async function operate(request: OperationRequest): Promise<HttpResult & { proof: Record<string, unknown>; targetId: string }> {
@@ -701,10 +722,14 @@ async function operate(request: OperationRequest): Promise<HttpResult & { proof:
       issuedAt: request.issuedAt,
     });
 
+  const session = request.session === undefined ? request.context.actor_user_id : request.session;
   const result = await post(
     ROUTE[request.kind](targetId),
     { proof, payload, ...(request.bodyExtras ?? {}) },
-    request.trace === undefined ? {} : { 'x-trace-id': request.trace },
+    {
+      ...(request.trace === undefined ? {} : { 'x-trace-id': request.trace }),
+      ...(session === null ? {} : asSession(session)),
+    },
   );
   return { ...result, proof, targetId };
 }
@@ -787,6 +812,35 @@ async function withMutationBeforeCommit<T>(mutate: () => Promise<void>, run: () 
   } finally {
     spy.mockRestore();
   }
+}
+
+/**
+ * The establishment ceremony's equivalent seam: `mutate` runs BETWEEN the
+ * preflight and the final transaction of `completeEstablishment`.
+ *
+ * The seam is the transaction's first statement — the locking challenge read —
+ * so at that instant the preflight has approved everything and the transaction
+ * holds no lock. Exactly the D25-04A hazard, on the ceremony that MINTS
+ * authority rather than on one that spends it.
+ */
+async function withMutationBeforeEstablishmentCommit<T>(mutate: () => Promise<void>, run: () => Promise<T>): Promise<T> {
+  const original = gatewayRepository.lockEstablishmentChallenge.bind(gatewayRepository);
+  const spy = vi
+    .spyOn(gatewayRepository, 'lockEstablishmentChallenge')
+    .mockImplementationOnce(async (tx, organisationId, id) => {
+      await mutate();
+      return original(tx, organisationId, id);
+    });
+  try {
+    return await run();
+  } finally {
+    spy.mockRestore();
+  }
+}
+
+/** Every gateway event this tenant holds, for the cross-tenant provenance assertions. */
+async function eventCountFor(organisationId: string): Promise<number> {
+  return prisma.deviceGatewayOperationEvent.count({ where: { organisationId } });
 }
 
 /**
@@ -967,8 +1021,9 @@ describe('WP-25/D25-01 there is no device bearer token, ever', () => {
     const { context } = await establish(device);
 
     // The whole "stolen context" scenario: every field perfect, presented by
-    // somebody who does not hold the hardware key.
-    const naked = await post(`${GATEWAY}/operations/field-state`, { payload: fieldStatePayload() });
+    // somebody who does not hold the hardware key. With a live session, so this
+    // is a possession failure and not an authentication one.
+    const naked = await post(`${GATEWAY}/operations/field-state`, { payload: fieldStatePayload() }, asSession(fx.opAlpha));
     expect(naked.status).toBe(403);
 
     const trace = traceId();
@@ -1007,7 +1062,11 @@ describe('WP-25/D25-01 there is no device bearer token, ever', () => {
     // The identical request, byte for byte — a captured proof replayed. The
     // one-shot identity is already spent, so this converges on the stored
     // outcome and causes NO second domain effect (D25-02).
-    const replay = await post(ROUTE.ASSIGNMENT_ACCEPT(assignmentId), { proof: first.proof, payload: { expected_status: 'REQUESTED' } });
+    const replay = await post(
+      ROUTE.ASSIGNMENT_ACCEPT(assignmentId),
+      { proof: first.proof, payload: { expected_status: 'REQUESTED' } },
+      asSession(fx.opAlpha),
+    );
     expect(replay.status).toBe(201);
     expect(replay.body.outcome).toBe('CONVERGED');
 
@@ -1049,7 +1108,11 @@ describe('WP-25/D25-01 there is no device bearer token, ever', () => {
 
     // And carried to the DECLINE route for the same assignment: the kind is in
     // the digest, so this is a different statement.
-    const declined = await post(ROUTE.ASSIGNMENT_DECLINE(assignmentId), { proof: accept.proof, payload: { expected_status: 'REQUESTED' } });
+    const declined = await post(
+      ROUTE.ASSIGNMENT_DECLINE(assignmentId),
+      { proof: accept.proof, payload: { expected_status: 'REQUESTED' } },
+      asSession(fx.opAlpha),
+    );
     expect(declined.status).toBe(403);
   });
 
@@ -1089,8 +1152,22 @@ describe('WP-25/D25-01 there is no device bearer token, ever', () => {
     });
     expect(smuggled.status).toBe(403);
 
-    // And a top-level `idempotency_key` is simply not read: the key the domain
-    // actually stores is the SERVER's derivation, over the signed operation.
+    // C17-06: a top-level `idempotency_key` is no longer merely IGNORED — it is
+    // REFUSED. The outer request schema is `.strict()`, because a field the
+    // device did not sign has no business being accepted at a cryptographic
+    // boundary even when nothing currently reads it.
+    const rejected = await operate({
+      kind: 'ASSIGNMENT_ACCEPT',
+      device,
+      context,
+      targetId: await newAssignment(fx.opAlpha),
+      payload: { expected_status: 'REQUESTED' },
+      bodyExtras: { idempotency_key: 'chosen-by-the-device' },
+    });
+    expect(rejected.status).toBe(403);
+
+    // And the key the domain actually stores is the SERVER's derivation, over
+    // the signed operation — there is no parameter for it anywhere.
     const alphaAssignment = await newAssignment(fx.opAlpha);
     const committed = await operate({
       kind: 'ASSIGNMENT_ACCEPT',
@@ -1098,7 +1175,6 @@ describe('WP-25/D25-01 there is no device bearer token, ever', () => {
       context,
       targetId: alphaAssignment,
       payload: { expected_status: 'REQUESTED' },
-      bodyExtras: { idempotency_key: 'chosen-by-the-device' },
     });
     expect(committed.status).toBe(201);
 
@@ -1493,7 +1569,7 @@ describe('WP-25/D25-02 convergence and conflict', () => {
     const again = await post(
       ROUTE.INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE(messageId),
       { proof: first.proof, payload: {} },
-      { 'x-trace-id': trace },
+      { 'x-trace-id': trace, ...asSession(fx.opAlpha) },
     );
     expect(again.status).toBe(201);
     expect(again.body.outcome).toBe('CONVERGED');
@@ -1551,7 +1627,7 @@ describe('WP-25/D25-02 convergence and conflict', () => {
     const unresolvable = await post(
       ROUTE.INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE(messageId),
       { proof: first.proof, payload: {} },
-      { 'x-trace-id': trace },
+      { 'x-trace-id': trace, ...asSession(fx.opAlpha) },
     );
     expect(unresolvable.status).toBe(403);
     expect(await refusalReasonFor(trace)).toContain('DUPLICATE_UNRESOLVABLE');
@@ -1646,7 +1722,9 @@ describe('WP-25/D25-10 what the gateway does NOT expose', () => {
     const assignmentId = await newAssignment(fx.opAlpha);
 
     for (const action of ['start', 'complete', 'cancel', 'reassign']) {
-      const response = await post(`${GATEWAY}/operations/assignments/${assignmentId}/${action}`, {
+      const response = await post(
+        `${GATEWAY}/operations/assignments/${assignmentId}/${action}`,
+        {
         proof: signProof(device.keyPair, {
           contextId: context.context_id,
           organisationId: context.organisation_id,
@@ -1659,9 +1737,13 @@ describe('WP-25/D25-10 what the gateway does NOT expose', () => {
           payloadDigest: 'f'.repeat(64),
         }),
         payload: { expected_status: 'REQUESTED' },
-      });
+        },
+        asSession(fx.opAlpha),
+      );
       // 404: there is NO ROUTE. Not a guard that could be relaxed, not a check
       // somebody could delete — nothing in the module constructs those actions.
+      // The session is present, so this is a route that does not exist rather
+      // than a route refusing an unauthenticated caller.
       expect(response.status, action).toBe(404);
     }
     expect((await prisma.fieldAssignment.findUniqueOrThrow({ where: { id: assignmentId } })).status).toBe('REQUESTED');
@@ -1670,8 +1752,8 @@ describe('WP-25/D25-10 what the gateway does NOT expose', () => {
   it('there is no device WebSocket ingress and no realtime device route', async () => {
     // The REST surface is the whole surface (D25-10). This asserts the routes
     // that exist are the six that were declared, by probing an invented one.
-    expect((await post(`${GATEWAY}/operations/whisper`, {})).status).toBe(404);
-    expect((await post(`${GATEWAY}/socket`, {})).status).toBe(404);
+    expect((await post(`${GATEWAY}/operations/whisper`, {}, asSession(fx.opAlpha))).status).toBe(404);
+    expect((await post(`${GATEWAY}/socket`, {}, asSession(fx.opAlpha))).status).toBe(404);
   });
 });
 
@@ -1766,5 +1848,630 @@ describe('WP-25/D25-13 nothing secret ever reaches an audit payload', () => {
 
     // The context id IS recorded, precisely because it authorises nothing.
     expect(events.some((event) => event.contextId === context.context_id)).toBe(true);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// C17-01 — the session proves WHO, the proof proves WHICH HARDWARE, and the
+// live re-read proves STILL AUTHORISED NOW. None substitutes for another.
+// ---------------------------------------------------------------------------
+
+describe('WP-25/C17-01 human AUTHENTICATION is not an authorisation lookup', () => {
+  it('a VALID P-256 proof with NO human session refuses, with zero effect', async () => {
+    const device = await enrol();
+    const { context } = await establish(device);
+    const assignmentId = await newAssignment(fx.opAlpha);
+    const claimsBefore = (await nonceConsumptions()).length;
+
+    // Everything the old code needed: a perfect context, a perfect signature by
+    // the registered key, and an actor row that still resolves with a live
+    // capability. The ONLY thing missing is the human on the other end.
+    const anonymous = await operate({
+      kind: 'ASSIGNMENT_ACCEPT',
+      device,
+      context,
+      targetId: assignmentId,
+      payload: { expected_status: 'REQUESTED' },
+      session: null,
+    });
+    expect(anonymous.status).toBe(401);
+    expect((await prisma.fieldAssignment.findUniqueOrThrow({ where: { id: assignmentId } })).status).toBe('REQUESTED');
+    expect((await nonceConsumptions()).length).toBe(claimsBefore);
+
+    // ...and the same request WITH the session commits, so the refusal above is
+    // the session and nothing else.
+    const admitted = await operate({
+      kind: 'ASSIGNMENT_ACCEPT',
+      device,
+      context,
+      targetId: assignmentId,
+      payload: { expected_status: 'REQUESTED' },
+    });
+    expect(admitted.status).toBe(201);
+    expect((await prisma.fieldAssignment.findUniqueOrThrow({ where: { id: assignmentId } })).status).toBe('ACCEPTED');
+  });
+
+  it('a VALID proof carried by the WRONG authenticated human refuses, with zero effect', async () => {
+    const device = await enrol();
+    const { context } = await establish(device);
+    const assignmentId = await newAssignment(fx.opAlpha);
+    const trace = traceId();
+
+    // opBravo is a real, live, gateway-capable operative at the same site. The
+    // proof is alpha's device speaking for alpha's context. Possession is
+    // perfect and authority is perfect — and the caller is not the person the
+    // context is bound to.
+    const impostor = await operate({
+      kind: 'ASSIGNMENT_ACCEPT',
+      device,
+      context,
+      targetId: assignmentId,
+      payload: { expected_status: 'REQUESTED' },
+      session: fx.opBravo,
+      trace,
+    });
+    expect(impostor.status).toBe(403);
+    expect(impostor.body.error).toBe('DEVICE_REQUEST_REFUSED');
+    expect(await refusalReasonFor(trace)).toContain('SESSION_ACTOR_MISMATCH');
+    expect((await prisma.fieldAssignment.findUniqueOrThrow({ where: { id: assignmentId } })).status).toBe('REQUESTED');
+  });
+
+  it('the CORRECT session with an INVALID proof refuses — the session rescues nothing', async () => {
+    const device = await enrol();
+    const { context } = await establish(device);
+    const assignmentId = await newAssignment(fx.opAlpha);
+    const trace = traceId();
+
+    const forged = await operate({
+      kind: 'ASSIGNMENT_ACCEPT',
+      device,
+      context,
+      targetId: assignmentId,
+      payload: { expected_status: 'REQUESTED' },
+      signer: generateTestDeviceKeyPair(),
+      trace,
+    });
+    expect(forged.status).toBe(403);
+    expect(await refusalReasonFor(trace)).toContain('POSSESSION_NOT_PROVEN');
+    expect((await prisma.fieldAssignment.findUniqueOrThrow({ where: { id: assignmentId } })).status).toBe('REQUESTED');
+  });
+
+  it('a challenge issued, then NO session at completion: refuse, and ZERO context', async () => {
+    const device = await enrol();
+    const issued = await requestChallenge(device);
+    const challenge = (issued.body as { challenge: DeviceContextEstablishmentChallengeView }).challenge;
+
+    const anonymous = await completeEstablishment(challenge, device.keyPair, { session: null });
+    expect(anonymous.status).toBe(401);
+    expect(await prisma.authenticatedDeviceContextRecord.findUnique({ where: { id: challenge.proposed_context_id } })).toBeNull();
+    // The ceremony is untouched, so the legitimate holder can still complete it.
+    expect((await prisma.deviceContextEstablishmentChallenge.findUniqueOrThrow({ where: { id: challenge.establishment_id } })).consumedAt).toBeNull();
+
+    // A DIFFERENT live human, holding the whole challenge and a perfect
+    // signature, is refused too — and the internal reason names why.
+    const trace = traceId();
+    const impostor = await completeEstablishment(challenge, device.keyPair, { session: fx.opBravo, trace });
+    expect(impostor.status).toBe(403);
+    expect(await refusalReasonFor(trace)).toContain('SESSION_ACTOR_MISMATCH');
+    expect(await prisma.authenticatedDeviceContextRecord.findUnique({ where: { id: challenge.proposed_context_id } })).toBeNull();
+
+    const honest = await completeEstablishment(challenge, device.keyPair);
+    expect(honest.status).toBe(201);
+  });
+
+  it('a stolen context PLUS the device key, with no human session, is ZERO authority', async () => {
+    const device = await enrol();
+    const { context } = await establish(device);
+    const before = await eventCountFor(fx.orgA);
+    const stateBefore = await prisma.fieldOperativeStateHistory.count({ where: { organisationId: fx.orgA, userId: fx.opAlpha } });
+    const acknowledgedBefore = await prisma.incidentFieldMessageRecipient.count({
+      where: { organisationId: fx.orgA, deliveryState: 'ACKNOWLEDGED' },
+    });
+    const claimsBefore = (await nonceConsumptions()).length;
+
+    // The complete attacker: the context id, the device, the registered private
+    // key, and a freshly minted signature for every route. No session.
+    const outcomes = await Promise.all([
+      operate({ kind: 'FIELD_STATE_UPDATE', device, context, payload: fieldStatePayload(), session: null }),
+      operate({ kind: 'ASSIGNMENT_ACCEPT', device, context, targetId: await newAssignment(fx.opAlpha), payload: { expected_status: 'REQUESTED' }, session: null }),
+      operate({ kind: 'ASSIGNMENT_DECLINE', device, context, targetId: await newAssignment(fx.opAlpha), payload: { expected_status: 'REQUESTED' }, session: null }),
+      operate({ kind: 'INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE', device, context, targetId: await newDeliveredMessage(fx.opAlpha), session: null }),
+    ]);
+    for (const outcome of outcomes) expect(outcome.status).toBe(401);
+
+    // Nothing happened, anywhere: no state transition, no acknowledgement, no
+    // one-shot identity spent, and not even an audit row — the guard chain
+    // refuses before the module runs.
+    expect(await prisma.fieldOperativeStateHistory.count({ where: { organisationId: fx.orgA, userId: fx.opAlpha } })).toBe(stateBefore);
+    expect(
+      await prisma.incidentFieldMessageRecipient.count({ where: { organisationId: fx.orgA, deliveryState: 'ACKNOWLEDGED' } }),
+    ).toBe(acknowledgedBefore);
+    expect((await nonceConsumptions()).length).toBe(claimsBefore);
+    expect(await eventCountFor(fx.orgA)).toBe(before);
+  });
+
+  it('a live session does NOT rescue a role withdrawn between preflight and commit, at ESTABLISHMENT', async () => {
+    const charlie: TenantFixture = { ...A, operativeId: fx.opCharlie, operative: principalFor(fx.opCharlie, 'field.operative', fx.siteA1, fx.orgA) };
+    const device = await enrol({ tenant: charlie });
+    const issued = await requestChallenge(device, { actor: fx.opCharlie });
+    const challenge = (issued.body as { challenge: DeviceContextEstablishmentChallengeView }).challenge;
+
+    const roles = await prisma.userRole.findMany({ where: { userId: fx.opCharlie } });
+    const trace = traceId();
+    try {
+      const result = await withMutationBeforeEstablishmentCommit(
+        async () => {
+          await prisma.userRole.deleteMany({ where: { userId: fx.opCharlie } });
+        },
+        () => completeEstablishment(challenge, device.keyPair, { session: fx.opCharlie, trace }),
+      );
+      expect(result.status).toBe(403);
+      // AUTHENTICATED and AUTHORISED are two facts. The session is live and
+      // correct throughout; the live re-read is what refuses.
+      expect(await refusalReasonFor(trace)).not.toBeNull();
+      expect(await prisma.authenticatedDeviceContextRecord.findUnique({ where: { id: challenge.proposed_context_id } })).toBeNull();
+      expect((await prisma.deviceContextEstablishmentChallenge.findUniqueOrThrow({ where: { id: challenge.establishment_id } })).consumedAt).toBeNull();
+    } finally {
+      await prisma.userRole.createMany({ data: roles.map((role) => ({ userId: role.userId, role: role.role, siteId: role.siteId })) });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C17-02 — a request may not choose which tenant owns an append-only row
+// ---------------------------------------------------------------------------
+
+describe('WP-25/C17-02 the audit tenant is the SESSION’s, never the request’s', () => {
+  it('an org-A session claiming org-B writes NOTHING under org-B, in either ceremony', async () => {
+    const device = await enrol();
+    const { context } = await establish(device);
+    const bEventsBefore = await eventCountFor(fx.orgB);
+
+    // 1. The establishment REQUEST, naming another tenant.
+    const claimedRequest = await requestChallenge(device, { organisationId: fx.orgB });
+    // 2. A real org-A challenge, answered by a proof that CLAIMS org B. The
+    //    signature is genuine — it is a real signature over a lying statement.
+    const issued = await requestChallenge(device);
+    const challenge = (issued.body as { challenge: DeviceContextEstablishmentChallengeView }).challenge;
+    const lyingProof = signProof(device.keyPair, {
+      contextId: challenge.proposed_context_id,
+      organisationId: fx.orgB,
+      siteId: challenge.site_id,
+      actorUserId: challenge.actor_user_id,
+      deviceId: challenge.device_id,
+      keyId: challenge.key_id,
+      keyVersion: challenge.key_version,
+      purpose: 'RECONNECT_HANDSHAKE',
+      payloadDigest: deviceContextEstablishmentChallengeDigest(challenge),
+    });
+    const completionTrace = traceId();
+    const claimedCompletion = await completeEstablishment(challenge, device.keyPair, {
+      proof: lyingProof,
+      trace: completionTrace,
+    });
+    // 3. An OPERATION whose proof claims org B against a real org-A context.
+    const operationTrace = traceId();
+    const claimedOperation = await operate({
+      kind: 'FIELD_STATE_UPDATE',
+      device,
+      context,
+      payload: fieldStatePayload(),
+      proof: signProof(device.keyPair, {
+        contextId: context.context_id,
+        organisationId: fx.orgB,
+        siteId: fx.siteA1,
+        actorUserId: context.actor_user_id,
+        deviceId: context.device_id,
+        keyId: context.key_id,
+        keyVersion: context.key_version,
+        purpose: 'FIELD_OPERATION',
+        payloadDigest: envelopeDigestFor('FIELD_STATE_UPDATE', context, fx.siteA1, context.actor_user_id, fieldStatePayload()),
+      }),
+      trace: operationTrace,
+    });
+
+    // Externally identical, in the D25-13 shape.
+    expect(claimedRequest.status).toBe(403);
+    expect(claimedCompletion.status).toBe(403);
+    expect(claimedOperation.status).toBe(403);
+    for (const answer of [claimedRequest, claimedCompletion, claimedOperation]) {
+      expect(answer.body.error).toBe('DEVICE_REQUEST_REFUSED');
+    }
+
+    // ZERO gateway events under org B. The tenant an attacker NAMED is not the
+    // tenant that owns the row — the audit tables have no lifecycle foreign key,
+    // so this is the only provenance there is.
+    expect(await eventCountFor(fx.orgB)).toBe(bEventsBefore);
+
+    // ...and every retained event belongs to org A, with the precise internal
+    // reason naming the claim.
+    const retained = await prisma.deviceGatewayOperationEvent.findMany({
+      where: { traceId: { in: [completionTrace, operationTrace] } },
+      select: { organisationId: true, refusalReason: true },
+    });
+    expect(retained.length).toBe(2);
+    for (const row of retained) {
+      expect(row.organisationId).toBe(fx.orgA);
+      expect(row.refusalReason).toContain('PROOF_ORGANISATION_MISMATCH');
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C17-03 — the lost response, answered honestly
+// ---------------------------------------------------------------------------
+
+describe('WP-25/C17-03 an exact establishment retry CONVERGES', () => {
+  it('the byte-identical signed request returns the SAME context, and mints no second one', async () => {
+    const device = await enrol();
+    const issued = await requestChallenge(device);
+    const challenge = (issued.body as { challenge: DeviceContextEstablishmentChallengeView }).challenge;
+
+    const first = await completeEstablishment(challenge, device.keyPair);
+    expect(first.status).toBe(201);
+    const original = (first.body as { context: IssuedContext }).context;
+
+    // THE LOST RESPONSE. The server committed; the answer never arrived; the
+    // device re-sends the EXACT bytes it sent the first time.
+    const trace = traceId();
+    const retry = await completeEstablishment(challenge, device.keyPair, { proof: first.proof, trace });
+    expect(retry.status).toBe(201);
+    const converged = (retry.body as { context: IssuedContext }).context;
+
+    expect(converged.context_id).toBe(original.context_id);
+    expect(converged.issued_at).toBe(original.issued_at);
+    // NO EXPIRY EXTENSION. A retry that lengthened the window would be minting
+    // authority out of a network failure.
+    expect(converged.expires_at).toBe(original.expires_at);
+    expect(converged).toEqual(original);
+
+    expect(await prisma.authenticatedDeviceContextRecord.count({ where: { establishmentId: challenge.establishment_id } })).toBe(1);
+    expect(await prisma.authenticatedDeviceContextSite.count({ where: { contextId: original.context_id } })).toBe(1);
+    expect((await eventsForTrace(trace)).map((event) => event.eventType)).toEqual(['CONTEXT_CONVERGED']);
+  });
+
+  it('convergence grants NO new authority — the session requirement still applies to the retry', async () => {
+    const device = await enrol();
+    const issued = await requestChallenge(device);
+    const challenge = (issued.body as { challenge: DeviceContextEstablishmentChallengeView }).challenge;
+    const first = await completeEstablishment(challenge, device.keyPair);
+    expect(first.status).toBe(201);
+
+    const anonymous = await completeEstablishment(challenge, device.keyPair, { proof: first.proof, session: null });
+    expect(anonymous.status).toBe(401);
+
+    const trace = traceId();
+    const impostor = await completeEstablishment(challenge, device.keyPair, { proof: first.proof, session: fx.opBravo, trace });
+    expect(impostor.status).toBe(403);
+    expect(await refusalReasonFor(trace)).toContain('SESSION_ACTOR_MISMATCH');
+
+    expect(await prisma.authenticatedDeviceContextRecord.count({ where: { establishmentId: challenge.establishment_id } })).toBe(1);
+  });
+
+  it('CHANGED SEMANTICS under a spent establishment is still a refusal, not a convergence', async () => {
+    const device = await enrol();
+    const issued = await requestChallenge(device);
+    const challenge = (issued.body as { challenge: DeviceContextEstablishmentChallengeView }).challenge;
+    const nonce = randomBytes(24).toString('base64url');
+
+    expect((await completeEstablishment(challenge, device.keyPair, { nonce })).status).toBe(201);
+
+    // The SAME one-shot identity — the replay key does not cover `issued_at` —
+    // carrying a DIFFERENT signed statement. There is nothing to converge on.
+    const trace = traceId();
+    const changed = await completeEstablishment(challenge, device.keyPair, {
+      nonce,
+      trace,
+      proof: signProof(device.keyPair, {
+        contextId: challenge.proposed_context_id,
+        organisationId: challenge.organisation_id,
+        siteId: challenge.site_id,
+        actorUserId: challenge.actor_user_id,
+        deviceId: challenge.device_id,
+        keyId: challenge.key_id,
+        keyVersion: challenge.key_version,
+        purpose: 'RECONNECT_HANDSHAKE',
+        payloadDigest: deviceContextEstablishmentChallengeDigest(challenge),
+        nonce,
+        issuedAt: new Date(Date.now() - 1_500).toISOString(),
+      }),
+    });
+    expect(changed.status).toBe(403);
+    expect(await refusalReasonFor(trace)).toContain('NONCE_REUSED_WITH_CHANGED_SEMANTICS');
+    expect(await prisma.authenticatedDeviceContextRecord.count({ where: { establishmentId: challenge.establishment_id } })).toBe(1);
+  });
+
+  it('a stored outcome ref that resolves to NO exact context FAILS CLOSED', async () => {
+    const device = await enrol();
+    const issued = await requestChallenge(device);
+    const challenge = (issued.body as { challenge: DeviceContextEstablishmentChallengeView }).challenge;
+    const first = await completeEstablishment(challenge, device.keyPair);
+    expect(first.status).toBe(201);
+    const original = (first.body as { context: IssuedContext }).context;
+
+    // Erase the authoritative context while leaving the replay row and the spent
+    // challenge behind: a stored outcome reference that no longer resolves.
+    await prisma.authenticatedDeviceContextSite.deleteMany({ where: { contextId: original.context_id } });
+    await prisma.authenticatedDeviceContextRecord.delete({ where: { id: original.context_id } });
+
+    const trace = traceId();
+    const retry = await completeEstablishment(challenge, device.keyPair, { proof: first.proof, trace });
+    expect(retry.status).toBe(403);
+    expect(await refusalReasonFor(trace)).toContain('DUPLICATE_UNRESOLVABLE');
+    // It did NOT quietly mint a replacement.
+    expect(await prisma.authenticatedDeviceContextRecord.count({ where: { establishmentId: challenge.establishment_id } })).toBe(0);
+  });
+
+  it('a SECOND, FRESHLY SIGNED use of a spent ceremony is still refused', async () => {
+    // C17-03 relaxes the gate for an EXACT retry and for nothing else. A new
+    // nonce is a new identity, so this is a second ceremony, not a lost answer.
+    const device = await enrol();
+    const issued = await requestChallenge(device);
+    const challenge = (issued.body as { challenge: DeviceContextEstablishmentChallengeView }).challenge;
+    expect((await completeEstablishment(challenge, device.keyPair)).status).toBe(201);
+
+    const trace = traceId();
+    const second = await completeEstablishment(challenge, device.keyPair, { nonce: randomBytes(24).toString('base64url'), trace });
+    expect(second.status).toBe(403);
+    expect(await refusalReasonFor(trace)).toContain('ESTABLISHMENT_NOT_USABLE');
+    expect(await prisma.authenticatedDeviceContextRecord.count({ where: { establishmentId: challenge.establishment_id } })).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C17-04 — the final fence reads inside its own transaction, and LOCKS
+// ---------------------------------------------------------------------------
+
+describe('WP-25/C17-04 the final fence holds the rows its decision rests on', () => {
+  it('a CONCURRENT transaction cannot release the device site scope between the decision and the commit', async () => {
+    const device = await enrol();
+    const { context } = await establish(device);
+    const assignmentId = await newAssignment(fx.opAlpha);
+
+    let releaseSettled = false;
+    let releaseObserved: Promise<unknown> | null = null;
+
+    // The seam is INSIDE the gateway's final transaction, AFTER it has locked
+    // the exact (organisation, device, site) scope row and BEFORE it commits.
+    // This is a REAL concurrent transaction, not a hook that mutates a row in
+    // front of an unlocked read: it runs on its own connection, against the same
+    // Postgres, and the only thing standing between it and the row is the lock.
+    const original = gatewayRepository.appendOperationEvent.bind(gatewayRepository);
+    const spy = vi.spyOn(gatewayRepository, 'appendOperationEvent').mockImplementationOnce(async (db, envelope, input) => {
+      releaseObserved = prisma
+        .$transaction(
+          async (tx) =>
+            tx.$executeRaw`UPDATE device_site_scopes
+               SET released_at = clock_timestamp()
+               WHERE organisation_id = ${fx.orgA} AND device_id = ${device.deviceId}::uuid
+                 AND site_id = ${fx.siteA1} AND released_at IS NULL`,
+          { timeout: 20_000, maxWait: 20_000 },
+        )
+        .then((value) => {
+          releaseSettled = true;
+          return value;
+        });
+      // Give the concurrent writer a real chance to win. It cannot: the row is
+      // locked by the transaction this callback is running inside.
+      await new Promise((resolve) => {
+        setTimeout(resolve, 750);
+      });
+      expect(releaseSettled, 'a scope withdrawal slipped between the decision and the commit').toBe(false);
+      return original(db, envelope, input);
+    });
+
+    let committed: Awaited<ReturnType<typeof operate>>;
+    try {
+      committed = await operate({ kind: 'ASSIGNMENT_ACCEPT', device, context, targetId: assignmentId, payload: { expected_status: 'REQUESTED' } });
+    } finally {
+      spy.mockRestore();
+    }
+
+    // The gateway won the row, so its decision and its effect commit together.
+    expect(committed.status).toBe(201);
+    expect((await prisma.fieldAssignment.findUniqueOrThrow({ where: { id: assignmentId } })).status).toBe('ACCEPTED');
+
+    // The withdrawal was not lost — it was SERIALISED behind the commit, and it
+    // lands the moment the lock is released.
+    await releaseObserved;
+    expect(releaseSettled).toBe(true);
+    expect(await prisma.deviceSiteScope.count({ where: { organisationId: fx.orgA, deviceId: device.deviceId, releasedAt: null } })).toBe(0);
+
+    // ...and the very next operation on that device is refused, because the
+    // fence is re-read per request rather than trusted from the last one.
+    const trace = traceId();
+    const after = await operate({
+      kind: 'ASSIGNMENT_DECLINE',
+      device,
+      context,
+      targetId: await newAssignment(fx.opAlpha),
+      payload: { expected_status: 'REQUESTED' },
+      trace,
+    });
+    expect(after.status).toBe(403);
+    expect(await refusalReasonFor(trace)).toContain('SITE_AUTHORITY_MISSING');
+  });
+
+  it('a device site scope released BEFORE the locked read refuses, with zero effect', async () => {
+    const device = await enrol();
+    const { context } = await establish(device);
+    const assignmentId = await newAssignment(fx.opAlpha);
+    const claimsBefore = (await nonceConsumptions()).length;
+    const trace = traceId();
+
+    const result = await withMutationBeforeCommit(
+      async () => {
+        await prisma.deviceSiteScope.updateMany({
+          where: { organisationId: fx.orgA, deviceId: device.deviceId, siteId: fx.siteA1, releasedAt: null },
+          data: { releasedAt: new Date() },
+        });
+      },
+      () => operate({ kind: 'ASSIGNMENT_ACCEPT', device, context, targetId: assignmentId, payload: { expected_status: 'REQUESTED' }, trace }),
+    );
+
+    expect(result.status).toBe(403);
+    expect(await refusalReasonFor(trace)).toContain('SITE_AUTHORITY_MISSING');
+    expect((await prisma.fieldAssignment.findUniqueOrThrow({ where: { id: assignmentId } })).status).toBe('REQUESTED');
+    expect((await nonceConsumptions()).length).toBe(claimsBefore);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C17-05 — the key binding is enforced by Postgres, not by a service check
+// ---------------------------------------------------------------------------
+
+describe('WP-25/C17-05 a context cannot name one device and carry another’s key', () => {
+  const CHALLENGE_INSERT = `INSERT INTO device_context_establishment_challenges
+      (id, organisation_id, proposed_context_id, actor_user_id, device_id, site_id, key_id, key_version, nonce, issued_at, expires_at, updated_at)
+    VALUES ($1::uuid, $2, $3::uuid, $4, $5::uuid, $6, $7, $8, $9, clock_timestamp(), clock_timestamp(), clock_timestamp())`;
+
+  const CONTEXT_INSERT = `INSERT INTO authenticated_device_contexts
+      (id, organisation_id, actor_user_id, device_id, key_id, key_version, issued_at, expires_at, establishment_id, issuance_trace_id, updated_at)
+    VALUES ($1::uuid, $2, $3, $4::uuid, $5, $6, clock_timestamp(), clock_timestamp(), $7::uuid, $8, clock_timestamp())`;
+
+  it('POSTGRES ITSELF rejects a raw challenge or context carrying another device’s key', async () => {
+    const alpha = await enrol();
+    const bravo = await enrol();
+    expect(bravo.keyId).not.toBe(alpha.keyId);
+
+    // A CHALLENGE naming device alpha while carrying bravo's key. Both objects
+    // genuinely exist; the TUPLE does not.
+    await expect(
+      prisma.$executeRawUnsafe(
+        CHALLENGE_INSERT,
+        randomUUID(),
+        fx.orgA,
+        randomUUID(),
+        fx.opAlpha,
+        alpha.deviceId,
+        fx.siteA1,
+        bravo.keyId,
+        bravo.keyVersion,
+        'c17-05',
+      ),
+    ).rejects.toThrow(/foreign key|violates/iu);
+
+    // The same for a CONTEXT, against a real, unspent challenge of alpha's.
+    const issued = await requestChallenge(alpha);
+    const challenge = (issued.body as { challenge: DeviceContextEstablishmentChallengeView }).challenge;
+    await expect(
+      prisma.$executeRawUnsafe(
+        CONTEXT_INSERT,
+        randomUUID(),
+        fx.orgA,
+        fx.opAlpha,
+        alpha.deviceId,
+        bravo.keyId,
+        bravo.keyVersion,
+        challenge.establishment_id,
+        'c17-05',
+      ),
+    ).rejects.toThrow(/foreign key|violates/iu);
+
+    // A WRONG KEY VERSION of the device's OWN key is rejected too — the tuple is
+    // four columns, not two.
+    await expect(
+      prisma.$executeRawUnsafe(
+        CONTEXT_INSERT,
+        randomUUID(),
+        fx.orgA,
+        fx.opAlpha,
+        alpha.deviceId,
+        alpha.keyId,
+        alpha.keyVersion + 1,
+        challenge.establishment_id,
+        'c17-05',
+      ),
+    ).rejects.toThrow(/foreign key|violates/iu);
+
+    // ...and the HONEST tuple is accepted, so the constraint is not vacuously
+    // rejecting everything.
+    const honestId = randomUUID();
+    await prisma.$executeRawUnsafe(
+      CONTEXT_INSERT,
+      honestId,
+      fx.orgA,
+      fx.opAlpha,
+      alpha.deviceId,
+      alpha.keyId,
+      alpha.keyVersion,
+      challenge.establishment_id,
+      'c17-05',
+    );
+    expect(await prisma.authenticatedDeviceContextRecord.findUnique({ where: { id: honestId } })).not.toBeNull();
+    await prisma.authenticatedDeviceContextRecord.delete({ where: { id: honestId } });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C17-06 — an unsigned field is refused at a signed boundary
+// ---------------------------------------------------------------------------
+
+describe('WP-25/C17-06 the signed boundary refuses unknown top-level fields', () => {
+  it('every unsigned top-level value on an OPERATION is refused, with zero effect', async () => {
+    const device = await enrol();
+    const { context } = await establish(device);
+
+    for (const extra of [
+      { organisation_id: fx.orgB },
+      { device_id: randomUUID() },
+      { actor_user_id: fx.opBravo },
+      { context_id: randomUUID() },
+      { purpose: 'OFFLINE_SYNC' },
+      { idempotency_key: 'chosen-by-the-device' },
+      { seen_at: new Date().toISOString() },
+    ]) {
+      const assignmentId = await newAssignment(fx.opAlpha);
+      const trace = traceId();
+      const refused = await operate({
+        kind: 'ASSIGNMENT_ACCEPT',
+        device,
+        context,
+        targetId: assignmentId,
+        payload: { expected_status: 'REQUESTED' },
+        bodyExtras: extra,
+        trace,
+      });
+      expect(refused.status, JSON.stringify(extra)).toBe(403);
+      // REJECTED, not silently discarded: the internal audit names the envelope.
+      expect(await refusalReasonFor(trace)).toContain('ENVELOPE_MALFORMED');
+      expect((await prisma.fieldAssignment.findUniqueOrThrow({ where: { id: assignmentId } })).status).toBe('REQUESTED');
+    }
+  });
+
+  it('the DELIBERATE equality-bound echoes are still accepted', async () => {
+    const device = await enrol();
+    const { context } = await establish(device);
+    const assignmentId = await newAssignment(fx.opAlpha);
+
+    const committed = await operate({
+      kind: 'ASSIGNMENT_ACCEPT',
+      device,
+      context,
+      targetId: assignmentId,
+      payload: { expected_status: 'REQUESTED' },
+      bodyExtras: { operation_kind: 'ASSIGNMENT_ACCEPT', target_type: 'FIELD_ASSIGNMENT', target_id: assignmentId },
+    });
+    expect(committed.status).toBe(201);
+    expect((await prisma.fieldAssignment.findUniqueOrThrow({ where: { id: assignmentId } })).status).toBe('ACCEPTED');
+  });
+
+  it('an unsigned top-level value on the COMPLETION request is refused, and the ceremony survives', async () => {
+    const device = await enrol();
+    const issued = await requestChallenge(device);
+    const challenge = (issued.body as { challenge: DeviceContextEstablishmentChallengeView }).challenge;
+
+    const smuggled = await completeEstablishment(challenge, device.keyPair, {
+      bodyExtras: { organisation_id: fx.orgB, context_id: randomUUID() },
+    });
+    // A SHAPE complaint about the caller’s own bytes, and nothing was touched.
+    expect(smuggled.status).toBe(400);
+    expect(smuggled.body.error).toBe('DEVICE_REQUEST_MALFORMED');
+    expect(await prisma.authenticatedDeviceContextRecord.findUnique({ where: { id: challenge.proposed_context_id } })).toBeNull();
+    expect((await prisma.deviceContextEstablishmentChallenge.findUniqueOrThrow({ where: { id: challenge.establishment_id } })).consumedAt).toBeNull();
+
+    // The honest request still completes.
+    expect((await completeEstablishment(challenge, device.keyPair)).status).toBe(201);
   });
 });

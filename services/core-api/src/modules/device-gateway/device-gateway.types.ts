@@ -1,4 +1,4 @@
-import type { DeviceRequestProofRefusal, DevicePrincipalRefusal } from '@sentinel/contracts';
+import type { DeviceRequestProofRefusal, DevicePrincipalRefusal, DeviceTrust } from '@sentinel/contracts';
 import type { DeviceGatewayOperationKind, DeviceGatewayTargetType } from './device-gateway.envelope';
 
 /**
@@ -63,6 +63,26 @@ export const DEVICE_GATEWAY_REFUSALS = [
   'ESTABLISHMENT_NOT_PERMITTED',
   /** The one-context-per-ceremony database constraint spoke. */
   'ESTABLISHMENT_ALREADY_ISSUED',
+  /**
+   * C17-02: the tenant the PROOF claimed is not the tenant of the persisted
+   * challenge or context the AUTHENTICATED SESSION resolved.
+   *
+   * The claimed organisation may appear in this internal reason. It may NEVER
+   * select which tenant owns an audit row — the session's organisation does
+   * that until a server-owned row resolves, and the row's own persisted
+   * organisation does it afterwards.
+   */
+  'PROOF_ORGANISATION_MISMATCH',
+  /**
+   * C17-01: a valid possession proof presented under a DIFFERENT authenticated
+   * human than the one the challenge or context is bound to.
+   *
+   * This is the refusal that makes the two principals two. A perfect signature
+   * over a perfect statement, carried by a live session belonging to somebody
+   * else, is not a weaker request — it is a request by a person who was never
+   * granted this context.
+   */
+  'SESSION_ACTOR_MISMATCH',
 ] as const;
 export type DeviceGatewayRefusal = (typeof DEVICE_GATEWAY_REFUSALS)[number];
 
@@ -116,6 +136,43 @@ export type DeviceGatewayOperationResult =
   | { readonly outcome: 'CONFLICT' }
   | { readonly outcome: 'REFUSED' };
 
+/**
+ * WP-25/C17-01 — THE FIVE FACTS, NAMED SEPARATELY, BECAUSE THEY ARE FIVE.
+ *
+ * The defect this shape exists to make unrepresentable was one boolean doing
+ * two jobs: `userAuthenticated` was fed from "a matching user row exists and
+ * their roles resolve", which is CURRENT AUTHORISATION and says nothing at all
+ * about whether THIS HTTP request came from that human. A device holding a
+ * stolen context and a registered key satisfied it every time.
+ *
+ *   sessionAuthenticated      THIS REQUEST carries the authenticated human
+ *                             principal the global guard chain attached. It is
+ *                             the only fact that answers "who is calling?", and
+ *                             nothing else in this module may be substituted
+ *                             for it.
+ *   actorCurrentlyAuthorised  the live user/role re-read says that person still
+ *                             exists in this tenant and still holds the
+ *                             capability THIS operation requires. Authorisation
+ *                             NOW — a different question, asked separately.
+ *   deviceAuthenticated       possession was PROVEN against the registered key
+ *                             AND the credential is intact. Which hardware.
+ *   deviceCurrentlyTrusted    the registry's CURRENT effective standing, never
+ *                             the context's issuance-time snapshot.
+ *   siteAuthorityGranted      BOTH halves: the human currently works the site
+ *                             and the device is currently deployed at it.
+ *
+ * None substitutes for another, and the compiler now says so: a caller cannot
+ * satisfy `sessionAuthenticated` by passing the value it computed for
+ * `actorCurrentlyAuthorised` without writing that substitution out by hand.
+ */
+export interface DeviceGatewayPrincipalFacts {
+  readonly sessionAuthenticated: boolean;
+  readonly actorCurrentlyAuthorised: boolean;
+  readonly deviceAuthenticated: boolean;
+  readonly deviceCurrentlyTrusted: DeviceTrust;
+  readonly siteAuthorityGranted: boolean;
+}
+
 /** What the establishment ceremony can end as. */
 export type DeviceContextEstablishmentResult =
   | {
@@ -126,6 +183,22 @@ export type DeviceContextEstablishmentResult =
        * it authorises nothing: every effect-causing request that names it must
        * still carry a fresh hardware-signed possession proof.
        */
+      readonly context: unknown;
+    }
+  | {
+      /**
+       * C17-03: an EXACT RETRY of a ceremony that already succeeded, answered
+       * with the context that ALREADY EXISTS.
+       *
+       * The lost-response case is not an attack and must not be answered like
+       * one: the server issued a context, the response never arrived, and the
+       * device re-sent the byte-identical signed request. Telling that retry
+       * `ESTABLISHMENT_NOT_USABLE` is Sentinel lying about a ceremony that
+       * succeeded. The context here is READ BACK from the committed row — same
+       * id, same `issued_at`, same `expires_at`. No second context, no extended
+       * window, and no authority that the first issuance did not already grant.
+       */
+      readonly outcome: 'CONVERGED';
       readonly context: unknown;
     }
   | { readonly outcome: 'REFUSED' };

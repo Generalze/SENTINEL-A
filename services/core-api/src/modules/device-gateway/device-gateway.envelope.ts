@@ -190,9 +190,26 @@ export type DeviceGatewayEnvelopeParse =
  *
  * `proof` is validated by the frozen `DeviceRequestProofSchema` elsewhere; here
  * it is only carved off so it cannot leak into the semantic payload. The
- * echoed `operation_kind` and `target_type` are OPTIONAL and are equality-bound
- * to the route's choice — a device that wants to state what it thinks it is
- * doing may, and a device that states something else is refused.
+ * echoed `operation_kind`, `target_type` and `target_id` are OPTIONAL and are
+ * equality-bound to what the ROUTE and the SERVER resolved — a device that
+ * wants to state what it thinks it is doing may, and a device that states
+ * something else is refused.
+ *
+ * C17-06 — `.strict()`, BECAUSE THIS IS A SIGNED BOUNDARY.
+ *
+ * The semantic payloads have always been strict. This outer envelope was
+ * `.passthrough()`, which meant a top-level key that is NO PART of the signed
+ * object was accepted and silently dropped: `organisation_id`, `device_id`,
+ * `actor_user_id`, `context_id`, `purpose`, `idempotency_key`. None of them was
+ * read, so it was not a bypass — it was the debt that BECOMES one the day a
+ * refactor adds `body.organisation_id` to a handler whose parse already
+ * succeeded. Accepting fields the signature does not cover is how the two sides
+ * of a signature scheme start disagreeing about what was signed, so an unknown
+ * top-level value is REFUSED rather than discarded.
+ *
+ * The three echoes stay because they are the opposite of unsigned input: each
+ * is equality-bound below to a value the SERVER already decided, and a
+ * disagreement is a refusal.
  */
 const RequestBodySchema = z
   .object({
@@ -202,7 +219,7 @@ const RequestBodySchema = z
     target_type: z.string().optional(),
     target_id: z.string().optional(),
   })
-  .passthrough();
+  .strict();
 
 /**
  * Builds the canonical envelope for `kind`, or refuses.

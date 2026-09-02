@@ -145,9 +145,21 @@ export class DeviceRegistryService {
    * which re-derives the thumbprint from the key and refuses a row whose
    * status and timestamps tell different stories. A registry row that cannot
    * satisfy its own contract is not handed to a verifier.
+   *
+   * WP-25/C17-04: `tx` IS NOT OPTIONAL DECORATION. A caller that has taken the
+   * device and key row locks and then resolves the key OUTSIDE its transaction
+   * is reading a row nothing is holding still — the registry could have rotated
+   * or withdrawn it in the gap, and the decision would commit against a fact
+   * that was already stale when it was read. Every gateway call site inside a
+   * final transaction passes its `tx`; the preflight, which commits nothing,
+   * deliberately does not.
    */
-  async resolveRegistryKeyRecord(organisationId: string, keyId: string): Promise<DeviceRegistryKeyRecord | null> {
-    const key = await this.repository.findDeviceKeyByKeyId(organisationId, keyId);
+  async resolveRegistryKeyRecord(
+    organisationId: string,
+    keyId: string,
+    tx?: Prisma.TransactionClient,
+  ): Promise<DeviceRegistryKeyRecord | null> {
+    const key = await this.repository.findDeviceKeyByKeyId(organisationId, keyId, tx);
     if (key === null) return null;
     const parsed = DeviceRegistryKeyRecordSchema.safeParse({
       schema_version: 1,

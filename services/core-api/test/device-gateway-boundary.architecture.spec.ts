@@ -19,6 +19,8 @@ import { describe, expect, it } from 'vitest';
  *      (D25-10)?
  *   4. Does it wire itself to the frozen Whisper device-key resolver (D25-07)?
  *   5. Does it open a device WebSocket ingress path (D25-10)?
+ *   6. Does ANY route in it exempt itself from human authentication, or file an
+ *      audit row under a tenant the REQUEST named (C17-01 / C17-02)?
  *
  * A behavioural test can only prove that the paths it happens to call do not do
  * these things. It cannot prove the absence of a path. So this is a pure source
@@ -242,5 +244,91 @@ describe('WP-25/D25-12 the frozen timing constants are imported, never restated'
     expect(declarations.map((file) => relative(CORE_API_SRC, file))).toEqual([
       relative(CORE_API_SRC, join(GATEWAY_DIR, 'device-gateway.constants.ts')),
     ]);
+  });
+});
+
+describe('WP-25/C17-01 no gateway route exempts itself from human authentication', () => {
+  it('nothing in the gateway declares @Public() or imports the decorator', () => {
+    // A behavioural test can only prove that the routes it happens to call
+    // require a session. It cannot prove that the SIXTH route somebody adds
+    // next quarter does, and `@Public()` is a one-line edit with no visible
+    // consequence at the call site. So the absence is asserted as a source fact.
+    //
+    // The prohibition is absolute HERE and nowhere else: `@Public()` is
+    // legitimate on liveness probes and is used elsewhere in this service. What
+    // it may never mark is a route that consumes a device possession proof,
+    // because on such a route it removes the SECOND PRINCIPAL - and the two
+    // principals are the whole of §62.1.
+    for (const file of gatewaySource) {
+      const body = withoutComments(readFileSync(file, 'utf8'));
+      expect(/@Public\s*\(/u.test(body), file).toBe(false);
+      expect(/\bPublic\b[^\n]*from\s+'[^']*requires-action\.decorator'/u.test(body), file).toBe(false);
+    }
+  });
+
+  it('every effect-causing route reads the authenticated principal', () => {
+    const controller = withoutComments(readFileSync(join(GATEWAY_DIR, 'device-gateway.controller.ts'), 'utf8'));
+    for (const route of [
+      "@Post('contexts/establishment')",
+      "@Post('contexts')",
+      "@Post('operations/field-state')",
+      "@Post('operations/assignments/:id/accept')",
+      "@Post('operations/assignments/:id/decline')",
+      "@Post('operations/messages/:id/acknowledge')",
+    ]) {
+      expect(controller.includes(route), route).toBe(true);
+    }
+    // The six routes, and exactly two handlers that reach a service without
+    // going through `run` - so three `requirePrincipal` call sites cover all six.
+    expect(controller.split('requirePrincipal(req)').length - 1).toBe(3);
+    // The principal is PASSED, never re-derived inside the services.
+    expect(controller).toContain('this.gateway.execute(principal,');
+    expect(controller).toContain('this.contexts.completeEstablishment(principal,');
+    expect(controller).toContain('this.contexts.requestEstablishment(principal,');
+  });
+
+  it('the tripwire fires on the shapes a future edit could reach an exemption by', () => {
+    for (const shape of ['@Public()', '@Public ()', "import { Public } from '../../common/security/requires-action.decorator';"]) {
+      const publicDecorator = /@Public\s*\(/u.test(shape);
+      const publicImport = /\bPublic\b[^\n]*from\s+'[^']*requires-action\.decorator'/u.test(shape);
+      expect(publicDecorator || publicImport, shape).toBe(true);
+    }
+    expect(/@Public\s*\(/u.test("@Post('contexts')")).toBe(false);
+  });
+});
+
+describe('WP-25/C17-02 no lookup and no audit row is anchored on a claimed tenant', () => {
+  /**
+   * `proof.organisation_id` is a CLAIM. It may be equality-bound against a
+   * persisted row, and it may appear in an internal refusal reason. It may never
+   * SELECT a row or OWN an audit event - the gateway audit has no lifecycle
+   * foreign key, so write-time provenance is the only provenance it has, and a
+   * tenant an attacker merely named must not be able to acquire it.
+   */
+  const CLAIMED_TENANT_AS_ANCHOR =
+    /(?:find|lock|list)[A-Za-z]*\(\s*(?:tx\s*,\s*)?proof\.organisation_id|organisationId:\s*proof\.organisation_id|organisationId:\s*input\.organisationId/u;
+
+  it('no gateway source uses a claimed organisation as a lookup or audit anchor', () => {
+    const offenders = gatewaySource.filter((file) => CLAIMED_TENANT_AS_ANCHOR.test(withoutComments(readFileSync(file, 'utf8'))));
+    expect(offenders.map((file) => relative(CORE_API_SRC, file))).toEqual([]);
+  });
+
+  it('the tripwire fires on the exact shapes C17-02 found', () => {
+    for (const shape of [
+      'const contextRow = await this.repository.findContext(proof.organisation_id, proof.context_id);',
+      'await this.repository.lockEstablishmentChallenge(tx, proof.organisation_id, id);',
+      'this.replay.peek(tx, { organisationId: proof.organisation_id, replayKey })',
+      'appendOperationEventOutsideTransaction({ organisationId: input.organisationId, contextId: null })',
+    ]) {
+      expect(CLAIMED_TENANT_AS_ANCHOR.test(shape), shape).toBe(true);
+    }
+    for (const legal of [
+      'const contextRow = await this.repository.findContext(principal.organisation_id, proof.context_id);',
+      'if (proof.organisation_id !== contextRow.organisationId) return refuse();',
+      'organisationId: contextRow.organisationId,',
+      'organisationId: auditOrganisationId,',
+    ]) {
+      expect(CLAIMED_TENANT_AS_ANCHOR.test(legal), legal).toBe(false);
+    }
   });
 });

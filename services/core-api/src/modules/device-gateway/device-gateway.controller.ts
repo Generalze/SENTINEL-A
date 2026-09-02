@@ -2,7 +2,6 @@ import { randomUUID } from 'node:crypto';
 import { BadRequestException, Body, ConflictException, Controller, ForbiddenException, Inject, Param, Post, Req } from '@nestjs/common';
 import { z } from 'zod';
 import { requirePrincipal, type RequestWithPrincipal } from '../../common/security/principal';
-import { Public } from '../../common/security/requires-action.decorator';
 import { DeviceContextService } from './device-context.service';
 import type { DeviceGatewayOperationKind } from './device-gateway.envelope';
 import { DeviceGatewayService } from './device-gateway.service';
@@ -18,38 +17,62 @@ import type { DeviceGatewayOperationResult } from './device-gateway.types';
  * it. THIS FILE IS THAT LIFT, and it is lifted only for a surface that
  * consumes real device authentication.
  *
- * WHAT AUTHENTICATES A CALLER HERE
- * --------------------------------
- * A FRESH, HARDWARE-SIGNED `DeviceRequestProof`. Nothing else. There is no
- * device bearer token, no device session cookie, no authenticated socket, no
- * per-connection exemption and no header this controller reads as a
- * credential.
+ * WHAT AUTHENTICATES A CALLER HERE — THREE FACTS, AND NONE SUBSTITUTES
+ * FOR ANOTHER (C17-01)
+ * ------------------------------------------------------------------------
+ *     THE SESSION            proves WHO is calling. It is the ordinary
+ *                            authenticated human principal the global guard
+ *                            chain attaches — the same one every other
+ *                            authenticated route in this codebase carries.
+ *
+ *     THE POSSESSION PROOF   proves WHICH HARDWARE is answering. A fresh,
+ *                            hardware-signed `DeviceRequestProof`, bound to the
+ *                            context, the key version, the purpose, the payload
+ *                            digest and a one-shot nonce.
+ *
+ *     THE LIVE RE-READ       proves they are STILL AUTHORISED NOW. The user row
+ *                            and the role assignments, read on every request and
+ *                            again under lock inside the effect transaction.
+ *
+ * A request missing ANY of the three is refused, and NONE of them can be
+ * produced out of another. The code says so structurally: the five facts they
+ * feed are five separately named fields (`DeviceGatewayPrincipalFacts`), not one
+ * conflated boolean.
+ *
+ * NONE OF THIS IS A DEVICE BEARER CREDENTIAL. D25-01 forbids a credential a
+ * DEVICE can hold and present as authority — a device token, a device session
+ * cookie, an authenticated socket, a per-connection exemption, a header this
+ * controller reads as a device credential. It does not forbid the independent
+ * HUMAN session; it depends on one. An earlier revision of this file argued the
+ * opposite and marked the device routes `@Public()`, then re-derived the "human
+ * half" from a live user/role lookup keyed on the context’s own
+ * `actor_user_id`. That is an AUTHORISATION lookup wearing an AUTHENTICATION
+ * label: it answers "does a person with that id still hold a capability?" and
+ * says nothing whatever about who sent the request — so a stolen context plus a
+ * device key was a complete authority. Collapsing the two principals is exactly
+ * what the two-principal split exists to prevent, and it is why every route
+ * below now carries the session.
  *
  *     A context id presented WITHOUT a matching possession proof is refused
  *     POSSESSION_NOT_PROVEN (D25-01).
  *
+ *     A valid proof presented by a DIFFERENT authenticated human, or with no
+ *     session at all, is refused and causes nothing (C17-01).
+ *
  * `AuthenticatedDeviceContext` is a SCOPE STATEMENT, not a credential: holding
- * one says what a device WOULD be entitled to IF the hardware were present. So
- * `context_id` may be logged, echoed and even leaked without conferring
- * anything, and every effect-causing request carries its own proof, bound to
- * the context, the key version, the purpose, the payload digest and a one-shot
- * nonce.
+ * one says what a device WOULD be entitled to IF the hardware were present AND
+ * the operative were the one calling. So `context_id` may be logged, echoed and
+ * even leaked without conferring anything.
  *
- * WHY THE DEVICE ROUTES ARE `@Public()`
- * -------------------------------------
- * `@Public()` in this codebase means exactly one thing: the global DevAuthGuard
- * attaches no HUMAN SESSION principal. It does NOT mean unauthenticated. These
- * routes are authenticated by hardware possession, which is a stronger
- * statement than the `x-dev-user-id` header the human routes carry — and
- * marking them otherwise would require the device to also present a human
- * session credential, which is the bearer-token shortcut D25-01 forbids. The
- * HUMAN half of the invariant is not skipped: it is re-established from CURRENT
- * server state on every request, and `evaluateDeviceOperationPrincipals`
- * refuses when either principal is missing.
- *
- * The establishment REQUEST route is the opposite and is deliberately NOT
- * `@Public()`: it is the one call in this module made by a person, and the
- * ceremony rests on that independent human session existing.
+ * THE TENANT ANCHOR IS THE SESSION’S (C17-02)
+ * -------------------------------------------
+ * No lookup in this module is keyed on `proof.organisation_id`, and no audit row
+ * is filed under a tenant a request merely NAMED. Server state is resolved under
+ * `principal.organisation_id`, the proof’s claim is equality-bound against the
+ * persisted row, and once a challenge or context resolves its own persisted
+ * organisation is authoritative. The gateway audit deliberately carries no
+ * lifecycle foreign key, which makes write-time provenance the only provenance
+ * it has.
  *
  * WHAT THIS BOUNDARY REFUSES
  * --------------------------
@@ -57,12 +80,18 @@ import type { DeviceGatewayOperationResult } from './device-gateway.types';
  *   * a proof replayed verbatim — the nonce is one-shot;
  *   * a proof minted for another purpose, another payload or another operation;
  *   * a body that names an `operation_kind` other than the route's (D25-11);
+ *   * a body carrying ANY top-level value the device did not sign — refused,
+ *     not silently discarded (C17-06);
  *   * any attempt to choose the downstream domain idempotency key (D25-16B);
  *   * `start`, `complete`, `cancel` and reassignment — there is no route for
  *     them and nothing in this module constructs those actions (D25-10);
  *   * anything at all, once the device is revoked, the key is rotated, the
  *     context is closed, the actor's authority is withdrawn or the site
  *     entitlement is lost — re-checked under lock, per request (D25-04A).
+ *
+ * ...and what it does NOT refuse: an EXACT RETRY of an establishment ceremony
+ * that already succeeded. That is the lost response, not an attack, and it is
+ * answered with the context that already exists (C17-03).
  *
  * THE REFUSAL BOUNDARY IS NOT AN ENUMERATION ORACLE (D25-13)
  * ----------------------------------------------------------
@@ -106,12 +135,23 @@ const EstablishmentRequestSchema = z
   })
   .strict();
 
+/**
+ * C17-06: `.strict()`, at a CRYPTOGRAPHIC BOUNDARY.
+ *
+ * The semantic payload schemas have always been strict; the outer request
+ * envelope was not, so a top-level key that is no part of the signed object was
+ * accepted and silently discarded. That is not a bypass today - nothing reads
+ * those keys - and it is exactly the debt a later refactor turns into one, the
+ * day somebody adds `const organisationId = body.organisation_id` to a handler
+ * that already parsed successfully. A field that is not part of what the device
+ * signed is REFUSED here rather than dropped quietly.
+ */
 const CompleteEstablishmentSchema = z
   .object({
     establishment_id: z.string().min(1).max(256),
     proof: z.unknown(),
   })
-  .passthrough();
+  .strict();
 
 @Controller('api/v1/device-gateway')
 export class DeviceGatewayController {
@@ -156,8 +196,19 @@ export class DeviceGatewayController {
   }
 
   /**
-   * STEP TWO of D25-03A. The DEVICE answers the challenge and a context is
-   * issued, or nothing is.
+   * STEP TWO of D25-03A. The DEVICE's answer is submitted, and a context is
+   * issued, converged on, or nothing happens.
+   *
+   * C17-01: NOT `@Public()`. The same authenticated human who opened the
+   * ceremony submits its answer, and the session is bound to the challenge's own
+   * tenant and actor before any server state is touched - so a perfect proof
+   * carried by somebody else's live session refuses.
+   *
+   * C17-03: an EXACT RETRY of a ceremony that already succeeded - the
+   * lost-response case - is answered with the context that ALREADY EXISTS: same
+   * id, same `issued_at`, same `expires_at`, no second context and no extended
+   * window. Telling that retry `ESTABLISHMENT_NOT_USABLE` was Sentinel lying
+   * about a ceremony that had succeeded.
    *
    * The response carries the ISSUED context, assembled from the committed row.
    * The IN-MEMORY CANDIDATE the evaluators judged is never returned, never
@@ -165,17 +216,22 @@ export class DeviceGatewayController {
    * context at all, and no context row exists.
    */
   @Post('contexts')
-  @Public()
   async completeEstablishment(@Req() req: RequestWithPrincipal, @Body() body: unknown): Promise<unknown> {
+    const principal = requirePrincipal(req);
     const parsed = CompleteEstablishmentSchema.safeParse(body);
     if (!parsed.success) throw new BadRequestException(EXTERNAL_MALFORMED);
 
-    const outcome = await this.contexts.completeEstablishment({
+    const outcome = await this.contexts.completeEstablishment(principal, {
       establishmentId: parsed.data.establishment_id,
       proof: parsed.data.proof,
       traceId: traceIdOf(req),
     });
     if (outcome.outcome === 'REFUSED') throw new ForbiddenException(EXTERNAL_REFUSED);
+    // ISSUED and CONVERGED return the SAME body, because C17-03's whole point is
+    // that a retry of a ceremony that already succeeded sees exactly what the
+    // first attempt produced - the same context id, the same window, no second
+    // context. The distinction is recorded in the internal audit, where an
+    // operator can count issuances without subtracting retries.
     return { context: outcome.context };
   }
 
@@ -188,14 +244,12 @@ export class DeviceGatewayController {
    * writing.
    */
   @Post('operations/field-state')
-  @Public()
   async fieldState(@Req() req: RequestWithPrincipal, @Body() body: unknown): Promise<unknown> {
     return this.run(req, 'FIELD_STATE_UPDATE', null, body);
   }
 
   /** B. Assignment ACCEPT. */
   @Post('operations/assignments/:id/accept')
-  @Public()
   async acceptAssignment(@Req() req: RequestWithPrincipal, @Param('id') id: string, @Body() body: unknown): Promise<unknown> {
     return this.run(req, 'ASSIGNMENT_ACCEPT', id, body);
   }
@@ -209,7 +263,6 @@ export class DeviceGatewayController {
    * module (D25-10).
    */
   @Post('operations/assignments/:id/decline')
-  @Public()
   async declineAssignment(@Req() req: RequestWithPrincipal, @Param('id') id: string, @Body() body: unknown): Promise<unknown> {
     return this.run(req, 'ASSIGNMENT_DECLINE', id, body);
   }
@@ -225,7 +278,6 @@ export class DeviceGatewayController {
    * one.
    */
   @Post('operations/messages/:id/acknowledge')
-  @Public()
   async acknowledgeMessage(@Req() req: RequestWithPrincipal, @Param('id') id: string, @Body() body: unknown): Promise<unknown> {
     return this.run(req, 'INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE', id, body);
   }
@@ -243,7 +295,12 @@ export class DeviceGatewayController {
     targetId: string | null,
     body: unknown,
   ): Promise<unknown> {
-    const result: DeviceGatewayOperationResult = await this.gateway.execute(kind, {
+    // C17-01: the AUTHENTICATED HUMAN, passed explicitly. It is a required
+    // argument of `execute` rather than something the service could go and look
+    // up, so there is no path on which the human half is inferred from server
+    // state instead of established from the request.
+    const principal = requirePrincipal(req);
+    const result: DeviceGatewayOperationResult = await this.gateway.execute(principal, kind, {
       proof: readProof(body),
       body,
       targetId,

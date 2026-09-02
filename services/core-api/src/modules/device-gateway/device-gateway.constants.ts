@@ -83,6 +83,15 @@ export const DEVICE_GATEWAY_EVENT_TYPES = [
   'ESTABLISHMENT_CHALLENGE_ISSUED',
   'ESTABLISHMENT_REFUSED',
   'CONTEXT_ISSUED',
+  /**
+   * C17-03: an exact retry of a ceremony that already succeeded, answered with
+   * the context that already exists. It is a SEPARATE event type from
+   * `CONTEXT_ISSUED` deliberately — an operator counting issuances must not
+   * have to subtract retries, and a convergence that recorded itself as an
+   * issuance would make "how many contexts were minted?" unanswerable from the
+   * audit alone.
+   */
+  'CONTEXT_CONVERGED',
   'OPERATION_COMMITTED',
   'OPERATION_CONVERGED',
   'OPERATION_REFUSED',

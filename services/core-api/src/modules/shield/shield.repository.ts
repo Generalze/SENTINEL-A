@@ -946,6 +946,48 @@ export class ShieldRepository {
     await tx.deviceSiteScope.create({ data: input });
   }
 
+  /**
+   * WP-25/C17-04 — THE ONE (organisation, device, site) SCOPE ROW A REQUEST
+   * DEPENDS ON, HELD STILL FOR THE DECISION IT FEEDS.
+   *
+   * `listDeviceSiteIds` answers "where is this device deployed?" as an
+   * unlocked list, which is the right shape for a roster read and the WRONG
+   * shape for an authority fence: between reading the list and committing the
+   * effect, a concurrent transaction can release or move the very association
+   * the decision rested on, and nothing would have stopped it.
+   *
+   * `device_site_scope_key` — UNIQUE (organisation_id, device_id, site_id) —
+   * means the tuple this locks is at most one row, so `FOR UPDATE` here is a
+   * lock on the EXACT fact, not on a range. A concurrent release blocks until
+   * the gateway's transaction commits or rolls back; a release that got there
+   * first is already visible and this returns `false`.
+   *
+   * `released_at IS NULL` is part of the predicate rather than a check the
+   * caller applies afterwards, so "no such association" and "an association
+   * that has been released" are one answer, taken by the database.
+   */
+  async lockActiveDeviceSiteScope(tx: Tx, organisationId: string, deviceId: string, siteId: string): Promise<boolean> {
+    if (!isUuid(deviceId)) return false;
+    const rows = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+      SELECT id
+      FROM device_site_scopes
+      WHERE organisation_id = ${organisationId}
+        AND device_id = ${deviceId}::uuid
+        AND site_id = ${siteId}
+        AND released_at IS NULL
+      FOR UPDATE`);
+    return rows.length === 1;
+  }
+
+  /** The unlocked variant of the same question, for a preflight that commits nothing. */
+  async hasActiveDeviceSiteScope(organisationId: string, deviceId: string, siteId: string): Promise<boolean> {
+    const row = await this.prisma.deviceSiteScope.findFirst({
+      where: { organisationId, deviceId, siteId, releasedAt: null },
+      select: { id: true },
+    });
+    return row !== null;
+  }
+
   async listDeviceSiteIds(organisationId: string, deviceId: string): Promise<string[]> {
     const rows = await this.prisma.deviceSiteScope.findMany({
       where: { organisationId, deviceId, releasedAt: null },

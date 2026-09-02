@@ -32,10 +32,15 @@ import {
   DEVICE_GATEWAY_ESTABLISHMENT_NONCE_BYTES,
 } from './device-gateway.constants';
 import { DEVICE_GATEWAY_CAPABILITY_ACTIONS } from './device-gateway.envelope';
-import { resolveGatewayActor } from './device-gateway.principals';
-import { DeviceGatewayRepository, type EstablishmentChallengeRow, type GatewayTx } from './device-gateway.repository';
+import { composeDeviceGatewayPrincipalFacts, resolveGatewayActor, sessionAuthenticatedBy } from './device-gateway.principals';
+import {
+  DeviceGatewayRepository,
+  type EstablishmentChallengeRow,
+  type GatewayTx,
+  type IssuedContextRow,
+} from './device-gateway.repository';
 import { DeviceGatewayTransactionRollback, isDeviceGatewayTransactionRollback } from './device-gateway.rollback';
-import type { DeviceContextEstablishmentResult, DeviceGatewayRefusal } from './device-gateway.types';
+import type { DeviceContextEstablishmentResult, DeviceGatewayPrincipalFacts, DeviceGatewayRefusal } from './device-gateway.types';
 
 /**
  * WP-25/D25-03A — THE PRE-CONTEXT ESTABLISHMENT CEREMONY.
@@ -58,7 +63,8 @@ import type { DeviceContextEstablishmentResult, DeviceGatewayRefusal } from './d
  *           current registry standing, current actor/site intersection
  *        -> SERVER creates a short-lived ONE-SHOT challenge
  *        -> NO CONTEXT HAS BEEN ISSUED. NO DEVICE AUTHORITY EXISTS.
- *        -> DEVICE signs a frozen DeviceRequestProof:
+ *        -> THE SAME HUMAN, STILL AUTHENTICATED, submits the device's answer:
+ *           a frozen DeviceRequestProof signed by the registered key —
  *             context_id     = the PROPOSED context id
  *             purpose        = RECONNECT_HANDSHAKE
  *             payload_digest = digest of the EXACT challenge
@@ -68,6 +74,38 @@ import type { DeviceContextEstablishmentResult, DeviceGatewayRefusal } from './d
  *           + evaluateDeviceOperationPrincipals
  *        -> FINAL TRANSACTION: re-read, consume the challenge, consume the
  *           replay identity, persist the context and its site rows, append audit
+ *
+ * C17-01 — BOTH STEPS REQUIRE THE AUTHENTICATED HUMAN, AND THAT IS NOT A
+ * BEARER SHORTCUT
+ * -----------------------------------------------------------------------
+ * The previous revision of this file made step two `@Public()` and then
+ * re-derived the "human half" from a live user/role lookup keyed on the
+ * challenge's own `actor_user_id`. That is an AUTHORISATION lookup wearing an
+ * AUTHENTICATION label: it proves a person with that id exists and still holds
+ * a capability, and says nothing whatsoever about who sent the request. Anyone
+ * holding the challenge and the device key satisfied it.
+ *
+ * D25-01 forbids a DEVICE BEARER CREDENTIAL. It does not forbid — it REQUIRES —
+ * the independent human session, and collapsing the two is exactly what the
+ * two-principal split exists to prevent. So:
+ *
+ *     THE SESSION proves WHO is calling.
+ *     THE POSSESSION PROOF proves WHICH HARDWARE is answering.
+ *     THE LIVE RE-READ proves THEY ARE STILL AUTHORISED NOW.
+ *
+ * and none of the three substitutes for another. The session is checked against
+ * the challenge's own tenant and actor before anything else happens, so a valid
+ * proof presented by a DIFFERENT authenticated human refuses.
+ *
+ * C17-02 — THE SESSION'S TENANT IS THE INITIAL TRUST ANCHOR
+ * --------------------------------------------------------
+ * Nothing here looks a challenge up by `proof.organisation_id`, and no audit
+ * row is ever filed under a tenant the request merely NAMED. The challenge is
+ * resolved under `principal.organisation_id`; the proof's claim is then
+ * EQUALITY-BOUND against the persisted row and a mismatch is a refusal. Once
+ * the row resolves, its own persisted organisation is authoritative. The
+ * gateway audit deliberately carries no lifecycle foreign key, which makes
+ * write-time provenance the only provenance there is.
  *
  * THE CANDIDATE IS NOT AN ISSUED CONTEXT, AND IT NEVER LEAVES THIS PROCESS.
  *
@@ -125,10 +163,14 @@ export class DeviceContextService {
     principal: Principal,
     input: { organisationId: string; deviceId: string; siteId: string; traceId: string },
   ): Promise<{ outcome: 'ISSUED'; challenge: DeviceContextEstablishmentChallengeView } | { outcome: 'REFUSED' }> {
+    // C17-02: THE AUDIT TENANT IS THE SESSION'S, NEVER THE REQUEST'S. Filing a
+    // refusal under `input.organisationId` would let any authenticated caller
+    // append an append-only event to any tenant it could name.
+    const auditOrganisationId = principal.organisation_id;
     const refuse = async (refusal: DeviceGatewayRefusal): Promise<{ outcome: 'REFUSED' }> => {
       await this.repository.appendOperationEventOutsideTransaction(
         {
-          organisationId: input.organisationId,
+          organisationId: auditOrganisationId,
           contextId: null,
           deviceId: null,
           actorUserId: principal.user.id,
@@ -140,6 +182,9 @@ export class DeviceContextService {
           type: 'ESTABLISHMENT_REFUSED',
           establishmentId: null,
           proposedContextId: null,
+          // The site is only a site id: it names nothing outside this tenant and
+          // is a scalar the operator needs. The TENANT above is the field that
+          // decides ownership, and it is the session's.
           siteId: input.siteId,
           refusal,
           contractRefusal: null,
@@ -151,44 +196,46 @@ export class DeviceContextService {
     // The session's own tenant is the only tenant it may ask about. A principal
     // naming another organisation is not an error to be reported, it is a probe.
     if (principal.organisation_id !== input.organisationId) return refuse('ESTABLISHMENT_NOT_PERMITTED');
+    const organisationId = principal.organisation_id;
 
     const actor = await resolveGatewayActor(
       this.repository,
-      { organisationId: input.organisationId, actorUserId: principal.user.id, actions: DEVICE_GATEWAY_CAPABILITY_ACTIONS },
+      { organisationId, actorUserId: principal.user.id, actions: DEVICE_GATEWAY_CAPABILITY_ACTIONS },
       undefined,
     );
     if (actor === null) return refuse('ACTOR_NOT_USABLE');
     if (!actor.gatewaySiteIds.includes(input.siteId)) return refuse('SITE_NOT_USABLE');
 
-    const device = await this.shield.findDevice(input.organisationId, input.deviceId);
+    const device = await this.shield.findDevice(organisationId, input.deviceId);
     if (device === null) return refuse('DEVICE_NOT_USABLE');
     if (device.currentKeyId === null || device.currentKeyVersion === null) return refuse('REGISTRY_KEY_UNRESOLVABLE');
 
     // The device must be deployed at the site the context is being issued for.
     // This is the DEVICE half of site authority and it is asked separately from
     // the actor half above — neither may stand in for the other.
-    const deviceSiteIds = await this.shield.listDeviceSiteIds(input.organisationId, device.id);
-    if (!deviceSiteIds.includes(input.siteId)) return refuse('SITE_NOT_USABLE');
+    if (!(await this.shield.hasActiveDeviceSiteScope(organisationId, device.id, input.siteId))) {
+      return refuse('SITE_NOT_USABLE');
+    }
 
     // CURRENT registry standing, through Shield's ONE canonical effective
     // resolution (C16-R5) at the frozen RECONNECT_HANDSHAKE purpose. A
     // QUARANTINED or COMPROMISED device gets no challenge at all: those are
     // decisions, not ignorance, and the purpose table says so.
-    if (!(await this.registry.deviceMayAct(input.organisationId, device.id, 'RECONNECT_HANDSHAKE'))) {
+    if (!(await this.registry.deviceMayAct(organisationId, device.id, 'RECONNECT_HANDSHAKE'))) {
       return refuse('DEVICE_NOT_USABLE');
     }
-    const effectiveTrust = await this.registry.effectiveDeviceTrust(input.organisationId, device.id);
+    const effectiveTrust = await this.registry.effectiveDeviceTrust(organisationId, device.id);
     if (effectiveTrust === null) return refuse('DEVICE_NOT_USABLE');
 
     // The key is RESOLVED FROM THE REGISTRY. There is no parameter through
     // which a caller could supply one, here or anywhere else in this module.
-    const keyRecord = await this.registry.resolveRegistryKeyRecord(input.organisationId, device.currentKeyId);
+    const keyRecord = await this.registry.resolveRegistryKeyRecord(organisationId, device.currentKeyId);
     if (keyRecord === null) return refuse('REGISTRY_KEY_UNRESOLVABLE');
 
     const issuedAt = await this.repository.now();
     const expiresAt = new Date(issuedAt.getTime() + DEVICE_CONTEXT_ESTABLISHMENT_MAX_AGE_MS);
     const row = await this.repository.createEstablishmentChallenge({
-      organisationId: input.organisationId,
+      organisationId,
       proposedContextId: randomUUID(),
       actorUserId: principal.user.id,
       deviceId: device.id,
@@ -204,7 +251,7 @@ export class DeviceContextService {
     const challenge = challengeViewOf(row);
     await this.repository.appendOperationEventOutsideTransaction(
       {
-        organisationId: input.organisationId,
+        organisationId: row.organisationId,
         contextId: null,
         deviceId: device.id,
         actorUserId: principal.user.id,
@@ -230,35 +277,62 @@ export class DeviceContextService {
   }
 
   /**
-   * STEP TWO — the device answers, and a context is issued or nothing is.
+   * STEP TWO — the device answers, and a context is issued, converged on, or
+   * nothing happens.
    *
-   * There is no human session on this call, deliberately: the caller is the
-   * DEVICE. The human half was established when the challenge was issued and
-   * is RE-ESTABLISHED here from current server state — the actor must still
-   * exist and must still hold a gateway-operable capability at the site — so a
-   * session that was live at step one and withdrawn before step two refuses.
+   * C17-01: THE SAME AUTHENTICATED HUMAN AS STEP ONE. The session is not a
+   * formality bolted onto a device call — it is the second principal, and the
+   * three checks it feeds are asked before any server state is touched:
+   *
+   *     the request carries an authenticated principal at all;
+   *     that principal's tenant owns the persisted challenge;
+   *     that principal IS the actor the challenge is bound to.
+   *
+   * The human half is ALSO re-established from current server state (the actor
+   * must still exist and must still hold a gateway-operable capability at the
+   * site), because "authenticated a moment ago" and "authorised now" are two
+   * facts and this ceremony needs both.
    */
-  async completeEstablishment(input: {
-    establishmentId: string;
-    proof: unknown;
-    traceId: string;
-  }): Promise<DeviceContextEstablishmentResult> {
-    const parsedProof = DeviceRequestProofSchema.safeParse(input.proof);
-    if (!parsedProof.success) {
-      // Nothing has been resolved, so there is no tenant to file the event
-      // under and no device to name. A malformed proof is a shape complaint.
-      return { outcome: 'REFUSED' };
-    }
-    const proof = parsedProof.data;
+  async completeEstablishment(
+    principal: Principal,
+    input: { establishmentId: string; proof: unknown; traceId: string },
+  ): Promise<DeviceContextEstablishmentResult> {
+    /**
+     * C17-01 — THE SESSION FACT, ESTABLISHED ONCE, AT THE TOP.
+     *
+     * `principal` is a REQUIRED parameter of this method, and the controller
+     * obtains it with `requirePrincipal`, which throws when the global guard
+     * chain attached none. There is therefore no path on which this value is
+     * defaulted, inferred, or derived from anything the caller sent — which is
+     * precisely what was wrong with the boolean it replaces.
+     */
+    // C17-01: the TYPE is the proof, not this line. `principal` is a required,
+    // non-nullable parameter supplied by `requirePrincipal` behind the global
+    // session guard, so a caller cannot reach here without one — and
+    // `sessionAuthenticatedBy` will not produce `true` from anything else.
+    // The previous revision derived this half from "a matching user row was
+    // found", which is authorisation, not authentication.
+    const sessionAuthenticated = sessionAuthenticatedBy(principal);
+
+    // C17-02: the initial tenant anchor, before ANY server row has resolved. It
+    // is replaced, below, by the persisted challenge's own organisation the
+    // moment one is found — and never by anything the request claimed.
+    let auditOrganisationId = principal.organisation_id;
 
     const refuse = async (
       refusal: DeviceGatewayRefusal,
       contractRefusal: string | null,
-      context: { deviceId: string | null; actorUserId: string | null; establishmentId: string | null; proposedContextId: string | null; siteId: string | null },
+      context: {
+        deviceId: string | null;
+        actorUserId: string | null;
+        establishmentId: string | null;
+        proposedContextId: string | null;
+        siteId: string | null;
+      },
     ): Promise<DeviceContextEstablishmentResult> => {
       await this.repository.appendOperationEventOutsideTransaction(
         {
-          organisationId: proof.organisation_id,
+          organisationId: auditOrganisationId,
           contextId: null,
           deviceId: context.deviceId,
           actorUserId: context.actorUserId,
@@ -278,19 +352,40 @@ export class DeviceContextService {
       return { outcome: 'REFUSED' };
     };
 
-    // ---------------------------------------------------------------------
-    // PREFLIGHT — establishes nothing, commits nothing
-    // ---------------------------------------------------------------------
-    const challengeRow = await this.repository.findEstablishmentChallenge(proof.organisation_id, input.establishmentId);
-    if (challengeRow === null) {
-      return refuse('ESTABLISHMENT_NOT_USABLE', null, {
+    const parsedProof = DeviceRequestProofSchema.safeParse(input.proof);
+    if (!parsedProof.success) {
+      // A malformed proof is a shape complaint about the caller's own bytes.
+      // The event is still filed, and it is filed under the SESSION's tenant,
+      // which is a fact the server established rather than one it was told.
+      return refuse('PROOF_MALFORMED', null, {
         deviceId: null,
-        actorUserId: null,
+        actorUserId: principal.user.id,
         establishmentId: input.establishmentId,
         proposedContextId: null,
         siteId: null,
       });
     }
+    const proof = parsedProof.data;
+
+    // ---------------------------------------------------------------------
+    // PREFLIGHT — establishes nothing, commits nothing
+    // ---------------------------------------------------------------------
+
+    // C17-02: LOOKED UP BY THE SESSION'S TENANT. Never by `proof.organisation_id`.
+    const challengeRow = await this.repository.findEstablishmentChallenge(principal.organisation_id, input.establishmentId);
+    if (challengeRow === null) {
+      return refuse('ESTABLISHMENT_NOT_USABLE', null, {
+        deviceId: null,
+        actorUserId: principal.user.id,
+        establishmentId: input.establishmentId,
+        proposedContextId: null,
+        siteId: null,
+      });
+    }
+    // The persisted row's organisation is authoritative from here on. It equals
+    // the session's, because that is what selected it; assigning it anyway is
+    // the statement that the ROW owns the tenant, not the lookup.
+    auditOrganisationId = challengeRow.organisationId;
     const trace = {
       deviceId: challengeRow.deviceId,
       actorUserId: challengeRow.actorUserId,
@@ -299,14 +394,20 @@ export class DeviceContextService {
       siteId: challengeRow.siteId,
     };
 
-    const preflightNow = await this.repository.now();
-    // Expiry is evaluated AT REQUEST TIME, exclusively (`now >= expires_at`),
-    // and there is no scheduler anywhere. One-shot is decided here for the
-    // cheap case and AGAIN under lock in the transaction, which is the one that
-    // counts.
-    if (challengeRow.consumedAt !== null) return refuse('ESTABLISHMENT_NOT_USABLE', null, trace);
-    if (preflightNow.getTime() >= challengeRow.expiresAt.getTime()) return refuse('ESTABLISHMENT_NOT_USABLE', null, trace);
+    // C17-02: the proof's CLAIMED tenant, equality-bound against the persisted
+    // one. A claim may name a tenant in an internal reason; it may never select
+    // which tenant owns an audit row.
+    if (proof.organisation_id !== challengeRow.organisationId) {
+      return refuse('PROOF_ORGANISATION_MISMATCH', null, trace);
+    }
+    // C17-01: a valid proof carried by a DIFFERENT authenticated human refuses.
+    // Possession and identity are two facts; holding the key does not make the
+    // caller the person the ceremony was opened for.
+    if (principal.user.id !== challengeRow.actorUserId) {
+      return refuse('SESSION_ACTOR_MISMATCH', null, trace);
+    }
 
+    const preflightNow = await this.repository.now();
     const preflight = await this.resolveFacts(challengeRow, undefined);
     if (preflight.kind === 'REFUSED') return refuse(preflight.refusal, null, trace);
 
@@ -325,18 +426,17 @@ export class DeviceContextService {
     });
 
     const replayKey = deviceRequestProofReplayKey(proof);
-    const peeked = await this.repository.readOnly((tx) => this.replay.peek(tx, { organisationId: proof.organisation_id, replayKey }));
+    const peeked = await this.repository.readOnly((tx) =>
+      this.replay.peek(tx, { organisationId: challengeRow.organisationId, replayKey }),
+    );
 
     const preflightDecision = this.judge({
       challenge: challengeRow,
       proof,
       now: preflightNow,
       registered: preflight.registered,
-      trust: preflight.trust,
       verified,
-      credentialIntact: preflight.credentialIntact,
-      actorResolved: preflight.actorResolved,
-      siteAuthorityGranted: preflight.siteAuthorityGranted,
+      principals: preflight.principals(verified, sessionAuthenticated),
       consumptionStored:
         peeked === null ? null : { statement_fingerprint: peeked.statementFingerprint, stored_outcome_ref: peeked.storedOutcomeRef ?? '' },
       replayKey,
@@ -345,16 +445,33 @@ export class DeviceContextService {
       return refuse(preflightDecision.refusal, preflightDecision.contractRefusal, trace);
     }
 
+    // C17-03: the ONE-SHOT GATES ARE ASKED OF AN ISSUANCE, NOT OF A RETRY.
+    //
+    // The old ordering rejected any challenge with `consumed_at IS NOT NULL`
+    // before the classifier ever ran, which meant the lost-response retry — the
+    // byte-identical signed request whose first response never arrived — was
+    // told `ESTABLISHMENT_NOT_USABLE` about a ceremony that had SUCCEEDED. That
+    // is Sentinel lying to an honest client about its own state.
+    //
+    // So the gates below apply to the arm that would MINT something. An exact
+    // retry mints nothing: it is answered from the row that already exists.
+    if (preflightDecision.effect === 'PROCEED') {
+      if (challengeRow.consumedAt !== null) return refuse('ESTABLISHMENT_NOT_USABLE', null, trace);
+      // Expiry is evaluated AT REQUEST TIME, exclusively (`now >= expires_at`),
+      // and there is no scheduler anywhere. One-shot is decided here for the
+      // cheap case and AGAIN under lock in the transaction, which is the one
+      // that counts.
+      if (preflightNow.getTime() >= challengeRow.expiresAt.getTime()) return refuse('ESTABLISHMENT_NOT_USABLE', null, trace);
+    }
+
     // ---------------------------------------------------------------------
     // FINAL TRANSACTION — one transaction, or nothing
     // ---------------------------------------------------------------------
     try {
-      const issued = await this.repository.transaction(async (tx) => {
-        const locked = await this.repository.lockEstablishmentChallenge(tx, proof.organisation_id, input.establishmentId);
+      return await this.repository.transaction(async (tx) => {
+        const locked = await this.repository.lockEstablishmentChallenge(tx, challengeRow.organisationId, input.establishmentId);
         if (locked === null) throw new DeviceGatewayTransactionRollback('ESTABLISHMENT_NOT_USABLE');
         const now = await this.repository.dbNow(tx);
-        if (locked.consumedAt !== null) throw new DeviceGatewayTransactionRollback('ESTABLISHMENT_NOT_USABLE');
-        if (now.getTime() >= locked.expiresAt.getTime()) throw new DeviceGatewayTransactionRollback('ESTABLISHMENT_NOT_USABLE');
 
         // Every fact re-read, under the device and key row locks, INSIDE the
         // transaction that is about to mint the context.
@@ -363,17 +480,14 @@ export class DeviceContextService {
         const facts = await this.resolveFacts(locked, tx);
         if (facts.kind === 'REFUSED') throw new DeviceGatewayTransactionRollback(facts.refusal);
 
-        const finalPeek = await this.replay.peek(tx, { organisationId: proof.organisation_id, replayKey });
+        const finalPeek = await this.replay.peek(tx, { organisationId: locked.organisationId, replayKey });
         const decision = this.judge({
           challenge: locked,
           proof,
           now,
           registered: facts.registered,
-          trust: facts.trust,
           verified,
-          credentialIntact: facts.credentialIntact,
-          actorResolved: facts.actorResolved,
-          siteAuthorityGranted: facts.siteAuthorityGranted,
+          principals: facts.principals(verified, sessionAuthenticated),
           consumptionStored:
             finalPeek === null
               ? null
@@ -384,6 +498,21 @@ export class DeviceContextService {
           throw new DeviceGatewayTransactionRollback(decision.refusal, decision.contractRefusal);
         }
 
+        if (decision.effect === 'CONVERGE') {
+          return this.converge(tx, {
+            locked,
+            storedOutcomeRef: decision.storedOutcomeRef,
+            fingerprint: decision.fingerprint,
+            traceId: input.traceId,
+            trust: facts.trust,
+          });
+        }
+
+        // A FIRST issuance. Both one-shot gates again, now under the row lock,
+        // which is the check that actually decides.
+        if (locked.consumedAt !== null) throw new DeviceGatewayTransactionRollback('ESTABLISHMENT_NOT_USABLE');
+        if (now.getTime() >= locked.expiresAt.getTime()) throw new DeviceGatewayTransactionRollback('ESTABLISHMENT_NOT_USABLE');
+
         // Spend the ceremony. Fenced on `consumed_at IS NULL`, so a second use
         // updates zero rows and the whole transaction rolls back — "one-shot"
         // is a compare-and-set, not an intention.
@@ -392,8 +521,10 @@ export class DeviceContextService {
 
         // Spend the one-shot replay identity in Shield's ONE store, under this
         // module's own ceremony label. The outcome reference is the context id
-        // that is about to exist, so a later exact retry converges on THIS
-        // ceremony rather than minting a second context.
+        // that is about to exist, which is exactly what makes the C17-03
+        // convergence above a REAL comparison rather than a tautology: the
+        // retry derives nothing — it reads this stored value and resolves it
+        // against the committed row.
         const claimed = await this.replay.consume(tx, {
           organisationId: locked.organisationId,
           ceremony: DEVICE_GATEWAY_ESTABLISHMENT_CEREMONY,
@@ -402,11 +533,20 @@ export class DeviceContextService {
           candidateOutcomeRef: locked.proposedContextId,
           traceId: input.traceId,
         });
-        if (claimed.consumption.outcome !== 'FIRST_SEEN') {
-          // The challenge CAS above already refuses an honest retry, so an
-          // identity that is already spent here means this nonce was burned by
-          // some other ceremony. There is nothing to converge on.
-          throw new DeviceGatewayTransactionRollback('ESTABLISHMENT_NOT_USABLE');
+        if (claimed.consumption.outcome === 'REUSED_WITH_CHANGED_SEMANTICS') {
+          throw new DeviceGatewayTransactionRollback('REPLAY_CONFLICT', 'NONCE_REUSED_WITH_CHANGED_SEMANTICS');
+        }
+        if (claimed.consumption.outcome === 'EXACT_DUPLICATE') {
+          // A concurrent identical request committed between the peek and this
+          // insert. It is the same convergence, decided against the store's
+          // authoritative answer rather than against the peek's.
+          return this.converge(tx, {
+            locked,
+            storedOutcomeRef: claimed.consumption.stored_outcome_ref,
+            fingerprint: decision.fingerprint,
+            traceId: input.traceId,
+            trust: facts.trust,
+          });
         }
 
         const expiresAt = new Date(now.getTime() + DEVICE_CONTEXT_MAX_LIFETIME_MS);
@@ -455,23 +595,8 @@ export class DeviceContextService {
         // ASSEMBLED FROM THE COMMITTED ROW, not from the candidate. The
         // candidate `judge` built above is discarded here and has never left
         // this process.
-        return AuthenticatedDeviceContextSchema.parse({
-          schema_version: 1,
-          context_id: record.id,
-          organisation_id: record.organisationId,
-          actor_user_id: record.actorUserId,
-          device_id: record.deviceId,
-          authorised_site_ids: [locked.siteId],
-          // HISTORICAL ISSUANCE STATE. The frozen contract requires the field;
-          // no column stores it, and every operation reads CURRENT standing.
-          device_trust: facts.trust,
-          key_id: record.keyId,
-          key_version: record.keyVersion,
-          issued_at: record.issuedAt.toISOString(),
-          expires_at: record.expiresAt.toISOString(),
-        });
+        return { outcome: 'ISSUED' as const, context: contextViewOf(record, [locked.siteId], facts.trust) };
       });
-      return { outcome: 'ISSUED', context: issued };
     } catch (error) {
       if (isDeviceGatewayTransactionRollback(error)) {
         // The transaction is already rolled back. The audit event is written
@@ -483,6 +608,96 @@ export class DeviceContextService {
     }
   }
 
+  /**
+   * C17-03 — THE CONVERGENCE ARM: THE LOST RESPONSE, ANSWERED HONESTLY.
+   *
+   * EVERY ONE of the following must agree before a retry is answered with a
+   * context, and any disagreement FAILS CLOSED rather than degrading into a
+   * second issuance:
+   *
+   *   * the same ESTABLISHMENT — the locked challenge row this retry named;
+   *   * the same REPLAY IDENTITY — the store already holds it;
+   *   * the same STATEMENT FINGERPRINT — the frozen classifier said
+   *     EXACT_DUPLICATE, so the signed bytes are the same bytes;
+   *   * the same PROPOSED CONTEXT — the stored outcome reference IS this
+   *     challenge's `proposed_context_id`, not merely something that parses;
+   *   * an AUTHORITATIVE PERSISTED CONTEXT — read back, under lock, in this
+   *     transaction, still open;
+   *   * the EXACT binding — organisation, actor, device, site, key id and key
+   *     version, each equality-bound against the challenge.
+   *
+   * WHAT IT RETURNS IS THE ROW, NOT A RECONSTRUCTION. The same `context_id`,
+   * the same `issued_at`, the same `expires_at`. A retry that extended the
+   * window would be minting authority out of a network failure, which is the
+   * mirror image of the bug this fixes.
+   *
+   * AND IT GRANTS NOTHING NEW. The session checks in `completeEstablishment`
+   * ran before this point and apply to the retry exactly as they applied to the
+   * first attempt: an exact retry presented by a different authenticated human,
+   * or with no session at all, never reaches here.
+   */
+  private async converge(
+    tx: GatewayTx,
+    input: {
+      locked: EstablishmentChallengeRow;
+      storedOutcomeRef: string;
+      fingerprint: string;
+      traceId: string;
+      trust: DeviceTrust;
+    },
+  ): Promise<DeviceContextEstablishmentResult> {
+    const { locked } = input;
+    // The stored reference must be THIS ceremony's proposed context id. A
+    // reference that resolves to anything else is a stored outcome this
+    // ceremony cannot claim.
+    if (input.storedOutcomeRef !== locked.proposedContextId) {
+      throw new DeviceGatewayTransactionRollback('DUPLICATE_UNRESOLVABLE');
+    }
+    const record = await this.repository.lockContext(tx, locked.organisationId, locked.proposedContextId);
+    if (record === null) throw new DeviceGatewayTransactionRollback('DUPLICATE_UNRESOLVABLE');
+    if (record.closedAt !== null) throw new DeviceGatewayTransactionRollback('DUPLICATE_UNRESOLVABLE');
+    if (
+      record.establishmentId !== locked.id ||
+      record.organisationId !== locked.organisationId ||
+      record.actorUserId !== locked.actorUserId ||
+      record.deviceId !== locked.deviceId ||
+      record.keyId !== locked.keyId ||
+      record.keyVersion !== locked.keyVersion
+    ) {
+      throw new DeviceGatewayTransactionRollback('DUPLICATE_UNRESOLVABLE');
+    }
+    const siteIds = await this.repository.listContextSiteIds(tx, record.organisationId, record.id);
+    if (siteIds.length !== 1 || siteIds[0] !== locked.siteId) {
+      throw new DeviceGatewayTransactionRollback('DUPLICATE_UNRESOLVABLE');
+    }
+
+    await this.repository.appendOperationEvent(
+      tx,
+      {
+        organisationId: record.organisationId,
+        contextId: record.id,
+        deviceId: record.deviceId,
+        actorUserId: record.actorUserId,
+        operationKind: null,
+        occurredAt: new Date(),
+        traceId: input.traceId,
+      },
+      {
+        type: 'CONTEXT_CONVERGED',
+        establishmentId: locked.id,
+        siteId: locked.siteId,
+        keyId: record.keyId,
+        keyVersion: record.keyVersion,
+        issuedAt: record.issuedAt.toISOString(),
+        expiresAt: record.expiresAt.toISOString(),
+        statementFingerprint: input.fingerprint,
+        storedOutcomeRef: input.storedOutcomeRef,
+      },
+    );
+
+    return { outcome: 'CONVERGED', context: contextViewOf(record, siteIds, input.trust) };
+  }
+
   // -------------------------------------------------------------------------
   // The facts, resolved identically in preflight and under lock
   // -------------------------------------------------------------------------
@@ -490,6 +705,16 @@ export class DeviceContextService {
   /**
    * ONE resolution, called TWICE — once in preflight and once inside the final
    * transaction with `tx` supplied.
+   *
+   * C17-04: WHEN `tx` IS SUPPLIED, EVERY READ BELOW JOINS IT. The previous
+   * revision claimed that in a comment while resolving the registry key record
+   * and the device's site deployment on the base client — outside the
+   * transaction holding the device and key locks. Both are authority-bearing,
+   * and a read taken outside the transaction that commits on it is a read of a
+   * world that may already have moved. The site deployment is not merely joined
+   * to the transaction now: the EXACT `(organisation, device, site)` scope row
+   * is LOCKED, so a concurrent release blocks rather than slipping between the
+   * decision and the commit.
    *
    * Two copies of this would be two opinions about what the current facts are,
    * and the fence in the transaction would then be checking something subtly
@@ -504,10 +729,12 @@ export class DeviceContextService {
         registered: DeviceRegistryFacts;
         publicKey: string;
         trust: DeviceTrust;
-        credentialIntact: boolean;
-        /** The actor row was RESOLVED from live tables. Never a default. */
-        actorResolved: boolean;
-        siteAuthorityGranted: boolean;
+        /**
+         * The five facts of C17-01, composed from what THIS resolution
+         * established plus the two the caller owns: whether the signature
+         * verified, and whether THIS REQUEST carried an authenticated session.
+         */
+        principals: (possessionVerified: boolean, sessionAuthenticated: boolean) => DeviceGatewayPrincipalFacts;
       }
     | { kind: 'REFUSED'; refusal: DeviceGatewayRefusal }
   > {
@@ -519,7 +746,7 @@ export class DeviceContextService {
     // never by anything the proof claims. The proof's own `key_id` and
     // `key_version` are then bound against these by the frozen evaluator, so a
     // disagreement is a refusal rather than a lookup somebody could skip.
-    const keyRecord = await this.registry.resolveRegistryKeyRecord(challenge.organisationId, device.currentKeyId);
+    const keyRecord = await this.registry.resolveRegistryKeyRecord(challenge.organisationId, device.currentKeyId, tx);
     if (keyRecord === null) return { kind: 'REFUSED', refusal: 'REGISTRY_KEY_UNRESOLVABLE' };
 
     const trust = await this.registry.effectiveDeviceTrust(challenge.organisationId, device.id, tx);
@@ -533,18 +760,32 @@ export class DeviceContextService {
     );
     if (actor === null) return { kind: 'REFUSED', refusal: 'ACTOR_NOT_USABLE' };
 
-    const deviceSiteIds = await this.shield.listDeviceSiteIds(challenge.organisationId, device.id);
     // Both halves of site authority, asked independently: the HUMAN must
     // currently work this site and the DEVICE must currently be deployed at it.
-    const siteAuthorityGranted = actor.gatewaySiteIds.includes(challenge.siteId) && deviceSiteIds.includes(challenge.siteId);
+    const humanSiteAuthorityGranted = actor.gatewaySiteIds.includes(challenge.siteId);
+    const deviceSiteAuthorityGranted =
+      tx === undefined
+        ? await this.shield.hasActiveDeviceSiteScope(challenge.organisationId, device.id, challenge.siteId)
+        : await this.shield.lockActiveDeviceSiteScope(tx, challenge.organisationId, device.id, challenge.siteId);
 
     return {
       kind: 'RESOLVED',
       publicKey: keyRecord.public_key,
       trust,
-      credentialIntact,
-      actorResolved: true,
-      siteAuthorityGranted,
+      principals: (possessionVerified, sessionAuthenticated) =>
+        composeDeviceGatewayPrincipalFacts({
+          sessionAuthenticated,
+          // The establishment ceremony is not pinned to one §62 action (see
+          // `resolveGatewayActor`): what it requires is that the person still
+          // holds SOME gateway-operable capability SOMEWHERE, and the site
+          // question is asked separately below.
+          actorCurrentlyAuthorised: actor.gatewaySiteIds.length > 0,
+          possessionVerified,
+          credentialIntact,
+          deviceCurrentlyTrusted: trust,
+          humanSiteAuthorityGranted,
+          deviceSiteAuthorityGranted,
+        }),
       registered: {
         organisation_id: keyRecord.organisation_id,
         device_id: keyRecord.device_id,
@@ -561,7 +802,7 @@ export class DeviceContextService {
           // steer the reconnect verdict. It is set honestly all the same, and
           // the authority question that DOES bind is asked immediately below by
           // `evaluateDeviceOperationPrincipals`.
-          holds_required_capability: actor.gatewaySiteIds.includes(challenge.siteId),
+          holds_required_capability: humanSiteAuthorityGranted,
         },
       },
     };
@@ -573,20 +814,18 @@ export class DeviceContextService {
    * escape it.
    */
   private judge(input: {
-    /** Set ONLY where the actor row was read back from live tables. Never defaulted. */
-    actorResolved: boolean;
     challenge: EstablishmentChallengeRow;
     proof: DeviceRequestProof;
     now: Date;
     registered: DeviceRegistryFacts;
-    trust: DeviceTrust;
     verified: boolean;
-    credentialIntact: boolean;
-    siteAuthorityGranted: boolean;
+    /** C17-01: five named facts, never one boolean standing in for two. */
+    principals: DeviceGatewayPrincipalFacts;
     consumptionStored: { statement_fingerprint: string; stored_outcome_ref: string } | null;
     replayKey: string;
   }):
-    | { kind: 'AUTHENTICATED'; fingerprint: string }
+    | { kind: 'AUTHENTICATED'; effect: 'PROCEED'; fingerprint: string }
+    | { kind: 'AUTHENTICATED'; effect: 'CONVERGE'; fingerprint: string; storedOutcomeRef: string }
     | { kind: 'REFUSED'; refusal: DeviceGatewayRefusal; contractRefusal: string | null } {
     const nowIso = input.now.toISOString();
 
@@ -601,7 +840,7 @@ export class DeviceContextService {
       actor_user_id: input.challenge.actorUserId,
       device_id: input.challenge.deviceId,
       authorised_site_ids: [input.challenge.siteId],
-      device_trust: input.trust,
+      device_trust: input.principals.deviceCurrentlyTrusted,
       key_id: input.challenge.keyId,
       key_version: input.challenge.keyVersion,
       issued_at: nowIso,
@@ -630,19 +869,39 @@ export class DeviceContextService {
       consumption,
     });
     if (!authentication.authenticated) {
-      return { kind: 'REFUSED', refusal: 'PROOF_REFUSED', contractRefusal: authentication.refusal };
+      // C17-03: the SAME one-shot identity carrying DIFFERENT signed semantics
+      // is not a retry to converge, it is a conflict, and it stays one whether
+      // or not the establishment has been spent.
+      const conflict = authentication.refusal === 'NONCE_REUSED_WITH_CHANGED_SEMANTICS';
+      return {
+        kind: 'REFUSED',
+        refusal: conflict ? 'REPLAY_CONFLICT' : 'PROOF_REFUSED',
+        contractRefusal: authentication.refusal,
+      };
+    }
+
+    // C17-01: AUTHORISATION NOW, asked as its own question. `AUTHENTICATION_ONLY`
+    // deliberately skips the frozen evaluator's actor block, so this is the only
+    // place the establishment ceremony asks it, and it is asked of a fact the
+    // live user/role re-read established — never of the session, and never of
+    // the device.
+    if (!input.principals.actorCurrentlyAuthorised) {
+      return { kind: 'REFUSED', refusal: 'ACTOR_NOT_USABLE', contractRefusal: null };
     }
 
     // BOTH PRINCIPALS, INDEPENDENTLY. A perfectly TRUSTED device with no
-    // current human authority is refused here, and an authenticated human with
-    // no hardware possession was already refused above. That symmetry is the
-    // whole ruling.
+    // current human SESSION is refused here, and an authenticated human with no
+    // hardware possession was already refused above. That symmetry is the whole
+    // ruling.
     const admission = evaluateDeviceOperationPrincipals({
-      userAuthenticated: input.actorResolved,
-      deviceAuthenticated: input.verified && input.credentialIntact,
-      deviceTrust: input.trust,
+      // C17-01: THE SESSION, AND ONLY THE SESSION. This used to be fed from
+      // "the actor row resolved", which answers a different question entirely
+      // and answered it `true` for a caller with no session at all.
+      userAuthenticated: input.principals.sessionAuthenticated,
+      deviceAuthenticated: input.principals.deviceAuthenticated,
+      deviceTrust: input.principals.deviceCurrentlyTrusted,
       requiredTrust: DEVICE_PURPOSE_PERMITTED_TRUST.RECONNECT_HANDSHAKE,
-      siteAuthorityGranted: input.siteAuthorityGranted,
+      siteAuthorityGranted: input.principals.siteAuthorityGranted,
       // WP-25 adds no Constitution policy to these three surfaces. When one is
       // introduced it is evaluated HERE, as its own independent fact, and never
       // inferred from the device or the session.
@@ -652,7 +911,10 @@ export class DeviceContextService {
       return { kind: 'REFUSED', refusal: 'PRINCIPALS_REFUSED', contractRefusal: admission.refusal };
     }
 
-    return { kind: 'AUTHENTICATED', fingerprint: authentication.fingerprint };
+    if (authentication.effect === 'CONVERGE_ON_STORED_OUTCOME') {
+      return { kind: 'AUTHENTICATED', effect: 'CONVERGE', fingerprint: authentication.fingerprint, storedOutcomeRef: authentication.stored_outcome_ref };
+    }
+    return { kind: 'AUTHENTICATED', effect: 'PROCEED', fingerprint: authentication.fingerprint };
   }
 }
 
@@ -671,4 +933,29 @@ function challengeViewOf(row: EstablishmentChallengeRow): DeviceContextEstablish
     issued_at: row.issuedAt.toISOString(),
     expires_at: row.expiresAt.toISOString(),
   };
+}
+
+/**
+ * The context handed back, ASSEMBLED FROM THE COMMITTED ROW.
+ *
+ * One function for both the issuance and the convergence arm, deliberately: two
+ * would be two opinions about what an issued context looks like, and the whole
+ * point of C17-03 is that a retry sees exactly what the first attempt produced.
+ */
+function contextViewOf(record: IssuedContextRow, siteIds: string[], trust: DeviceTrust): AuthenticatedDeviceContext {
+  return AuthenticatedDeviceContextSchema.parse({
+    schema_version: 1,
+    context_id: record.id,
+    organisation_id: record.organisationId,
+    actor_user_id: record.actorUserId,
+    device_id: record.deviceId,
+    authorised_site_ids: siteIds,
+    // HISTORICAL ISSUANCE STATE. The frozen contract requires the field; no
+    // column stores it, and every operation reads CURRENT standing.
+    device_trust: trust,
+    key_id: record.keyId,
+    key_version: record.keyVersion,
+    issued_at: record.issuedAt.toISOString(),
+    expires_at: record.expiresAt.toISOString(),
+  });
 }

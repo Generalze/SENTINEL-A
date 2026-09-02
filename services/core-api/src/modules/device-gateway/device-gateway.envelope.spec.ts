@@ -61,18 +61,32 @@ describe('WP-25/D25-11 the route chooses the operation kind, never the body', ()
     ).toEqual({ ok: false, refusal: 'OPERATION_KIND_CONFLICT' });
   });
 
-  it('identity is taken from the SERVER, and a body that names its own is ignored', () => {
-    const parsed = parseOperationEnvelope('ASSIGNMENT_ACCEPT', identity, {
-      organisation_id: 'org-b',
-      site_id: 'site-99',
-      actor_user_id: 'someone-else',
-      device_id: 'another-device',
-      payload: { expected_status: 'REQUESTED' },
-    });
+  it('C17-06: a body that names its own identity is REFUSED, not silently ignored', () => {
+    // This used to parse and drop the fields, which was safe only for as long as
+    // nobody read them. At a cryptographic boundary a value that is no part of
+    // the signed object is refused: "ignored" and "not accepted" look identical
+    // in a log right up until a refactor makes them different.
+    for (const unsigned of [
+      { organisation_id: 'org-b' },
+      { site_id: 'site-99' },
+      { actor_user_id: 'someone-else' },
+      { device_id: 'another-device' },
+      { context_id: 'context-99' },
+      { purpose: 'OFFLINE_SYNC' },
+      { idempotency_key: 'chosen-by-the-device' },
+    ]) {
+      expect(
+        parseOperationEnvelope('ASSIGNMENT_ACCEPT', identity, { ...unsigned, payload: { expected_status: 'REQUESTED' } }),
+        JSON.stringify(unsigned),
+      ).toEqual({ ok: false, refusal: 'ENVELOPE_MALFORMED' });
+    }
+  });
+
+  it('identity is taken from the SERVER, and the body has nowhere to propose one', () => {
+    const parsed = parseOperationEnvelope('ASSIGNMENT_ACCEPT', identity, { payload: { expected_status: 'REQUESTED' } });
     expect(parsed.ok).toBe(true);
     if (!parsed.ok) return;
-    // Not merely "the body did not win": the body's values are nowhere in the
-    // signed bytes at all.
+    // Every identity field in the signed bytes came from the SERVER.
     expect(parsed.envelope.organisation_id).toBe('org-a');
     expect(parsed.envelope.site_id).toBe('site-1');
     expect(parsed.envelope.actor_user_id).toBe('user-1');

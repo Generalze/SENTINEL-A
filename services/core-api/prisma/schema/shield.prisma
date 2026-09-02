@@ -433,6 +433,13 @@ model DeviceKey {
 
   device Device @relation(fields: [deviceId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
 
+  /// WP-25/C17-05: the gateway rows that are DATABASE-BOUND to this exact key.
+  /// They are back-relations only — nothing in Shield reads them, and the
+  /// binding they exist for is enforced by `device_key_identity_tuple_key`
+  /// below, not by any code that walks these lists.
+  gatewayEstablishmentChallenges DeviceContextEstablishmentChallenge[]
+  gatewayContexts AuthenticatedDeviceContextRecord[]
+
   /// A KEY VERSION IS NEVER REUSED, enforced below the service layer.
   ///
   /// D24-10 forbids resurrecting an older key, returning a ROTATED key to
@@ -445,6 +452,22 @@ model DeviceKey {
   /// A key id resolves to exactly one key within a tenant: the lookup the
   /// verifier performs when a request names the credential it signed with.
   @@unique([organisationId, keyId], map: "device_key_id_key")
+  /// WP-25/C17-05 — THE CANDIDATE KEY A GATEWAY CONTEXT IS BOUND TO.
+  ///
+  /// The two uniques above constrain (device, version) and (key id) SEPARATELY.
+  /// Neither ties the FULL tuple, so neither can be the target of a foreign key
+  /// that says "this key id, at this version, belongs to THIS device". Without
+  /// such a target, `AuthenticatedDeviceContextRecord.keyId` and `.keyVersion`
+  /// are plain scalars, and a writer bypassing the service layer can persist a
+  /// context naming device A while carrying device B's key — with every
+  /// existing constraint satisfied, because both objects genuinely exist.
+  ///
+  /// This constraint is redundant as an INDEX and load-bearing as a
+  /// CONSTRAINT. It is what makes the composite foreign keys in
+  /// `device-gateway.prisma` expressible, and it is Postgres itself — not a
+  /// service check somebody can route around — that then rejects a mismatched
+  /// tuple.
+  @@unique([organisationId, deviceId, keyId, keyVersion], map: "device_key_identity_tuple_key")
   /// "Which key of this device is CURRENT" — the hot path of every
   /// verification.
   @@index([organisationId, deviceId, status])

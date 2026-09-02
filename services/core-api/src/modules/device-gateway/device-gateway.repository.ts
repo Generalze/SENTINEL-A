@@ -261,6 +261,28 @@ export class DeviceGatewayRepository {
     return rows.map((row) => row.siteId);
   }
 
+  /**
+   * WP-25/C17-04 — the EXACT site binding the request depends on, LOCKED.
+   *
+   * `listContextSiteIds` above answers "which sites does this context cover?"
+   * and joins the transaction, which makes it a consistent read. It does not
+   * make it a HELD one: the row backing the answer is not locked, so a
+   * concurrent writer could move the binding between the read and the commit.
+   *
+   * `authenticated_device_context_site_key` — UNIQUE (context_id, site_id) —
+   * means the tuple below is at most one row, so this is a lock on the exact
+   * fact the decision rests on rather than on a range.
+   */
+  async lockContextSiteBinding(tx: GatewayTx, organisationId: string, contextId: string, siteId: string): Promise<boolean> {
+    if (!isUuid(contextId)) return false;
+    const rows = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+      SELECT id
+      FROM authenticated_device_context_sites
+      WHERE context_id = ${contextId}::uuid AND organisation_id = ${organisationId} AND site_id = ${siteId}
+      FOR UPDATE`);
+    return rows.length === 1;
+  }
+
   /** The unlocked variant, for the preflight that establishes nothing. */
   async listContextSiteIdsUnlocked(organisationId: string, contextId: string): Promise<string[]> {
     const rows = await this.prisma.authenticatedDeviceContextSite.findMany({
