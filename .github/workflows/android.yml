@@ -84,7 +84,17 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
-          build-root-directory: apps/field-mobile-android
+
+      # The first attempt failed with "project 'app' not found in root project
+      # 'field-mobile-android'" — Gradle naming the root after the DIRECTORY,
+      # which is what it does when it finds no settings file at all. This step
+      # exists so the next failure, if there is one, is diagnosed rather than
+      # guessed at.
+      - name: Show what Gradle can actually see
+        run: |
+          echo "pwd: $(pwd)"
+          ls -la
+          gradle --no-daemon projects
 
       # THERE IS NO GRADLE WRAPPER IN THIS PROJECT, DELIBERATELY.
       #
