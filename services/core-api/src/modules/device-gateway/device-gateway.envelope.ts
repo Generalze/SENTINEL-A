@@ -1,4 +1,11 @@
-import { canonicalDeviceJson, deviceCanonicalDigest } from '@sentinel/contracts';
+import {
+  DEVICE_PURPOSE_PERMITTED_TRUST,
+  WhisperDeviceActionV2ClaimsSchema,
+  canonicalDeviceJson,
+  deviceCanonicalDigest,
+  type DeviceRequestPurpose,
+  type DeviceTrust,
+} from '@sentinel/contracts';
 import { z } from 'zod';
 import { DEVICE_GATEWAY_OPERATION_ENVELOPE_DOMAIN } from './device-gateway.constants';
 
@@ -47,6 +54,16 @@ export const DEVICE_GATEWAY_OPERATION_KINDS = [
   'ASSIGNMENT_ACCEPT',
   'ASSIGNMENT_DECLINE',
   'INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE',
+  /**
+   * WP-27: the M3 device-action statement.
+   *
+   * It is an operation KIND rather than a new subsystem for the same reason
+   * D25-11 made the other four kinds: the ROUTE chooses it, the body cannot,
+   * and choosing it selects the target type, the required 62 action, the
+   * device-request PURPOSE and the semantic payload schema together, from
+   * server-owned tables, in one place.
+   */
+  'DEVICE_ACTION',
 ] as const;
 export const DeviceGatewayOperationKindSchema = z.enum(DEVICE_GATEWAY_OPERATION_KINDS);
 export type DeviceGatewayOperationKind = z.infer<typeof DeviceGatewayOperationKindSchema>;
@@ -56,7 +73,12 @@ export type DeviceGatewayOperationKind = z.infer<typeof DeviceGatewayOperationKi
  * taken from the request: a caller able to name the target TYPE could sign one
  * statement and have it resolved against a different domain's row.
  */
-export const DEVICE_GATEWAY_TARGET_TYPES = ['FIELD_OPERATIVE_STATE', 'FIELD_ASSIGNMENT', 'INCIDENT_FIELD_MESSAGE'] as const;
+export const DEVICE_GATEWAY_TARGET_TYPES = [
+  'FIELD_OPERATIVE_STATE',
+  'FIELD_ASSIGNMENT',
+  'INCIDENT_FIELD_MESSAGE',
+  'DEVICE_ACTION_STATEMENT',
+] as const;
 export type DeviceGatewayTargetType = (typeof DEVICE_GATEWAY_TARGET_TYPES)[number];
 
 export const DEVICE_GATEWAY_TARGET_TYPE_FOR_KIND: Readonly<Record<DeviceGatewayOperationKind, DeviceGatewayTargetType>> = {
@@ -64,6 +86,19 @@ export const DEVICE_GATEWAY_TARGET_TYPE_FOR_KIND: Readonly<Record<DeviceGatewayO
   ASSIGNMENT_ACCEPT: 'FIELD_ASSIGNMENT',
   ASSIGNMENT_DECLINE: 'FIELD_ASSIGNMENT',
   INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE: 'INCIDENT_FIELD_MESSAGE',
+  /**
+   * WP-27: the target is the OPERATIVE THEMSELVES, exactly as it is for a field
+   * state update, and the target id is resolved from the persisted context.
+   *
+   * The Whisper signal the statement names is deliberately NOT the envelope's
+   * target. It is a SIGNED CLAIM inside the semantic payload, covered by the
+   * payload digest, so it binds cryptographically without ever appearing in a
+   * route, a path parameter or an audit identifier. W21-14's rule about audit
+   * disclosure applies with full force to a covert channel: a route that named
+   * a signal id would publish, in every access log, which discreet
+   * configuration a device was firing.
+   */
+  DEVICE_ACTION: 'DEVICE_ACTION_STATEMENT',
 };
 
 /**
@@ -80,7 +115,50 @@ export const DEVICE_GATEWAY_REQUIRED_ACTION: Readonly<Record<DeviceGatewayOperat
   ASSIGNMENT_ACCEPT: 'field.assignment.act',
   ASSIGNMENT_DECLINE: 'field.assignment.act',
   INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE: 'field.message.acknowledge',
+  /**
+   * W21-12: firing a device action is its OWN capability, and no other action
+   * implies it. `field.operative` holds it; `admin` deliberately holds nothing
+   * operational on this channel.
+   */
+  DEVICE_ACTION: 'whisper.device-action.invoke',
 };
+
+/**
+ * WP-27/D25-11 — THE ROUTE CHOOSES THE PURPOSE, AND THE PURPOSE IS A TABLE.
+ *
+ * WP-25 hard-coded `expectedPurpose: 'FIELD_OPERATION'` at the one call site
+ * that needed it, with the note that all three operations mapped to the frozen
+ * FIELD_OPERATION and no new `DeviceRequestPurpose` value was added merely
+ * because there were three route types. That reasoning still holds for those
+ * kinds and is unchanged below.
+ *
+ * WP-27 is different, and the difference is the whole point.
+ * `DEVICE_PURPOSE_PERMITTED_TRUST` admits `TRUSTED` and `DEGRADED` for
+ * FIELD_OPERATION but `TRUSTED` ALONE for WHISPER_DEVICE_ACTION — that is
+ * W21-05, and it is the reason a covert-channel operation must not travel under
+ * a Field purpose. Running a device action as FIELD_OPERATION would let a
+ * DEGRADED device fire the silent channel, which is exactly what the frozen
+ * table forbids.
+ *
+ * So the purpose becomes a SERVER-OWNED TABLE KEYED ON THE ROUTE'S KIND. It is
+ * still not caller-controlled security input: there is no parameter anywhere in
+ * this module through which a caller could propose a purpose, and a proof minted
+ * for one purpose is refused for another by the frozen evaluator's
+ * `PURPOSE_NOT_ALLOWED`. Adding a row here is a visible change to a frozen route
+ * table, which is the property D25-11 asked for.
+ */
+export const DEVICE_GATEWAY_PURPOSE_FOR_KIND: Readonly<Record<DeviceGatewayOperationKind, DeviceRequestPurpose>> = {
+  FIELD_STATE_UPDATE: 'FIELD_OPERATION',
+  ASSIGNMENT_ACCEPT: 'FIELD_OPERATION',
+  ASSIGNMENT_DECLINE: 'FIELD_OPERATION',
+  INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE: 'FIELD_OPERATION',
+  DEVICE_ACTION: 'WHISPER_DEVICE_ACTION',
+};
+
+/** The trust states each kind's purpose admits, read from the FROZEN table, never restated. */
+export function deviceGatewayPermittedTrustFor(kind: DeviceGatewayOperationKind): readonly DeviceTrust[] {
+  return DEVICE_PURPOSE_PERMITTED_TRUST[DEVICE_GATEWAY_PURPOSE_FOR_KIND[kind]];
+}
 
 /** Every action any gateway operation can require. Used by the establishment gate. */
 export const DEVICE_GATEWAY_CAPABILITY_ACTIONS: readonly string[] = [
@@ -151,6 +229,23 @@ const SEMANTIC_PAYLOAD_SCHEMA: Readonly<Record<DeviceGatewayOperationKind, z.Zod
   ASSIGNMENT_ACCEPT: AssignmentSemanticPayloadSchema,
   ASSIGNMENT_DECLINE: AssignmentSemanticPayloadSchema,
   INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE: AcknowledgeSemanticPayloadSchema,
+  /**
+   * WP-27: the CONTRACT's own claims schema, used directly rather than restated.
+   *
+   * A second definition of what a device action carries would be a second
+   * opinion about what the device signed, and a signature scheme cannot survive
+   * two opinions about its own preimage. It is `.strict()` in the contract, so
+   * `signature_algorithm`, `signature_profile`, `curve` and `hash_algorithm` are
+   * parse failures HERE too — the client never names the algorithm, at any
+   * layer.
+   *
+   * Note what it does NOT contain: `organisation_id`, `site_id`,
+   * `actor_user_id`, `device_id` and `context_id`. Those are ENVELOPE fields,
+   * resolved by the server from the persisted context, and the v2 service
+   * assembles the full submission from them. There is no parameter through which
+   * a caller could propose one.
+   */
+  DEVICE_ACTION: WhisperDeviceActionV2ClaimsSchema,
 };
 
 export type FieldStateSemanticPayload = z.infer<typeof FieldStateSemanticPayloadSchema>;

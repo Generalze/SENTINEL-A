@@ -201,6 +201,20 @@
             android:layout_height="wrap_content"
             android:text="@string/action_acknowledge_message" />
 
+        <EditText
+            android:id="@+id/inputWhisperSignal"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="@string/hint_whisper_signal"
+            android:importantForAutofill="no"
+            android:inputType="text" />
+
+        <Button
+            android:id="@+id/buttonDeviceAction"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/action_device_action" />
+
         <Button
             android:id="@+id/buttonDiscardKey"
             android:layout_width="match_parent"

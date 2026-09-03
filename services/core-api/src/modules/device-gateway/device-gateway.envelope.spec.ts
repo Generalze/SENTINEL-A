@@ -1,11 +1,14 @@
+import { DEVICE_PURPOSE_PERMITTED_TRUST } from '@sentinel/contracts';
 import { describe, expect, it } from 'vitest';
 import {
   DEVICE_GATEWAY_ASSIGNMENT_ACTION,
   DEVICE_GATEWAY_CAPABILITY_ACTIONS,
   DEVICE_GATEWAY_OPERATION_KINDS,
+  DEVICE_GATEWAY_PURPOSE_FOR_KIND,
   DEVICE_GATEWAY_REQUIRED_ACTION,
   DEVICE_GATEWAY_TARGET_TYPE_FOR_KIND,
   canonicalDeviceGatewayEnvelope,
+  deviceGatewayPermittedTrustFor,
   parseOperationEnvelope,
 } from './device-gateway.envelope';
 
@@ -173,13 +176,62 @@ describe('WP-25/D25-11 the digest distinguishes what the security decision depen
 });
 
 describe('WP-25/D25-10 the frozen route tables', () => {
-  it('there are exactly four operation kinds', () => {
+  it('the operation kinds are exactly the five the routes declare', () => {
+    // Adding a kind is a VISIBLE change to a frozen route table, which is the
+    // property D25-11 asked for. WP-27 added `DEVICE_ACTION`, and the
+    // per-kind tables below say what that selects.
     expect([...DEVICE_GATEWAY_OPERATION_KINDS]).toEqual([
       'FIELD_STATE_UPDATE',
       'ASSIGNMENT_ACCEPT',
       'ASSIGNMENT_DECLINE',
       'INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE',
+      'DEVICE_ACTION',
     ]);
+  });
+
+  it('WP-27: the ROUTE chooses the device-request purpose, and it is not FIELD_OPERATION for a device action', () => {
+    // `DEVICE_PURPOSE_PERMITTED_TRUST` admits TRUSTED and DEGRADED for
+    // FIELD_OPERATION but TRUSTED ALONE for WHISPER_DEVICE_ACTION (W21-05).
+    // Running the covert channel under a Field purpose would let a device the
+    // platform has stopped fully vouching for fire it.
+    expect(DEVICE_GATEWAY_PURPOSE_FOR_KIND.FIELD_STATE_UPDATE).toBe('FIELD_OPERATION');
+    expect(DEVICE_GATEWAY_PURPOSE_FOR_KIND.ASSIGNMENT_ACCEPT).toBe('FIELD_OPERATION');
+    expect(DEVICE_GATEWAY_PURPOSE_FOR_KIND.ASSIGNMENT_DECLINE).toBe('FIELD_OPERATION');
+    expect(DEVICE_GATEWAY_PURPOSE_FOR_KIND.INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE).toBe('FIELD_OPERATION');
+    expect(DEVICE_GATEWAY_PURPOSE_FOR_KIND.DEVICE_ACTION).toBe('WHISPER_DEVICE_ACTION');
+
+    // The trust states are READ from the frozen table, never restated here.
+    expect([...deviceGatewayPermittedTrustFor('FIELD_STATE_UPDATE')]).toEqual([...DEVICE_PURPOSE_PERMITTED_TRUST.FIELD_OPERATION]);
+    expect([...deviceGatewayPermittedTrustFor('DEVICE_ACTION')]).toEqual(['TRUSTED']);
+  });
+
+  it('WP-27: a device-action payload may not name an algorithm, a profile, a curve or a hash', () => {
+    const identity = {
+      organisationId: 'org-a',
+      siteId: 'site-a',
+      actorUserId: 'op-a',
+      deviceId: 'dev-a',
+      targetId: 'op-a',
+    };
+    const claims = {
+      schema_version: 2,
+      key_id: 'key-a',
+      key_version: 1,
+      whisper_signal_id: 'signal-a',
+      whisper_signal_version: 1,
+      modality: 'DEVICE_ACTION',
+      device_action_id: 'action-a',
+      recognised_at: '2026-01-01T00:00:00.000Z',
+      confidence: 0.9,
+      anti_replay_nonce: 'nonce-0123456789abcdef',
+      // A structurally valid canonical P-256 signature is required by the
+      // BRANDED contract schema before the envelope will build at all.
+      signature: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB'.padEnd(86, 'A'),
+    };
+    for (const field of ['signature_algorithm', 'signature_profile', 'curve', 'hash_algorithm']) {
+      const parsed = parseOperationEnvelope('DEVICE_ACTION', identity, { proof: {}, payload: { ...claims, [field]: 'x' } });
+      expect(parsed.ok, field).toBe(false);
+    }
   });
 
   it('assignment reaches exactly accept and decline', () => {
@@ -199,8 +251,11 @@ describe('WP-25/D25-10 the frozen route tables', () => {
     expect(DEVICE_GATEWAY_REQUIRED_ACTION.ASSIGNMENT_ACCEPT).toBe('field.assignment.act');
     expect(DEVICE_GATEWAY_REQUIRED_ACTION.ASSIGNMENT_DECLINE).toBe('field.assignment.act');
     expect(DEVICE_GATEWAY_REQUIRED_ACTION.INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE).toBe('field.message.acknowledge');
+    // W21-12: firing a device action is its OWN capability and no other action
+    // implies it.
+    expect(DEVICE_GATEWAY_REQUIRED_ACTION.DEVICE_ACTION).toBe('whisper.device-action.invoke');
     expect([...DEVICE_GATEWAY_CAPABILITY_ACTIONS].sort()).toEqual(
-      ['field.assignment.act', 'field.message.acknowledge', 'field.state.write'].sort(),
+      ['field.assignment.act', 'field.message.acknowledge', 'field.state.write', 'whisper.device-action.invoke'].sort(),
     );
   });
 });

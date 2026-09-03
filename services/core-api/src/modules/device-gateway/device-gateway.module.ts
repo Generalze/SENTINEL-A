@@ -3,6 +3,7 @@ import { PrismaModule } from '../../prisma/prisma.module';
 import { FieldMessagingModule } from '../field-messaging/field-messaging.module';
 import { FieldModule } from '../field/field.module';
 import { ShieldModule } from '../shield/shield.module';
+import { WhisperDeviceActionModule } from '../whisper-device-action/whisper-device-action.module';
 import { DeviceContextService } from './device-context.service';
 import { DeviceGatewayController } from './device-gateway.controller';
 import { DeviceGatewayDomainAdapters } from './device-gateway.adapters';
@@ -48,16 +49,26 @@ import { DeviceGatewayService } from './device-gateway.service';
  * written — it is that the two drift and only one of them is the one an auditor
  * reads.
  *
- * THE WHISPER RESOLVER IS DELIBERATELY NOT WIRED (D25-07)
- * -------------------------------------------------------
- * WP-25 is the first work package with the technical means to break the Whisper
- * prohibition: it can authenticate a device, and it must still refuse to become
- * the physical-device Whisper path. `WHISPER_DEVICE_KEY_RESOLVER` verifies
+ * THE FROZEN WHISPER v1 RESOLVER IS STILL NOT WIRED (D25-07), AND WP-27 DOES
+ * NOT WIRE IT
+ * -------------------------------------------------------------------------
+ * WP-25 was the first work package with the technical means to break the
+ * Whisper prohibition: it can authenticate a device, and it refused to become
+ * the physical-device Whisper path. WP-27 is the sanctioned step forward, and
+ * it takes it WITHOUT touching v1. `WHISPER_DEVICE_KEY_RESOLVER` verifies
  * Ed25519 under the frozen Whisper v1 contract; the Shield registry holds P-256
  * under the M3 profile. Pointing one at the other would reinterpret a frozen M2
- * contract, which is exactly what C14-01 versioned forward to avoid. This
- * module does not import WhisperModule at all, so there is no accidental route
- * to that wiring, and the source guard asserts it.
+ * contract, which is exactly what C14-01 versioned forward to avoid.
+ *
+ * So this module imports `WhisperDeviceActionModule` — the WP-27 v2 path, which
+ * has its own contract, its own domain separator, its own key resolver, its own
+ * ceremony label and its own result type — and it still imports NOTHING from
+ * `../whisper/`. Not the module, not the service, not the verifier, not the
+ * resolver token. Both facts are asserted as source scans:
+ * `test/device-gateway-boundary.architecture.spec.ts` for this module, and
+ * `test/whisper-device-action-boundary.architecture.spec.ts` for the v2 module
+ * it now depends on — because an indirection is only a boundary if the far side
+ * is guarded too.
  *
  * NO BACKGROUND SCHEDULER (D25-08). Expiry — of a context and of an
  * establishment challenge alike — is evaluated at request time. WP-24's live
@@ -67,7 +78,7 @@ import { DeviceGatewayService } from './device-gateway.service';
  * REST ONLY (D25-10). No device WebSocket path; existing realtime untouched.
  */
 @Module({
-  imports: [PrismaModule, ShieldModule, FieldModule, FieldMessagingModule],
+  imports: [PrismaModule, ShieldModule, FieldModule, FieldMessagingModule, WhisperDeviceActionModule],
   controllers: [DeviceGatewayController],
   providers: [DeviceGatewayRepository, DeviceGatewayDomainAdapters, DeviceContextService, DeviceGatewayService],
   exports: [DeviceContextService, DeviceGatewayService],

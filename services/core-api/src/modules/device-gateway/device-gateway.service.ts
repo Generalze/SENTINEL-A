@@ -1,6 +1,5 @@
 import { HttpException, Inject, Injectable } from '@nestjs/common';
 import {
-  DEVICE_PURPOSE_PERMITTED_TRUST,
   DeviceRequestProofSchema,
   canonicalDeviceRequestProofStatement,
   classifyDeviceNonceConsumption,
@@ -22,8 +21,10 @@ import { ShieldRepository } from '../shield/shield.repository';
 import { DeviceGatewayDomainAdapters, type DeviceGatewayDomainCall } from './device-gateway.adapters';
 import { DEVICE_GATEWAY_OPERATION_CEREMONY } from './device-gateway.constants';
 import {
+  DEVICE_GATEWAY_PURPOSE_FOR_KIND,
   DEVICE_GATEWAY_REQUIRED_ACTION,
   DEVICE_GATEWAY_TARGET_TYPE_FOR_KIND,
+  deviceGatewayPermittedTrustFor,
   parseOperationEnvelope,
   type DeviceGatewayOperationEnvelope,
   type DeviceGatewayOperationKind,
@@ -310,6 +311,7 @@ export class DeviceGatewayService {
     );
 
     const preflightJudgement = this.judge({
+      kind,
       context: preflight.context,
       proof,
       now: await this.repository.now(),
@@ -355,6 +357,7 @@ export class DeviceGatewayService {
 
         const finalPeek = await this.replay.peek(tx, { organisationId: lockedContext.organisationId, replayKey });
         const judgement = this.judge({
+          kind,
           context: facts.context,
           proof,
           now: await this.repository.dbNow(tx),
@@ -391,6 +394,10 @@ export class DeviceGatewayService {
 
         const call: DeviceGatewayDomainCall = {
           kind,
+          // WP-27: the GENUINE server-established context, passed as the value
+          // it already is. No adapter may reconstruct one, widen one, or
+          // coerce it into another module's context type.
+          deviceContext: facts.context,
           principal: facts.actor.principal,
           siteScope: facts.actor.siteScope,
           siteId: proof.site_id,
@@ -705,6 +712,12 @@ export class DeviceGatewayService {
    * preflight and again under lock.
    */
   private judge(input: {
+    /**
+     * WP-27/D25-11: the ROUTE's kind, which SELECTS the device-request purpose
+     * and the trust states that purpose admits. It is not caller-controlled
+     * security input — the controller supplies it and no body may name it.
+     */
+    kind: DeviceGatewayOperationKind;
     /** C17-01: five named facts, never one boolean standing in for two. */
     principals: DeviceGatewayPrincipalFacts;
     context: AuthenticatedDeviceContext;
@@ -733,11 +746,20 @@ export class DeviceGatewayService {
       expectedPayloadDigest: input.expectedPayloadDigest,
       registered: input.registered,
       verified: input.verified,
-      // D25-10: all three operations map to the frozen FIELD_OPERATION. No new
-      // `DeviceRequestPurpose` value is added merely because there are three
-      // route types; their semantic distinction lives in the payload digest,
-      // which is what makes a proof for one of them unusable for another.
-      expectedPurpose: 'FIELD_OPERATION',
+      // D25-11/WP-27: the purpose comes from the ROUTE's kind, through the
+      // server-owned table in `device-gateway.envelope.ts`. The four Field
+      // operations still map to the frozen FIELD_OPERATION — no new purpose was
+      // invented merely because there are several route types, and their
+      // semantic distinction lives in the payload digest, which is what makes a
+      // proof for one unusable for another. DEVICE_ACTION maps to
+      // WHISPER_DEVICE_ACTION because `DEVICE_PURPOSE_PERMITTED_TRUST` admits
+      // TRUSTED ALONE there (W21-05) and DEGRADED for FIELD_OPERATION: running
+      // the covert channel under a Field purpose would let a device we have
+      // stopped fully vouching for fire it.
+      //
+      // Exactly ONE purpose is admissible per evaluation (C15-04), and a proof
+      // minted for another refuses as PURPOSE_NOT_ALLOWED.
+      expectedPurpose: DEVICE_GATEWAY_PURPOSE_FOR_KIND[input.kind],
       consumption,
     });
     if (!decision.admitted) {
@@ -765,7 +787,9 @@ export class DeviceGatewayService {
       // alone is sufficient and neither manufactures the other.
       deviceAuthenticated: input.principals.deviceAuthenticated,
       deviceTrust: input.principals.deviceCurrentlyTrusted,
-      requiredTrust: DEVICE_PURPOSE_PERMITTED_TRUST.FIELD_OPERATION,
+      // The SAME table, read for the SAME purpose. Two lookups that could
+      // disagree would be two policies about which devices may act.
+      requiredTrust: deviceGatewayPermittedTrustFor(input.kind),
       // BOTH halves - the human works this site AND the device is deployed at it.
       siteAuthorityGranted: input.principals.siteAuthorityGranted,
       policySatisfied: true,

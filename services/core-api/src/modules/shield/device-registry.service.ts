@@ -204,6 +204,39 @@ export class DeviceRegistryService {
   }
 
   /**
+   * WP-27/D24-09 — THE TWO WITHDRAWALS, EXPOSED SEPARATELY AND PRINCIPAL-FREE.
+   *
+   * `credentialAdmitsNewOperations` above returns the AND of the two, which is
+   * the right answer for a caller that only needs "may this credential act?".
+   * It is the WRONG shape for a caller whose contract asks the two questions
+   * INDEPENDENTLY — and `evaluateWhisperDeviceActionV2Admissibility` does, for
+   * exactly the reason C15-R4-final gives: the device row and the key row move
+   * at different times by different paths, so an evaluator that received one
+   * fused boolean could not name which half withdrew the credential, and an
+   * operator reading the audit could not either.
+   *
+   * The two halves are ALREADY computed here, by `deviceLevelWithdrawn` and
+   * `keyLevelWithdrawn`, and this method exposes those same helpers rather than
+   * letting a caller re-derive them. A second implementation of "is this
+   * credential withdrawn?" outside Shield is precisely what D24-09 exists to
+   * prevent: the failure mode is not that the copy is wrong on the day it is
+   * written, it is that the two drift and only one is the one an auditor reads.
+   *
+   * `null` for an unknown device — the only fail-closed answer, matching
+   * `credentialAdmitsNewOperations` and `effectiveDeviceTrust`.
+   */
+  async credentialWithdrawal(
+    organisationId: string,
+    deviceId: string,
+    tx?: Prisma.TransactionClient,
+  ): Promise<{ deviceLevelWithdrawn: boolean; keyLevelWithdrawn: boolean } | null> {
+    const device = await this.repository.findDevice(organisationId, deviceId, tx);
+    if (device === null) return null;
+    const key = device.currentKeyId === null ? null : await this.repository.findDeviceKeyByKeyId(organisationId, device.currentKeyId, tx);
+    return { deviceLevelWithdrawn: this.deviceLevelWithdrawn(device), keyLevelWithdrawn: this.keyLevelWithdrawn(key) };
+  }
+
+  /**
    * C16-R5's EFFECTIVE standing, exposed as a VALUE, principal-free.
    *
    * WP-25 needs the trust WORD and not merely a boolean: the frozen

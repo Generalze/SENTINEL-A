@@ -1,11 +1,18 @@
 import { Inject, Injectable } from '@nestjs/common';
 import type { Prisma } from '@prisma/client';
+import { whisperDeviceActionV2StatementIsVerified, type AuthenticatedDeviceContext } from '@sentinel/contracts';
 import type { Principal } from '../../common/security/principal';
 import { FieldMessagingService } from '../field-messaging/field-messaging.service';
 import type { IncidentFieldMessageView } from '../field-messaging/field-messaging.types';
 import { FieldService } from '../field/field.service';
+import {
+  WhisperDeviceActionService,
+  type WhisperDeviceActionConvergedView,
+} from '../whisper-device-action/whisper-device-action.service';
 import type { FieldAssignmentView, FieldOperativeStateView } from '../field/field.types';
 import type { SiteScope } from '../identity/list-pagination';
+import { DeviceGatewayRepository } from './device-gateway.repository';
+import { DeviceGatewayTransactionRollback } from './device-gateway.rollback';
 import {
   DEVICE_GATEWAY_ASSIGNMENT_ACTION,
   type AssignmentSemanticPayload,
@@ -53,6 +60,16 @@ import {
 
 export interface DeviceGatewayDomainCall {
   readonly kind: DeviceGatewayOperationKind;
+  /**
+   * WP-27: the GENUINE `AuthenticatedDeviceContext` the gateway established
+   * from its own persisted row, passed as the value it already is.
+   *
+   * It is here rather than reconstructed inside an adapter because the WP-27
+   * verification path must COMPARE the device's signed claims against a context
+   * the SERVER established — and a context an adapter assembled for itself
+   * would be a context assembled from the request it is judging.
+   */
+  readonly deviceContext: AuthenticatedDeviceContext;
   /** The CURRENT actor, rebuilt from live rows. Never a session. */
   readonly principal: Principal;
   /** Derived from that principal exactly as an HTTP route derives it. */
@@ -78,6 +95,15 @@ export class DeviceGatewayDomainAdapters {
   constructor(
     @Inject(FieldService) private readonly field: FieldService,
     @Inject(FieldMessagingService) private readonly messaging: FieldMessagingService,
+    @Inject(WhisperDeviceActionService) private readonly deviceActions: WhisperDeviceActionService,
+    /**
+     * The gateway's OWN repository, for the authoritative `clock_timestamp()`
+     * only. `now()` is pinned to transaction START, which is before the row
+     * locks a commit takes, so every timing rule the gateway applies is judged
+     * against `dbNow` — and WP-27's freshness judgement must be judged against
+     * the same instant as everything else in the transaction, not a second one.
+     */
+    @Inject(DeviceGatewayRepository) private readonly repository: DeviceGatewayRepository,
   ) {}
 
   /** Runs the domain effect inside the gateway's transaction. */
@@ -90,6 +116,8 @@ export class DeviceGatewayDomainAdapters {
         return this.transitionAssignment(tx, call, call.kind);
       case 'INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE':
         return this.acknowledge(tx, call);
+      case 'DEVICE_ACTION':
+        return this.verifyDeviceActionStatement(tx, call);
     }
   }
 
@@ -126,6 +154,8 @@ export class DeviceGatewayDomainAdapters {
       }
       case 'INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE':
         return this.messaging.probeAcknowledgeEvidence(call.principal, call.targetId, call.domainIdempotencyKey);
+      case 'DEVICE_ACTION':
+        return (await this.probeDeviceActionStatement(call)) !== null;
     }
   }
 
@@ -146,7 +176,84 @@ export class DeviceGatewayDomainAdapters {
         return this.field.getOwnAssignment(call.principal, call.siteScope, call.targetId);
       case 'INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE':
         return this.messaging.readEntitled(call.principal, call.siteScope, call.targetId);
+      case 'DEVICE_ACTION': {
+        // Read back from the AUTHORITATIVE consumption row, never reconstructed
+        // from the request that asked for it. `resolveCommitted` has already
+        // proved the row exists on these exact bytes and this exact
+        // server-derived reference; a null here would mean the two probes
+        // disagreed, which is a fault rather than a convergence.
+        const view = await this.probeDeviceActionStatement(call);
+        if (view === null) throw new DeviceGatewayTransactionRollback('DUPLICATE_UNRESOLVABLE');
+        return view;
+      }
     }
+  }
+
+  /**
+   * D. WP-27 — the M3 device-action statement.
+   *
+   * THE ADAPTER OWNS NOTHING. It hands the gateway's transaction, the genuine
+   * server-established context, the server-resolved site and the SERVER-DERIVED
+   * outcome reference to `WhisperDeviceActionService` and reports what that
+   * service concluded. It parses no claims, resolves no key, verifies no
+   * signature, consults no registry and takes no replay decision of its own.
+   *
+   * A REFUSAL ROLLS THE WHOLE TRANSACTION BACK, CARRYING ITS REASON. The
+   * gateway has already claimed its own one-shot identity by the time `apply`
+   * runs, so returning a refusal normally would COMMIT that claim for an
+   * operation that never happened — the exact failure D25-02 spent two
+   * correction batches eliminating. Throwing the rollback sentinel with the
+   * contract's own verdict means Postgres discards the gateway consumption, the
+   * v2 consumption and everything else, and the audit still records precisely
+   * which check refused.
+   *
+   * THE OPERATIONAL EFFECT OF THIS KIND IS THE VERIFIED STATEMENT AND ITS SPENT
+   * ONE-SHOT IDENTITY, AND NOTHING MORE. It does not enter Whisper recognition;
+   * see `whisper-device-action.service.ts` for why that convergence cannot
+   * preserve the frozen v1 invariants and is therefore not attempted.
+   */
+  private async verifyDeviceActionStatement(
+    tx: Prisma.TransactionClient,
+    call: DeviceGatewayDomainCall,
+  ): Promise<DeviceGatewayDomainResult> {
+    const outcome = await this.deviceActions.verifyStatement(tx, {
+      context: call.deviceContext,
+      siteId: call.siteId,
+      claims: call.semanticPayload,
+      now: await this.repository.dbNow(tx),
+      outcomeRef: call.domainIdempotencyKey,
+      traceId: call.traceId,
+    });
+    if (outcome.kind === 'UNRESOLVED') {
+      throw new DeviceGatewayTransactionRollback('DOMAIN_EFFECT_REFUSED', outcome.refusal);
+    }
+    if (outcome.result.outcome === 'REFUSED') {
+      throw new DeviceGatewayTransactionRollback('DOMAIN_EFFECT_REFUSED', outcome.result.refusal);
+    }
+    return {
+      view: outcome.result,
+      // The gateway attests to what the verification actually concluded, never
+      // to the fact that a call returned.
+      authoritative:
+        whisperDeviceActionV2StatementIsVerified(outcome.result) &&
+        outcome.result.context_id === call.deviceContext.context_id &&
+        outcome.result.device_id === call.deviceContext.device_id &&
+        outcome.result.actor_user_id === call.deviceContext.actor_user_id &&
+        outcome.result.site_id === call.siteId,
+    };
+  }
+
+  /** The read-only convergence probe. Causes no effect, and fails closed. */
+  private async probeDeviceActionStatement(call: DeviceGatewayDomainCall): Promise<WhisperDeviceActionConvergedView | null> {
+    return this.deviceActions.probeVerifiedStatement({
+      organisationId: call.deviceContext.organisation_id,
+      siteId: call.siteId,
+      actorUserId: call.deviceContext.actor_user_id,
+      deviceId: call.deviceContext.device_id,
+      contextId: call.deviceContext.context_id,
+      claims: call.semanticPayload,
+      expectedOutcomeRef: call.domainIdempotencyKey,
+    });
   }
 
   /**
