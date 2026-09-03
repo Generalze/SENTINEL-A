@@ -1,15 +1,47 @@
 # WP-26-HW-ACCEPTANCE-DEFERRED
 
 ```text
-Status                  DEFERRED — NOT WAIVED
-Reason                  No StrongBox-capable physical Android device presently
-                        available.
-Qualified implementation
-                        943a8fc2de18ae2f0d1e160062efc2ba23d005a6
-Required before closure
-                        The physical StrongBox acceptance procedure in
-                        docs/execution/WP-26-PHYSICAL-ACCEPTANCE-RUNBOOK.md
+WP-26 implementation          COMPLETE
+WP-26 software qualification  PASS
+WP-26 physical acceptance     DEFERRED — NOT WAIVED
+WP-26 overall                 OPEN / DEFERRED
+
+qualified head                943a8fc2de18ae2f0d1e160062efc2ba23d005a6
+Server CI                     33697234113  SUCCESS
+Android CI                    33697234025  SUCCESS
+migration count               23
+
+Proof C                       UNCLAIMED
+Proof D                       UNCLAIMED
+
+Reason                        No StrongBox-capable physical Android device
+                              presently available.
+Required before closure       The physical StrongBox acceptance procedure in
+                              docs/execution/WP-26-PHYSICAL-ACCEPTANCE-RUNBOOK.md
 ```
+
+The hardware test has **not been run and has not failed**. It has not been
+attempted, because the device required to attempt it is not available.
+
+### Merge provenance
+
+The qualified implementation reached `main` unchanged. One docs-only commit —
+this record and the roadmap status — sits between the qualified head and the
+merged head, and it touches no code:
+
+```text
+qualified head    943a8fc2de18ae2f0d1e160062efc2ba23d005a6
+merged head       3c6a489b9a204f274edc5f522cf1b5fb6d7482d8   (943a8fc2 + docs only)
+PR #19 merge      b5dfb902ca63fa75d12c5a53edcbf8bbf45eeaf0   (parents: 572ab324, 3c6a489)
+main              b5dfb902ca63fa75d12c5a53edcbf8bbf45eeaf0
+
+post-main Server CI    33700646561  SUCCESS
+post-main Android CI   33700646560  SUCCESS
+```
+
+`git diff 943a8fc2 3c6a489 -- . ':!docs'` is empty, so `943a8fc2` remains the
+exact code the software qualification was proven at, and it is an ancestor of
+`main`. The future hardware run keeps its relationship to that SHA.
 
 **Deferred does not become passed.** This file exists so that the distinction
 survives the passage of time and the arrival of later work packages. Nothing in
