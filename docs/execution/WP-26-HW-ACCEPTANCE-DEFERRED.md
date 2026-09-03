@@ -111,13 +111,18 @@ worth capturing when convenient. It simply is not the positive half.
 ## What remains blocked, and what does not
 
 ```text
-WP-27 SOFTWARE WORK              released
-WP-27 acceptance criteria that
-  depend on a successfully
-  enrolled StrongBox device      PENDING until hardware exists
+WP-27 SOFTWARE WORK              COMPLETE — closed at 662a91c7
+WP-28 Proof C gate               BLOCKED — NOT STARTED
+                                 this deferral is its blocker
 Proof C                          LOCKED — UNCLAIMED
 Proof D                          LOCKED — UNCLAIMED
 ```
+
+WP-28's own directive
+(`directives/WP-28-device-action-proof-c.md`) names this file's status as its
+start gate. Closing this item is therefore what releases WP-28, and the
+acceptance run must go against the frozen candidate `943a8fc2`, not whatever
+`main` happens to be by then.
 
 Proof C is unchanged by any of this. It requires the organisation to create,
 test and activate a device/wearable Whisper signal and invoke the silent
