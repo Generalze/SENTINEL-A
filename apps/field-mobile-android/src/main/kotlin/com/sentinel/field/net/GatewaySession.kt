@@ -1,8 +1,11 @@
 package com.sentinel.field.net
 
+import com.sentinel.field.security.CanonicalJson
 import com.sentinel.field.security.ClientNonce
+import com.sentinel.field.security.DeviceActionStatements
 import com.sentinel.field.security.DeviceStatements
 import com.sentinel.field.security.StrongBoxKeyManager
+import java.math.BigDecimal
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
@@ -61,6 +64,18 @@ class GatewaySession(
         const val KIND_ASSIGNMENT_ACCEPT = "ASSIGNMENT_ACCEPT"
         const val KIND_ASSIGNMENT_DECLINE = "ASSIGNMENT_DECLINE"
         const val KIND_MESSAGE_ACKNOWLEDGE = "INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE"
+
+        /** WP-27. The fourth surface, and the only one whose payload is itself signed. */
+        const val KIND_DEVICE_ACTION = "DEVICE_ACTION"
+
+        /**
+         * The server's own "I cannot yet say what your submission produced".
+         *
+         * Named here, as `EnrollmentCeremony` names its own, so that the one
+         * status this client must NOT read as a refusal is a constant somebody
+         * has to delete on purpose rather than a magic number in a comparison.
+         */
+        private const val COMPLETION_UNKNOWN = 409
     }
 
     /** The challenge, exactly as the server issued it. Every field is the server's. */
@@ -364,6 +379,127 @@ class GatewaySession(
     }
 
     // -----------------------------------------------------------------------
+    // D. WP-27 — the M3 device-action statement
+    // -----------------------------------------------------------------------
+
+    /**
+     * TWO SIGNATURES, OVER TWO DIFFERENT THINGS, AND THAT IS THE POINT.
+     *
+     * Every other operation on this class signs ONE thing: a request proof whose
+     * `payload_digest` covers the gateway envelope. A device action signs that
+     * too — nothing about the WP-25 pipeline is relaxed here — and it ALSO signs
+     * the v2 device-action statement itself, which is the artefact the platform
+     * keeps. The proof authenticates the REQUEST; the statement authenticates
+     * the CLAIM, survives the request, and is what a later audit reads.
+     *
+     * THE ORDER MATTERS AND IS NOT INTERCHANGEABLE. The statement is signed
+     * first, because its signature is a FIELD OF THE CLAIMS; the claims are the
+     * envelope's semantic payload; the envelope's digest is what the proof
+     * covers. So the proof transitively covers the statement signature, and a
+     * statement lifted out of one request cannot be replayed inside another
+     * without the proof failing.
+     *
+     * THERE IS NO TARGET ID IN THE ROUTE, and none is sent. The server resolves
+     * it from the persisted context — the operative themselves — exactly as the
+     * field-state route does. THE WHISPER SIGNAL IS NOT IN THE ROUTE EITHER: it
+     * is a signed claim inside the payload, so it binds cryptographically
+     * without appearing in a URL or an access log. W21-14 — on a covert channel
+     * that is the difference between a discreet configuration and a published
+     * one, and a client that "helpfully" put the signal id in the path would
+     * undo it from this side.
+     *
+     * WHAT THIS CLIENT DOES NOT NAME. No algorithm, no profile, no curve, no
+     * digest, no public key travels in the payload. `signature_profile` appears
+     * in the bytes that are SIGNED, because the server puts it there; it appears
+     * in no field this method sends. The claims schema is `.strict()`, so a
+     * profile field would be a parse failure rather than an ignored extra.
+     *
+     * THIS IS NOT WHISPER RECOGNITION AND DOES NOT CLAIM TO BE. This client
+     * resolves no signal, consults no roster and compares no threshold. What it
+     * produces is a hardware-signed statement that a registered device made this
+     * exact claim, freshly, inside a server-issued context.
+     */
+    fun submitDeviceAction(
+        sessionUserId: String,
+        context: DeviceContext,
+        siteId: String,
+        whisperSignalId: String,
+        whisperSignalVersion: Int,
+        deviceActionId: String,
+        confidenceHundredths: Int,
+    ): CeremonyStep<JsonObject> {
+        // Both are CLIENT-MINTED and neither is authority. `recognised_at` is
+        // judged against the server clock; the nonce is one-shot and the SERVER
+        // decides the identity it is spent against (D23-12).
+        val recognisedAt = ClientNonce.nowIso()
+        val antiReplayNonce = ClientNonce.next()
+
+        // The identity fields come from the ISSUED context, never from the UI:
+        // the server rebuilds the same statement from its own persisted columns,
+        // so a value invented here would simply fail to verify.
+        val statement = DeviceActionStatements.statement(
+            contextId = context.contextId,
+            organisationId = context.organisationId,
+            siteId = siteId,
+            actorUserId = context.actorUserId,
+            deviceId = context.deviceId,
+            keyId = context.keyId,
+            keyVersion = context.keyVersion,
+            whisperSignalId = whisperSignalId,
+            whisperSignalVersion = whisperSignalVersion,
+            deviceActionId = deviceActionId,
+            recognisedAt = recognisedAt,
+            confidenceHundredths = confidenceHundredths,
+            antiReplayNonce = antiReplayNonce,
+        )
+        val statementSignature = keys.signCanonicalStatement(statement)
+
+        // ONE map, built once: the digest below and the body posted at the end
+        // are the same object. Two literals drift, and a drift here would let
+        // the proof cover something other than what was sent.
+        val claims = DeviceActionStatements.claims(
+            keyId = context.keyId,
+            keyVersion = context.keyVersion,
+            whisperSignalId = whisperSignalId,
+            whisperSignalVersion = whisperSignalVersion,
+            deviceActionId = deviceActionId,
+            recognisedAt = recognisedAt,
+            confidenceHundredths = confidenceHundredths,
+            antiReplayNonce = antiReplayNonce,
+            signature = statementSignature,
+        )
+        val digest = DeviceStatements.operationEnvelopeDigest(
+            operationKind = KIND_DEVICE_ACTION,
+            organisationId = context.organisationId,
+            siteId = siteId,
+            actorUserId = context.actorUserId,
+            deviceId = context.deviceId,
+            targetId = context.actorUserId,
+            semanticPayload = claims,
+        )
+        val proof = signProof(
+            contextId = context.contextId,
+            organisationId = context.organisationId,
+            siteId = siteId,
+            actorUserId = context.actorUserId,
+            deviceId = context.deviceId,
+            keyId = context.keyId,
+            keyVersion = context.keyVersion,
+            // NOT `FIELD_OPERATION`. The route selects `WHISPER_DEVICE_ACTION`,
+            // whose permitted trust is `['TRUSTED']` alone, and the purpose is
+            // inside the signed proof.
+            purpose = DeviceStatements.PURPOSE_WHISPER_DEVICE_ACTION,
+            payloadDigest = digest,
+        )
+        return submitUnprovable(
+            sessionUserId,
+            "$GATEWAY/operations/device-action",
+            proof,
+            jsonPayload(claims),
+        )
+    }
+
+    // -----------------------------------------------------------------------
     // The one place a proof is minted, and the one place a body is posted
     // -----------------------------------------------------------------------
 
@@ -449,5 +585,75 @@ class GatewaySession(
         val body = answer.body
         if (!answer.ok || body == null) return CeremonyStep.refused(answer.status, answer.text)
         return CeremonyStep.ok(body)
+    }
+
+    /**
+     * C18-R1, applied to the ONE operation whose submission spends a one-shot
+     * identity the client cannot re-mint.
+     *
+     * The three surfaces above are idempotent enough to treat every non-2xx as
+     * terminal: press the button again and the same field state, the same
+     * accept or the same acknowledgement is sent. A DEVICE ACTION IS NOT LIKE
+     * THAT. Its `anti_replay_nonce` is one-shot, and the server may have
+     * consumed it and committed while the answer was lost — so "the network
+     * failed" and "the server refused" are DIFFERENT facts here, and collapsing
+     * them would have this client report a refusal for an action that happened.
+     *
+     * So only an AUTHORITATIVE 4xx that is not the server's own `409` is
+     * terminal. A transport failure (status 0), a 5xx, the `409`, and a 2xx
+     * whose body cannot be read as JSON are all UNPROVEN, and this client says
+     * so instead of guessing. Retrying an unproven submission mints a NEW nonce
+     * and a NEW statement, which the server will judge on its own merits — it is
+     * a fresh claim, not a replay of the lost one.
+     */
+    private fun submitUnprovable(
+        sessionUserId: String,
+        path: String,
+        proof: JsonObject,
+        payload: JsonObject,
+    ): CeremonyStep<JsonObject> {
+        val answer = http.post(
+            path,
+            sessionUserId,
+            buildJsonObject {
+                put("proof", proof)
+                put("payload", payload)
+            },
+        )
+        val body = answer.body
+        if (answer.ok && body != null) return CeremonyStep.ok(body)
+        val terminal = answer.status in 400..499 && answer.status != COMPLETION_UNKNOWN
+        if (terminal) return CeremonyStep.refused(answer.status, answer.text)
+        return CeremonyStep.completionUnknown(answer.status, answer.text)
+    }
+
+    /**
+     * The canonical semantic payload, as the JSON body that carries it.
+     *
+     * EXPLICIT, BY TYPE, AND IT THROWS ON ANYTHING ELSE. The map this converts
+     * is the same map the envelope digest was taken over, so the only thing
+     * that could go wrong is a value type whose JSON form differs between the
+     * canonicaliser and the serialiser — which is exactly what the `else`
+     * branch refuses to let happen quietly.
+     *
+     * `CanonicalJson.JsonNumber` goes through `BigDecimal` rather than a
+     * `Double`, so the digits on the wire are the digits that were signed. A
+     * `Double` here would re-enter the number-printing problem the
+     * canonicaliser exists to avoid.
+     */
+    private fun jsonPayload(payload: Map<String, Any?>): JsonObject = buildJsonObject {
+        for (entry in payload) {
+            val value = entry.value
+            when (value) {
+                null -> put(entry.key, JsonNull)
+                is String -> put(entry.key, JsonPrimitive(value))
+                is Int -> put(entry.key, JsonPrimitive(value))
+                is Boolean -> put(entry.key, JsonPrimitive(value))
+                is CanonicalJson.JsonNumber -> put(entry.key, JsonPrimitive(BigDecimal(value.text)))
+                else -> throw IllegalArgumentException(
+                    "a semantic payload value has no canonical JSON form: ${entry.key}",
+                )
+            }
+        }
     }
 }

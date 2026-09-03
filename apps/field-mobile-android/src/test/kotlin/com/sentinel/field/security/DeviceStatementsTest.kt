@@ -220,7 +220,10 @@ class DeviceStatementsTest {
         assertEquals("FIELD_ASSIGNMENT", DeviceStatements.TARGET_TYPE_FOR_KIND["ASSIGNMENT_ACCEPT"])
         assertEquals("FIELD_ASSIGNMENT", DeviceStatements.TARGET_TYPE_FOR_KIND["ASSIGNMENT_DECLINE"])
         assertEquals("INCIDENT_FIELD_MESSAGE", DeviceStatements.TARGET_TYPE_FOR_KIND["INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE"])
-        assertEquals(4, DeviceStatements.TARGET_TYPE_FOR_KIND.size)
+        // WP-27 added the fifth kind. The count is asserted so a kind cannot be
+        // added without a reviewer seeing it here.
+        assertEquals("DEVICE_ACTION_STATEMENT", DeviceStatements.TARGET_TYPE_FOR_KIND["DEVICE_ACTION"])
+        assertEquals(5, DeviceStatements.TARGET_TYPE_FOR_KIND.size)
     }
 
     @Test

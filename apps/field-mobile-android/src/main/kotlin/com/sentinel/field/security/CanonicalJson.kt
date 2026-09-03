@@ -34,16 +34,90 @@ package com.sentinel.field.security
  * from V8's shortest-round-trip algorithm, and Kotlin's `Double.toString` does
  * not always agree with it (`1e21`, `5e-324`, integral doubles printing as
  * `1.0` rather than `1`). Reproducing V8's number printing from memory would be
- * a guess in the one place a guess is fatal. NO SENTINEL DEVICE STATEMENT
- * CONTAINS A NON-INTEGER: the only numbers in any of them are `schema_version`,
- * `key_version` and `freshness_ms`, all integers. So integers are supported
- * exactly and everything else is refused loudly.
+ * a guess in the one place a guess is fatal. So [Double] and [Float] are refused
+ * here, permanently, and no future edit should relax that.
+ *
+ * WP-27 AND THE ONE FRACTIONAL FIELD IN ANY SENTINEL STATEMENT
+ * ------------------------------------------------------------
+ * Until WP-27 every number in every device statement was an integer —
+ * `schema_version`, `key_version`, `freshness_ms`. The v2 device-action
+ * statement adds ONE that is not: `confidence`, a `z.number().min(0).max(1)`.
+ *
+ * It is still not admitted as a [Double]. It is admitted as [JsonNumber], a
+ * value whose decimal text is CONSTRUCTED HERE from an integer number of
+ * hundredths and can therefore only ever be one of 101 strings — `"0"`, `"1"`,
+ * and `"0.01"`..`"0.99"` with a trailing zero trimmed. Every one of those was
+ * checked against a shortest-round-trip printer before this was written, and
+ * each is exactly what `JSON.stringify` emits for the double that same text
+ * parses to. The client therefore never has to reproduce V8's printer; it only
+ * has to refuse to produce a confidence that is not a whole number of
+ * hundredths, which it does, at the one place such a value can be made.
  * ============================================================================
  */
 object CanonicalJson {
 
     /** Thrown for any value the contract's canonicaliser would also refuse. */
     class NotCanonicallyRepresentable(message: String) : IllegalArgumentException(message)
+
+    /**
+     * A JSON NUMBER whose decimal text this file produced, emitted verbatim.
+     *
+     * PRIVATE CONSTRUCTOR, ON PURPOSE. There is no way to hand this class a
+     * string of your own, so there is no way for a caller to slip a decimal
+     * form into signed bytes that the server's canonicaliser would print
+     * differently. The only door in is [ofHundredths], whose whole output space
+     * is 101 known-good strings.
+     *
+     * This is deliberately NOT a general "raw number" escape hatch. If a future
+     * statement needs a number this cannot express, the right move is another
+     * narrow factory whose output space is small enough to have been checked —
+     * not a validator over arbitrary text.
+     */
+    class JsonNumber private constructor(val text: String) {
+
+        override fun toString(): String = text
+
+        override fun equals(other: Any?): Boolean = other is JsonNumber && other.text == text
+
+        override fun hashCode(): Int = text.hashCode()
+
+        companion object {
+
+            /** `confidence` is carried as a whole number of hundredths, 0..100. */
+            const val HUNDREDTHS = 100
+
+            /**
+             * The canonical decimal for [hundredths] / 100.
+             *
+             * Out of range is a REFUSAL rather than a clamp: a clamp would
+             * silently sign a different claim from the one the caller made.
+             */
+            fun ofHundredths(hundredths: Int): JsonNumber {
+                if (hundredths < 0 || hundredths > HUNDREDTHS) {
+                    throw CanonicalJson.NotCanonicallyRepresentable(
+                        "a hundredths value must be 0..$HUNDREDTHS, not $hundredths",
+                    )
+                }
+                return JsonNumber(hundredthsText(hundredths))
+            }
+
+            /**
+             * `0` · `1` · `0.05` · `0.9` · `0.87`.
+             *
+             * A trailing zero is TRIMMED and the integral ends print without a
+             * fractional part, because that is what a shortest-round-trip
+             * printer does and the two sides must agree on the digits, not
+             * merely on the value.
+             */
+            private fun hundredthsText(hundredths: Int): String = when {
+                hundredths == 0 -> "0"
+                hundredths == HUNDREDTHS -> "1"
+                hundredths % 10 == 0 -> "0." + (hundredths / 10).toString()
+                hundredths < 10 -> "0.0" + hundredths.toString()
+                else -> "0." + hundredths.toString()
+            }
+        }
+    }
 
     private const val FORM_FEED = '\u000C'
     private const val HEX = "0123456789abcdef"
@@ -52,7 +126,7 @@ object CanonicalJson {
      * The canonical string for [value].
      *
      * Accepted node types, and only these: `null`, [String], [Boolean], [Int],
-     * [Long], [Map] with [String] keys, and [List].
+     * [Long], [JsonNumber], [Map] with [String] keys, and [List].
      */
     fun encode(value: Any?): String {
         val out = StringBuilder()
@@ -82,6 +156,7 @@ object CanonicalJson {
             is Boolean -> out.append(if (value) "true" else "false")
             is Int -> out.append(value.toString())
             is Long -> out.append(value.toString())
+            is JsonNumber -> out.append(value.text)
             is Map<*, *> -> writeObject(value, out, path, stack)
             is List<*> -> writeArray(value, out, path, stack)
             else -> throw NotCanonicallyRepresentable(

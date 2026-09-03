@@ -10,6 +10,7 @@ import com.sentinel.field.net.EnrollmentCeremony
 import com.sentinel.field.net.FieldReads
 import com.sentinel.field.net.GatewaySession
 import com.sentinel.field.net.SentinelHttp
+import com.sentinel.field.security.ClientNonce
 import com.sentinel.field.security.StrongBoxKeyManager
 import com.sentinel.field.store.ClientStateStore
 import com.sentinel.field.store.EncryptedClientState
@@ -87,6 +88,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var inputIncident: EditText
     private lateinit var inputAssignment: EditText
     private lateinit var inputMessage: EditText
+    private lateinit var inputWhisperSignal: EditText
     private lateinit var textLog: TextView
 
     private lateinit var keys: StrongBoxKeyManager
@@ -129,6 +131,7 @@ class MainActivity : AppCompatActivity() {
         inputIncident = findViewById(R.id.inputIncident)
         inputAssignment = findViewById(R.id.inputAssignment)
         inputMessage = findViewById(R.id.inputMessage)
+        inputWhisperSignal = findViewById(R.id.inputWhisperSignal)
         textLog = findViewById(R.id.textLog)
 
         keys = StrongBoxKeyManager(applicationContext)
@@ -153,6 +156,7 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.buttonAcceptAssignment).setOnClickListener { runAssignmentAction(true) }
         findViewById<Button>(R.id.buttonDeclineAssignment).setOnClickListener { runAssignmentAction(false) }
         findViewById<Button>(R.id.buttonAcknowledgeMessage).setOnClickListener { runAcknowledgeMessage() }
+        findViewById<Button>(R.id.buttonDeviceAction).setOnClickListener { runDeviceAction() }
         findViewById<Button>(R.id.buttonDiscardKey).setOnClickListener { runDiscardKey() }
         findViewById<Button>(R.id.buttonClearLog).setOnClickListener { textLog.text = "" }
     }
@@ -702,6 +706,69 @@ class MainActivity : AppCompatActivity() {
                 siteId = site,
                 messageId = messageId,
             )
+            if (!result.isOk) {
+                log(result.describe())
+                return@background
+            }
+            log("operation: ${result.valueOrThrow()}")
+        }
+    }
+
+    /**
+     * WP-27 — the M3 device-action statement.
+     *
+     * THIS SCREEN DOES NOT RECOGNISE ANYTHING, AND THE LOG SAYS SO ON EVERY
+     * PRESS. There is no recogniser in this client, so `confidence` is a fixed
+     * placeholder rather than a measurement, and presenting it as one would be
+     * exactly the manufactured evidence WP-26 refused to produce for StrongBox.
+     * What the press does establish is real and is the whole point: a
+     * registered, trusted device holding the registered private key produced
+     * this exact statement, freshly, bound to a server-issued context.
+     *
+     * The signal id is TYPED rather than listed, because there is no read
+     * surface that enumerates Whisper signals to a handset and this client will
+     * not invent one — W21-14 keeps the configuration discreet, and a client
+     * that could list signals would publish it.
+     *
+     * THE UNPROVEN OUTCOME IS REPORTED AS UNPROVEN. A device action spends a
+     * one-shot nonce, so a lost response is not a refusal, and this is the one
+     * operation on this screen that says which of the two it was.
+     */
+    private fun runDeviceAction() {
+        val currentContext = establishedContext() ?: return
+        val signalId = inputWhisperSignal.value()
+        if (signalId.isEmpty()) {
+            log("enter a Whisper signal id: a device action is bound to the exact signal it answers.")
+            return
+        }
+        val session = inputSessionUser.value()
+        val site = operatingSite(currentContext)
+        val gateway = gateway()
+
+        // A fresh id per press. Each press IS a distinct action occurrence, and
+        // W21-06 wants the statement to say WHICH action it witnessed rather
+        // than merely that one happened.
+        val deviceActionId = ClientNonce.next()
+        val signalVersion = 1
+        val confidenceHundredths = 100
+
+        background {
+            log("POST operations/device-action (statement signature, then a FRESH hardware proof) ...")
+            log("this client recognises nothing: confidence is a fixed $confidenceHundredths/100, not a measurement.")
+            val result = gateway.submitDeviceAction(
+                sessionUserId = session,
+                context = currentContext,
+                siteId = site,
+                whisperSignalId = signalId,
+                whisperSignalVersion = signalVersion,
+                deviceActionId = deviceActionId,
+                confidenceHundredths = confidenceHundredths,
+            )
+            if (result.isCompletionUnknown) {
+                log(result.describe())
+                log("the server may have committed this action. Pressing again sends a NEW statement with a NEW nonce, never a replay of this one.")
+                return@background
+            }
             if (!result.isOk) {
                 log(result.describe())
                 return@background

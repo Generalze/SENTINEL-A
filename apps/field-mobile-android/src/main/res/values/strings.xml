@@ -12,6 +12,7 @@
     <string name="hint_incident">Incident id (message reads are scoped to one incident)</string>
     <string name="hint_assignment">Assignment id (from the list above)</string>
     <string name="hint_message">Message id (from the list above)</string>
+    <string name="hint_whisper_signal">Whisper signal id (typed; never listed to a handset)</string>
 
     <string name="label_ceremony">Enrollment ceremony</string>
     <string name="label_reads">Reads — ordinary authenticated routes, session only</string>
@@ -32,6 +33,7 @@
     <string name="action_accept_assignment">Accept the assignment</string>
     <string name="action_decline_assignment">Decline the assignment</string>
     <string name="action_acknowledge_message">Acknowledge the message</string>
+    <string name="action_device_action">Device action statement (WP-27, hardware-signed)</string>
 
     <string name="action_clear_log">Clear log</string>
     <string name="action_discard_key">Discard the device key and forget client state</string>

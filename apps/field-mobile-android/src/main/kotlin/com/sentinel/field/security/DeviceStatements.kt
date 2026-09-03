@@ -57,6 +57,19 @@ object DeviceStatements {
     const val PURPOSE_RECONNECT_HANDSHAKE = "RECONNECT_HANDSHAKE"
     const val PURPOSE_FIELD_OPERATION = "FIELD_OPERATION"
 
+    /**
+     * WP-27. The purpose the gateway's `DEVICE_ACTION` kind selects, quoted from
+     * `DEVICE_GATEWAY_PURPOSE_FOR_KIND` rather than invented here.
+     *
+     * It is a STRICTLY NARROWER gate than `FIELD_OPERATION`:
+     * `DEVICE_PURPOSE_PERMITTED_TRUST.WHISPER_DEVICE_ACTION` is `['TRUSTED']`
+     * alone (W21-05). The client does not enforce that and must not pretend to
+     * — trust is the platform's judgement — but it must not mint a device-action
+     * proof under the wider purpose either, because the purpose is inside the
+     * signed proof and a proof minted for one purpose is refused for another.
+     */
+    const val PURPOSE_WHISPER_DEVICE_ACTION = "WHISPER_DEVICE_ACTION"
+
     // -----------------------------------------------------------------------
     // Enrollment: the possession statement (D23-03 / C15-03)
     // -----------------------------------------------------------------------
@@ -208,12 +221,23 @@ object DeviceStatements {
     // Gateway: the canonical typed operation envelope (D25-11)
     // -----------------------------------------------------------------------
 
-    /** The four kinds the gateway exposes, and the target type fixed for each. */
+    /**
+     * The five kinds the gateway exposes, and the target type fixed for each.
+     *
+     * Mirrors `DEVICE_GATEWAY_TARGET_TYPE_FOR_KIND` in
+     * `services/core-api/.../device-gateway.envelope.ts`. The target type is
+     * NEVER taken from a caller on either side: the ROUTE chooses the kind and
+     * the kind fixes the type, so a device cannot describe its own operation as
+     * something else and have the digest still agree.
+     *
+     * `DEVICE_ACTION` is WP-27's addition and maps to `DEVICE_ACTION_STATEMENT`.
+     */
     val TARGET_TYPE_FOR_KIND: Map<String, String> = mapOf(
         "FIELD_STATE_UPDATE" to "FIELD_OPERATIVE_STATE",
         "ASSIGNMENT_ACCEPT" to "FIELD_ASSIGNMENT",
         "ASSIGNMENT_DECLINE" to "FIELD_ASSIGNMENT",
         "INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE" to "INCIDENT_FIELD_MESSAGE",
+        "DEVICE_ACTION" to "DEVICE_ACTION_STATEMENT",
     )
 
     /**
