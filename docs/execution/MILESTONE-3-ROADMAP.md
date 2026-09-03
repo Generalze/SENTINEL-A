@@ -175,9 +175,13 @@ new development base              572ab324d0d21de60c6192234599f028d6497f0a
 WP-23 Device Identity Contract    CLOSED at ded82d596
 WP-24 Shield Device Registry      CLOSED at 578055a2
 WP-25 Authenticated Device Gateway  CLOSED at 572ab324
-WP-26 Field Mobile Foundation     ACTIVE (design PASSED with addendum;
-                                    IMPLEMENTATION GO; migration target 23)
-WP-27 Real DEVICE_ACTION Whisper  HOLD
+WP-26 Field Mobile Foundation     IMPLEMENTATION COMPLETE
+                                  SOFTWARE QUALIFICATION PASS
+                                  PHYSICAL ACCEPTANCE DEFERRED - NOT WAIVED
+                                  see WP-26-HW-ACCEPTANCE-DEFERRED.md
+WP-27 Real DEVICE_ACTION Whisper  RELEASED for software work; any acceptance
+                                  criterion needing an enrolled StrongBox
+                                  device stays PENDING until hardware exists
 WP-28 Proof C gate                UNCLAIMED
 WP-29 .. WP-31 / Proof D          HOLD / UNCLAIMED
 
