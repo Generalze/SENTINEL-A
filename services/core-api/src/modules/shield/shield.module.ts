@@ -1,6 +1,8 @@
 import { Module } from '@nestjs/common';
 import { PrismaModule } from '../../prisma/prisma.module';
-import { DEVICE_ATTESTATION_EVALUATOR, UnavailableDeviceAttestationEvaluator } from './attestation.evaluator';
+import { AndroidAttestationArtifactReader } from '../device-enrollment-ingress/android-attestation.artifact-reader';
+import { AndroidKeyAttestationEvaluator } from '../device-enrollment-ingress/android-key-attestation.evaluator';
+import { DEVICE_ATTESTATION_EVALUATOR } from './attestation.evaluator';
 import { DeviceEnrollmentService } from './device-enrollment.service';
 import { DeviceKeyService } from './device-key.service';
 import { DeviceRegistryService } from './device-registry.service';
@@ -67,7 +69,40 @@ import { ShieldRepository } from './shield.repository';
     DeviceEnrollmentService,
     DeviceTrustService,
     DeviceKeyService,
-    { provide: DEVICE_ATTESTATION_EVALUATOR, useClass: UnavailableDeviceAttestationEvaluator },
+    // WP-26/D26-04B — THE SEAM NOW HAS A REAL PROVIDER BEHIND IT.
+    //
+    // `UnavailableDeviceAttestationEvaluator` still exists and still documents
+    // why UNAVAILABLE was the only honest default while no provider existed; it
+    // is no longer the wiring, and WP-24's and WP-25's suites still override
+    // this token with their own settable evaluator, so nothing they assert
+    // moves.
+    //
+    // WHY THE BINDING IS HERE AND NOT IN THE INGRESS MODULE. Nest resolves an
+    // injection token in the injector that constructs the CONSUMER, and
+    // `DeviceEnrollmentService` is constructed here. A provider declared in
+    // `DeviceEnrollmentIngressModule` would never reach it, and the verifier
+    // would silently never run — which is precisely the failure mode this
+    // codebase treats as worse than none at all, because it reads as evidence.
+    //
+    // WHY THAT DOES NOT HAND SHIELD A NEW POWER. The evaluator is a STRICT
+    // SUPERSET of the default it replaces. Given no server-owned artifact
+    // reference — which is every caller that predates WP-26, including
+    // `DeviceTrustService`'s re-attestation path — it returns exactly what the
+    // default returned: `UNAVAILABLE`, with a null reference. The only path that
+    // can produce anything else is one where the WP-26 ingress verified a
+    // certificate chain against SERVER-configured trust anchors and wrote the
+    // artifact itself, and the evaluator re-binds that reference to this
+    // organisation and this exact key before believing it. Shield gains no
+    // ability to conclude anything it could not conclude before; it gains the
+    // ability to be TOLD what the server already proved.
+    //
+    // `AndroidAttestationArtifactReader` is provided beside it for the same
+    // injector reason. It is a read-only, single-method collaborator that
+    // CANNOT load the raw certificate chain — its `select` omits the column —
+    // so registering it here gives the registry no reach into the ingress's
+    // ceremony state and no way to touch the restricted evidence.
+    AndroidAttestationArtifactReader,
+    { provide: DEVICE_ATTESTATION_EVALUATOR, useClass: AndroidKeyAttestationEvaluator },
   ],
   // WP-25/D25-10: `DeviceReplayService` is exported so the device gateway can
   // consume Shield's ONE anti-replay store with a new `ceremony` value rather

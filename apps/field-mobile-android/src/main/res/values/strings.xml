@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Sentinel Field</string>
+
+    <string name="default_base_url">http://10.0.2.2:3000</string>
+    <string name="hint_base_url">Base URL (e.g. http://10.0.2.2:3000)</string>
+    <string name="hint_session_user">Session user id (the HUMAN)</string>
+    <string name="hint_organisation">Organisation id</string>
+    <string name="hint_site">Site id</string>
+    <string name="hint_bootstrap_token">Bootstrap grant (secret; masked, never stored)</string>
+    <string name="hint_device">Device id (filled in by the commit)</string>
+    <string name="hint_incident">Incident id (message reads are scoped to one incident)</string>
+    <string name="hint_assignment">Assignment id (from the list above)</string>
+    <string name="hint_message">Message id (from the list above)</string>
+
+    <string name="label_ceremony">Enrollment ceremony</string>
+    <string name="label_reads">Reads — ordinary authenticated routes, session only</string>
+    <string name="label_operations">Operations — WP-25 gateway, hardware-signed</string>
+    <string name="label_log">Log</string>
+
+    <string name="action_challenge_and_generate">1 · Attestation challenge, then generate the StrongBox key</string>
+    <string name="action_submit_request">2 · Submit the enrollment request</string>
+    <string name="action_prove_and_commit">3 · Possession + commit (after a commander approves)</string>
+    <string name="action_establish_context">4 · Establish a WP-25 device context</string>
+
+    <string name="action_identity">Who am I — current identity and scope</string>
+    <string name="action_assignments">My assignments</string>
+    <string name="action_messages">My messages on this incident</string>
+    <string name="action_patrol_runs">My patrol runs (read only)</string>
+
+    <string name="action_field_state">Field state update (AVAILABLE)</string>
+    <string name="action_accept_assignment">Accept the assignment</string>
+    <string name="action_decline_assignment">Decline the assignment</string>
+    <string name="action_acknowledge_message">Acknowledge the message</string>
+
+    <string name="action_clear_log">Clear log</string>
+    <string name="action_discard_key">Discard the device key and forget client state</string>
+</resources>

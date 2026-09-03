@@ -233,6 +233,28 @@ export type IssueBootstrapGrantOutcome =
 
 export type RevokeBootstrapGrantOutcome = { readonly outcome: 'REVOKED'; readonly grantId: string } | ShieldRefused;
 
+/**
+ * WP-26/D26-04A: the answer to "is this presented token usable RIGHT NOW, for
+ * exactly this organisation, site and intended user?".
+ *
+ * IT CARRIES NO SECRET. The token went in; what comes back is the grant's
+ * server-owned identity and its expiry, which is what the enrollment ingress
+ * needs in order to CLAMP an attestation challenge so it can never outlive the
+ * grant it belongs to. There is no path back from this shape to the token, and
+ * nothing here is a credential: the grant still creates ZERO device authority
+ * (D24-03).
+ */
+export type PresentBootstrapGrantOutcome =
+  | {
+      readonly outcome: 'USABLE';
+      readonly grantId: string;
+      /** The grant's OWN site, not the presented one. They were proved equal. */
+      readonly siteId: string;
+      readonly intendedUserId: string;
+      readonly expiresAt: Date;
+    }
+  | ShieldRefused;
+
 // ---------------------------------------------------------------------------
 // Enrollment (D24-03 / D24-06)
 // ---------------------------------------------------------------------------
@@ -271,6 +293,24 @@ export interface EnrollmentRequestSubmission {
    * approved-semantics digest the human approval binds.
    */
   readonly custodyRegimeId: string | null;
+  /**
+   * WP-26/D26-04B — THE SERVER'S OWN ATTESTATION ARTIFACT REFERENCE, OR NULL.
+   *
+   * NOT A CLIENT FIELD, AND STRUCTURALLY NOT ONE. There is no HTTP body member,
+   * no contract field and no device-reachable path that produces it: the WP-26
+   * ingress verifies an Android Key Attestation chain ITSELF, persists what it
+   * concluded as a restricted server-owned record, and passes the handle here.
+   * The device supplies the EVIDENCE (a public key and a certificate chain); the
+   * server supplies the VERDICT, which is the D24-08 rule that a field a client
+   * could set would make the whole model decorative, applied one level up.
+   *
+   * It is handed to the injected `DeviceAttestationEvaluator` and to nothing
+   * else. This service takes no decision from it, stores no copy of it beyond
+   * what the evaluator's own evidence carries, and every pre-WP-26 caller passes
+   * `null` — which the evaluator answers exactly as it did before the field
+   * existed.
+   */
+  readonly attestationArtifactRef: string | null;
   readonly traceId: string;
 }
 
@@ -299,6 +339,70 @@ export type CreateEnrollmentRequestOutcome =
 
 export type ApproveEnrollmentOutcome =
   | { readonly outcome: 'APPROVED'; readonly approvalId: string; readonly approvedRequestFingerprint: string }
+  | ShieldRefused;
+
+/**
+ * WP-26/D26-09: what the INTENDED USER of a ceremony may be told about it.
+ *
+ * The narrowest read in this module, and deliberately so. It exists because the
+ * enrollment ingress must equality-bind the authenticated session to the
+ * request's intended user before the possession step (C17-01), and it cannot do
+ * that without asking Shield — the ingress never reads a Shield table itself.
+ *
+ * IT IS NOT A REGISTRY READ. There is no device here, no key, no trust value
+ * and no attestation reference. `state` and the fingerprint are exactly what a
+ * client already learns from creating the request; nothing new is disclosed by
+ * being able to ask again.
+ *
+ * ISOLATION: a request in another tenant, a request belonging to another
+ * intended user and an id that never existed all answer
+ * `ENROLLMENT_REQUEST_NOT_FOUND` — the same rule `issuePossessionChallenge`
+ * follows, because any distinction between them is an existence oracle.
+ */
+export type ReadIntendedUserEnrollmentOutcome =
+  | {
+      readonly outcome: 'FOUND';
+      readonly enrollmentRequestId: string;
+      readonly siteId: string;
+      readonly state: string;
+      readonly requestFingerprint: string;
+      readonly publicKeyThumbprint: string;
+      readonly attestationOutcome: string;
+    }
+  | ShieldRefused;
+
+/**
+ * WP-26/D26-09: the COMMANDER's view of enrollments awaiting a decision.
+ *
+ * Gated by `device.registry.read` and projected to the sites the reader's
+ * granting assignments actually cover — the C16-06 rule that holding one site
+ * is not a way to enumerate another. An organisation-wide assignment sees the
+ * tenant; a site-scoped commander sees their sites; a reader holding the action
+ * at no site sees nothing, which is deliberately NOT the same as seeing
+ * everything.
+ *
+ * `requestFingerprint` is here because it is the thing the approver must name
+ * back (C14-02: a human approves a specific set of bytes, not an id). The
+ * attestation OUTCOME is here for the same reason — it is part of what the
+ * approver is approving — and the raw certificate chain is NOT, and could not
+ * be: no read path in this module can load it.
+ */
+export interface PendingEnrollmentSummary {
+  readonly enrollmentRequestId: string;
+  readonly siteId: string;
+  readonly intendedUserId: string;
+  readonly custody: DeviceCustody;
+  readonly custodyRegimeId: string | null;
+  readonly keyStorage: DeviceKeyStorage;
+  readonly publicKeyThumbprint: string;
+  readonly requestFingerprint: string;
+  readonly attestationOutcome: string;
+  readonly state: string;
+  readonly requestedAt: Date;
+}
+
+export type ListPendingEnrollmentsOutcome =
+  | { readonly outcome: 'FOUND'; readonly requests: readonly PendingEnrollmentSummary[] }
   | ShieldRefused;
 
 export type IssuePossessionChallengeOutcome =

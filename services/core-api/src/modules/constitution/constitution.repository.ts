@@ -44,6 +44,9 @@ export interface StoredPolicy {
   readonly activatedAt: Date | null;
 }
 
+/** How many times a losing boot re-attempts the baseline seed before failing loudly. */
+const BASELINE_SEED_ATTEMPTS = 5;
+
 /** `created_by` marker for the baseline seeded at first boot (the bootstrap exemption). */
 export const BOOTSTRAP_AUTHOR = 'system.bootstrap';
 
@@ -208,29 +211,57 @@ export class ConstitutionPolicyRepository {
    * treats the conflict as "already seeded".
    */
   async ensureBaselineSeeded(): Promise<void> {
-    try {
-      await this.prisma.$transaction(
-        async (tx) => {
-          const existing = await tx.constitutionPolicy.count();
-          if (existing > 0) return;
-
-          assertValidPolicy(SENTINEL_BASELINE_POLICY);
-          await tx.constitutionPolicy.create({
-            data: {
-              version: SENTINEL_BASELINE_POLICY.version,
-              body: policyBody(SENTINEL_BASELINE_POLICY) as Prisma.InputJsonObject,
-              contentSha256: policyContentSha256(SENTINEL_BASELINE_POLICY),
-              status: 'active',
-              createdBy: BOOTSTRAP_AUTHOR,
-              activatedAt: new Date(),
-            },
-          });
-        },
-        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
-      );
-    } catch (error: unknown) {
-      if (!isConcurrentWriteConflict(error)) throw error;
-      // Another instance seeded the baseline first; its row is the one we will load.
+    // WP-26: RETRY, RATHER THAN ASSUME THE WINNER HAS COMMITTED.
+    //
+    // This used to swallow a concurrent-write conflict once and return,
+    // reasoning that "another instance seeded the baseline first; its row is
+    // the one we will load". That reasoning has a gap. A serialization failure
+    // aborts THIS transaction at the moment the conflict is detected, which is
+    // not the moment the other transaction COMMITS — so a caller that returns
+    // immediately can go on to `findActive()` and legitimately see nothing,
+    // and `reload()` then throws `NoActivePolicyError` on a database that is
+    // about to be perfectly well seeded.
+    //
+    // It is not a test artefact. Any fresh deployment whose API replicas boot
+    // simultaneously against an empty database can lose this race, and the
+    // symptom is a crash in `onModuleInit` rather than a retryable error.
+    //
+    // Re-running is both safe and sufficient: the transaction's first act is a
+    // count, so a later attempt either OBSERVES the committed baseline and
+    // returns, or finds the table still empty and inserts it. The final attempt
+    // deliberately does not swallow — if we genuinely cannot make progress, a
+    // loud failure is better than a service that believes it has a
+    // constitution and does not.
+    for (let attempt = 1; attempt <= BASELINE_SEED_ATTEMPTS; attempt += 1) {
+      try {
+        await this.seedBaselineOnce();
+        return;
+      } catch (error: unknown) {
+        if (!isConcurrentWriteConflict(error)) throw error;
+        if (attempt === BASELINE_SEED_ATTEMPTS) throw error;
+      }
     }
+  }
+
+  private async seedBaselineOnce(): Promise<void> {
+    await this.prisma.$transaction(
+      async (tx) => {
+        const existing = await tx.constitutionPolicy.count();
+        if (existing > 0) return;
+
+        assertValidPolicy(SENTINEL_BASELINE_POLICY);
+        await tx.constitutionPolicy.create({
+          data: {
+            version: SENTINEL_BASELINE_POLICY.version,
+            body: policyBody(SENTINEL_BASELINE_POLICY) as Prisma.InputJsonObject,
+            contentSha256: policyContentSha256(SENTINEL_BASELINE_POLICY),
+            status: 'active',
+            createdBy: BOOTSTRAP_AUTHOR,
+            activatedAt: new Date(),
+          },
+        });
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+    );
   }
 }

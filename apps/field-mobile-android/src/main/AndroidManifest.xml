@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    WP-26 Field Mobile Foundation.
+
+    NOTE THE ABSENCES, WHICH ARE THE POINT:
+
+      * android:allowBackup="false" — the device credential is a StrongBox
+        handle and cannot be backed up in any case, but an app that opted into
+        cloud backup for "client state" would be an app whose next field is the
+        one somebody regrets. D26-06 scopes secure local storage to client
+        state only, and WP-29 owns the offline queue.
+
+      * no android:debuggable, no exported components beyond the single
+        launcher activity, no content provider, no receiver, no service.
+
+      * no android:usesCleartextTraffic here. It is set in
+        src/debug/AndroidManifest.xml ONLY, so a release build of this client
+        cannot talk to a plaintext endpoint at all.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!--
+        D26-03A: StrongBox is REQUIRED, with no silent fallback. Declaring the
+        feature as required keeps this build off handsets that cannot host the
+        reference path at all; `StrongBoxKeyManager` still catches
+        StrongBoxUnavailableException and reports UNSUPPORTED, because a
+        declared feature is not a working one.
+    -->
+    <uses-feature
+        android:name="android.hardware.strongbox_keystore"
+        android:required="true" />
+
+    <application
+        android:allowBackup="false"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.AppCompat.DayNight">
+
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+    </application>
+
+</manifest>

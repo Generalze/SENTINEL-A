@@ -376,6 +376,10 @@ async function enrol(
     keyStorage: options.keyStorage ?? 'HARDWARE_BACKED',
     claimedSignatureProfile: PROFILE,
     custodyRegimeId: null,
+    // WP-26/D26-04B: the SERVER's own attestation artifact reference. `null`
+    // here means "no server-owned attestation accompanies this submission",
+    // which the evaluator answers exactly as it did before the field existed.
+    attestationArtifactRef: null,
     traceId: traceId(),
   });
   if (request.outcome !== 'REQUESTED') throw new Error(`request not created: ${JSON.stringify(request)}`);

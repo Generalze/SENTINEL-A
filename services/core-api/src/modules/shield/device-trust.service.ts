@@ -145,6 +145,12 @@ export class DeviceTrustService {
       enrollmentRequestId: null,
       publicKeyThumbprint: key.publicKeyThumbprint,
       now: now.toISOString(),
+      // WP-26/D26-04B: NULL, and permanently so on this path. A re-attestation
+      // is Sentinel ASKING the platform about hardware it already registered;
+      // there is no ceremony in flight and therefore no server-owned artifact to
+      // name. An evaluator answers `null` exactly as it did before the field
+      // existed, so this call's behaviour is unchanged.
+      attestationArtifactRef: null,
     });
 
     return this.repository.transaction(async (tx) => {

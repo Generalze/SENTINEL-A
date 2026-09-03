@@ -1,0 +1,16 @@
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+captures/
+.cxx/
+
+# WP-26 acceptance signing identity. The keystore and its passwords are supplied
+# at build time and NEVER committed; Sentinel only ever needs the PUBLIC
+# certificate fingerprint. These patterns are a second line of defence behind
+# that rule, not the rule itself.
+*.jks
+*.keystore
+signing.properties
+keystore.properties

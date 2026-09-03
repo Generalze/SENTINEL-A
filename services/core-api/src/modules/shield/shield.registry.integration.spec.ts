@@ -316,6 +316,10 @@ async function prepareCeremony(options: CeremonyOptions = {}): Promise<PreparedC
     keyStorage: options.keyStorage ?? 'HARDWARE_BACKED',
     claimedSignatureProfile: PROFILE,
     custodyRegimeId,
+    // WP-26/D26-04B: the SERVER's own attestation artifact reference. `null`
+    // here means "no server-owned attestation accompanies this submission",
+    // which the evaluator answers exactly as it did before the field existed.
+    attestationArtifactRef: null,
     traceId: traceId(),
   });
   if (request.outcome !== 'REQUESTED') throw new Error(`request not created: ${JSON.stringify(request)}`);
@@ -855,6 +859,10 @@ describe('WP-24 Shield device registry (live)', () => {
         keyStorage: 'HARDWARE_BACKED',
         claimedSignatureProfile: PROFILE,
         custodyRegimeId: null,
+        // WP-26/D26-04B: the SERVER's own attestation artifact reference. `null`
+        // here means "no server-owned attestation accompanies this submission",
+        // which the evaluator answers exactly as it did before the field existed.
+        attestationArtifactRef: null,
         traceId: traceId(),
       });
       if (request.outcome !== 'REQUESTED') throw new Error('request');
@@ -894,6 +902,10 @@ describe('WP-24 Shield device registry (live)', () => {
         keyStorage: 'HARDWARE_BACKED',
         claimedSignatureProfile: PROFILE,
         custodyRegimeId: null,
+        // WP-26/D26-04B: the SERVER's own attestation artifact reference. `null`
+        // here means "no server-owned attestation accompanies this submission",
+        // which the evaluator answers exactly as it did before the field existed.
+        attestationArtifactRef: null,
         traceId: traceId(),
       });
       if (request.outcome !== 'REQUESTED') throw new Error('request');
@@ -930,6 +942,10 @@ describe('WP-24 Shield device registry (live)', () => {
           keyStorage: 'HARDWARE_BACKED',
           claimedSignatureProfile: PROFILE,
           custodyRegimeId: null,
+          // WP-26/D26-04B: the SERVER's own attestation artifact reference. `null`
+          // here means "no server-owned attestation accompanies this submission",
+          // which the evaluator answers exactly as it did before the field existed.
+          attestationArtifactRef: null,
           traceId: traceId(),
         }),
       ).toEqual({ outcome: 'REFUSED', refusal: 'ENROLLMENT_REQUEST_CONFLICT' });
@@ -956,6 +972,10 @@ describe('WP-24 Shield device registry (live)', () => {
         keyStorage: 'HARDWARE_BACKED',
         claimedSignatureProfile: PROFILE,
         custodyRegimeId: null,
+        // WP-26/D26-04B: the SERVER's own attestation artifact reference. `null`
+        // here means "no server-owned attestation accompanies this submission",
+        // which the evaluator answers exactly as it did before the field existed.
+        attestationArtifactRef: null,
         traceId: traceId(),
       });
       if (attackerRequest.outcome !== 'REQUESTED') throw new Error('attacker request');
@@ -1034,6 +1054,10 @@ describe('WP-24 Shield device registry (live)', () => {
         keyStorage: 'HARDWARE_BACKED',
         claimedSignatureProfile: PROFILE,
         custodyRegimeId: null,
+        // WP-26/D26-04B: the SERVER's own attestation artifact reference. `null`
+        // here means "no server-owned attestation accompanies this submission",
+        // which the evaluator answers exactly as it did before the field existed.
+        attestationArtifactRef: null,
         traceId: traceId(),
       });
       if (request.outcome !== 'REQUESTED') throw new Error('request');
@@ -1070,6 +1094,10 @@ describe('WP-24 Shield device registry (live)', () => {
         keyStorage: 'HARDWARE_BACKED',
         claimedSignatureProfile: PROFILE,
         custodyRegimeId: null,
+        // WP-26/D26-04B: the SERVER's own attestation artifact reference. `null`
+        // here means "no server-owned attestation accompanies this submission",
+        // which the evaluator answers exactly as it did before the field existed.
+        attestationArtifactRef: null,
         traceId: traceId(),
       });
       expect(secondRequest).toEqual({ outcome: 'REFUSED', refusal: 'ENROLLMENT_REQUEST_CONFLICT' });
@@ -1095,6 +1123,10 @@ describe('WP-24 Shield device registry (live)', () => {
         keyStorage: 'HARDWARE_BACKED',
         claimedSignatureProfile: PROFILE,
         custodyRegimeId: null,
+        // WP-26/D26-04B: the SERVER's own attestation artifact reference. `null`
+        // here means "no server-owned attestation accompanies this submission",
+        // which the evaluator answers exactly as it did before the field existed.
+        attestationArtifactRef: null,
         traceId: traceId(),
       });
       // A dropped response is a RETRY, not a conflict: it converges on the
@@ -1204,6 +1236,10 @@ describe('WP-24 Shield device registry (live)', () => {
           keyStorage: 'HARDWARE_BACKED',
           claimedSignatureProfile: PROFILE,
           custodyRegimeId: null,
+          // WP-26/D26-04B: the SERVER's own attestation artifact reference. `null`
+          // here means "no server-owned attestation accompanies this submission",
+          // which the evaluator answers exactly as it did before the field existed.
+          attestationArtifactRef: null,
           traceId: traceId(),
         }),
       ).toEqual({ outcome: 'REFUSED', refusal: 'BOOTSTRAP_GRANT_UNUSABLE' });
@@ -1230,6 +1266,10 @@ describe('WP-24 Shield device registry (live)', () => {
           keyStorage: 'HARDWARE_BACKED',
           claimedSignatureProfile: PROFILE,
           custodyRegimeId: null,
+          // WP-26/D26-04B: the SERVER's own attestation artifact reference. `null`
+          // here means "no server-owned attestation accompanies this submission",
+          // which the evaluator answers exactly as it did before the field existed.
+          attestationArtifactRef: null,
           traceId: traceId(),
         }),
       ).toEqual({ outcome: 'REFUSED', refusal: 'BOOTSTRAP_CONTEXT_MISMATCH' });
@@ -1256,6 +1296,10 @@ describe('WP-24 Shield device registry (live)', () => {
           keyStorage: 'HARDWARE_BACKED',
           claimedSignatureProfile: PROFILE,
           custodyRegimeId: null,
+          // WP-26/D26-04B: the SERVER's own attestation artifact reference. `null`
+          // here means "no server-owned attestation accompanies this submission",
+          // which the evaluator answers exactly as it did before the field existed.
+          attestationArtifactRef: null,
           traceId: traceId(),
         })).outcome,
       ).toBe('REFUSED');
@@ -1288,6 +1332,10 @@ describe('WP-24 Shield device registry (live)', () => {
           keyStorage: 'HARDWARE_BACKED',
           claimedSignatureProfile: PROFILE,
           custodyRegimeId: null,
+          // WP-26/D26-04B: the SERVER's own attestation artifact reference. `null`
+          // here means "no server-owned attestation accompanies this submission",
+          // which the evaluator answers exactly as it did before the field existed.
+          attestationArtifactRef: null,
           traceId: traceId(),
         }),
       ).toEqual({ outcome: 'REFUSED', refusal: 'PUBLIC_KEY_NOT_RUNTIME_VALID' });
@@ -1330,6 +1378,10 @@ describe('WP-24 Shield device registry (live)', () => {
         keyStorage: 'HARDWARE_BACKED',
         claimedSignatureProfile: PROFILE,
         custodyRegimeId: null,
+        // WP-26/D26-04B: the SERVER's own attestation artifact reference. `null`
+        // here means "no server-owned attestation accompanies this submission",
+        // which the evaluator answers exactly as it did before the field existed.
+        attestationArtifactRef: null,
         traceId: traceId(),
       });
       if (request.outcome !== 'REQUESTED') throw new Error('request');
@@ -2957,6 +3009,10 @@ describe('WP-24 Shield device registry (live)', () => {
         keyStorage,
         claimedSignatureProfile: PROFILE,
         custodyRegimeId: null,
+        // WP-26/D26-04B: the SERVER's own attestation artifact reference. `null`
+        // here means "no server-owned attestation accompanies this submission",
+        // which the evaluator answers exactly as it did before the field existed.
+        attestationArtifactRef: null,
         traceId: traceId(),
       };
     }
@@ -3328,6 +3384,10 @@ async function prepareCeremonyStoppingAtApproval(): Promise<{ enrollmentRequestI
     keyStorage: 'HARDWARE_BACKED',
     claimedSignatureProfile: PROFILE,
     custodyRegimeId: null,
+    // WP-26/D26-04B: the SERVER's own attestation artifact reference. `null`
+    // here means "no server-owned attestation accompanies this submission",
+    // which the evaluator answers exactly as it did before the field existed.
+    attestationArtifactRef: null,
     traceId: traceId(),
   });
   if (request.outcome !== 'REQUESTED') throw new Error('request');

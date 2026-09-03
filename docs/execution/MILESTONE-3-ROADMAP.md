@@ -1,8 +1,8 @@
 # Milestone 3 - Trusted Device & Degraded Operations
 
-**Status:** M3A in execution. **WP-23 and WP-24 CLOSED; WP-25 ACTIVE.**
-**Current development base:** `578055a288d436d4e51b10fb428c1ba025d2c5b2`
-(the WP-24 merge commit on `main`)
+**Status:** M3A in execution. **WP-23, WP-24 and WP-25 CLOSED; WP-26 ACTIVE.**
+**Current development base:** `572ab324d0d21de60c6192234599f028d6497f0a`
+(the WP-25 merge commit on `main`)
 **Milestone-2 freeze point:** `f660407c78f3600c6c6307d2bd3c7d310274f026`
 (`milestone-2-field-workflow`) — history, not a workspace
 **Owner of record:** masterzee001
@@ -170,14 +170,18 @@ MILESTONE 3                       M3A IN EXECUTION
 M3A target                        Proof C — genuine authenticated device
 M3B target                        Proof D — genuine WAN-loss / Edge recovery
 
-new development base              578055a288d436d4e51b10fb428c1ba025d2c5b2
+new development base              572ab324d0d21de60c6192234599f028d6497f0a
 
 WP-23 Device Identity Contract    CLOSED at ded82d596
 WP-24 Shield Device Registry      CLOSED at 578055a2
-WP-25 Authenticated Device Gateway  ACTIVE (design PASSED with addendum;
-                                    IMPLEMENTATION GO; migration target 22)
-WP-26 Field Mobile Foundation     HOLD
-WP-27 Real DEVICE_ACTION Whisper  HOLD
+WP-25 Authenticated Device Gateway  CLOSED at 572ab324
+WP-26 Field Mobile Foundation     IMPLEMENTATION COMPLETE
+                                  SOFTWARE QUALIFICATION PASS
+                                  PHYSICAL ACCEPTANCE DEFERRED - NOT WAIVED
+                                  see WP-26-HW-ACCEPTANCE-DEFERRED.md
+WP-27 Real DEVICE_ACTION Whisper  RELEASED for software work; any acceptance
+                                  criterion needing an enrolled StrongBox
+                                  device stays PENDING until hardware exists
 WP-28 Proof C gate                UNCLAIMED
 WP-29 .. WP-31 / Proof D          HOLD / UNCLAIMED
 
