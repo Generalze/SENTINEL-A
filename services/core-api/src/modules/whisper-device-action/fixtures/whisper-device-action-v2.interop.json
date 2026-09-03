@@ -1,0 +1,70 @@
+{
+  "fixture_version": 1,
+  "fixture_id": "sentinel.whisper.device-action.v2.interop.1",
+  "what_this_is": "A frozen, byte-exact example of the WP-27 v2 device-action statement. Server and client implementations MUST reproduce canonical_statement byte for byte from identity + claims + signature_profile, and MUST agree on canonical_statement_sha256_hex. The Android client asserts equality against this same file.",
+  "key_material_warning": "THIS IS A DETERMINISTIC TEST KEY, GENERATED ONCE FOR THIS FIXTURE AND COMMITTED ON PURPOSE. It is never production material, it is registered to no real device, and it must never be enrolled in any environment. Its private half is present only so an implementation can reproduce a signature over these exact bytes.",
+  "profile": {
+    "profile": "P256_ECDSA_SHA256",
+    "key_type": "EC",
+    "curve": "secp256r1",
+    "curve_openssl_name": "prime256v1",
+    "signature_algorithm": "ECDSA",
+    "digest_algorithm": "SHA-256",
+    "signature_encoding": "IEEE-P1363",
+    "signature_encoding_detail": "raw r||s, 32 bytes each, low-S, canonical unpadded base64url",
+    "public_key_encoding": "SEC1-UNCOMPRESSED",
+    "public_key_encoding_detail": "0x04 || X(32) || Y(32), canonical unpadded base64url",
+    "encoding_rationale": "IEEE P1363 rather than DER: DER admits several encodings of one signature, so one signature would have several byte identities for anything that fingerprints, de-duplicates or logs it. P1363 is fixed-length and single-representation, and DeviceSignatureSchema additionally refuses high-S — so malleability is closed AT THE ENCODING, before any verifier is reachable."
+  },
+  "domains": {
+    "statement": "sentinel.whisper.device-action.v2",
+    "replay_identity": "sentinel.whisper.replay-identity.v2"
+  },
+  "key": {
+    "private_key_pkcs8_der_base64": "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgawGolIAEyJoKZPhDaGY897EIQcQGhYsW4DObYNkG2MihRANCAATezwz9X84IBCLyZAh71oGUuEFEX9twKbw5tihm27hk2ygBCp1O4SIAlDdBGdskSuT6J6z1aYJzMxAPjXs8zet1",
+    "public_key_canonical_base64url": "BN7PDP1fzggEIvJkCHvWgZS4QURf23ApvDm2KGbbuGTbKAEKnU7hIgCUN0EZ2yRK5PonrPVpgnMzEA-NezzN63U",
+    "public_key_thumbprint_sha256_hex": "54d99fc4a2c5ce7d9cc87e8c49538964238f61e1659e14f8ebd6f77ad947fc8a"
+  },
+  "server_resolved_signature_profile": "P256_ECDSA_SHA256",
+  "server_resolved_identity": {
+    "context_id": "9f1c0c1e-0000-4000-8000-000000000001",
+    "organisation_id": "wp27-interop-org",
+    "site_id": "wp27-interop-site",
+    "actor_user_id": "wp27-interop-operative",
+    "device_id": "9f1c0c1e-0000-4000-8000-0000000000de"
+  },
+  "client_claims": {
+    "schema_version": 2,
+    "key_id": "wp27-interop-key",
+    "key_version": 1,
+    "whisper_signal_id": "wp27-interop-signal",
+    "whisper_signal_version": 1,
+    "modality": "DEVICE_ACTION",
+    "device_action_id": "wp27-interop-action",
+    "recognised_at": "2026-03-01T12:00:00.000Z",
+    "confidence": 0.87,
+    "anti_replay_nonce": "wp27-interop-nonce-0001",
+    "signature": "OXX1Nh05GIefkhyX5eQqxouhWy6-vZP13oD6br2ePpkDSzI9dVTK9_7-hFqe4E3IXnSH64qVTNaAZsT6qz9o5w"
+  },
+  "canonical_statement": "{\"actor_user_id\":\"wp27-interop-operative\",\"anti_replay_nonce\":\"wp27-interop-nonce-0001\",\"confidence\":0.87,\"context_id\":\"9f1c0c1e-0000-4000-8000-000000000001\",\"device_action_id\":\"wp27-interop-action\",\"device_id\":\"9f1c0c1e-0000-4000-8000-0000000000de\",\"domain\":\"sentinel.whisper.device-action.v2\",\"key_id\":\"wp27-interop-key\",\"key_version\":1,\"modality\":\"DEVICE_ACTION\",\"organisation_id\":\"wp27-interop-org\",\"recognised_at\":\"2026-03-01T12:00:00.000Z\",\"schema_version\":2,\"signature_profile\":\"P256_ECDSA_SHA256\",\"site_id\":\"wp27-interop-site\",\"whisper_signal_id\":\"wp27-interop-signal\",\"whisper_signal_version\":1}",
+  "canonical_statement_sha256_hex": "45d9a8680562099fc2523e4acb1733e2ac6336aa14c07953ec953c8c76c42ef0",
+  "replay_identity": {
+    "organisation_id": "wp27-interop-org",
+    "site_id": "wp27-interop-site",
+    "actor_user_id": "wp27-interop-operative",
+    "device_id": "9f1c0c1e-0000-4000-8000-0000000000de",
+    "key_version": 1,
+    "whisper_signal_id": "wp27-interop-signal",
+    "whisper_signal_version": 1,
+    "anti_replay_nonce": "wp27-interop-nonce-0001"
+  },
+  "replay_key": "{\"actor_user_id\":\"wp27-interop-operative\",\"anti_replay_nonce\":\"wp27-interop-nonce-0001\",\"device_id\":\"9f1c0c1e-0000-4000-8000-0000000000de\",\"domain\":\"sentinel.whisper.replay-identity.v2\",\"key_version\":1,\"organisation_id\":\"wp27-interop-org\",\"site_id\":\"wp27-interop-site\",\"whisper_signal_id\":\"wp27-interop-signal\",\"whisper_signal_version\":1}",
+  "replay_identity_digest_sha256_hex": "ea216c97b18f68ebe6d2d0880122bebd5a2c919597fb52731a30cc920f59a3c2",
+  "expected": {
+    "signature_verifies_against_public_key": true,
+    "admissibility_effect": "PROCEED",
+    "verification_outcome": "VERIFIED_STATEMENT",
+    "signature_is_excluded_from_canonical_statement": true,
+    "signature_is_excluded_from_replay_identity": true
+  }
+}

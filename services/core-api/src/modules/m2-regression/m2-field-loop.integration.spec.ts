@@ -1461,9 +1461,48 @@ describe('WP-22 Milestone 2 integrated Field loop (live stack)', () => {
     expect(whisperRoutes).toHaveLength(7);
 
     // 2. And nowhere in the ENTIRE table — not merely under /whisper — does a
-    //    recognition-shaped path exist. A future `POST /api/v1/device-actions`
-    //    hung off some unrelated controller is caught by this line.
-    const forbidden = [...new Set(routes.filter((r) => /recogni|invoke|device-action/i.test(r.path)).map((r) => `${r.method} ${r.path}`))];
+    //    recognition-shaped path exist, EXCEPT the one WP-27 route named below.
+    //    A future `POST /api/v1/device-actions` hung off some unrelated
+    //    controller is caught by this line.
+    //
+    //    WP-27 — WHY THERE IS AN EXCEPTION, AND WHY IT IS EXACTLY ONE.
+    //
+    //    This guard's property was never "no path may contain the word
+    //    device-action". It is stated two paragraphs above: W21-05's safety
+    //    argument rests on the device context being SERVER-ESTABLISHED, and an
+    //    invoke endpoint would mean accepting that context FROM A JSON BODY —
+    //    the C10-02 trust hole, on the channel whose consequence is a forged
+    //    silent duress dispatch. That property is intact and assertion 1 above
+    //    still enforces it absolutely: the `/whisper/**` surface is the Studio
+    //    seven and nothing else, so nothing anywhere accepts an
+    //    `AuthenticatedWhisperDeviceContext` over HTTP, and the frozen v1
+    //    `recognise` seam still has no route at all (the source guard in
+    //    `test/whisper-boundary.architecture.spec.ts` proves no controller can
+    //    even call it).
+    //
+    //    What WP-27 adds is a route on the WP-25 AUTHENTICATED DEVICE GATEWAY,
+    //    where the device context is server-issued by a ceremony requiring a
+    //    live human session AND a hardware signature, re-read under lock on
+    //    every request, and never parsed from a body. It carries the M3 v2
+    //    P-256 statement; it does not reach v1 recognition.
+    //
+    //    The exception is spelled as ONE EXACT `METHOD PATH` string rather than
+    //    as a pattern, and the two assertions below make it unable to rot: the
+    //    allowlisted route must actually be registered (so a rename does not
+    //    silently widen the guard into covering nothing), and it must live under
+    //    the device gateway (so the exemption cannot be moved onto some other
+    //    controller). Naming the route something neutral to slip past the scan
+    //    would have been the dishonest option, and it is the very trick this
+    //    file's sibling source guard exists to catch.
+    const WP27_DEVICE_GATEWAY_DEVICE_ACTION_ROUTE = 'POST /api/v1/device-gateway/operations/device-action';
+    const recognitionShaped = [
+      ...new Set(routes.filter((r) => /recogni|invoke|device-action/i.test(r.path)).map((r) => `${r.method} ${r.path}`)),
+    ];
+    expect(recognitionShaped, 'the WP-27 gateway route must still be registered under its own name').toContain(
+      WP27_DEVICE_GATEWAY_DEVICE_ACTION_ROUTE,
+    );
+    expect(WP27_DEVICE_GATEWAY_DEVICE_ACTION_ROUTE.startsWith('POST /api/v1/device-gateway/')).toBe(true);
+    const forbidden = recognitionShaped.filter((route) => route !== WP27_DEVICE_GATEWAY_DEVICE_ACTION_ROUTE);
     expect(forbidden, `recognition-shaped routes are registered: ${JSON.stringify(forbidden)}`).toEqual([]);
 
     // 3. Belt and braces: the two most plausible convenience paths, probed

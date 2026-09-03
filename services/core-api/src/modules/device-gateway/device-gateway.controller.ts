@@ -283,6 +283,44 @@ export class DeviceGatewayController {
   }
 
   /**
+   * D. WP-27 — the M3 device-action statement.
+   *
+   * THE TARGET IS THE OPERATIVE THEMSELVES, so there is no target id in the
+   * path: it is resolved from the persisted context, exactly as the field-state
+   * route resolves it. THE WHISPER SIGNAL IS NOT IN THE PATH EITHER — it is a
+   * signed claim inside the semantic payload, covered by the payload digest, so
+   * it binds cryptographically without appearing in a URL, an access log or an
+   * audit identifier. On a covert channel that distinction is the difference
+   * between a discreet configuration and a published one (W21-14).
+   *
+   * THE ROUTE CHOOSES `operation_kind` AND `purpose`. `DEVICE_ACTION` selects
+   * `WHISPER_DEVICE_ACTION`, which `DEVICE_PURPOSE_PERMITTED_TRUST` admits for
+   * TRUSTED devices ALONE (W21-05) — a strictly narrower gate than the Field
+   * operations' — and it selects `whisper.device-action.invoke` as the 62 action
+   * the CURRENT human must hold. Neither is caller-controlled: there is no
+   * parameter through which a body could name a kind, a purpose or an action,
+   * and a body that echoes a DIFFERENT `operation_kind` is refused rather than
+   * silently overridden (D25-11).
+   *
+   * It inherits the ENTIRE C17-corrected pipeline unchanged — the human session,
+   * the fresh hardware possession proof, the live authority re-read, the
+   * preflight, the ONE final effect transaction, the D25-04A fence under lock,
+   * the tenant-anchored append-only audit and the D25-13 refusal boundary. Not
+   * one of them is relaxed for this kind; two of them are tightened by it.
+   *
+   * THIS IS STILL NOT WHISPER RECOGNITION, AND IT DOES NOT CLAIM TO BE. What
+   * this route establishes is that a registered, trusted device holding the
+   * registered private key produced this exact statement, freshly, bound to a
+   * server-issued context, and that its one-shot identity is now spent. It
+   * resolves no signal, consults no roster, compares no threshold and enters no
+   * response protocol; the frozen v1 runtime owns all of that and is untouched.
+   */
+  @Post('operations/device-action')
+  async deviceAction(@Req() req: RequestWithPrincipal, @Body() body: unknown): Promise<unknown> {
+    return this.run(req, 'DEVICE_ACTION', null, body);
+  }
+
+  /**
    * The ONE mapping from an internal outcome to an external answer.
    *
    * It is one method rather than four so the D25-13 boundary cannot be got

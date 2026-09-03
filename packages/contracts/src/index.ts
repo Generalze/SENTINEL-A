@@ -16,3 +16,4 @@ export * from './device-identity.js';
 export * from './device-context.js';
 export * from './device-offline.js';
 export * from './device-key-rotation.js';
+export * from './whisper-device-action-v2.js';
