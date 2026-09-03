@@ -1,8 +1,9 @@
 # Milestone 3 - Trusted Device & Degraded Operations
 
-**Status:** M3A in execution. **WP-23, WP-24 and WP-25 CLOSED; WP-26 ACTIVE.**
-**Current development base:** `572ab324d0d21de60c6192234599f028d6497f0a`
-(the WP-25 merge commit on `main`)
+**Status:** M3A in execution. **WP-23, WP-24, WP-25 and WP-27 CLOSED;
+WP-26 open with physical acceptance deferred; WP-28 blocked on it.**
+**Current development base:** `662a91c7c59b6bfa408a4c930950f7a3e8ff082f`
+(the WP-27 merge commit on `main`)
 **Milestone-2 freeze point:** `f660407c78f3600c6c6307d2bd3c7d310274f026`
 (`milestone-2-field-workflow`) — history, not a workspace
 **Owner of record:** masterzee001
@@ -170,7 +171,7 @@ MILESTONE 3                       M3A IN EXECUTION
 M3A target                        Proof C — genuine authenticated device
 M3B target                        Proof D — genuine WAN-loss / Edge recovery
 
-new development base              572ab324d0d21de60c6192234599f028d6497f0a
+new development base              662a91c7c59b6bfa408a4c930950f7a3e8ff082f
 
 WP-23 Device Identity Contract    CLOSED at ded82d596
 WP-24 Shield Device Registry      CLOSED at 578055a2
@@ -179,10 +180,12 @@ WP-26 Field Mobile Foundation     IMPLEMENTATION COMPLETE
                                   SOFTWARE QUALIFICATION PASS
                                   PHYSICAL ACCEPTANCE DEFERRED - NOT WAIVED
                                   see WP-26-HW-ACCEPTANCE-DEFERRED.md
-WP-27 Real DEVICE_ACTION Whisper  RELEASED for software work; any acceptance
-                                  criterion needing an enrolled StrongBox
-                                  device stays PENDING until hardware exists
-WP-28 Proof C gate                UNCLAIMED
+WP-27 Real DEVICE_ACTION Whisper  CLOSED at 662a91c7
+                                  ends at VERIFIED_STATEMENT by design; it
+                                  invokes no protocol and creates no incident
+WP-28 Proof C gate                BLOCKED - NOT STARTED
+                                  blocker: WP-26 PHYSICAL ACCEPTANCE
+                                  directive: directives/WP-28-device-action-proof-c.md
 WP-29 .. WP-31 / Proof D          HOLD / UNCLAIMED
 
 Proof C                           UNCLAIMED
