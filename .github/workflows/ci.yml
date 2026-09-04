@@ -80,6 +80,15 @@ jobs:
           sudo apt-get install -y ripgrep
           rg --version
 
+      # MC-01: the chain must build exactly the declared datamodel. This runs
+      # immediately after the deploy above, against a service container that
+      # started EMPTY — so it is a genuine from-zero proof, not an assertion
+      # about a developer's database. It deliberately does not count
+      # migrations; a chain of the right length can still build the wrong
+      # schema.
+      - name: Migration drift gate
+        run: bash scripts/migration-drift-gate.sh
+
       - name: Security source gate
         run: bash scripts/security-source-gate.sh .
 
