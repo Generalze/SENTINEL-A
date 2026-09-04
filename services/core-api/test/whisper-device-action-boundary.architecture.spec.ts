@@ -197,9 +197,31 @@ describe('WP-27 there is no second replay store and no second freshness opinion'
   });
 
   it('creates no new Prisma model of its own — WP-27 adds no migration', () => {
+    // MC-01: this asserted a GLOBAL COUNT of 23, which said the right thing
+    // for the wrong reason. The claim being made is "WP-27 contributed no
+    // migration", and a total is a poor proxy for it: the number moves
+    // whenever any OTHER work package legitimately adds one — as the drift
+    // reconciliation then did — and the failure reads as though WP-27 had
+    // sneaked a migration in when it had not.
+    //
+    // The intent is asserted directly instead. No migration in the chain may
+    // belong to this work package, whatever the chain's length. That is
+    // strictly stronger: a count of 23 would still have passed if WP-27 had
+    // added one while another was removed in the same change.
     const migrations = join(CORE_API_SRC, '..', 'prisma', 'schema', 'migrations');
     const directories = readdirSync(migrations).filter((entry) => statSync(join(migrations, entry)).isDirectory());
-    expect(directories.length, 'WP-27 adds no migration; replay reuses Shield’s DeviceNonceConsumption').toBe(23);
+    const wp27Owned = directories.filter((name) => /wp27|device[-_]?action/iu.test(name));
+    expect(wp27Owned, 'WP-27 adds no migration; replay reuses Shield’s DeviceNonceConsumption').toEqual([]);
+
+    // Spelled a second way, because a WP-27 migration called something like
+    // `whisper_v2_replay` would not contain "wp27". The only whisper-named
+    // migration in the chain is WP-21B's, which predates this work package.
+    expect(directories.filter((name) => /whisper/iu.test(name))).toEqual(['20260821090000_wp21b_whisper_foundation']);
+
+    // And the mechanism it reuses must actually still be Shield's, so that
+    // "no migration" cannot be satisfied by quietly writing to some other
+    // store instead.
+    expect(directories.some((name) => /wp24_shield_device_registry/u.test(name))).toBe(true);
   });
 });
 
