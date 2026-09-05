@@ -16,6 +16,7 @@ import type { Principal } from '../../common/security/principal';
 import { FieldOfflineReplayService } from '../field-offline/field-offline.service';
 import type { OfflineSubmissionOutcome } from '../field-offline/field-offline.types';
 import { DeviceRegistryService } from '../shield/device-registry.service';
+import { ShieldRepository } from '../shield/shield.repository';
 import { DeviceReplayService } from '../shield/device-replay.service';
 import { P256KeyImporter } from '../shield/p256-key.importer';
 import { DeviceGatewayRepository } from './device-gateway.repository';
@@ -74,6 +75,7 @@ export class DeviceOfflineIngressService {
     @Inject(DevicePolicyLeaseService) private readonly leases: DevicePolicyLeaseService,
     @Inject(DeviceGatewayRepository) private readonly repository: DeviceGatewayRepository,
     @Inject(DeviceRegistryService) private readonly registry: DeviceRegistryService,
+    @Inject(ShieldRepository) private readonly shield: ShieldRepository,
     @Inject(DeviceReplayService) private readonly replay: DeviceReplayService,
     @Inject(P256KeyImporter) private readonly keys: P256KeyImporter,
     @Inject(FieldOfflineReplayService) private readonly offline: FieldOfflineReplayService,
@@ -159,7 +161,29 @@ export class DeviceOfflineIngressService {
     });
 
     const lease = await this.leases.resolve(context.organisation_id, offlineEnvelope.policy_lease_id);
-    const deviceRevokedAt = registeredKey.revoked_at;
+
+    /**
+     * D23-08 — REVOCATION IS TWO FACTS, AND THEY DO NOT MOVE TOGETHER.
+     *
+     * `shield.prisma` says it in terms: `devices.revoked_at` and
+     * `device_keys.revoked_at` are separate answers, asked independently,
+     * because a device can be withdrawn without its key being touched and a key
+     * can be withdrawn while the device stands. Passing only the key's instant
+     * — which this did at first — would let a DEVICE-level withdrawal reach the
+     * evaluator as `null`, and the evaluator would judge the queued operation
+     * as though the credential were intact.
+     *
+     * In practice authentication has already refused a withdrawn device before
+     * this line is reached, so this is defence in depth rather than the only
+     * guard. It is still worth being exact: the two checks are independent
+     * precisely so that neither is relied on to cover the other.
+     *
+     * The EARLIER instant wins, because the question the evaluator asks is
+     * "was this credential withdrawn?", and the honest answer is when it FIRST
+     * was.
+     */
+    const deviceRow = await this.shield.findDevice(context.organisation_id, context.device_id);
+    const deviceRevokedAt = earliestInstant(deviceRow?.revokedAt?.toISOString() ?? null, registeredKey.revoked_at);
 
     const replayKey = deviceOfflineOperationReplayKey(offlineEnvelope);
     const fingerprint = deviceOfflineOperationFingerprint(statementInput);
@@ -277,7 +301,7 @@ export class DeviceOfflineIngressService {
  * boundary, not two. Nothing downstream trusts this value: it is compared
  * against the signed envelope's own id and a mismatch refuses.
  */
-function readClaimedOfflineOperationId(body: unknown): string | null {
+export function readClaimedOfflineOperationId(body: unknown): string | null {
   if (typeof body !== 'object' || body === null) return null;
   // `body.payload`, not `body` — the gateway's canonical envelope carries every
   // operation's semantic content under `payload`, and its outer schema is
@@ -305,7 +329,7 @@ function readClaimedOfflineOperationId(body: unknown): string | null {
  * then refuses, which is the correct fail-closed answer for a fact we cannot
  * act on, rather than the admission that reading it charitably would produce.
  */
-function buildConsumptionFact(
+export function buildConsumptionFact(
   replayKey: string,
   fingerprint: string,
   peeked: { statementFingerprint: string; storedOutcomeRef: string | null } | null,
@@ -337,4 +361,21 @@ function buildConsumptionFact(
     statement_fingerprint: peeked.statementFingerprint,
     stored_outcome_ref: null,
   };
+}
+
+/**
+ * The earlier of two optional instants, or `null` when neither is set.
+ *
+ * An unparseable instant is treated as PRESENT rather than absent: a
+ * withdrawal timestamp we cannot read is still a withdrawal, and resolving it
+ * to `null` would turn an unreadable revocation into no revocation at all.
+ */
+function earliestInstant(left: string | null, right: string | null): string | null {
+  if (left === null) return right;
+  if (right === null) return left;
+  const leftMs = Date.parse(left);
+  const rightMs = Date.parse(right);
+  if (Number.isNaN(leftMs)) return left;
+  if (Number.isNaN(rightMs)) return right;
+  return leftMs <= rightMs ? left : right;
 }
