@@ -5,6 +5,7 @@ import { requirePrincipal, type RequestWithPrincipal } from '../../common/securi
 import { DeviceContextService } from './device-context.service';
 import type { DeviceGatewayOperationKind } from './device-gateway.envelope';
 import { DeviceGatewayService } from './device-gateway.service';
+import { DeviceOfflineIngressService } from './device-offline-ingress.service';
 import type { DeviceGatewayOperationResult } from './device-gateway.types';
 
 /**
@@ -158,6 +159,7 @@ export class DeviceGatewayController {
   constructor(
     @Inject(DeviceContextService) private readonly contexts: DeviceContextService,
     @Inject(DeviceGatewayService) private readonly gateway: DeviceGatewayService,
+    @Inject(DeviceOfflineIngressService) private readonly offlineIngress: DeviceOfflineIngressService,
   ) {}
 
   /**
@@ -227,12 +229,46 @@ export class DeviceGatewayController {
       traceId: traceIdOf(req),
     });
     if (outcome.outcome === 'REFUSED') throw new ForbiddenException(EXTERNAL_REFUSED);
+
     // ISSUED and CONVERGED return the SAME body, because C17-03's whole point is
     // that a retry of a ceremony that already succeeded sees exactly what the
     // first attempt produced - the same context id, the same window, no second
     // context. The distinction is recorded in the internal audit, where an
     // operator can count issuances without subtracting retries.
-    return { context: outcome.context };
+    //
+    // WP-29A: `policy_lease` is present on a fresh issuance and absent on a
+    // converged retry, because a ceremony mints one lease and a retry is the
+    // same ceremony. See `DeviceContextService.completeEstablishment`.
+    return { context: outcome.context, policy_lease: 'policyLease' in outcome ? outcome.policyLease : null };
+  }
+
+  /**
+   * WP-29A — ONE QUEUED OPERATION, SUBMITTED ON RECONNECT.
+   *
+   * Not `@Public()`, for the reason none of the others are (C17-01): the global
+   * session guard runs first, and the operative whose queue this is must be the
+   * authenticated human on the request. A device reconnecting on its own,
+   * holding a perfectly good key and a perfectly good queue, is not sufficient.
+   *
+   * It does NOT go through `run` — that helper ends in
+   * `DeviceGatewayService.execute`, whose single effect transaction cannot host
+   * WP-20's three-transaction replay sequence. The authentication is identical;
+   * only what happens after it differs.
+   */
+  @Post('operations/offline-queue')
+  async submitOfflineQueue(@Req() req: RequestWithPrincipal, @Body() body: unknown): Promise<unknown> {
+    const principal = requirePrincipal(req);
+    const result = await this.offlineIngress.submit(principal, {
+      proof: readProof(body),
+      body,
+      traceId: traceIdOf(req),
+    });
+    if (result.outcome === 'REFUSED') throw new ForbiddenException(EXTERNAL_REFUSED);
+    if (result.outcome === 'CONFLICT') throw new ConflictException(EXTERNAL_CONFLICT);
+    // The WP-20 outcome, unreinterpreted. The replay service already decides
+    // what a queued operation is allowed to disclose on reconnect, and a second
+    // opinion here would be a second disclosure policy.
+    return { submission: result.submission };
   }
 
   /**

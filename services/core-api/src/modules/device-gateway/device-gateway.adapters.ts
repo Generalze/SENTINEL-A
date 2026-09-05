@@ -118,6 +118,27 @@ export class DeviceGatewayDomainAdapters {
         return this.acknowledge(tx, call);
       case 'DEVICE_ACTION':
         return this.verifyDeviceActionStatement(tx, call);
+      /**
+       * WP-29A — THIS KIND NEVER REACHES A DOMAIN ADAPTER, BY CONSTRUCTION.
+       *
+       * A queued operation cannot commit inside the gateway's single effect
+       * transaction, because `FieldOfflineReplayService` deliberately runs
+       * THREE sequential transactions: it makes the request fingerprint durable,
+       * then claims the receipt under a recovery lease, then applies and
+       * finalizes. That sequence is what makes a crashed attempt recoverable and
+       * what makes UNKNOWN expressible at all (C10-08). Nesting it inside an
+       * outer interactive transaction would collapse all three into one and
+       * silently delete WP-20's recovery model.
+       *
+       * So `DeviceOfflineIngressService` runs the WP-25 authentication and then
+       * hands off to WP-20 as a separate phase, and `DeviceGatewayService.execute`
+       * refuses this kind before the preflight. Throwing here is not defensive
+       * padding: it is the assertion that the refusal above still exists. If a
+       * future edit routes this kind through `execute`, this throws instead of
+       * quietly nesting transactions and corrupting the recovery semantics.
+       */
+      case 'OFFLINE_QUEUE_SUBMIT':
+        throw new Error('OFFLINE_QUEUE_SUBMIT must not reach the gateway domain adapters');
     }
   }
 
@@ -156,6 +177,9 @@ export class DeviceGatewayDomainAdapters {
         return this.messaging.probeAcknowledgeEvidence(call.principal, call.targetId, call.domainIdempotencyKey);
       case 'DEVICE_ACTION':
         return (await this.probeDeviceActionStatement(call)) !== null;
+      /** See `apply`. This kind is refused before the preflight. */
+      case 'OFFLINE_QUEUE_SUBMIT':
+        throw new Error('OFFLINE_QUEUE_SUBMIT must not reach the gateway domain adapters');
     }
   }
 
