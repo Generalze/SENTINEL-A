@@ -216,6 +216,12 @@ async function cleanup(): Promise<void> {
   await prisma.deviceKeyRotationVerification.deleteMany({ where: { organisationId } });
   await prisma.deviceKeyRotationChallenge.deleteMany({ where: { organisationId } });
   await prisma.deviceKeyRotationRequest.deleteMany({ where: { organisationId } });
+  // WP-29A: leases BEFORE devices. `device_policy_leases` holds a tenant-composite
+  // Restrict relation to `devices`, so a device that any lease names cannot be
+  // deleted -- which is the point of the relation (D29A-26 s10: a lease must
+  // survive the device's lifecycle, not be erased by it). Context establishment
+  // now issues a lease, so every suite that establishes one creates these rows.
+  await prisma.devicePolicyLease.deleteMany({ where: { organisationId } });
   await prisma.deviceSiteScope.deleteMany({ where: { organisationId } });
   await prisma.deviceKey.deleteMany({ where: { organisationId } });
   await prisma.device.deleteMany({ where: { organisationId } });

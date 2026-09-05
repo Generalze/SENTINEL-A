@@ -152,11 +152,62 @@ describe('WP-29A/D29A-26 §24 receipt lease provenance (live stack)', () => {
       },
     });
 
-    // Devices, because a lease holds a tenant-composite Restrict relation to one.
+    /**
+     * Devices, because a lease holds a tenant-composite Restrict relation to
+     * one -- and a device in turn requires the enrolment record it came from.
+     *
+     * The grant -> request -> device chain is seeded DIRECTLY rather than by
+     * running the real ceremony. The ceremony is proven at length in the
+     * enrolment and gateway acceptance suites; re-running it here would make
+     * this suite depend on attestation trust material it has no use for, and a
+     * receipt-provenance test that fails because a challenge expired tells
+     * nobody anything about receipt provenance.
+     *
+     * The chain is seeded HONESTLY, though: every foreign key is real, so the
+     * `Restrict` relation under test is exercised against genuine rows.
+     */
     for (const [deviceId, org, site, user] of [
       [fx.deviceA, fx.orgA, fx.siteA1, fx.opAlpha],
       [fx.deviceB, fx.orgB, fx.siteB1, fx.opB],
     ] as const) {
+      const grantId = randomUUID();
+      const requestId = randomUUID();
+      await db.enrollmentBootstrapGrant.create({
+        data: {
+          id: grantId,
+          organisationId: org,
+          siteId: site,
+          intendedUserId: user,
+          issuedByUserId: user,
+          // A DIGEST of a token that never existed. No bootstrap token is
+          // created, stored or logged by this fixture -- the column holds a
+          // digest by design, and a fixture has no reason to hold the preimage.
+          tokenDigest: `${'0'.repeat(64)}`,
+          issuedAt: new Date(),
+          expiresAt: new Date(Date.now() + 3_600_000),
+        },
+      });
+      await db.enrollmentRequest.create({
+        data: {
+          id: requestId,
+          organisationId: org,
+          siteId: site,
+          intendedUserId: user,
+          bootstrapGrantId: grantId,
+          custody: 'PERSONAL',
+          publicKey: 'seeded-public-key',
+          publicKeyThumbprint: `${'1'.repeat(64)}`,
+          keyStorage: 'HARDWARE_BACKED',
+          claimedSignatureProfile: 'P256_ECDSA_SHA256',
+          serverSelectedSignatureProfile: 'P256_ECDSA_SHA256',
+          requestFingerprint: `${'2'.repeat(64)}`,
+          approvedSemanticsDigest: `${'3'.repeat(64)}`,
+          attestationOutcome: 'UNAVAILABLE',
+          attestationEvaluatedAt: new Date(),
+          requestedAt: new Date(),
+          state: 'ENROLLED',
+        },
+      });
       await db.device.create({
         data: {
           id: deviceId,
@@ -166,7 +217,7 @@ describe('WP-29A/D29A-26 §24 receipt lease provenance (live stack)', () => {
           trust: 'TRUSTED',
           enrolledByUserId: user,
           intendedUserId: user,
-          enrollmentRequestId: randomUUID(),
+          enrollmentRequestId: requestId,
           enrolledAt: new Date(),
         },
       });
@@ -195,6 +246,8 @@ describe('WP-29A/D29A-26 §24 receipt lease provenance (live stack)', () => {
     await db.devicePolicyLease.deleteMany({ where: { organisationId: { in: orgs } } });
     await db.deviceSiteScope.deleteMany({ where: { organisationId: { in: orgs } } });
     await db.device.deleteMany({ where: { organisationId: { in: orgs } } });
+    await db.enrollmentRequest.deleteMany({ where: { organisationId: { in: orgs } } });
+    await db.enrollmentBootstrapGrant.deleteMany({ where: { organisationId: { in: orgs } } });
     await db.fieldAuditLog.deleteMany({ where: { organisationId: { in: orgs } } });
     await db.incidentFieldMessageRecipient.deleteMany({ where: { organisationId: { in: orgs } } });
     await db.incidentFieldMessage.deleteMany({ where: { organisationId: { in: orgs } } });
