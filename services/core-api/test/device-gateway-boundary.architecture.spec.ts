@@ -275,16 +275,30 @@ describe('WP-25/C17-01 no gateway route exempts itself from human authentication
       "@Post('operations/assignments/:id/accept')",
       "@Post('operations/assignments/:id/decline')",
       "@Post('operations/messages/:id/acknowledge')",
+      // WP-29A. It is listed here for the reason the other five are: a route
+      // that consumes a device possession proof must be enumerated somewhere a
+      // reviewer looks, so that deleting its session requirement is a visible
+      // diff rather than a quiet one.
+      "@Post('operations/offline-queue')",
     ]) {
       expect(controller.includes(route), route).toBe(true);
     }
-    // The six routes, and exactly two handlers that reach a service without
-    // going through `run` - so three `requirePrincipal` call sites cover all six.
-    expect(controller.split('requirePrincipal(req)').length - 1).toBe(3);
+    // Seven routes, and exactly THREE handlers that reach a service without
+    // going through `run` - the two establishment steps and WP-29A's offline
+    // submission - so four `requirePrincipal` call sites cover all seven.
+    //
+    // The count is asserted rather than the mere presence of the call, because
+    // presence is satisfied by any one route having it. A route added without
+    // one would leave this number unchanged and the suite green.
+    expect(controller.split('requirePrincipal(req)').length - 1).toBe(4);
     // The principal is PASSED, never re-derived inside the services.
     expect(controller).toContain('this.gateway.execute(principal,');
     expect(controller).toContain('this.contexts.completeEstablishment(principal,');
     expect(controller).toContain('this.contexts.requestEstablishment(principal,');
+    // WP-29A: the queued-submission path takes the human explicitly too. It
+    // does not go through `run`, so it would otherwise be the one route on
+    // which the session could be inferred rather than established.
+    expect(controller).toContain('this.offlineIngress.submit(principal,');
   });
 
   it('the tripwire fires on the shapes a future edit could reach an exemption by', () => {

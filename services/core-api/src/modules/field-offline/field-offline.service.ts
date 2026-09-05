@@ -136,7 +136,23 @@ export class FieldOfflineReplayService {
    * `device_id` are treated as untrusted claims and bound against this context
    * and the live principal, fail-closed, BEFORE any receipt is read.
    */
-  async submit(principal: Principal, deviceContext: AuthenticatedFieldDeviceContext, rawOperation: unknown): Promise<OfflineSubmissionOutcome> {
+  async submit(
+    principal: Principal,
+    deviceContext: AuthenticatedFieldDeviceContext,
+    rawOperation: unknown,
+    /**
+     * WP-29A / D29A-26 §16 — THE AUTHORITY PROVENANCE, WHEN THERE IS ONE.
+     *
+     * Optional, and deliberately so. This surface predates policy leases and
+     * its existing callers have none to give; defaulting to `null` keeps them
+     * exactly as they were and keeps their receipts honestly marked as the
+     * pre-WP-29A era they belong to (§21). What must never happen is the
+     * reverse — an envelope-backed submission arriving here without one — and
+     * that is prevented upstream, where the frozen evaluator refuses
+     * LEASE_MISSING before a receipt is ever created.
+     */
+    provenance: { policyLeaseId: string | null } = { policyLeaseId: null },
+  ): Promise<OfflineSubmissionOutcome> {
     // C10-01: an unadmitted kind, or a payload that does not match its kind
     // exactly, never reaches the executor. This runs before ANY persistence,
     // so an invalid envelope leaves no trace and consumes no queue position.
@@ -181,7 +197,9 @@ export class FieldOfflineReplayService {
     await this.repository.ensureCursor(namespace);
 
     // ---- step tx1: classify and make the fingerprint durable -----------------
-    const admission = await this.repository.transaction((tx) => this.admit(tx, namespace, operation, requestFingerprint, downstreamIdempotencyKey));
+    const admission = await this.repository.transaction((tx) =>
+      this.admit(tx, namespace, operation, requestFingerprint, downstreamIdempotencyKey, provenance.policyLeaseId),
+    );
 
     if (admission.kind === 'refuse') return this.conflict(admission.conflictCode, operation, admission.expectedSequence);
     if (admission.kind === 'replay') return this.replayStoredResult(operation, admission.receipt, admission.lastFinalizedSequence);
@@ -254,6 +272,8 @@ export class FieldOfflineReplayService {
     operation: FieldOfflineOperationV2,
     requestFingerprint: string,
     downstreamIdempotencyKey: string,
+    /** D29A-26 §16: written onto the receipt this step creates. See `submit`. */
+    policyLeaseId: string | null,
   ): Promise<OfflineAdmission> {
     const cursor = await this.repository.lockCursor(tx, namespace);
     // `ensureCursor` committed a row and no write path deletes one, so this is
@@ -321,6 +341,12 @@ export class FieldOfflineReplayService {
       // C10-06: telemetry. It is recorded, and it is never server authority.
       clientCreatedAt: new Date(operation.created_at),
       firstTraceId: operation.trace_id,
+      // D29A-26 §16/§24: written ONCE, with the receipt, in the same statement
+      // that makes the fingerprint durable. A retry converges on this receipt
+      // rather than creating a second, so the lease recorded here is the lease
+      // the operation is answered under for the rest of its life — no later
+      // step can substitute a different one.
+      policyLeaseId,
     });
     return { kind: 'proceed', receipt: created, lastFinalizedSequence };
   }

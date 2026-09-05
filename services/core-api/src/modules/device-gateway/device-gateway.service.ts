@@ -129,6 +129,48 @@ import type { DeviceGatewayOperationResult, DeviceGatewayPrincipalFacts, DeviceG
  * effect and zero consumption — an open connection is not a grant, and neither
  * is a preflight that passed a moment ago.
  */
+/**
+ * Everything `authenticateRequest` established, handed to whichever phase runs
+ * next.
+ *
+ * `seen` is deliberately the SAME MUTABLE OBJECT the authentication filled in,
+ * not a copy: the audit fields it accumulates — the payload digest, the
+ * effective trust — must keep accumulating across the phases that follow, so a
+ * refusal filed later names the same facts a refusal filed earlier would have.
+ */
+export interface GatewayAuthenticatedRequest {
+  readonly sessionAuthenticated: boolean;
+  readonly audit: (
+    refusal: DeviceGatewayRefusal,
+    contractRefusal: string | null,
+    seen: {
+      contextId: string | null;
+      deviceId: string | null;
+      actorUserId: string | null;
+      siteId: string | null;
+      targetId: string | null;
+      payloadDigest: string | null;
+      effectiveTrust: string | null;
+    },
+  ) => Promise<void>;
+  readonly proof: DeviceRequestProof;
+  readonly contextRow: IssuedContextRow;
+  readonly seen: {
+    contextId: string | null;
+    deviceId: string | null;
+    actorUserId: string | null;
+    siteId: string | null;
+    targetId: string | null;
+    payloadDigest: string | null;
+    effectiveTrust: string | null;
+  };
+  readonly envelopeParse: Extract<ReturnType<typeof parseOperationEnvelope>, { ok: true }>;
+  readonly requiredAction: string;
+  readonly verified: boolean;
+  readonly replayKey: string;
+  readonly fingerprint: string;
+}
+
 @Injectable()
 export class DeviceGatewayService {
   constructor(
@@ -153,182 +195,19 @@ export class DeviceGatewayService {
     kind: DeviceGatewayOperationKind,
     request: { proof: unknown; body: unknown; targetId: string | null; traceId: string },
   ): Promise<DeviceGatewayOperationResult> {
-    /**
-     * C17-01 - THE SESSION FACT, ESTABLISHED ONCE, AT THE TOP.
-     *
-     * `principal` is a REQUIRED parameter and the controller obtains it with
-     * `requirePrincipal`, which throws when the global guard chain attached
-     * none. There is no path on which this is defaulted or inferred - which is
-     * exactly what was wrong with the boolean it replaces.
-     */
-    // C17-01: the TYPE is the proof, not this line. `principal` is a required,
-    // non-nullable parameter supplied by `requirePrincipal` behind the global
-    // session guard, so a caller cannot reach here without one — and
-    // `sessionAuthenticatedBy` will not produce `true` from anything else.
-    // The previous revision derived this half from "a matching user row was
-    // found", which is authorisation, not authentication.
-    const sessionAuthenticated = sessionAuthenticatedBy(principal);
+    // WP-29A: a queued submission is NOT a live domain operation and must never
+    // reach the single effect transaction below. See the adapter cases, which
+    // throw: `FieldOfflineReplayService` runs three sequential transactions by
+    // design, and nesting them inside this one would silently collapse WP-20's
+    // recovery model. `DeviceOfflineIngressService` owns this kind and calls
+    // `authenticateQueueSubmission` instead.
+    if (kind === 'OFFLINE_QUEUE_SUBMIT') return { outcome: 'REFUSED' };
 
-    // C17-02: the initial tenant anchor, before ANY server row has resolved.
-    // Replaced below by the persisted context's own organisation, and never by
-    // anything the request claimed.
-    let auditOrganisationId = principal.organisation_id;
+    const authenticated = await this.authenticateRequest(principal, kind, request);
+    if (authenticated.kind === 'REFUSED') return authenticated.result;
+    const { sessionAuthenticated, audit, proof, contextRow, seen, envelopeParse, requiredAction, verified, replayKey, fingerprint } =
+      authenticated.state;
 
-    const audit = (
-      refusal: DeviceGatewayRefusal,
-      contractRefusal: string | null,
-      seen: {
-        contextId: string | null;
-        deviceId: string | null;
-        actorUserId: string | null;
-        siteId: string | null;
-        targetId: string | null;
-        payloadDigest: string | null;
-        effectiveTrust: string | null;
-      },
-    ): Promise<void> =>
-      this.repository.appendOperationEventOutsideTransaction(
-        {
-          organisationId: auditOrganisationId,
-          contextId: seen.contextId,
-          deviceId: seen.deviceId,
-          actorUserId: seen.actorUserId,
-          operationKind: kind,
-          occurredAt: new Date(),
-          traceId: request.traceId,
-        },
-        {
-          type: 'OPERATION_REFUSED',
-          siteId: seen.siteId,
-          targetType: DEVICE_GATEWAY_TARGET_TYPE_FOR_KIND[kind],
-          targetId: seen.targetId,
-          payloadDigest: seen.payloadDigest,
-          refusal,
-          contractRefusal,
-          effectiveTrust: seen.effectiveTrust,
-        },
-      );
-
-    // -----------------------------------------------------------------------
-    // PREFLIGHT
-    // -----------------------------------------------------------------------
-
-    const parsedProof = DeviceRequestProofSchema.safeParse(request.proof);
-    if (!parsedProof.success) {
-      // A malformed proof is a shape complaint about the caller's own bytes.
-      // The event is still filed, and it is filed under the SESSION's tenant -
-      // a fact the server established rather than one it was told.
-      await audit('PROOF_MALFORMED', null, blank({ targetId: request.targetId }));
-      return { outcome: 'REFUSED' };
-    }
-    const proof = parsedProof.data;
-
-    // C17-02: RESOLVED BY THE SESSION'S TENANT, never by `proof.organisation_id`.
-    // The context is resolved by (id, organisation) TOGETHER, so a foreign
-    // context and a context that never existed produce one answer, from one
-    // query, and there is no branch in which they could diverge (D25-13).
-    const contextRow = await this.repository.findContext(principal.organisation_id, proof.context_id);
-    if (contextRow === null) {
-      await audit('CONTEXT_NOT_USABLE', null, blank({ targetId: request.targetId }));
-      return { outcome: 'REFUSED' };
-    }
-    // The persisted row's organisation is authoritative from here on.
-    auditOrganisationId = contextRow.organisationId;
-    const contextSiteIds = await this.repository.listContextSiteIdsUnlocked(contextRow.organisationId, contextRow.id);
-    const seen = {
-      contextId: contextRow.id,
-      deviceId: contextRow.deviceId,
-      actorUserId: contextRow.actorUserId,
-      siteId: proof.site_id,
-      targetId: request.targetId ?? contextRow.actorUserId,
-      payloadDigest: null as string | null,
-      effectiveTrust: null as string | null,
-    };
-
-    // C17-02: the proof's CLAIMED tenant, equality-bound against the persisted
-    // context's. A claim may appear in an internal reason; it may never select
-    // which tenant owns an audit row.
-    if (proof.organisation_id !== contextRow.organisationId) {
-      await audit('PROOF_ORGANISATION_MISMATCH', null, seen);
-      return { outcome: 'REFUSED' };
-    }
-    // C17-01: a valid proof carried by a DIFFERENT authenticated human refuses.
-    // Possession and identity are two facts, and holding the hardware does not
-    // make the caller the operative the context is bound to.
-    if (principal.user.id !== contextRow.actorUserId) {
-      await audit('SESSION_ACTOR_MISMATCH', null, seen);
-      return { outcome: 'REFUSED' };
-    }
-
-    const targetId = request.targetId ?? contextRow.actorUserId;
-    const envelopeParse = parseOperationEnvelope(
-      kind,
-      {
-        // Every identity field is SERVER-RESOLVED — from the persisted context
-        // and from the signed proof's site — and none is read from the body.
-        organisationId: contextRow.organisationId,
-        siteId: proof.site_id,
-        actorUserId: contextRow.actorUserId,
-        deviceId: contextRow.deviceId,
-        targetId,
-      },
-      request.body,
-    );
-    if (!envelopeParse.ok) {
-      await audit(envelopeParse.refusal, null, seen);
-      return { outcome: 'REFUSED' };
-    }
-    seen.payloadDigest = envelopeParse.digest;
-
-    const requiredAction = DEVICE_GATEWAY_REQUIRED_ACTION[kind];
-    const preflight = await this.resolveFacts(contextRow, contextSiteIds, proof, requiredAction, undefined);
-    if (preflight.kind === 'REFUSED') {
-      await audit(preflight.refusal, null, seen);
-      return { outcome: 'REFUSED' };
-    }
-    seen.effectiveTrust = preflight.trust;
-
-    const statement = canonicalDeviceRequestProofStatement(
-      deviceRequestProofStatementInput(proof, preflight.registered.signature_profile),
-    );
-    const verified = this.keys.verifySignature({
-      registeredPublicKey: preflight.publicKey,
-      message: statement,
-      signature: proof.signature,
-      serverResolvedProfile: preflight.registered.signature_profile,
-      claimedProfile: proof.claimed_signature_profile,
-    });
-
-    const replayKey = deviceRequestProofReplayKey(proof);
-    const fingerprint = deviceRequestProofFingerprint(
-      deviceRequestProofStatementInput(proof, preflight.registered.signature_profile),
-    );
-    // CLASSIFY WITHOUT CREATING AN EFFECT. `peek` reads what the store already
-    // holds for this identity and takes no decision; `consume` — the call that
-    // BURNS the identity — happens only inside the final transaction.
-    const peeked = await this.repository.readOnly((tx) =>
-      this.replay.peek(tx, { organisationId: contextRow.organisationId, replayKey }),
-    );
-
-    const preflightJudgement = this.judge({
-      kind,
-      context: preflight.context,
-      proof,
-      now: await this.repository.now(),
-      expectedPayloadDigest: envelopeParse.digest,
-      registered: preflight.registered,
-      verified,
-      principals: preflight.principals(verified, sessionAuthenticated),
-      replayKey,
-      fingerprint,
-      stored: peeked === null ? null : { statement_fingerprint: peeked.statementFingerprint, stored_outcome_ref: peeked.storedOutcomeRef ?? '' },
-    });
-    if (preflightJudgement.kind === 'REFUSED') {
-      await audit(preflightJudgement.refusal, preflightJudgement.contractRefusal, seen);
-      return preflightJudgement.refusal === 'REPLAY_CONFLICT' ? { outcome: 'CONFLICT' } : { outcome: 'REFUSED' };
-    }
-
-    // -----------------------------------------------------------------------
     // FINAL EFFECT TRANSACTION — one, or nothing
     // -----------------------------------------------------------------------
     try {
@@ -502,6 +381,380 @@ export class DeviceGatewayService {
       }
       throw error;
     }
+  }
+
+  /**
+   * WP-29A — AUTHENTICATE A QUEUED SUBMISSION, AND COMMIT NOTHING ELSE.
+   *
+   * This is `execute` with the domain effect removed, and that is the whole
+   * difference between them. It runs the same authentication, takes the same
+   * four locks, re-resolves the same facts under them, re-runs the same two
+   * frozen evaluators, and spends the fresh proof's one-shot identity in the
+   * same transaction. What it does NOT do is cause a domain effect, because the
+   * effect for this kind is a WP-20 replay submission that must run as its own
+   * sequence of transactions afterwards.
+   *
+   * WHY SPENDING THE PROOF BEFORE THE EFFECT IS CORRECT HERE.
+   *
+   * The fresh proof authenticates THE CONNECTION — it says the device that
+   * still holds the registered key is on the line right now. The QUEUED
+   * OPERATION carries its own signature, its own one-shot identity and its own
+   * receipt, and those are what guard the effect. So if this commits and the
+   * replay phase then fails, nothing is lost and nothing is duplicated: the
+   * device retries with a NEW proof, and the queued operation converges through
+   * the machinery that exists for exactly that.
+   *
+   * A REPEATED PROOF IS NOT A SHORT CIRCUIT. When the same proof arrives twice
+   * the identity converges here, and the caller still runs the replay phase —
+   * which answers from the durable receipt. Returning "already done" from this
+   * layer would be claiming an effect this layer never observed.
+   */
+  async authenticateQueueSubmission(
+    principal: Principal,
+    request: { proof: unknown; body: unknown; targetId: string | null; traceId: string },
+  ): Promise<
+    | { outcome: 'AUTHENTICATED'; context: AuthenticatedDeviceContext; envelope: DeviceGatewayOperationEnvelope; siteId: string }
+    | { outcome: 'REFUSED' }
+    | { outcome: 'CONFLICT' }
+  > {
+    const kind = 'OFFLINE_QUEUE_SUBMIT' as const;
+    const authenticated = await this.authenticateRequest(principal, kind, request);
+    if (authenticated.kind === 'REFUSED') {
+      return authenticated.result.outcome === 'CONFLICT' ? { outcome: 'CONFLICT' } : { outcome: 'REFUSED' };
+    }
+    const { audit, proof, contextRow, seen, envelopeParse, requiredAction, verified, replayKey, fingerprint, sessionAuthenticated } =
+      authenticated.state;
+
+    try {
+      return await this.repository.transaction(async (tx) => {
+        const lockedContext = await this.repository.lockContext(tx, contextRow.organisationId, contextRow.id);
+        if (lockedContext === null) throw new DeviceGatewayTransactionRollback('CONTEXT_NOT_USABLE');
+        if (lockedContext.closedAt !== null) throw new DeviceGatewayTransactionRollback('CONTEXT_NOT_USABLE');
+        const lockedSiteIds = await this.repository.listContextSiteIds(tx, lockedContext.organisationId, lockedContext.id);
+        if (!(await this.repository.lockContextSiteBinding(tx, lockedContext.organisationId, lockedContext.id, proof.site_id))) {
+          throw new DeviceGatewayTransactionRollback('SITE_NOT_USABLE');
+        }
+
+        await this.shield.lockDevice(tx, lockedContext.organisationId, lockedContext.deviceId);
+        await this.shield.lockDeviceKeyByKeyId(tx, lockedContext.organisationId, lockedContext.keyId);
+
+        const facts = await this.resolveFacts(lockedContext, lockedSiteIds, proof, requiredAction, tx);
+        if (facts.kind === 'REFUSED') throw new DeviceGatewayTransactionRollback(facts.refusal);
+
+        const finalPeek = await this.replay.peek(tx, { organisationId: lockedContext.organisationId, replayKey });
+        const judgement = this.judge({
+          kind,
+          context: facts.context,
+          proof,
+          now: await this.repository.dbNow(tx),
+          expectedPayloadDigest: envelopeParse.digest,
+          registered: facts.registered,
+          verified,
+          principals: facts.principals(verified, sessionAuthenticated),
+          replayKey,
+          fingerprint,
+          stored:
+            finalPeek === null
+              ? null
+              : { statement_fingerprint: finalPeek.statementFingerprint, stored_outcome_ref: finalPeek.storedOutcomeRef ?? '' },
+        });
+        if (judgement.kind === 'REFUSED') {
+          throw new DeviceGatewayTransactionRollback(judgement.refusal, judgement.contractRefusal);
+        }
+
+        const auditEnvelope = {
+          organisationId: lockedContext.organisationId,
+          contextId: lockedContext.id,
+          deviceId: lockedContext.deviceId,
+          actorUserId: lockedContext.actorUserId,
+          operationKind: kind,
+          occurredAt: new Date(),
+          traceId: request.traceId,
+        };
+
+        // The identity a later exact retry of THIS PROOF converges on. It is
+        // the server-derived key over the signed request, exactly as `execute`
+        // derives it, so the retry computes the same value rather than being
+        // handed one.
+        const proofOutcomeRef = deviceGatewayDomainIdempotencyKey({
+          organisationId: lockedContext.organisationId,
+          contextId: lockedContext.id,
+          actorUserId: lockedContext.actorUserId,
+          deviceId: lockedContext.deviceId,
+          keyId: facts.registered.key_id,
+          keyVersion: facts.registered.key_version,
+          operationKind: kind,
+          targetType: envelopeParse.envelope.target_type,
+          targetId: envelopeParse.envelope.target_id,
+          deviceNonce: proof.nonce,
+          payloadDigest: envelopeParse.digest,
+        });
+
+        const claimed = await this.replay.consume(tx, {
+          organisationId: lockedContext.organisationId,
+          ceremony: DEVICE_GATEWAY_OPERATION_CEREMONY,
+          replayKey,
+          statementFingerprint: fingerprint,
+          candidateOutcomeRef: proofOutcomeRef,
+          traceId: request.traceId,
+        });
+        if (claimed.consumption.outcome === 'REUSED_WITH_CHANGED_SEMANTICS') {
+          throw new DeviceGatewayTransactionRollback('REPLAY_CONFLICT', 'NONCE_REUSED_WITH_CHANGED_SEMANTICS');
+        }
+
+        await this.repository.appendOperationEvent(tx, auditEnvelope, {
+          type: 'OPERATION_COMMITTED',
+          siteId: proof.site_id,
+          targetType: envelopeParse.envelope.target_type,
+          targetId: envelopeParse.envelope.target_id,
+          keyId: facts.registered.key_id,
+          keyVersion: facts.registered.key_version,
+          payloadDigest: envelopeParse.digest,
+          statementFingerprint: fingerprint,
+          domainIdempotencyKey: proofOutcomeRef,
+          effectiveTrust: facts.trust,
+        });
+
+        return {
+          outcome: 'AUTHENTICATED' as const,
+          context: facts.context,
+          envelope: envelopeParse.envelope,
+          siteId: proof.site_id,
+        };
+      });
+    } catch (error) {
+      if (isDeviceGatewayTransactionRollback(error)) {
+        await audit(error.refusal, error.contractRefusal, seen);
+        return error.refusal === 'REPLAY_CONFLICT' ? { outcome: 'CONFLICT' } : { outcome: 'REFUSED' };
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * THE AUTHENTICATION HALF OF EVERY DEVICE OPERATION, IN ONE PLACE.
+   *
+   * WP-29A extracted this from `execute` VERBATIM. Nothing about it changed —
+   * the same order, the same refusals, the same single external answer — and it
+   * was extracted rather than copied for the reason this repository gives every
+   * time the question comes up: a second copy of a security sequence is a second
+   * copy that drifts. `execute` continues into its one final effect transaction;
+   * `DeviceOfflineIngressService` continues into WP-20's replay machinery, which
+   * cannot run inside that transaction. Both need to have established the same
+   * facts first, and now they establish them by running the same code.
+   *
+   * What it settles: the proof parses; the context resolves WITHIN THE SESSION'S
+   * TENANT; the proof's claimed tenant equals the context's; the authenticated
+   * human IS the actor the context is bound to; the body parses as this kind's
+   * canonical envelope; the device, key, trust and actor authority resolve; the
+   * signature verifies; and the two frozen evaluators admit it. It commits
+   * NOTHING — the one-shot identity is only PEEKED here, never spent, so a
+   * refusal leaves no trace and consumes no identity.
+   */
+  private async authenticateRequest(
+    principal: Principal,
+    kind: DeviceGatewayOperationKind,
+    request: { proof: unknown; body: unknown; targetId: string | null; traceId: string },
+  ): Promise<
+    | { kind: 'REFUSED'; result: DeviceGatewayOperationResult }
+    | { kind: 'READY'; state: GatewayAuthenticatedRequest }
+  > {
+    /**
+     * C17-01 — THE SESSION FACT, ESTABLISHED ONCE, AT THE TOP.
+     *
+     * THE TYPE IS THE PROOF, not this line. `principal` is a required,
+     * non-nullable parameter supplied by `requirePrincipal` behind the global
+     * session guard, so a caller cannot reach here without one — and
+     * `sessionAuthenticatedBy` will not produce `true` from anything else. The
+     * revision C17-01 corrected derived this half from "a matching user row was
+     * found", which answers a different question entirely, and answered it
+     * `true` for a caller with no session at all.
+     *
+     * It is computed HERE, once, and handed to both callers. Two computations
+     * of "is there a human on this request?" is two chances for one of them to
+     * be wrong.
+     */
+    const sessionAuthenticated = sessionAuthenticatedBy(principal);
+
+    // C17-02: the initial tenant anchor, before ANY server row has resolved.
+    // Replaced below by the persisted context's own organisation, and never by
+    // anything the request claimed.
+    let auditOrganisationId = principal.organisation_id;
+
+    const audit = (
+      refusal: DeviceGatewayRefusal,
+      contractRefusal: string | null,
+      seen: {
+        contextId: string | null;
+        deviceId: string | null;
+        actorUserId: string | null;
+        siteId: string | null;
+        targetId: string | null;
+        payloadDigest: string | null;
+        effectiveTrust: string | null;
+      },
+    ): Promise<void> =>
+      this.repository.appendOperationEventOutsideTransaction(
+        {
+          organisationId: auditOrganisationId,
+          contextId: seen.contextId,
+          deviceId: seen.deviceId,
+          actorUserId: seen.actorUserId,
+          operationKind: kind,
+          occurredAt: new Date(),
+          traceId: request.traceId,
+        },
+        {
+          type: 'OPERATION_REFUSED',
+          siteId: seen.siteId,
+          targetType: DEVICE_GATEWAY_TARGET_TYPE_FOR_KIND[kind],
+          targetId: seen.targetId,
+          payloadDigest: seen.payloadDigest,
+          refusal,
+          contractRefusal,
+          effectiveTrust: seen.effectiveTrust,
+        },
+      );
+
+    // -----------------------------------------------------------------------
+    // PREFLIGHT
+    // -----------------------------------------------------------------------
+
+    const parsedProof = DeviceRequestProofSchema.safeParse(request.proof);
+    if (!parsedProof.success) {
+      // A malformed proof is a shape complaint about the caller's own bytes.
+      // The event is still filed, and it is filed under the SESSION's tenant -
+      // a fact the server established rather than one it was told.
+      await audit('PROOF_MALFORMED', null, blank({ targetId: request.targetId }));
+      return { kind: 'REFUSED', result: { outcome: 'REFUSED' } };
+    }
+    const proof = parsedProof.data;
+
+    // C17-02: RESOLVED BY THE SESSION'S TENANT, never by `proof.organisation_id`.
+    // The context is resolved by (id, organisation) TOGETHER, so a foreign
+    // context and a context that never existed produce one answer, from one
+    // query, and there is no branch in which they could diverge (D25-13).
+    const contextRow = await this.repository.findContext(principal.organisation_id, proof.context_id);
+    if (contextRow === null) {
+      await audit('CONTEXT_NOT_USABLE', null, blank({ targetId: request.targetId }));
+      return { kind: 'REFUSED', result: { outcome: 'REFUSED' } };
+    }
+    // The persisted row's organisation is authoritative from here on.
+    auditOrganisationId = contextRow.organisationId;
+    const contextSiteIds = await this.repository.listContextSiteIdsUnlocked(contextRow.organisationId, contextRow.id);
+    const seen = {
+      contextId: contextRow.id,
+      deviceId: contextRow.deviceId,
+      actorUserId: contextRow.actorUserId,
+      siteId: proof.site_id,
+      targetId: request.targetId ?? contextRow.actorUserId,
+      payloadDigest: null as string | null,
+      effectiveTrust: null as string | null,
+    };
+
+    // C17-02: the proof's CLAIMED tenant, equality-bound against the persisted
+    // context's. A claim may appear in an internal reason; it may never select
+    // which tenant owns an audit row.
+    if (proof.organisation_id !== contextRow.organisationId) {
+      await audit('PROOF_ORGANISATION_MISMATCH', null, seen);
+      return { kind: 'REFUSED', result: { outcome: 'REFUSED' } };
+    }
+    // C17-01: a valid proof carried by a DIFFERENT authenticated human refuses.
+    // Possession and identity are two facts, and holding the hardware does not
+    // make the caller the operative the context is bound to.
+    if (principal.user.id !== contextRow.actorUserId) {
+      await audit('SESSION_ACTOR_MISMATCH', null, seen);
+      return { kind: 'REFUSED', result: { outcome: 'REFUSED' } };
+    }
+
+    const targetId = request.targetId ?? contextRow.actorUserId;
+    const envelopeParse = parseOperationEnvelope(
+      kind,
+      {
+        // Every identity field is SERVER-RESOLVED — from the persisted context
+        // and from the signed proof's site — and none is read from the body.
+        organisationId: contextRow.organisationId,
+        siteId: proof.site_id,
+        actorUserId: contextRow.actorUserId,
+        deviceId: contextRow.deviceId,
+        targetId,
+      },
+      request.body,
+    );
+    if (!envelopeParse.ok) {
+      await audit(envelopeParse.refusal, null, seen);
+      return { kind: 'REFUSED', result: { outcome: 'REFUSED' } };
+    }
+    seen.payloadDigest = envelopeParse.digest;
+
+    const requiredAction = DEVICE_GATEWAY_REQUIRED_ACTION[kind];
+    const preflight = await this.resolveFacts(contextRow, contextSiteIds, proof, requiredAction, undefined);
+    if (preflight.kind === 'REFUSED') {
+      await audit(preflight.refusal, null, seen);
+      return { kind: 'REFUSED', result: { outcome: 'REFUSED' } };
+    }
+    seen.effectiveTrust = preflight.trust;
+
+    const statement = canonicalDeviceRequestProofStatement(
+      deviceRequestProofStatementInput(proof, preflight.registered.signature_profile),
+    );
+    const verified = this.keys.verifySignature({
+      registeredPublicKey: preflight.publicKey,
+      message: statement,
+      signature: proof.signature,
+      serverResolvedProfile: preflight.registered.signature_profile,
+      claimedProfile: proof.claimed_signature_profile,
+    });
+
+    const replayKey = deviceRequestProofReplayKey(proof);
+    const fingerprint = deviceRequestProofFingerprint(
+      deviceRequestProofStatementInput(proof, preflight.registered.signature_profile),
+    );
+    // CLASSIFY WITHOUT CREATING AN EFFECT. `peek` reads what the store already
+    // holds for this identity and takes no decision; `consume` — the call that
+    // BURNS the identity — happens only inside the final transaction.
+    const peeked = await this.repository.readOnly((tx) =>
+      this.replay.peek(tx, { organisationId: contextRow.organisationId, replayKey }),
+    );
+
+    const preflightJudgement = this.judge({
+      kind,
+      context: preflight.context,
+      proof,
+      now: await this.repository.now(),
+      expectedPayloadDigest: envelopeParse.digest,
+      registered: preflight.registered,
+      verified,
+      principals: preflight.principals(verified, sessionAuthenticated),
+      replayKey,
+      fingerprint,
+      stored: peeked === null ? null : { statement_fingerprint: peeked.statementFingerprint, stored_outcome_ref: peeked.storedOutcomeRef ?? '' },
+    });
+    if (preflightJudgement.kind === 'REFUSED') {
+      await audit(preflightJudgement.refusal, preflightJudgement.contractRefusal, seen);
+      return {
+        kind: 'REFUSED',
+        result: preflightJudgement.refusal === 'REPLAY_CONFLICT' ? { outcome: 'CONFLICT' } : { outcome: 'REFUSED' },
+      };
+    }
+
+    // -----------------------------------------------------------------------
+
+    return {
+      kind: 'READY',
+      state: {
+        sessionAuthenticated,
+        audit,
+        proof,
+        contextRow,
+        seen,
+        envelopeParse,
+        requiredAction,
+        verified,
+        replayKey,
+        fingerprint,
+      },
+    };
   }
 
   /**

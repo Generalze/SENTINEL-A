@@ -82,6 +82,13 @@ model Site {
   /// naming a site grants nothing at that site (D26-04A): it is a freshness
   /// value bound to a ceremony, not a scope statement.
   deviceAttestationChallenges DeviceAttestationChallenge[]
+  /// WP-29A back-relation. Required by Prisma for the composite
+  /// (site_id, organisation_id) relation declared in shield.prisma; it adds no
+  /// column and no behaviour to Identity. A lease naming a site is SCOPE THAT
+  /// WAS GRANTED, never scope that is granted now: issuance proved the device's
+  /// entitlement to the site at that moment, and central still re-reads current
+  /// entitlement on reconnect.
+  devicePolicyLeases DevicePolicyLease[]
 
   @@unique([id, organisationId], map: "sites_id_organisation_key")
   @@index([organisationId])
@@ -153,6 +160,14 @@ model User {
   /// It is enrollment PROVENANCE, never authority: being the intended user of
   /// an attestation challenge confers no device, no site scope and no action.
   deviceAttestationChallenges DeviceAttestationChallenge[] @relation("AttestationChallengeIntendedUser")
+
+  /// WP-29A back-relation. Required by Prisma for the composite
+  /// (actor_user_id, organisation_id) relation declared in shield.prisma; it
+  /// adds no column and no behaviour to Identity. C15-06: the lease names the
+  /// actor whose capability justified it so that a SHARED device cannot let a
+  /// second operative ride the first one's cached authority. It is still a
+  /// binding and never a grant.
+  devicePolicyLeases DevicePolicyLease[]
 
   @@unique([organisationId, email])
   /// WP-24 / D24-04a: a candidate key, deliberately redundant with the primary

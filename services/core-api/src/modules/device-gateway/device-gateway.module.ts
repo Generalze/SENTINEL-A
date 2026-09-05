@@ -9,6 +9,9 @@ import { DeviceGatewayController } from './device-gateway.controller';
 import { DeviceGatewayDomainAdapters } from './device-gateway.adapters';
 import { DeviceGatewayRepository } from './device-gateway.repository';
 import { DeviceGatewayService } from './device-gateway.service';
+import { DeviceOfflineIngressService } from './device-offline-ingress.service';
+import { DevicePolicyLeaseService } from './device-policy-lease.service';
+import { FieldOfflineModule } from '../field-offline/field-offline.module';
 
 /**
  * WP-25 Authenticated Device Gateway.
@@ -78,9 +81,27 @@ import { DeviceGatewayService } from './device-gateway.service';
  * REST ONLY (D25-10). No device WebSocket path; existing realtime untouched.
  */
 @Module({
-  imports: [PrismaModule, ShieldModule, FieldModule, FieldMessagingModule, WhisperDeviceActionModule],
+  /**
+   * WP-29A adds `FieldOfflineModule`, and adds NOTHING ELSE.
+   *
+   * It is the WP-20 replay service alone — the module exports exactly that one
+   * provider. The offline ingress deliberately does not reach past it into the
+   * Field or messaging repositories: WP-20 already owns the cursor, the
+   * receipt, the recovery lease and the single domain effect, and a second
+   * caller writing those rows directly would be a second replay policy. The
+   * architecture scan in `test/device-gateway-boundary.architecture.spec.ts`
+   * keeps this honest by refusing repository imports outright.
+   */
+  imports: [PrismaModule, ShieldModule, FieldModule, FieldMessagingModule, WhisperDeviceActionModule, FieldOfflineModule],
   controllers: [DeviceGatewayController],
-  providers: [DeviceGatewayRepository, DeviceGatewayDomainAdapters, DeviceContextService, DeviceGatewayService],
-  exports: [DeviceContextService, DeviceGatewayService],
+  providers: [
+    DeviceGatewayRepository,
+    DeviceGatewayDomainAdapters,
+    DeviceContextService,
+    DeviceGatewayService,
+    DevicePolicyLeaseService,
+    DeviceOfflineIngressService,
+  ],
+  exports: [DeviceContextService, DeviceGatewayService, DevicePolicyLeaseService, DeviceOfflineIngressService],
 })
 export class DeviceGatewayModule {}

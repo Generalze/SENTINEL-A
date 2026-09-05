@@ -184,6 +184,16 @@ export type DeviceContextEstablishmentResult =
        * still carry a fresh hardware-signed possession proof.
        */
       readonly context: unknown;
+      /**
+       * WP-29A / D29A-26 §13 — the offline policy lease minted alongside this
+       * context, or `null` when none could be.
+       *
+       * `unknown` for the same reason `context` is: the controller's job is to
+       * hand it back, not to reason about it. A failure to issue is NOT a
+       * failure to establish — the context remains valid for live operations,
+       * which need no lease — so this is nullable rather than an error.
+       */
+      readonly policyLease: unknown;
     }
   | {
       /**

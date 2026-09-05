@@ -223,7 +223,19 @@ class DeviceStatementsTest {
         // WP-27 added the fifth kind. The count is asserted so a kind cannot be
         // added without a reviewer seeing it here.
         assertEquals("DEVICE_ACTION_STATEMENT", DeviceStatements.TARGET_TYPE_FOR_KIND["DEVICE_ACTION"])
-        assertEquals(5, DeviceStatements.TARGET_TYPE_FOR_KIND.size)
+        // WP-29A added the sixth, and the count moved 5 -> 6 as the deliberate,
+        // visible act this assertion exists to force. It is the ONLY change
+        // made here: nothing above was relaxed, and the new kind is enumerated
+        // by name like every other one rather than being absorbed by a looser
+        // count.
+        //
+        // `OFFLINE_QUEUE_SUBMIT` is the submission of ONE operation the device
+        // produced while disconnected. Its target is the QUEUED OPERATION
+        // itself — the `offline_operation_id` inside the signed offline
+        // envelope — and not the operative, because that is what binds a
+        // freshly minted proof to the specific queued statement it carries.
+        assertEquals("FIELD_OFFLINE_OPERATION", DeviceStatements.TARGET_TYPE_FOR_KIND["OFFLINE_QUEUE_SUBMIT"])
+        assertEquals(6, DeviceStatements.TARGET_TYPE_FOR_KIND.size)
     }
 
     @Test

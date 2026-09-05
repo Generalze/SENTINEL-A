@@ -54,6 +54,25 @@ object EncryptedClientState {
     fun open(context: Context): ClientStateStore =
         ClientStateStore(SharedPreferencesKeyValueStore(preferences(context)))
 
+    /**
+     * WP-29A. The cached policy lease, in the SAME encrypted file, through a
+     * SEPARATE store with a separate allowlist.
+     *
+     * The same file, because a second protected file is a second thing to get
+     * right and the lease is the same kind of value — small, keyed, and written
+     * one field at a time. A separate STORE, because `ClientStateStore` owns
+     * exactly six client-state ids and its test asserts that the allowlist is
+     * those six and nothing else; widening it here to admit nine lease keys
+     * would weaken a standing guarantee in order to make new work fit.
+     *
+     * The lease is a CACHE and never authority — [PolicyLease] carries that
+     * argument in full. Nothing about it being stored beside the device id makes
+     * it any more believed by the server, which re-resolves the lease by id on
+     * arrival and judges the operation against its own record.
+     */
+    fun openPolicyLease(context: Context): PolicyLeaseCache =
+        PolicyLeaseCache(SharedPreferencesKeyValueStore(preferences(context)))
+
     private fun preferences(context: Context): SharedPreferences {
         val application = context.applicationContext
         val masterKey = MasterKey.Builder(application)
