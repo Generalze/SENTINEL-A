@@ -158,6 +158,36 @@ export class UnavailableEdgeTrustedTimeSigningKeyProvider implements EdgeTrusted
  * secret storage, and the only safe action for all of them is identical.
  */
 @Injectable()
+/**
+ * WHAT THIS CUSTODY BOUNDARY IS, AND WHAT IT IS NOT.
+ *
+ * Recorded on CTO instruction, because the easy way to describe these
+ * mechanisms overstates them and an overstated defence is worse than a
+ * documented limit.
+ *
+ * 1. ZEROING THE SOURCE BUFFER IS HYGIENE, NOT ERASURE. It removes one
+ *    readable copy of the PEM. It does not erase the signing key from process
+ *    memory: the imported `KeyObject` necessarily retains usable secret state
+ *    for as long as this provider can sign, which is the whole point of
+ *    caching it.
+ *
+ * 2. `#key` IS NOT A MEMORY-EXTRACTION DEFENCE. A true private field prevents
+ *    ordinary JavaScript exposure — `Object.keys`, spread, `JSON.stringify`,
+ *    a log line that interpolates the object. It does nothing against anything
+ *    that can read the process's memory, and it is not offered as though it
+ *    did.
+ *
+ * 3. KEY ROTATION REQUIRES A CONTROLLED RESTART. The key is read once, at
+ *    first signer use, and cached. Replacing the mounted file does not reload
+ *    it. Rotating the signing key therefore means a deliberate process
+ *    restart, unless and until a separately governed reload mechanism is
+ *    added — which would be its own ruling, because a reload path is a second
+ *    way for key material to enter a running process.
+ *
+ * This is the first production path in core-api that reads a file from disk.
+ * That is inherent to secret-manager-mounted material rather than incidental,
+ * and it is why the read is confined to this class.
+ */
 export class MountedEdgeTrustedTimeSigningKeyProvider implements EdgeTrustedTimeSigningKeyProvider {
   private readonly logger = new Logger(MountedEdgeTrustedTimeSigningKeyProvider.name);
   private resolved: Promise<EdgeTrustedTimeSigningKey | null> | null = null;
