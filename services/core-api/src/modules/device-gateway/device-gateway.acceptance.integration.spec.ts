@@ -12,6 +12,9 @@ import {
   type DeviceAttestationOutcome,
   type DeviceKeyStorage,
   type DeviceRequestPurpose,
+  deviceCanonicalDigest,
+  canonicalDeviceOfflineOperationStatement,
+  deviceOfflineOperationStatementInput,
 } from '@sentinel/contracts';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { AppModule } from '../../app.module';
@@ -216,6 +219,13 @@ async function cleanup(): Promise<void> {
   await prisma.deviceKeyRotationVerification.deleteMany({ where: { organisationId } });
   await prisma.deviceKeyRotationChallenge.deleteMany({ where: { organisationId } });
   await prisma.deviceKeyRotationRequest.deleteMany({ where: { organisationId } });
+  // D29A-27: offline receipts and cursors BEFORE leases. A receipt holds a
+  // tenant-composite Restrict relation to the lease it acted under, so a lease
+  // any receipt cites cannot be deleted -- which is the point of that relation.
+  // This suite created no receipts until the D29A-27 block below submitted a
+  // queued operation end to end, which is why the ordering only matters now.
+  await prisma.fieldOfflineOperationReceipt.deleteMany({ where: { organisationId } });
+  await prisma.fieldOfflineDeviceCursor.deleteMany({ where: { organisationId } });
   // WP-29A: leases BEFORE devices. `device_policy_leases` holds a tenant-composite
   // Restrict relation to `devices`, so a device that any lease names cannot be
   // deleted -- which is the point of the relation (D29A-26 s10: a lease must
@@ -656,6 +666,7 @@ const ROUTE: Readonly<Record<DeviceGatewayOperationKind, (targetId: string) => s
   ASSIGNMENT_ACCEPT: (id) => `${GATEWAY}/operations/assignments/${id}/accept`,
   ASSIGNMENT_DECLINE: (id) => `${GATEWAY}/operations/assignments/${id}/decline`,
   INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE: (id) => `${GATEWAY}/operations/messages/${id}/acknowledge`,
+  OFFLINE_QUEUE_SUBMIT: () => `${GATEWAY}/operations/offline-queue`,
 };
 
 /**
@@ -2485,3 +2496,269 @@ describe('WP-25/C17-06 the signed boundary refuses unknown top-level fields', ()
     expect((await completeEstablishment(challenge, device.keyPair)).status).toBe(201);
   });
 });
+
+/**
+ * ============================================================================
+ * D29A-27 — THE AUDIT TRAIL MUST NOT SAY AN OPERATION COMMITTED WHEN IT WAS
+ * REFUSED.
+ *
+ * THE DEFECT THIS SUITE EXISTS FOR.
+ *
+ * `authenticateQueueSubmission` wrote `OPERATION_COMMITTED` inside its own
+ * transaction the moment authentication succeeded. `DeviceOfflineIngressService`
+ * then ran eight further refusal checks — envelope shape, operation-id binding,
+ * identity binding, admitted kind, registry key, key identity, signature
+ * profile, and the frozen admissibility evaluator — each returning a bare
+ * refusal that wrote no audit row at all.
+ *
+ * So a submission that authenticated and was then refused left a durable record
+ * saying it had COMMITTED, with no `OPERATION_REFUSED` beside it and no receipt
+ * anywhere downstream. It granted no unauthorised access — every refusal still
+ * refused — but the trail lied about queued submissions exactly where refusals
+ * live, which is the half an operator most needs to read.
+ *
+ * WHY THESE ASSERTIONS ARE SHAPED AS THEY ARE. Each case asserts three things
+ * together, because any one alone would pass against the defect:
+ *
+ *   1. the request was refused                    (it always was)
+ *   2. a durable OPERATION_REFUSED exists          (it did not, before)
+ *   3. NO OPERATION_COMMITTED exists for the trace (it did, before)
+ *
+ * Assertion 3 is the one that fails against the old code.
+ * ============================================================================
+ */
+describe('WP-29A/D29A-27 queued submission audit truth (live stack)', () => {
+  const OFFLINE_PROFILE = 'P256_ECDSA_SHA256' as const;
+
+  /** A signed offline envelope, built exactly as a disconnected handset builds one. */
+  function offlineEnvelope(
+    device: EnrolledDevice,
+    context: IssuedContext,
+    overrides: Record<string, unknown>,
+    payload: Record<string, unknown>,
+    signer?: TestDeviceKeyPair,
+  ): Record<string, unknown> {
+    const base = {
+      schema_version: 1 as const,
+      offline_operation_id: randomUUID(),
+      organisation_id: context.organisation_id,
+      site_id: context.authorised_site_ids[0] ?? '',
+      actor_user_id: context.actor_user_id,
+      device_id: context.device_id,
+      key_id: context.key_id,
+      key_version: context.key_version,
+      operation_kind: 'INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE' as const,
+      device_sequence: 0,
+      idempotency_key: randomUUID(),
+      payload_digest: deviceCanonicalDigest(payload),
+      policy_lease_id: 'unset',
+      nonce: `nonce-${randomUUID()}`,
+      created_at: new Date().toISOString(),
+      ...overrides,
+    };
+    const statement = canonicalDeviceOfflineOperationStatement(
+      deviceOfflineOperationStatementInput({ ...base, claimed_signature_profile: OFFLINE_PROFILE, signature: 'x' } as never, OFFLINE_PROFILE),
+    );
+    return {
+      ...base,
+      claimed_signature_profile: OFFLINE_PROFILE,
+      signature: signCanonicalStatement((signer ?? device.keyPair).privateKey, statement),
+    };
+  }
+
+  /** Submits one queued operation through the real HTTP gateway route. */
+  async function submitQueued(input: {
+    device: EnrolledDevice;
+    context: IssuedContext;
+    envelope: Record<string, unknown>;
+    payload: Record<string, unknown>;
+    trace: string;
+  }): Promise<HttpResult> {
+    const siteId = input.context.authorised_site_ids[0] ?? '';
+    const semanticPayload = { envelope: input.envelope, payload: input.payload };
+    const proof = signProof(input.device.keyPair, {
+      contextId: input.context.context_id,
+      organisationId: input.context.organisation_id,
+      siteId,
+      actorUserId: input.context.actor_user_id,
+      deviceId: input.context.device_id,
+      keyId: input.context.key_id,
+      keyVersion: input.context.key_version,
+      // The route's own frozen purpose. Not FIELD_OPERATION.
+      purpose: 'OFFLINE_SYNC',
+      payloadDigest: deviceGatewayEnvelopeDigest({
+        schema_version: 1,
+        operation_kind: 'OFFLINE_QUEUE_SUBMIT',
+        organisation_id: input.context.organisation_id,
+        site_id: siteId,
+        actor_user_id: input.context.actor_user_id,
+        device_id: input.context.device_id,
+        target_type: 'FIELD_OFFLINE_OPERATION',
+        target_id: input.envelope.offline_operation_id as string,
+        semantic_payload: semanticPayload,
+      }),
+    });
+    return post(
+      ROUTE.OFFLINE_QUEUE_SUBMIT(''),
+      { proof, payload: semanticPayload },
+      { 'x-trace-id': input.trace, ...asSession(input.context.actor_user_id) },
+    );
+  }
+
+  /** Every gateway event type recorded against one trace. */
+  async function eventTypesFor(trace: string): Promise<string[]> {
+    return (await eventsForTrace(trace)).map((event) => event.eventType);
+  }
+
+  /**
+   * THE ASSERTION D29A-27 IS ABOUT. A refused submission must leave a refusal
+   * on the record and must NOT leave a commitment.
+   */
+  async function expectRefusedAndAudited(trace: string, expectedContractRefusal: string | null): Promise<void> {
+    const types = await eventTypesFor(trace);
+    expect(types, `trace ${trace}`).toContain('OPERATION_REFUSED');
+    expect(types, `trace ${trace} must not claim a commitment`).not.toContain('OPERATION_COMMITTED');
+    expect(types, `trace ${trace} must not claim a convergence`).not.toContain('OPERATION_CONVERGED');
+    if (expectedContractRefusal !== null) {
+      expect(await refusalReasonFor(trace)).toContain(expectedContractRefusal);
+    }
+  }
+
+  it('records OPERATION_REFUSED and never OPERATION_COMMITTED for each post-authentication refusal', async () => {
+    const device = await enrol();
+    const context = (await establish(device)).context;
+    const messageId = await newDeliveredMessage(fx.opAlpha);
+    const payload = { message_id: messageId };
+
+    // Each case is a genuine refusal reachable only AFTER authentication has
+    // already succeeded — which is precisely the window the defect covered.
+    const cases: Array<{ name: string; envelope: Record<string, unknown>; contract: string | null }> = [
+      {
+        // Refused by the GATEWAY's own strict canonical-envelope parse, before
+        // the ingress is reached at all -- `OfflineQueueSubmissionSchema`
+        // embeds the frozen envelope schema. So the recorded refusal is
+        // ENVELOPE_MALFORMED with no contract refusal beside it. That is the
+        // correct answer and it is already audited; the ingress keeps its own
+        // re-parse as a defensive second gate.
+        name: 'unparseable envelope',
+        envelope: { ...offlineEnvelope(device, context, {}, payload), schema_version: 99 },
+        contract: null,
+      },
+      {
+        name: 'operation kind not admitted by WP-29A',
+        envelope: offlineEnvelope(device, context, { operation_kind: 'FIELD_ASSIGNMENT_ACCEPT' }, payload),
+        contract: 'OPERATION_KIND_NOT_ADMITTED',
+      },
+      {
+        name: 'envelope names another organisation',
+        envelope: offlineEnvelope(device, context, { organisation_id: fx.orgB }, payload),
+        contract: 'IDENTITY_BINDING_MISMATCH',
+      },
+      {
+        name: 'envelope names another actor',
+        envelope: offlineEnvelope(device, context, { actor_user_id: fx.opBravo }, payload),
+        contract: 'IDENTITY_BINDING_MISMATCH',
+      },
+      {
+        name: 'envelope names a key version the registry does not hold',
+        envelope: offlineEnvelope(device, context, { key_version: 99 }, payload),
+        contract: 'REGISTRY_KEY_MISMATCH',
+      },
+      {
+        name: 'envelope signed by a different key',
+        envelope: offlineEnvelope(device, context, {}, payload, generateTestDeviceKeyPair()),
+        contract: 'SIGNATURE_NOT_VERIFIED',
+      },
+      {
+        name: 'no such policy lease',
+        envelope: offlineEnvelope(device, context, { policy_lease_id: `lease-${randomUUID()}` }, payload),
+        contract: 'LEASE_MISSING',
+      },
+      {
+        name: 'payload does not match the signed digest',
+        envelope: offlineEnvelope(device, context, {}, payload),
+        contract: 'PAYLOAD_DIGEST_MISMATCH',
+      },
+    ];
+
+    for (const testCase of cases) {
+      const trace = `d29a27-${randomUUID()}`;
+      const submittedPayload = testCase.name === 'payload does not match the signed digest' ? { message_id: randomUUID() } : payload;
+      const result = await submitQueued({ device, context, envelope: testCase.envelope, payload: submittedPayload, trace });
+
+      expect(result.status, `${testCase.name} must be refused`).toBeGreaterThanOrEqual(400);
+      await expectRefusedAndAudited(trace, testCase.contract);
+    }
+  }, 300_000);
+
+  it('a refused submission creates no receipt and no domain effect', async () => {
+    const device = await enrol();
+    const context = (await establish(device)).context;
+    const messageId = await newDeliveredMessage(fx.opAlpha);
+    const trace = `d29a27-noeffect-${randomUUID()}`;
+
+    const envelope = offlineEnvelope(device, context, { policy_lease_id: `lease-${randomUUID()}` }, { message_id: messageId });
+    const result = await submitQueued({ device, context, envelope, payload: { message_id: messageId }, trace });
+    expect(result.status).toBeGreaterThanOrEqual(400);
+
+    // No receipt was created for the operation the envelope named...
+    const receipts = await prisma.fieldOfflineOperationReceipt.count({
+      where: { organisationId: fx.orgA, offlineOperationId: envelope.offline_operation_id as string },
+    });
+    expect(receipts).toBe(0);
+
+    // ...and the message it would have acknowledged is untouched.
+    const recipient = await prisma.incidentFieldMessageRecipient.findFirstOrThrow({
+      where: { messageId, recipientUserId: fx.opAlpha },
+      select: { deliveryState: true, acknowledgedAt: true },
+    });
+    expect(recipient.deliveryState).toBe('DELIVERED');
+    expect(recipient.acknowledgedAt).toBeNull();
+
+    await expectRefusedAndAudited(trace, 'LEASE_MISSING');
+  }, 180_000);
+
+  it('the audit answers OPERATION_COMMITTED only when the operation genuinely applied', async () => {
+    const device = await enrol();
+    const context = (await establish(device)).context;
+    const lease = await prisma.devicePolicyLease.findFirstOrThrow({
+      where: { organisationId: fx.orgA, deviceId: context.device_id },
+      orderBy: { issuedAt: 'desc' },
+      select: { id: true },
+    });
+    const messageId = await newDeliveredMessage(fx.opAlpha);
+    const payload = { message_id: messageId };
+    const envelope = offlineEnvelope(device, context, { policy_lease_id: lease.id }, payload);
+
+    const trace = `d29a27-ok-${randomUUID()}`;
+    const result = await submitQueued({ device, context, envelope, payload, trace });
+    expect(result.status, JSON.stringify(result.body)).toBe(201);
+
+    const types = await eventTypesFor(trace);
+    expect(types).toContain('OPERATION_COMMITTED');
+    expect(types).not.toContain('OPERATION_REFUSED');
+
+    // The domain effect exists exactly once.
+    const recipient = await prisma.incidentFieldMessageRecipient.findFirstOrThrow({
+      where: { messageId, recipientUserId: fx.opAlpha },
+      select: { deliveryState: true },
+    });
+    expect(recipient.deliveryState).toBe('ACKNOWLEDGED');
+
+    // A byte-identical resend converges: recorded as CONVERGED, never as a
+    // second commitment, and it produces no second domain effect.
+    const retryTrace = `d29a27-retry-${randomUUID()}`;
+    const retry = await submitQueued({ device, context, envelope, payload, trace: retryTrace });
+    expect(retry.status, JSON.stringify(retry.body)).toBe(201);
+
+    const retryTypes = await eventTypesFor(retryTrace);
+    expect(retryTypes).toContain('OPERATION_CONVERGED');
+    expect(retryTypes).not.toContain('OPERATION_COMMITTED');
+
+    const receipts = await prisma.fieldOfflineOperationReceipt.count({
+      where: { organisationId: fx.orgA, offlineOperationId: envelope.offline_operation_id as string },
+    });
+    expect(receipts).toBe(1);
+  }, 180_000);
+});
+

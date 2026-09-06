@@ -15,6 +15,7 @@ import {
 import type { Principal } from '../../common/security/principal';
 import { FieldOfflineReplayService } from '../field-offline/field-offline.service';
 import type { OfflineSubmissionOutcome } from '../field-offline/field-offline.types';
+import type { DeviceGatewayRefusal } from './device-gateway.types';
 import { DeviceRegistryService } from '../shield/device-registry.service';
 import { ShieldRepository } from '../shield/shield.repository';
 import { DeviceReplayService } from '../shield/device-replay.service';
@@ -25,6 +26,12 @@ import { DevicePolicyLeaseService, WP29A_ADMITTED_OFFLINE_OPERATION_KINDS } from
 
 /** The ceremony label WP-29A spends the QUEUED statement's one-shot identity under. */
 export const DEVICE_OFFLINE_OPERATION_CEREMONY = 'OFFLINE_OPERATION';
+
+/** The authenticated-and-audited handle `authenticateQueueSubmission` hands back. */
+type AuthenticatedQueueSubmission = Extract<
+  Awaited<ReturnType<DeviceGatewayService['authenticateQueueSubmission']>>,
+  { outcome: 'AUTHENTICATED' }
+>;
 
 export type DeviceOfflineIngressResult =
   | { readonly outcome: 'ACCEPTED'; readonly submission: OfflineSubmissionOutcome }
@@ -110,29 +117,35 @@ export class DeviceOfflineIngressService {
       payload: Record<string, unknown>;
     };
     const parsedEnvelope = DeviceOfflineOperationEnvelopeSchema.safeParse(submission.envelope);
-    if (!parsedEnvelope.success) return { outcome: 'REFUSED' };
+    if (!parsedEnvelope.success) return this.refuse(authenticated, 'ENVELOPE_MALFORMED', 'QUEUED_ENVELOPE_UNPARSEABLE');
     const offlineEnvelope = parsedEnvelope.data;
 
     // The outer target and the inner signed id must be the same queue position.
     // Without this, the canonical envelope the device proved freshly could
     // describe one operation while the statement it carried described another.
-    if (gatewayEnvelope.target_id !== offlineEnvelope.offline_operation_id) return { outcome: 'REFUSED' };
+    if (gatewayEnvelope.target_id !== offlineEnvelope.offline_operation_id) {
+      return this.refuse(authenticated, 'ENVELOPE_MALFORMED', 'QUEUED_OPERATION_ID_MISBOUND');
+    }
 
     const bound = this.bindEnvelopeToContext(offlineEnvelope, context, siteId);
-    if (!bound) return { outcome: 'REFUSED' };
+    // One code for all five identity checks, as `bindDeviceContext` does: the
+    // caller learns the binding failed and nothing about which side disagreed.
+    if (!bound) return this.refuse(authenticated, 'OFFLINE_ENVELOPE_REFUSED', 'IDENTITY_BINDING_MISMATCH');
 
     // WP-29A executes one kind. Anything else would reach
     // NO_TRUSTWORTHY_TIME_WITNESS in the evaluator below anyway — there is no
     // Edge to witness it — but refusing here names the real reason rather than
     // letting it surface as a witness complaint.
-    if (!WP29A_ADMITTED_OFFLINE_OPERATION_KINDS.includes(offlineEnvelope.operation_kind)) return { outcome: 'REFUSED' };
+    if (!WP29A_ADMITTED_OFFLINE_OPERATION_KINDS.includes(offlineEnvelope.operation_kind)) {
+      return this.refuse(authenticated, 'OFFLINE_ENVELOPE_REFUSED', 'OPERATION_KIND_NOT_ADMITTED');
+    }
 
     // -----------------------------------------------------------------------
     // The four inputs the frozen evaluator judges, each resolved from SERVER
     // state and none of them from the request.
     // -----------------------------------------------------------------------
     const registeredKey = await this.registry.resolveRegistryKeyRecord(context.organisation_id, context.key_id);
-    if (registeredKey === null) return { outcome: 'REFUSED' };
+    if (registeredKey === null) return this.refuse(authenticated, 'REGISTRY_KEY_UNRESOLVABLE', null);
 
     // The envelope must name the key the registry currently holds for this
     // device. A rotation between queueing and reconnecting is a real event, and
@@ -140,7 +153,7 @@ export class DeviceOfflineIngressService {
     // the signature below is verified against the key the statement CLAIMS
     // rather than against whichever key happens to be current.
     if (offlineEnvelope.key_id !== registeredKey.key_id || offlineEnvelope.key_version !== registeredKey.key_version) {
-      return { outcome: 'REFUSED' };
+      return this.refuse(authenticated, 'OFFLINE_ENVELOPE_REFUSED', 'REGISTRY_KEY_MISMATCH');
     }
 
     // The SERVER re-digests the payload it actually received. The digest inside
@@ -149,7 +162,9 @@ export class DeviceOfflineIngressService {
     const expectedPayloadDigest = deviceCanonicalDigest(submission.payload);
 
     const profileBinding = bindClaimedSignatureProfile(offlineEnvelope.claimed_signature_profile, registeredKey.signature_profile);
-    if (!profileBinding.bound) return { outcome: 'REFUSED' };
+    if (!profileBinding.bound) {
+      return this.refuse(authenticated, 'OFFLINE_ENVELOPE_REFUSED', 'SIGNATURE_PROFILE_CLAIM_MISMATCH');
+    }
 
     const statementInput = deviceOfflineOperationStatementInput(offlineEnvelope, profileBinding.profile);
     const signatureVerified = this.keys.verifySignature({
@@ -206,6 +221,11 @@ export class DeviceOfflineIngressService {
       consumption,
     });
     if (!admissibility.admitted) {
+      // The frozen evaluator's own verdict, appended VERBATIM to contract_refusal
+      // -- LEASE_MISSING, LEASE_NOT_IN_FORCE, CREDENTIAL_REVOKED,
+      // SIGNATURE_NOT_VERIFIED, PAYLOAD_DIGEST_MISMATCH and the rest. The
+      // external answer stays the single D25-13 refusal whichever it was.
+      await authenticated.recordRefused('OFFLINE_ENVELOPE_REFUSED', admissibility.refusal);
       return admissibility.refusal === 'NONCE_REUSED_WITH_CHANGED_SEMANTICS' ? { outcome: 'CONFLICT' } : { outcome: 'REFUSED' };
     }
 
@@ -260,7 +280,56 @@ export class DeviceOfflineIngressService {
       { policyLeaseId: offlineEnvelope.policy_lease_id },
     );
 
+    /**
+     * D29A-27 — THE OUTCOME EVENT, WRITTEN ONCE WP-20 HAS ACTUALLY ANSWERED.
+     *
+     * `OPERATION_COMMITTED` is emitted only for a genuine first application.
+     * A replay records `OPERATION_CONVERGED` instead, so an operator counting
+     * commitments never has to subtract retries -- the same distinction C17-03
+     * drew for context establishment. Anything WP-20 could not apply is a
+     * refusal and is recorded as one.
+     */
+    await this.recordSubmissionOutcome(authenticated, offlineEnvelope.offline_operation_id, submissionOutcome);
     return { outcome: 'ACCEPTED', submission: submissionOutcome };
+  }
+
+  /**
+   * Files the refusal and answers the caller, in one place.
+   *
+   * Every post-authentication refusal goes through here so none can be added
+   * later that forgets to leave a trace -- which is exactly how the defect
+   * D29A-27 corrects came to exist: eight `return { outcome: 'REFUSED' }`
+   * statements, each individually reasonable, and not one of them audited.
+   */
+  private async refuse(
+    authenticated: AuthenticatedQueueSubmission,
+    refusal: DeviceGatewayRefusal,
+    contractRefusal: string | null,
+  ): Promise<DeviceOfflineIngressResult> {
+    await authenticated.recordRefused(refusal, contractRefusal);
+    return { outcome: 'REFUSED' };
+  }
+
+  /**
+   * Translates WP-20's answer into the gateway's outcome vocabulary.
+   *
+   * WP-20 owns what happened; this only records it. A `conflict` or an
+   * `invalid` answer is a refusal even though the submission reached the
+   * replay service, because no domain effect was applied -- and an audit that
+   * called those COMMITTED would be the same lie in a later place.
+   */
+  private async recordSubmissionOutcome(
+    authenticated: AuthenticatedQueueSubmission,
+    offlineOperationId: string,
+    outcome: OfflineSubmissionOutcome,
+  ): Promise<void> {
+    if (outcome.kind === 'result') {
+      if (outcome.result.replayed) await authenticated.recordConverged(offlineOperationId);
+      else await authenticated.recordCommitted();
+      return;
+    }
+    const contractRefusal = outcome.kind === 'conflict' ? outcome.conflict.conflict_code : 'REPLAY_OPERATION_INVALID';
+    await authenticated.recordRefused('OFFLINE_ENVELOPE_REFUSED', contractRefusal);
   }
 
   /**

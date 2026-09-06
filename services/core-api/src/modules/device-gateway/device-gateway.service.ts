@@ -413,7 +413,25 @@ export class DeviceGatewayService {
     principal: Principal,
     request: { proof: unknown; body: unknown; targetId: string | null; traceId: string },
   ): Promise<
-    | { outcome: 'AUTHENTICATED'; context: AuthenticatedDeviceContext; envelope: DeviceGatewayOperationEnvelope; siteId: string }
+    | {
+        outcome: 'AUTHENTICATED';
+        context: AuthenticatedDeviceContext;
+        envelope: DeviceGatewayOperationEnvelope;
+        siteId: string;
+        /**
+         * D29A-27 — THE OUTCOME EVENT THE CALLER MUST WRITE.
+         *
+         * Three closures rather than a raw repository handle, so the ingress
+         * can record what happened and nothing else. It cannot choose the
+         * tenant, the context, the device, the key or the digest — every one of
+         * those was resolved under lock during authentication and is captured
+         * here. A caller that could supply them could file an event against a
+         * tenant it merely named, which is the C17-02 defect.
+         */
+        readonly recordRefused: (refusal: DeviceGatewayRefusal, contractRefusal: string | null) => Promise<void>;
+        readonly recordCommitted: () => Promise<void>;
+        readonly recordConverged: (storedOutcomeRef: string) => Promise<void>;
+      }
     | { outcome: 'REFUSED' }
     | { outcome: 'CONFLICT' }
   > {
@@ -426,7 +444,7 @@ export class DeviceGatewayService {
       authenticated.state;
 
     try {
-      return await this.repository.transaction(async (tx) => {
+      const authenticated_ = await this.repository.transaction(async (tx) => {
         const lockedContext = await this.repository.lockContext(tx, contextRow.organisationId, contextRow.id);
         if (lockedContext === null) throw new DeviceGatewayTransactionRollback('CONTEXT_NOT_USABLE');
         if (lockedContext.closedAt !== null) throw new DeviceGatewayTransactionRollback('CONTEXT_NOT_USABLE');
@@ -502,26 +520,86 @@ export class DeviceGatewayService {
           throw new DeviceGatewayTransactionRollback('REPLAY_CONFLICT', 'NONCE_REUSED_WITH_CHANGED_SEMANTICS');
         }
 
-        await this.repository.appendOperationEvent(tx, auditEnvelope, {
-          type: 'OPERATION_COMMITTED',
-          siteId: proof.site_id,
-          targetType: envelopeParse.envelope.target_type,
-          targetId: envelopeParse.envelope.target_id,
-          keyId: facts.registered.key_id,
-          keyVersion: facts.registered.key_version,
-          payloadDigest: envelopeParse.digest,
-          statementFingerprint: fingerprint,
-          domainIdempotencyKey: proofOutcomeRef,
-          effectiveTrust: facts.trust,
-        });
-
+        /**
+         * D29A-27 — NO `OPERATION_COMMITTED` IS WRITTEN HERE, AND THAT IS THE
+         * WHOLE POINT OF THIS METHOD'S EXISTENCE.
+         *
+         * It used to write one, inside this transaction, the moment
+         * authentication succeeded. Eight further refusal checks then ran in
+         * `DeviceOfflineIngressService` — envelope shape, identity binding,
+         * admitted kind, registry key, signature profile, signature, lease,
+         * revocation — each returning a bare refusal with no audit of its own.
+         * A submission that authenticated and was then refused therefore left a
+         * durable record saying it had COMMITTED, with no `OPERATION_REFUSED`
+         * beside it and no receipt anywhere.
+         *
+         * AUTHENTICATION SUCCESS MEANS ONLY THAT AUTHENTICATION SUCCEEDED. The
+         * caller now owns the outcome event and writes it once the genuine
+         * downstream operation has reached an authoritative result.
+         */
         return {
           outcome: 'AUTHENTICATED' as const,
           context: facts.context,
           envelope: envelopeParse.envelope,
           siteId: proof.site_id,
+          outcomeAudit: {
+            envelope: auditEnvelope,
+            siteId: proof.site_id,
+            targetType: envelopeParse.envelope.target_type,
+            targetId: envelopeParse.envelope.target_id,
+            keyId: facts.registered.key_id,
+            keyVersion: facts.registered.key_version,
+            payloadDigest: envelopeParse.digest,
+            statementFingerprint: fingerprint,
+            domainIdempotencyKey: proofOutcomeRef,
+            effectiveTrust: facts.trust,
+          },
         };
       });
+      const outcomeAudit = authenticated_.outcomeAudit;
+
+      return {
+        outcome: 'AUTHENTICATED' as const,
+        context: authenticated_.context,
+        envelope: authenticated_.envelope,
+        siteId: authenticated_.siteId,
+        /**
+         * The refusal lands in its OWN transaction, after this one committed —
+         * the same discipline `execute` uses after a rollback. The one-shot
+         * proof identity stays spent either way, which is correct: the device
+         * did present it, and a refusal is not a reason to hand it back.
+         */
+        recordRefused: (refusal: DeviceGatewayRefusal, contractRefusal: string | null) =>
+          audit(refusal, contractRefusal, seen),
+        recordCommitted: () =>
+          this.repository.appendOperationEventOutsideTransaction(outcomeAudit.envelope, {
+            type: 'OPERATION_COMMITTED',
+            siteId: outcomeAudit.siteId,
+            targetType: outcomeAudit.targetType,
+            targetId: outcomeAudit.targetId,
+            keyId: outcomeAudit.keyId,
+            keyVersion: outcomeAudit.keyVersion,
+            payloadDigest: outcomeAudit.payloadDigest,
+            statementFingerprint: outcomeAudit.statementFingerprint,
+            domainIdempotencyKey: outcomeAudit.domainIdempotencyKey,
+            effectiveTrust: outcomeAudit.effectiveTrust,
+          }),
+        // The reference a converged retry answered FROM. For a queued
+        // submission that is the operation's own id: WP-20's receipt for that
+        // id IS the stored outcome, and it is what the replay was read back
+        // from. It is passed rather than captured because only the caller
+        // knows, after WP-20 has answered, whether this was a replay at all.
+        recordConverged: (storedOutcomeRef: string) =>
+          this.repository.appendOperationEventOutsideTransaction(outcomeAudit.envelope, {
+            type: 'OPERATION_CONVERGED',
+            siteId: outcomeAudit.siteId,
+            targetType: outcomeAudit.targetType,
+            targetId: outcomeAudit.targetId,
+            payloadDigest: outcomeAudit.payloadDigest,
+            statementFingerprint: outcomeAudit.statementFingerprint,
+            storedOutcomeRef,
+          }),
+      };
     } catch (error) {
       if (isDeviceGatewayTransactionRollback(error)) {
         await audit(error.refusal, error.contractRefusal, seen);
