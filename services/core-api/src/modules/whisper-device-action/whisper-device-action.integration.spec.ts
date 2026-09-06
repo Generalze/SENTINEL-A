@@ -24,7 +24,9 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { deviceContextEstablishmentChallengeDigest, type DeviceContextEstablishmentChallengeView } from '../device-gateway/device-context.challenge';
 import { DEVICE_GATEWAY_TARGET_TYPE_FOR_KIND, deviceGatewayEnvelopeDigest } from '../device-gateway/device-gateway.envelope';
 import { PATROL_SWEEP_SCHEDULER } from '../patrol/patrol-sweep.scheduler';
+import { OUTBOX_PUBLISH_SCHEDULER } from '../../common/scheduling/outbox-publish.scheduler';
 import { NoopPatrolSweepScheduler } from '../patrol/patrol-sweep.scheduler.test-support';
+import { NoopOutboxPublishScheduler } from '../../common/scheduling/outbox-publish.scheduler.test-support';
 import { DEVICE_ATTESTATION_EVALUATOR } from '../shield/attestation.evaluator';
 import { DeviceEnrollmentService } from '../shield/device-enrollment.service';
 import { DeviceTrustService } from '../shield/device-trust.service';
@@ -184,6 +186,11 @@ beforeAll(async () => {
   const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
     .overrideProvider(PATROL_SWEEP_SCHEDULER)
     .useClass(NoopPatrolSweepScheduler)
+    // TI-02: and the three outbox publishers, which used to drain every
+    // tenant's pending rows at boot through no seam at all. One token
+    // reaches all three, so a suite need not know how many there are.
+    .overrideProvider(OUTBOX_PUBLISH_SCHEDULER)
+    .useClass(NoopOutboxPublishScheduler)
     .overrideProvider(DEVICE_ATTESTATION_EVALUATOR)
     .useValue(attestation)
     .compile();

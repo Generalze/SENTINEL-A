@@ -7,7 +7,9 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { AppModule } from '../../app.module';
 import { PrismaService } from '../../prisma/prisma.service';
 import { PATROL_SWEEP_SCHEDULER } from '../patrol/patrol-sweep.scheduler';
+import { OUTBOX_PUBLISH_SCHEDULER } from '../../common/scheduling/outbox-publish.scheduler';
 import { NoopPatrolSweepScheduler } from '../patrol/patrol-sweep.scheduler.test-support';
+import { NoopOutboxPublishScheduler } from '../../common/scheduling/outbox-publish.scheduler.test-support';
 import { WS_EVENT_FIELD_MESSAGE_UPDATED, WS_PATH } from '../realtime/realtime.constants';
 import { FieldMessagingOutboxPublisher } from './field-messaging-outbox.publisher';
 import { FieldMessagingRepository } from './field-messaging.repository';
@@ -96,6 +98,11 @@ describe('WP-18 realtime delivery evidence (live stack, C8-01)', () => {
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
       .overrideProvider(PATROL_SWEEP_SCHEDULER)
       .useClass(NoopPatrolSweepScheduler)
+      // TI-02: and the three outbox publishers, which used to drain every
+      // tenant's pending rows at boot through no seam at all. One token
+      // reaches all three, so a suite need not know how many there are.
+      .overrideProvider(OUTBOX_PUBLISH_SCHEDULER)
+      .useClass(NoopOutboxPublishScheduler)
       .compile();
     app = moduleRef.createNestApplication({ logger: false });
     await app.listen(0, '127.0.0.1');
