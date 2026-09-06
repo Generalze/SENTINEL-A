@@ -40,13 +40,36 @@ export class PatrolMissedSweeper implements OnApplicationBootstrap, OnModuleDest
    * cadence goes through the seam, which is exactly the part a test needs
    * silenced so its explicit `sweep()` calls are the only ones in flight.
    */
+  /**
+   * TI-01 — THE SCHEDULER OWNS BOTH EXECUTIONS.
+   *
+   * This used to `await this.sweep()` here and only then hand the recurring
+   * task to the injected scheduler. The behaviour was right for production and
+   * wrong as a seam: substituting a Noop scheduler suppressed the repeat and
+   * not the first sweep, so every test application that booted still performed
+   * one sweep — and `sweepMissedOnce` is deliberately GLOBAL, with no
+   * organisation filter, because one deployment serves every tenant. In a
+   * shared test database that made each unrelated boot a cross-tenant mutation.
+   *
+   * Production behaviour is unchanged: `runImmediately` is `true`, the real
+   * scheduler awaits that sweep before installing the timer, and the cadence is
+   * still the hard-wired constant. What changed is that the seam now covers
+   * what it always claimed to.
+   */
   async onApplicationBootstrap(): Promise<void> {
-    await this.sweep();
-    this.scheduler.start(() => {
-      void this.sweep().catch((error: unknown) => {
-        this.logger.error(`Patrol missed sweep failed: ${error instanceof Error ? error.message : String(error)}`);
-      });
-    }, PATROL_SWEEP_INTERVAL_MS);
+    await this.scheduler.start(
+      async () => {
+        try {
+          await this.sweep();
+        } catch (error: unknown) {
+          // A failed sweep must never take the application down with it, and
+          // must never stop the cadence: the next tick tries again.
+          this.logger.error(`Patrol missed sweep failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      },
+      PATROL_SWEEP_INTERVAL_MS,
+      { runImmediately: true },
+    );
   }
 
   onModuleDestroy(): void {

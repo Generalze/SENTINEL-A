@@ -34,21 +34,59 @@ import { Injectable } from '@nestjs/common';
  * in `patrol-sweep.scheduler.test-support.ts`) via Nest's `overrideProvider`,
  * which is compile-time test wiring and has no runtime representation at all.
  *
- * Note what the seam does NOT cover: the boot sweep in
- * `onApplicationBootstrap` runs unconditionally, under every scheduler. A
- * restarted server catches up on missed checkpoints immediately, and no test
- * double can skip that — the seam suppresses only the *repeating* timer.
+ * TI-01 — THE SEAM NOW COVERS THE BOOT SWEEP TOO, AND HAS TO.
+ *
+ * This comment used to end by recording that the boot sweep in
+ * `onApplicationBootstrap` ran unconditionally under every scheduler, and that
+ * no test double could skip it. That was accurate, it was deliberate, and it
+ * was the defect: `PatrolMissedSweeper` called `sweep()` directly and only
+ * afterwards handed the recurring task to this scheduler, so a Noop suppressed
+ * the repeat and not the first sweep.
+ *
+ * The reasoning behind the old design was that a boot sweep is a single,
+ * bounded, deterministic event — a suite would see exactly one and could
+ * account for it. What that missed is that `sweepMissedOnce` carries NO
+ * organisation filter. It is global by design, because one deployment serves
+ * every tenant. In a test database shared by sixteen concurrently booting
+ * suites, "one deterministic sweep per boot" is sixteen unpredictable global
+ * mutations of everyone else's rows, and a suite holding an IN_PROGRESS run
+ * with a past-deadline PENDING checkpoint could have it stamped MISSED by a
+ * suite that has nothing to do with patrols.
+ *
+ * So `start` now owns BOTH executions. Production asks for the immediate sweep
+ * explicitly and gets exactly the behaviour it always had — catch up at boot,
+ * then every five seconds. A Noop scheduler now genuinely means no sweeps at
+ * all, which is what every suite that installed one was already asking for.
  */
 
 /** DI token for the sweep scheduler. Injected by `PatrolMissedSweeper`. */
 export const PATROL_SWEEP_SCHEDULER = Symbol('PATROL_SWEEP_SCHEDULER');
 
+/**
+ * How the sweep task is executed. The interval is NOT a parameter a caller
+ * chooses freely — `PatrolMissedSweeper` passes the hard-wired constant — and
+ * `runImmediately` is REQUIRED rather than optional so that every call site has
+ * to state, in the diff, whether it wants a sweep at boot.
+ */
+export interface PatrolSweepStartOptions {
+  /**
+   * Whether to execute the task once before scheduling the repeat.
+   *
+   * Production passes `true`: a restarted server must catch up on checkpoints
+   * whose deadlines passed while it was down, without waiting five seconds. A
+   * test double ignores the request entirely, which is the whole point.
+   */
+  readonly runImmediately: boolean;
+}
+
 export interface PatrolSweepScheduler {
   /**
-   * Begins invoking `run` every `intervalMs` milliseconds. Called once, from
-   * `onApplicationBootstrap`, after the boot sweep has already completed.
+   * Starts the sweep task. AWAITS the immediate execution when one is
+   * requested, so an application's bootstrap does not complete until the
+   * catch-up sweep has, exactly as it did when the sweeper ran that sweep
+   * itself.
    */
-  start(run: () => void, intervalMs: number): void;
+  start(run: () => Promise<void>, intervalMs: number, options: PatrolSweepStartOptions): Promise<void>;
   /** Stops the cadence. Idempotent — safe to call without a prior `start`. */
   stop(): void;
 }
@@ -64,9 +102,15 @@ export interface PatrolSweepScheduler {
 export class IntervalPatrolSweepScheduler implements PatrolSweepScheduler {
   private timer: ReturnType<typeof globalThis.setInterval> | undefined;
 
-  start(run: () => void, intervalMs: number): void {
+  async start(run: () => Promise<void>, intervalMs: number, options: PatrolSweepStartOptions): Promise<void> {
     this.stop();
-    this.timer = globalThis.setInterval(run, intervalMs);
+    // BEFORE the timer is installed, and awaited. A server that has been down
+    // has missed checkpoints to judge, and it judges them as part of coming up
+    // rather than five seconds into serving traffic.
+    if (options.runImmediately) await run();
+    this.timer = globalThis.setInterval(() => {
+      void run();
+    }, intervalMs);
     this.timer.unref?.();
   }
 
