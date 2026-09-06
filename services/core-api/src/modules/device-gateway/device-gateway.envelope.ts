@@ -1,5 +1,8 @@
 import {
   DEVICE_PURPOSE_PERMITTED_TRUST,
+  DEVICE_QUEUE_ADMISSION_PURPOSE,
+  DeviceOfflineOperationEnvelopeSchema,
+  OfflineIncidentMessageAcknowledgePayloadSchema,
   WhisperDeviceActionV2ClaimsSchema,
   canonicalDeviceJson,
   deviceCanonicalDigest,
@@ -64,6 +67,24 @@ export const DEVICE_GATEWAY_OPERATION_KINDS = [
    * server-owned tables, in one place.
    */
   'DEVICE_ACTION',
+  /**
+   * WP-29A: submission of ONE operation a device produced while disconnected.
+   *
+   * It is a gateway kind, and not a separate ingress, because D29A-26 §13
+   * forbids a second device-authentication mechanism. Everything the other
+   * kinds get, this gets: the human session, the fresh possession proof over a
+   * canonical payload digest, the live authority re-read, the purpose table,
+   * the D25-13 refusal boundary.
+   *
+   * WHAT IS DIFFERENT IS WHAT THE PAYLOAD CONTAINS. The other kinds carry an
+   * instruction the device is issuing NOW. This one carries a statement the
+   * device signed EARLIER, under a policy lease, and the fresh proof attests
+   * only that the queued statement reached us intact from the device that still
+   * holds the key. The queued statement's own authority is judged separately,
+   * by the frozen WP-23 evaluator, against the SERVER's copy of the lease it
+   * names.
+   */
+  'OFFLINE_QUEUE_SUBMIT',
 ] as const;
 export const DeviceGatewayOperationKindSchema = z.enum(DEVICE_GATEWAY_OPERATION_KINDS);
 export type DeviceGatewayOperationKind = z.infer<typeof DeviceGatewayOperationKindSchema>;
@@ -78,6 +99,8 @@ export const DEVICE_GATEWAY_TARGET_TYPES = [
   'FIELD_ASSIGNMENT',
   'INCIDENT_FIELD_MESSAGE',
   'DEVICE_ACTION_STATEMENT',
+  /** WP-29A: a queued operation, identified by its own `offline_operation_id`. */
+  'FIELD_OFFLINE_OPERATION',
 ] as const;
 export type DeviceGatewayTargetType = (typeof DEVICE_GATEWAY_TARGET_TYPES)[number];
 
@@ -99,6 +122,13 @@ export const DEVICE_GATEWAY_TARGET_TYPE_FOR_KIND: Readonly<Record<DeviceGatewayO
    * configuration a device was firing.
    */
   DEVICE_ACTION: 'DEVICE_ACTION_STATEMENT',
+  /**
+   * WP-29A: the target is the QUEUED OPERATION itself, and its id is resolved
+   * from the signed offline envelope rather than from a path parameter. A route
+   * that took one would be a route through which a device could name a queue
+   * position other than the one it signed.
+   */
+  OFFLINE_QUEUE_SUBMIT: 'FIELD_OFFLINE_OPERATION',
 };
 
 /**
@@ -121,6 +151,22 @@ export const DEVICE_GATEWAY_REQUIRED_ACTION: Readonly<Record<DeviceGatewayOperat
    * operational on this channel.
    */
   DEVICE_ACTION: 'whisper.device-action.invoke',
+  /**
+   * WP-29A ADMITS EXACTLY ONE QUEUED KIND, AND THIS ENTRY IS THAT FACT.
+   *
+   * `INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE` is the only kind WP-23 lists as
+   * stale-tolerant, and therefore the only one that can be judged without an
+   * Edge time witness. So the action the CURRENT human must hold to submit a
+   * queued operation is the acknowledgement action, and the envelope's own kind
+   * is refused if it is anything else.
+   *
+   * THIS ENTRY MUST CHANGE WHEN THE SCOPE DOES. Widening the admitted kinds
+   * without revisiting it would let one capability submit queued work that
+   * requires another — which is why `FieldOfflineReplayService` independently
+   * re-checks `REQUIRED_ACTION_FOR_KIND` for the kind actually inside the
+   * envelope, and refuses on its own if they disagree.
+   */
+  OFFLINE_QUEUE_SUBMIT: 'field.message.acknowledge',
 };
 
 /**
@@ -153,6 +199,19 @@ export const DEVICE_GATEWAY_PURPOSE_FOR_KIND: Readonly<Record<DeviceGatewayOpera
   ASSIGNMENT_DECLINE: 'FIELD_OPERATION',
   INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE: 'FIELD_OPERATION',
   DEVICE_ACTION: 'WHISPER_DEVICE_ACTION',
+  /**
+   * WP-29A: `OFFLINE_SYNC` — the frozen purpose for queued work, and NOT
+   * `FIELD_OPERATION`.
+   *
+   * The two currently admit the same trust states, so this selection changes
+   * no behaviour today. It is still the correct one, and choosing the
+   * convenient one because it happens to match would be storing up the exact
+   * defect C15-R2-final removed: `DEVICE_QUEUE_ADMISSION_PURPOSE` exists so
+   * that the question "may this device's QUEUED work take effect?" is asked
+   * under its own name, and can be tightened later without also tightening
+   * live field operations.
+   */
+  OFFLINE_QUEUE_SUBMIT: DEVICE_QUEUE_ADMISSION_PURPOSE,
 };
 
 /** The trust states each kind's purpose admits, read from the FROZEN table, never restated. */
@@ -224,6 +283,30 @@ const AssignmentSemanticPayloadSchema = z
  */
 const AcknowledgeSemanticPayloadSchema = z.object({}).strict();
 
+/**
+ * WP-29A — ONE QUEUED OPERATION, AS IT ARRIVES.
+ *
+ * Two members, and the split between them is the whole design. The envelope is
+ * what the device SIGNED while disconnected; the payload is what that signature
+ * COMMITS TO without carrying. Keeping them apart is what lets an envelope be
+ * retained, logged and audited while the operational content it refers to is
+ * not (D23-14) — and it is why the server re-computes `payload_digest` from the
+ * payload it actually received rather than trusting the digest inside the
+ * envelope.
+ */
+const OfflineQueueSubmissionSchema = z
+  .object({
+    envelope: DeviceOfflineOperationEnvelopeSchema,
+    /**
+     * WP-29A admits one operation kind, so this is that kind's payload,
+     * referenced from the WP-20 contract rather than redeclared. When the
+     * admitted scope widens this becomes a discriminated union keyed on the
+     * envelope's `operation_kind` — never a loosened object.
+     */
+    payload: OfflineIncidentMessageAcknowledgePayloadSchema,
+  })
+  .strict();
+
 const SEMANTIC_PAYLOAD_SCHEMA: Readonly<Record<DeviceGatewayOperationKind, z.ZodTypeAny>> = {
   FIELD_STATE_UPDATE: FieldStateSemanticPayloadSchema,
   ASSIGNMENT_ACCEPT: AssignmentSemanticPayloadSchema,
@@ -246,6 +329,21 @@ const SEMANTIC_PAYLOAD_SCHEMA: Readonly<Record<DeviceGatewayOperationKind, z.Zod
    * a caller could propose one.
    */
   DEVICE_ACTION: WhisperDeviceActionV2ClaimsSchema,
+  /**
+   * WP-29A: the CONTRACTS' own schemas, composed — not restated.
+   *
+   * `envelope` is the frozen WP-23 `DeviceOfflineOperationEnvelopeSchema`,
+   * which runs the full canonical signature decode at parse time, so a
+   * malformed or high-S signature cannot reach a parsed submission. `payload`
+   * is the WP-20 payload the envelope's `payload_digest` commits to; it travels
+   * BESIDE the envelope rather than inside it (D23-14) so that an envelope
+   * retained in an audit trail discloses nothing, and the server re-digests it
+   * on arrival rather than believing the digest it was handed.
+   *
+   * `.strict()` on both, so an extra member is a parse failure rather than an
+   * unsigned field riding along beside a signed statement.
+   */
+  OFFLINE_QUEUE_SUBMIT: OfflineQueueSubmissionSchema,
 };
 
 export type FieldStateSemanticPayload = z.infer<typeof FieldStateSemanticPayloadSchema>;

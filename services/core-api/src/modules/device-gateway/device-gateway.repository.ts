@@ -398,6 +398,114 @@ export class DeviceGatewayRepository {
   async appendOperationEventOutsideTransaction(envelope: DeviceGatewayEventEnvelope, input: DeviceGatewayEventInput): Promise<void> {
     await this.appendOperationEvent(this.prisma, envelope, input);
   }
+
+  // -------------------------------------------------------------------------
+  // WP-29A — device policy leases (D29A-26)
+  // -------------------------------------------------------------------------
+
+  /**
+   * D29A-26 §5 — THE CAPABILITY GRANT AN ISSUANCE RESTED ON.
+   *
+   * Returns the `user_roles` row id that covers `siteId` for this actor, or
+   * `null` when none does. A SITE-SCOPED assignment is preferred over an
+   * organisation-wide one, and ties break on the lowest id, so the recorded
+   * basis is deterministic and is the NARROWEST assignment that could have
+   * justified the lease — the most conservative thing we can truthfully say
+   * about why authority was cached.
+   *
+   * It is deliberately a query of its own rather than a field added to
+   * `findActorAuthority`. That method feeds the frozen
+   * `DeviceActorAuthorityFacts`, which has no place for a role id and should
+   * not grow one: what grants a capability is a policy question answered from
+   * roles and actions together, while this is an AUDIT POINTER recorded beside
+   * the answer. Conflating them would put an identifier into a security
+   * evaluation that has no business reading it.
+   *
+   * The id is stored as a plain column with NO foreign key — see
+   * `DevicePolicyLease` in `shield.prisma`. A `Restrict` relation to a live,
+   * mutable role would make the database refuse to remove a user's role while
+   * any lease named it, so withdrawing someone's authority could be blocked for
+   * six hours by a queued acknowledgement. The lease must survive that change,
+   * not prevent it.
+   */
+  async findAuthorityBasis(organisationId: string, userId: string, siteId: string): Promise<string | null> {
+    const rows = await this.prisma.userRole.findMany({
+      where: {
+        userId,
+        user: { organisationId },
+        OR: [{ siteId }, { siteId: null }],
+      },
+      select: { id: true, siteId: true },
+      orderBy: { id: 'asc' },
+    });
+    const siteScoped = rows.find((row) => row.siteId === siteId);
+    if (siteScoped !== undefined) return siteScoped.id;
+    return rows[0]?.id ?? null;
+  }
+
+  /**
+   * Persists one issued lease.
+   *
+   * No upsert, and no `skipDuplicates`. A lease id is freshly generated per
+   * issuance, so a collision is not a retry — it is a bug or a supplied id, and
+   * either must fail loudly rather than silently returning somebody else's
+   * authority record.
+   */
+  async createPolicyLease(input: {
+    id: string;
+    organisationId: string;
+    deviceId: string;
+    siteId: string;
+    actorUserId: string;
+    authorityBasisId: string;
+    scope: string[];
+    issuedAt: Date;
+    expiresAt: Date;
+  }): Promise<void> {
+    await this.prisma.devicePolicyLease.create({ data: input });
+  }
+
+  /**
+   * Resolves a lease by its identity WITHIN a tenant.
+   *
+   * Both halves of the key are in the `where`, so a foreign tenant's real lease
+   * and an id that never existed return `null` from the same query. There is no
+   * branch on which they could diverge, which is what stops this becoming an
+   * enumeration oracle (D25-13).
+   */
+  async findPolicyLease(organisationId: string, leaseId: string, tx?: GatewayTx): Promise<DevicePolicyLeaseRow | null> {
+    const db = tx ?? this.prisma;
+    return db.devicePolicyLease.findFirst({ where: { id: leaseId, organisationId } });
+  }
+
+  /**
+   * Marks a lease revoked, keeping the FIRST withdrawal instant.
+   *
+   * `revokedAt: null` in the filter is what makes this idempotent: a second
+   * revocation matches no row and returns `false`, so the moment authority was
+   * withdrawn cannot be moved later by repeating the call.
+   */
+  async revokePolicyLease(organisationId: string, leaseId: string, at: Date): Promise<boolean> {
+    const updated = await this.prisma.devicePolicyLease.updateMany({
+      where: { id: leaseId, organisationId, revokedAt: null },
+      data: { revokedAt: at },
+    });
+    return updated.count === 1;
+  }
+}
+
+/** One persisted lease row, exactly as stored. */
+export interface DevicePolicyLeaseRow {
+  id: string;
+  organisationId: string;
+  deviceId: string;
+  siteId: string;
+  actorUserId: string;
+  authorityBasisId: string;
+  scope: string[];
+  issuedAt: Date;
+  expiresAt: Date;
+  revokedAt: Date | null;
 }
 
 /**

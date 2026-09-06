@@ -116,6 +116,17 @@ export interface CreateReceiptInput {
   /** C10-06: the client's CLAIM of when it queued the operation. Telemetry. */
   clientCreatedAt: Date;
   firstTraceId: string;
+  /**
+   * D29A-26 §16 — the policy lease this operation acted under, or `null` for
+   * a caller that has none.
+   *
+   * `null` is NOT a WP-29A option. It exists because the WP-20 replay surface
+   * predates policy leases and its existing callers legitimately have none;
+   * the offline-envelope path always resolves one before it gets here, and
+   * `DeviceOfflineIngressService` is unable to reach this call without it —
+   * the frozen evaluator refuses LEASE_MISSING first.
+   */
+  policyLeaseId: string | null;
 }
 
 export interface FinalizeInput {
@@ -322,6 +333,7 @@ export class FieldOfflineRepository {
         firstReceivedAt,
         status: RECEIPT_STATUS_RECEIVED,
         firstTraceId: input.firstTraceId,
+        policyLeaseId: input.policyLeaseId,
       },
       select: receiptProjection,
     });

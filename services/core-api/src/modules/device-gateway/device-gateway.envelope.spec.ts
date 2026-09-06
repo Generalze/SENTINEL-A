@@ -1,4 +1,4 @@
-import { DEVICE_PURPOSE_PERMITTED_TRUST } from '@sentinel/contracts';
+import { DEVICE_PURPOSE_PERMITTED_TRUST, DEVICE_QUEUE_ADMISSION_PURPOSE } from '@sentinel/contracts';
 import { describe, expect, it } from 'vitest';
 import {
   DEVICE_GATEWAY_ASSIGNMENT_ACTION,
@@ -176,17 +176,37 @@ describe('WP-25/D25-11 the digest distinguishes what the security decision depen
 });
 
 describe('WP-25/D25-10 the frozen route tables', () => {
-  it('the operation kinds are exactly the five the routes declare', () => {
+  it('the operation kinds are exactly the six the routes declare', () => {
     // Adding a kind is a VISIBLE change to a frozen route table, which is the
-    // property D25-11 asked for. WP-27 added `DEVICE_ACTION`, and the
-    // per-kind tables below say what that selects.
+    // property D25-11 asked for — and this assertion is how it stays visible.
+    // WP-27 added `DEVICE_ACTION`; WP-29A added `OFFLINE_QUEUE_SUBMIT`. Each
+    // arrived by editing this list on purpose, and the per-kind tables below
+    // say what each one selects.
     expect([...DEVICE_GATEWAY_OPERATION_KINDS]).toEqual([
       'FIELD_STATE_UPDATE',
       'ASSIGNMENT_ACCEPT',
       'ASSIGNMENT_DECLINE',
       'INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE',
       'DEVICE_ACTION',
+      'OFFLINE_QUEUE_SUBMIT',
     ]);
+  });
+
+  it('WP-29A: a queued submission runs under OFFLINE_SYNC, not FIELD_OPERATION', () => {
+    // The two purposes admit the same trust states TODAY, so this selection
+    // changes no behaviour yet. It is still the one that must be made: the
+    // question "may this device's QUEUED work take effect?" has its own frozen
+    // purpose (C15-R2-final) precisely so it can be tightened later without
+    // also tightening live field operations. Picking the convenient one because
+    // the tables currently agree is how that distinction gets lost.
+    expect(DEVICE_GATEWAY_PURPOSE_FOR_KIND.OFFLINE_QUEUE_SUBMIT).toBe('OFFLINE_SYNC');
+    expect(DEVICE_GATEWAY_PURPOSE_FOR_KIND.OFFLINE_QUEUE_SUBMIT).toBe(DEVICE_QUEUE_ADMISSION_PURPOSE);
+    // Read from the frozen table, never restated: OFFLINE_SYNC admits TRUSTED
+    // and DEGRADED, so a device that reconnects while OFFLINE or SUSPICIOUS
+    // cannot drain its queue until an evidenced trust transition happens.
+    expect([...deviceGatewayPermittedTrustFor('OFFLINE_QUEUE_SUBMIT')]).toEqual([...DEVICE_PURPOSE_PERMITTED_TRUST.OFFLINE_SYNC]);
+    expect([...deviceGatewayPermittedTrustFor('OFFLINE_QUEUE_SUBMIT')]).not.toContain('OFFLINE');
+    expect([...deviceGatewayPermittedTrustFor('OFFLINE_QUEUE_SUBMIT')]).not.toContain('SUSPICIOUS');
   });
 
   it('WP-27: the ROUTE chooses the device-request purpose, and it is not FIELD_OPERATION for a device action', () => {

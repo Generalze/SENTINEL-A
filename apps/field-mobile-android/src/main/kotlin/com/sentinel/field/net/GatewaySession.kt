@@ -511,8 +511,15 @@ class GatewaySession(
      * resolved profile, and the wire field beside the signature is the device's
      * `claimed_signature_profile` — the same string, deliberately named
      * differently, and never derived from one another.
+     *
+     * WP-29A widened this from `private` to `internal`, and to nothing wider.
+     * `OfflineSubmission` has to mint a proof of exactly this shape to drain the
+     * offline queue, and the alternative was a second proof-minting site — which
+     * is the shape in which the two eventually disagree about a field, and a
+     * proof over the wrong bytes is refused with a signature failure, the least
+     * diagnosable refusal there is. ONE minter, used by every surface.
      */
-    private fun signProof(
+    internal fun signProof(
         contextId: String,
         organisationId: String,
         siteId: String,

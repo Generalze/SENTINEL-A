@@ -3,6 +3,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import {
   AuthenticatedDeviceContextSchema,
   DEVICE_CONTEXT_MAX_LIFETIME_MS,
+  DEVICE_OFFLINE_LEASE_MAX_LIFETIME_MS,
   DEVICE_PURPOSE_PERMITTED_TRUST,
   DeviceRequestProofSchema,
   canonicalDeviceRequestProofStatement,
@@ -40,6 +41,7 @@ import {
   type IssuedContextRow,
 } from './device-gateway.repository';
 import { DeviceGatewayTransactionRollback, isDeviceGatewayTransactionRollback } from './device-gateway.rollback';
+import { DevicePolicyLeaseService, WP29A_ADMITTED_OFFLINE_OPERATION_KINDS } from './device-policy-lease.service';
 import type { DeviceContextEstablishmentResult, DeviceGatewayPrincipalFacts, DeviceGatewayRefusal } from './device-gateway.types';
 
 /**
@@ -144,6 +146,7 @@ export class DeviceContextService {
     @Inject(DeviceRegistryService) private readonly registry: DeviceRegistryService,
     @Inject(DeviceReplayService) private readonly replay: DeviceReplayService,
     @Inject(P256KeyImporter) private readonly keys: P256KeyImporter,
+    @Inject(DevicePolicyLeaseService) private readonly leases: DevicePolicyLeaseService,
   ) {}
 
   /**
@@ -468,7 +471,7 @@ export class DeviceContextService {
     // FINAL TRANSACTION — one transaction, or nothing
     // ---------------------------------------------------------------------
     try {
-      return await this.repository.transaction(async (tx) => {
+      const established = await this.repository.transaction(async (tx) => {
         const locked = await this.repository.lockEstablishmentChallenge(tx, challengeRow.organisationId, input.establishmentId);
         if (locked === null) throw new DeviceGatewayTransactionRollback('ESTABLISHMENT_NOT_USABLE');
         const now = await this.repository.dbNow(tx);
@@ -595,8 +598,61 @@ export class DeviceContextService {
         // ASSEMBLED FROM THE COMMITTED ROW, not from the candidate. The
         // candidate `judge` built above is discarded here and has never left
         // this process.
-        return { outcome: 'ISSUED' as const, context: contextViewOf(record, [locked.siteId], facts.trust) };
+        const view = contextViewOf(record, [locked.siteId], facts.trust);
+        // `issuedContext` is the SAME object as `context`, carried a second time
+        // under a name whose type survives. `context` is deliberately `unknown`
+        // at the wire boundary, and narrowing on this field is what lets the
+        // lease below read the site without weakening that boundary for anyone
+        // else. A converged retry has no such field, which is precisely how the
+        // "issue a lease only on a fresh ceremony" rule is enforced by the type
+        // rather than by remembering to check.
+        return { outcome: 'ISSUED' as const, context: view, issuedContext: view };
       });
+
+      /**
+       * WP-29A / D29A-26 §13 — THE LEASE, MINTED AFTER THE CEREMONY COMMITS.
+       *
+       * AFTER, not inside. `DevicePolicyLeaseService` writes on the base client
+       * rather than this transaction's, so issuing it above would commit
+       * independently of the ceremony — and a rollback would leave a lease
+       * granting offline authority for a context that does not exist.
+       *
+       * ON ISSUED ONLY, AND DELIBERATELY NOT ON CONVERGED. A converged retry is
+       * the lost-response case (C17-03): the ceremony already succeeded, and
+       * minting a second lease for one ceremony would hand a device two live
+       * grants of cached authority for the price of re-sending a request. The
+       * retry therefore receives its context and no lease, so it may act live
+       * but may queue nothing until it establishes a fresh context. That is
+       * fail-closed and costs a five-minute ceremony; the alternative is
+       * unbounded lease minting driven by the client.
+       */
+      if ('issuedContext' in established) {
+        const siteId = established.issuedContext.authorised_site_ids[0];
+        const lease =
+          siteId === undefined
+            ? null
+            : await this.leases.issue({
+                context: established.issuedContext,
+                siteId,
+                // NOT caller-supplied. The device cannot name a scope, so it
+                // cannot ask for one wider than it holds; this is the WP-29A
+                // executable set, narrowed further by the actor's and the
+                // device's current authority inside `issue`.
+                requestedScope: WP29A_ADMITTED_OFFLINE_OPERATION_KINDS,
+                authorityBasisId:
+                  (await this.repository.findAuthorityBasis(
+                    established.issuedContext.organisation_id,
+                    established.issuedContext.actor_user_id,
+                    siteId,
+                  )) ?? '',
+                // The frozen ceiling, asked for in full. `issue` clamps it, so
+                // this is a request for "as long as policy allows", never a way
+                // to exceed it.
+                requestedLifetimeMs: DEVICE_OFFLINE_LEASE_MAX_LIFETIME_MS,
+              });
+        return { ...established, policyLease: lease };
+      }
+      return established;
     } catch (error) {
       if (isDeviceGatewayTransactionRollback(error)) {
         // The transaction is already rolled back. The audit event is written
