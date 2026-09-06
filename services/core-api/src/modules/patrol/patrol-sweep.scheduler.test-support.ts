@@ -1,4 +1,4 @@
-import type { PatrolSweepScheduler } from './patrol-sweep.scheduler';
+import type { PatrolSweepScheduler, PatrolSweepStartOptions } from './patrol-sweep.scheduler';
 
 /**
  * C13-01 test doubles for the patrol sweep cadence.
@@ -12,13 +12,19 @@ import type { PatrolSweepScheduler } from './patrol-sweep.scheduler';
  */
 
 /**
- * A scheduler that never fires. The boot sweep still runs (it is not the
- * scheduler's business), so a spec sees a deterministic single sweep at boot
- * and thereafter only the sweeps it drives itself.
+ * A scheduler that never fires ANYTHING.
+ *
+ * TI-01: this used to suppress only the repeating timer, because the boot sweep
+ * was performed by `PatrolMissedSweeper` before this class was ever consulted.
+ * A suite that installed this double still emitted one GLOBAL sweep across
+ * every tenant in the shared test database, which is how an unrelated suite's
+ * boot could stamp another suite's patrol checkpoint MISSED. `start` now owns
+ * the immediate execution as well, so declining to do anything here means
+ * exactly what it says.
  */
 export class NoopPatrolSweepScheduler implements PatrolSweepScheduler {
-  start(): void {
-    /* deliberately nothing: the whole purpose of this double */
+  async start(): Promise<void> {
+    /* deliberately nothing — including the immediate sweep. That is the point. */
   }
 
   stop(): void {
@@ -33,12 +39,17 @@ export class NoopPatrolSweepScheduler implements PatrolSweepScheduler {
  */
 export class RecordingPatrolSweepScheduler implements PatrolSweepScheduler {
   readonly starts: number[] = [];
+  /** TI-01: what each `start` asked for, so a test can prove production asks for the boot sweep. */
+  readonly immediateRequests: boolean[] = [];
   stopCount = 0;
-  private run: (() => void) | undefined;
+  private run: (() => Promise<void>) | undefined;
 
-  start(run: () => void, intervalMs: number): void {
+  async start(run: () => Promise<void>, intervalMs: number, options: PatrolSweepStartOptions): Promise<void> {
     this.run = run;
     this.starts.push(intervalMs);
+    this.immediateRequests.push(options.runImmediately);
+    // Deliberately does NOT honour `runImmediately`. This double records
+    // intent; a test that wants the sweep to happen calls `fire()`.
   }
 
   stop(): void {
@@ -47,7 +58,7 @@ export class RecordingPatrolSweepScheduler implements PatrolSweepScheduler {
   }
 
   /** Fires the scheduled callback once, on the test's own terms. */
-  fire(): void {
-    this.run?.();
+  async fire(): Promise<void> {
+    await this.run?.();
   }
 }
