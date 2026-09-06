@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadConfig } from '../../config/env.schema';
 import { PATROL_SWEEP_INTERVAL_MS, PatrolMissedSweeper } from './patrol-missed.sweeper';
 import { IntervalPatrolSweepScheduler } from './patrol-sweep.scheduler';
-import { RecordingPatrolSweepScheduler } from './patrol-sweep.scheduler.test-support';
+import { NoopPatrolSweepScheduler, RecordingPatrolSweepScheduler } from './patrol-sweep.scheduler.test-support';
 import type { PatrolRepository } from './patrol.repository';
 
 /**
@@ -79,8 +79,52 @@ describe('C13-01: the patrol sweep cadence is not configurable', () => {
     // argument the sweeper passed, not from a value the test supplied.
     expect(scheduler.starts).toEqual([5_000]);
     expect(scheduler.starts[0]).toBe(PATROL_SWEEP_INTERVAL_MS);
-    // And the boot sweep ran unconditionally, before any cadence existed.
+
+    // TI-01: the sweeper ASKS for a boot sweep and no longer performs one
+    // itself. That distinction is the entire correction, so it is asserted
+    // directly: the request is recorded, and this double declines to honour it,
+    // and therefore NO sweep has happened yet.
+    expect(scheduler.immediateRequests).toEqual([true]);
+    expect(calls).toEqual([]);
+
+    // The task it handed over is the real sweep, not a stub: firing it works.
+    await scheduler.fire();
     expect(calls).toEqual([100]);
+  });
+
+  it('TI-01: a Noop scheduler produces NO sweep at bootstrap', async () => {
+    // The regression for the defect itself, at unit level. Before TI-01 the
+    // sweeper called `sweep()` directly, so this count was 1 no matter which
+    // scheduler was installed — and because `sweepMissedOnce` has no
+    // organisation filter, that one sweep crossed every tenant in a shared
+    // test database.
+    const { repository, calls } = repositoryStub();
+    const sweeper = new PatrolMissedSweeper(repository, new NoopPatrolSweepScheduler());
+
+    await sweeper.onApplicationBootstrap();
+
+    expect(calls).toEqual([]);
+  });
+
+  it('TI-01: the REAL scheduler still sweeps immediately at boot, then repeats', async () => {
+    // The other half, and the one that matters for production: TI-01 moved who
+    // owns the boot sweep, never whether it happens. A restarted server must
+    // still catch up on checkpoints whose deadlines passed while it was down,
+    // without waiting for the first five-second tick.
+    vi.useFakeTimers();
+    try {
+      const { repository, calls } = repositoryStub();
+      const sweeper = new PatrolMissedSweeper(repository, new IntervalPatrolSweepScheduler());
+
+      await sweeper.onApplicationBootstrap();
+      // Immediately — before any timer has advanced at all.
+      expect(calls).toEqual([100]);
+
+      await vi.advanceTimersByTimeAsync(PATROL_SWEEP_INTERVAL_MS * 2);
+      expect(calls.length).toBe(3);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('the sweeper takes no configuration dependency it could read an interval from', () => {
@@ -95,10 +139,13 @@ describe('C13-01: the patrol sweep cadence is not configurable', () => {
     const sweeper = new PatrolMissedSweeper(repository, scheduler);
 
     await sweeper.onApplicationBootstrap();
-    expect(calls).toHaveLength(1);
+    // TI-01: this double records the request for an immediate sweep and
+    // declines to honour it, so nothing has run yet. The assertion that
+    // matters is the next one: what was handed over is the REAL sweep.
+    expect(calls).toHaveLength(0);
 
-    scheduler.fire();
-    await vi.waitFor(() => expect(calls).toHaveLength(2));
+    await scheduler.fire();
+    expect(calls).toHaveLength(1);
   });
 
   it('shutdown stops the cadence', async () => {
@@ -114,20 +161,23 @@ describe('C13-01: the patrol sweep cadence is not configurable', () => {
 
   // --- 3. the production scheduler genuinely repeats -----------------------
 
-  it('IntervalPatrolSweepScheduler fires on the interval and stops on stop()', () => {
+  it('IntervalPatrolSweepScheduler fires on the interval and stops on stop()', async () => {
     vi.useFakeTimers();
     const scheduler = new IntervalPatrolSweepScheduler();
     let fired = 0;
 
-    scheduler.start(() => {
+    // `runImmediately: false` isolates the CADENCE from the boot sweep, so the
+    // count below is the timer's work alone.
+    await scheduler.start(async () => {
       fired += 1;
-    }, PATROL_SWEEP_INTERVAL_MS);
+    }, PATROL_SWEEP_INTERVAL_MS, { runImmediately: false });
+    expect(fired).toBe(0);
 
-    vi.advanceTimersByTime(PATROL_SWEEP_INTERVAL_MS * 3);
+    await vi.advanceTimersByTimeAsync(PATROL_SWEEP_INTERVAL_MS * 3);
     expect(fired).toBe(3);
 
     scheduler.stop();
-    vi.advanceTimersByTime(PATROL_SWEEP_INTERVAL_MS * 5);
+    await vi.advanceTimersByTimeAsync(PATROL_SWEEP_INTERVAL_MS * 5);
     expect(fired).toBe(3);
 
     // Idempotent: a second stop (e.g. a repeated shutdown hook) is harmless.

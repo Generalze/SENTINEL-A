@@ -1,7 +1,9 @@
 import type { INestApplication } from '@nestjs/common';
-import { NestFactory } from '@nestjs/core';
+import { Test } from '@nestjs/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { AppModule } from '../src/app.module';
+import { PATROL_SWEEP_SCHEDULER } from '../src/modules/patrol/patrol-sweep.scheduler';
+import { NoopPatrolSweepScheduler } from '../src/modules/patrol/patrol-sweep.scheduler.test-support';
 import { PrismaService } from '../src/prisma/prisma.service';
 
 /**
@@ -37,9 +39,35 @@ function applyEnv(devAuth: boolean): void {
   process.env.DEV_AUTH_ENABLED = devAuth ? 'true' : 'false';
 }
 
+/**
+ * TI-01 — BUILT THROUGH THE TESTING MODULE SO THE SWEEPER CAN BE STUBBED.
+ *
+ * This used `NestFactory.create(AppModule)`, which admits no provider
+ * override, and it was consequently the ONLY suite in the repository running a
+ * live patrol sweeper: one sweep at bootstrap and another every five seconds
+ * for as long as the suite lived. `sweepMissedOnce` carries no organisation
+ * filter — correct for production, where one deployment serves every tenant —
+ * so that timer was a continuous global mutation of whatever rows the fifteen
+ * other live suites happened to be holding.
+ *
+ * The change is to TEST CONSTRUCTION ONLY. Nothing about how the application
+ * boots in production is touched: `Test.createTestingModule({ imports: [AppModule] })`
+ * builds the same module graph, the same global guard chain, the same
+ * controllers, and `createNestApplication` + `listen` still serves real HTTP on
+ * an ephemeral port. The single difference is that the patrol scheduler is a
+ * declared, explicit choice rather than an ambient inheritance.
+ *
+ * What this suite exists to prove — that the guard chain is wired and
+ * enforcing over real HTTP — is untouched by that, because it asserts nothing
+ * about patrols.
+ */
 async function bootApp(devAuth: boolean): Promise<{ app: INestApplication; base: string }> {
   applyEnv(devAuth);
-  const app = await NestFactory.create(AppModule, { logger: false });
+  const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
+    .overrideProvider(PATROL_SWEEP_SCHEDULER)
+    .useClass(NoopPatrolSweepScheduler)
+    .compile();
+  const app = moduleRef.createNestApplication({ logger: false });
   await app.listen(0, '127.0.0.1');
   const address = app.getHttpServer().address();
   const port = typeof address === 'object' && address ? address.port : 0;
