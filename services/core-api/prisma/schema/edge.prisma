@@ -1,0 +1,576 @@
+// SENTINEL Edge identity registry and enrolment ceremony (WP-29B, migration 26).
+// Owned exclusively by services/core-api/src/modules/edge-registry. This file
+// is PERSISTENCE ONLY: every rule it serves is already frozen in
+// packages/contracts/src/device-offline.ts (`EdgeRegistryKeyRecordSchema`,
+// `DeviceEdgeTrustStatusSchema`) and device-identity.ts. Nothing here re-states
+// a rule the contracts own; these tables make those rules DURABLE and put a
+// second, database-level defence under the ones that matter most.
+//
+// THE HOLE THIS SCHEMA CLOSES
+// ---------------------------
+// C15-02 said it plainly: AN EDGE RECEIPT NOBODY CAN VERIFY IS NOT EVIDENCE.
+// `evaluateOfflineOperationAdmissibility` asks for a `registeredEdgeKey` —
+// the record carrying the public key an Edge signature is checked against, the
+// server-selected profile, the key's lifecycle and the Edge's own trust — and
+// until now Sentinel stored no Edge key anywhere. The whole time-witness
+// argument rested on a verification that had nothing to run against, so every
+// time-bounded offline operation refused at NO_TRUSTWORTHY_TIME_WITNESS. This
+// is the record that verification resolves to.
+//
+// AN EDGE IS A PRINCIPAL, AND ENROLLING ONE IS NOT TRUST-ON-FIRST-USE
+// -------------------------------------------------------------------
+// D23-10 makes Edge a principal in its own right. A principal that could
+// register itself by turning up is not a principal, it is a door. So the
+// ceremony below starts with a HUMAN holding a capability, in a named
+// organisation and a named site, and the Edge never supplies its own tenancy:
+//
+//   authorised actor  ->  EdgeEnrolmentAuthority  (short-lived, one-use,
+//                                                  org+site bound, digest only)
+//   Edge generates its keypair LOCALLY, offers the public half
+//                     ->  EdgeEnrolmentRequest    (state PENDING; the EdgeNode
+//                                                  exists but is NOT trusted)
+//   server issues     ->  EdgePossessionChallenge (server-chosen nonce)
+//   Edge signs        ->  EdgePossessionVerification (the server's BOUND verdict)
+//   server resolves org+site from the AUTHORITY, never from the request
+//                     ->  EdgeRegistryKey CURRENT, EdgeNode ACTIVE/TRUSTED
+//
+// THE EDGE PRIVATE KEY IS NEVER HERE. It is generated on the Edge, in the Edge,
+// and never leaves it. There is no column in this file it could occupy, which
+// is the `EnrollmentBootstrapGrant` argument applied again: a structure with
+// nowhere to put a secret cannot leak one. The same is true of the enrolment
+// authority's bearer secret — `secret_digest` and nothing else.
+//
+// EXACTLY ONE SITE, AND WHY THAT IS A NARROWING RATHER THAN A CHANGE
+// ------------------------------------------------------------------
+// `EdgeRegistryKeyRecordSchema` carries `authorised_site_ids` as an array with
+// `.min(1)`, and its comment explains there is deliberately no org-wide
+// wildcard: "a time witness is only evidence about work it could actually have
+// observed". This schema binds an Edge to ONE site, and the record handed to
+// the evaluator is built with that single site as a one-element array. That is
+// strictly narrower than the contract permits and can only ever cause MORE
+// refusals — never fewer — so it cannot widen anything the frozen evaluator
+// checks. An Edge legitimately serving several sites arrives as a visible diff
+// against this line and against the composite key below, which is exactly the
+// review the contract's own comment asks for.
+//
+// LIVE STATE VERSUS HISTORY — the WP-17A rule, as applied by shield.prisma
+// ------------------------------------------------------------------------
+// The registry and the ceremony tables are LIVE STATE: composite tenant-aware
+// foreign keys, `onDelete: Restrict`, never a cascade. A withdrawn Edge's
+// registry row must stay resolvable long after the site is reorganised or the
+// authorising human leaves, because that is precisely when someone asks which
+// box witnessed a shift's work. Restrict REFUSES the erasing lifecycle change
+// rather than propagating it.
+//
+// `EdgeSecurityEvent` is the other half: an append-only artefact with NO
+// foreign keys at all, holding the identifiers AS RECORDED at the time, so the
+// trail survives even the deletions Restrict would otherwise forbid.
+//
+// WHAT THIS MIGRATION DELIBERATELY DOES NOT ABSORB
+// ------------------------------------------------
+// The Edge's local offline queue, offline operation payloads, the trusted-time
+// anchor signing key, WP-30 WAN state, and anything resembling a metrics
+// platform. The queue is Edge-local by definition and central holding a copy
+// would defeat the purpose; the signing key is deployment trust material and
+// `edge-trusted-time-signing-key.provider.ts` explains at length why it is not
+// in a database.
+
+/// THE EDGE PRINCIPAL. One box, one organisation, one site.
+///
+/// A ROW HERE IS NOT A TRUSTED EDGE, and the two columns that say so are
+/// deliberately separate.
+///
+/// `enrolment_state` is where the CEREMONY got to. `edge_trust` is the frozen
+/// contract's `DeviceEdgeTrustStatusSchema`, read by
+/// `evaluateOfflineOperationAdmissibility` and refused as EDGE_NOT_TRUSTED
+/// unless it is TRUSTED. C15-02 keeps them apart for a reason this table
+/// inherits: a perfectly valid key belonging to an Edge we have suspended must
+/// not witness anything, and a suspended Edge whose key was also rotated is two
+/// facts rather than one.
+///
+/// A new row starts PENDING and SUSPENDED. It becomes ACTIVE and TRUSTED only
+/// when a possession proof has been verified against the authority's own
+/// organisation and site — never at creation, and never because the Edge asked.
+///
+/// LIVE STATE — composite tenant-aware relations, Restrict.
+model EdgeNode {
+  /// The Edge identity itself, and the `edge_id` of the frozen record.
+  ///
+  /// SERVER-GENERATED. D24-10A's rule about key identity applies with more
+  /// force to the principal's own id: an Edge that picked its own identity
+  /// could choose to be an Edge that already exists, or one whose id collides
+  /// with a receipt already in the audit trail.
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+
+  /// The one site this Edge is deployed at. `@db.Text` because `sites.id` is a
+  /// cuid — a `@db.Uuid` here would make the composite foreign key below
+  /// unbuildable, and Postgres rejects that at APPLY time rather than at
+  /// generate time, so the mistake survives typecheck and fails in CI.
+  siteId String @map("site_id") @db.Text
+
+  /// PENDING | ACTIVE | WITHDRAWN. See this model's header.
+  enrolmentState String @map("enrolment_state") @db.Text
+
+  /// TRUSTED | SUSPENDED | REVOKED — the frozen `DeviceEdgeTrustStatusSchema`.
+  edgeTrust String @map("edge_trust") @db.Text
+
+  /// PROVENANCE, AND NEVER A LIVE AUTHORISATION INPUT (C14-02's rule, applied
+  /// to a box instead of a phone). The human whose capability authorised this
+  /// Edge into the estate. Being named here grants nothing to anybody: every
+  /// authorisation is still answered from the current authenticated principal
+  /// and their current entitlement.
+  enrolledByUserId String @map("enrolled_by_user_id") @db.Text
+
+  /// When the ceremony completed. NULL for as long as the Edge is PENDING, so
+  /// "has this Edge ever been trusted?" is answerable without reading history.
+  activatedAt DateTime? @map("activated_at") @db.Timestamptz(3)
+
+  /// Withdrawal is a STATE, never a deletion. Erasing the row would destroy the
+  /// provenance of every receipt this Edge ever witnessed — which is the only
+  /// evidence placing a shift's offline operations inside their lease windows.
+  withdrawnAt DateTime? @map("withdrawn_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organisation Organisation @relation(fields: [organisationId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  /// Composite, over `sites_id_organisation_key`: the database itself rejects
+  /// an org-A Edge deployed at an org-B site (the D24-04a rule).
+  site Site @relation(fields: [siteId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  enrolledByUser User @relation("EdgeEnrolledByUser", fields: [enrolledByUserId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
+  registryKeys      EdgeRegistryKey[]
+  enrolmentRequests EdgeEnrolmentRequest[]
+
+  /// Candidate key, deliberately redundant with the primary key — it is what
+  /// every child table here references, so a child binds to THIS Edge UNDER
+  /// THIS TENANT rather than to an id that merely exists.
+  @@unique([id, organisationId], map: "edges_id_organisation_key")
+  /// The roster query: every Edge at a site, at a given standing.
+  @@index([organisationId, siteId, enrolmentState])
+  @@map("edges")
+}
+
+// ===========================================================================
+// ENROLMENT CEREMONY
+// ===========================================================================
+
+/// AUTHORITY FOR A CEREMONY, NEVER A CREDENTIAL — D24-03's rule, for Edge.
+///
+/// On its own this authorises nothing to happen: it is bound to an
+/// organisation, a site and an issuing human; it is single-use, revocable, and
+/// bounded by a lifetime ceiling; and a second use is a conflict and a refusal,
+/// never a second Edge.
+///
+/// THERE IS NO SECRET COLUMN, AND THAT IS THE POINT.
+///
+/// The bearer secret exists only in transit: cryptographically random entropy,
+/// returned ONCE to the authorised issuing caller, and persisted ONLY as
+/// `secret_digest`. It is never persisted raw, never logged and never placed in
+/// an audit payload. This is not a rule a service is asked to remember — a
+/// structure with nowhere to put a raw secret cannot leak one. A future column
+/// named `secret` would be a schema change and therefore a reviewable diff,
+/// which is precisely the property prose could not give.
+///
+/// THIS IS WHERE ORG AND SITE COME FROM. At activation the server reads the
+/// tenancy off THIS ROW, never off the Edge's request. An Edge that could name
+/// its own organisation could enrol into somebody else's.
+///
+/// CEREMONY STATE — composite tenant-aware relations, Restrict.
+model EdgeEnrolmentAuthority {
+  /// `id` IS the `authority_id`.
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  siteId String @map("site_id") @db.Text
+
+  /// The human this authority is auditable to, and the holder of the
+  /// capability that produced it. AN EDGE CAN NEVER APPEAR HERE: the column is
+  /// a `users` foreign key, so "the Edge granted itself authority" is not a
+  /// state this table can hold.
+  issuedByUserId String @map("issued_by_user_id") @db.Text
+
+  /// The DIGEST of the bearer secret, and the only form of it that exists at
+  /// rest. A presented secret is digested and resolved through the unique index
+  /// below; the raw value is never compared against anything at rest, because
+  /// the raw value is not at rest.
+  secretDigest String @map("secret_digest") @db.Text
+
+  issuedAt DateTime @map("issued_at") @db.Timestamptz(3)
+  /// Exclusive boundary, per the existing WP-23 doctrine (`isExpiredAt`).
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(3)
+
+  /// Set when the authority is BURNED. Presenting it in an unexpected
+  /// organisation or site context ALSO burns it and raises a security event:
+  /// a probe is not a typo, and an authority that survives being probed is one
+  /// an attacker may keep trying (D24-03a).
+  consumedAt DateTime? @map("consumed_at") @db.Timestamptz(3)
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  site Site @relation(fields: [siteId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  issuedByUser User @relation("EdgeEnrolmentAuthorityIssuedBy", fields: [issuedByUserId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
+  enrolmentRequests EdgeEnrolmentRequest[]
+
+  /// THE LOOKUP KEY. Unique within the tenant, so one digest names at most one
+  /// authority and a presented secret has exactly one possible meaning.
+  @@unique([organisationId, secretDigest], map: "edge_enrolment_authority_secret_digest_key")
+  /// Candidate key so a request binds to THIS authority UNDER THIS TENANT.
+  @@unique([id, organisationId], map: "edge_enrolment_authority_tenant_key")
+  /// "What authorities are outstanding at this site."
+  @@index([organisationId, siteId, expiresAt])
+  @@map("edge_enrolment_authorities")
+}
+
+/// One enrolment attempt: an Edge's locally generated public key offered for
+/// registration under a named authority.
+///
+/// The offered key lives HERE and not in the registry, deliberately. A registry
+/// row is a key Sentinel will verify signatures against; until possession has
+/// been proved there is no such key, only a claim. Keeping the claim in the
+/// ceremony table means every row in `edge_registry_keys` is, by construction,
+/// a key someone proved they hold — and it means every persisted registry row
+/// parses as the frozen `EdgeRegistryKeyRecordSchema`, whose lifecycle enum has
+/// no "pending" member to abuse.
+///
+/// CEREMONY STATE — composite tenant-aware relations, Restrict.
+model EdgeEnrolmentRequest {
+  /// `id` IS the `enrolment_request_id`.
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  /// Copied from the AUTHORITY at creation, never accepted from the requester.
+  siteId String @map("site_id") @db.Text
+
+  authorityId String @map("authority_id") @db.Uuid
+  /// The PENDING Edge this request will activate. Created alongside the
+  /// request so the possession statement has a stable identity to bind to.
+  edgeId String @map("edge_id") @db.Uuid
+
+  /// The canonical uncompressed SEC1 point the Edge offered, base64url, exactly
+  /// as `DeviceP256PublicKeySchema` defines it. Its curve validity is checked at
+  /// the runtime boundary (`P256KeyImporter`) before this row is written.
+  offeredPublicKey String @map("offered_public_key") @db.Text
+  /// A convenience name for the value above, refused unless it equals the digest
+  /// DERIVED from it. Never independently trusted, never a substitute.
+  offeredPublicKeyThumbprint String @map("offered_public_key_thumbprint") @db.Text
+
+  /// SERVER-selected, and the only thing that ever selects a verifier
+  /// (C11-04 / C15-01). An Edge's claimed profile is checked against this,
+  /// never the reverse.
+  signatureProfile String @map("signature_profile") @db.Text
+
+  /// PENDING | ACTIVATED | REJECTED.
+  state String @db.Text
+
+  /// The canonical fingerprint of this request, bound into the possession
+  /// verdict so a verdict produced for another request cannot be borrowed.
+  requestFingerprint String @map("request_fingerprint") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  authority EdgeEnrolmentAuthority @relation(fields: [authorityId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  edge EdgeNode @relation(fields: [edgeId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  site Site @relation(fields: [siteId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
+  challenges    EdgePossessionChallenge[]
+  verifications EdgePossessionVerification[]
+  registryKeys  EdgeRegistryKey[]
+
+  /// Candidate key so a challenge, a verdict and a registry key all bind to
+  /// THIS request UNDER THIS TENANT.
+  @@unique([id, organisationId], map: "edge_enrolment_request_tenant_key")
+  /// SINGLE-USE, ENFORCED BELOW THE SERVICE LAYER.
+  ///
+  /// The activation path is a single transaction that re-reads and locks the
+  /// authority, and that is what makes the normal path sound. This constraint
+  /// is what makes it sound anyway when the normal path is not taken: a
+  /// retried request racing itself, a crashed transaction re-driven, or a
+  /// service-bypassing writer CANNOT open a second ceremony against one
+  /// authority. A second insert is a unique violation, not a second Edge.
+  @@unique([organisationId, authorityId], map: "edge_enrolment_request_authority_key")
+  /// ONE REQUEST PER PENDING EDGE, for the same reason `devices_enrollment_request_key`
+  /// exists: one ceremony, one identity, and no path that mints a second.
+  @@unique([organisationId, edgeId], map: "edge_enrolment_request_edge_key")
+  @@map("edge_enrolment_requests")
+}
+
+/// The proof-of-possession challenge. SERVER-generated, single-ceremony,
+/// lifetime-bounded.
+///
+/// The Edge never chooses what it is asked to sign. A challenge is bound to one
+/// enrolment request, so a proof for request A can never activate request B —
+/// and the composite candidate key below makes that a referential-integrity
+/// fact rather than a comparison a service is trusted to perform.
+///
+/// CEREMONY STATE — composite tenant-aware relation, Restrict.
+model EdgePossessionChallenge {
+  /// `id` IS the `challenge_id`.
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  enrolmentRequestId String @map("enrolment_request_id") @db.Uuid
+
+  /// SERVER-generated, from a CSPRNG. Unpredictable is the whole property: a
+  /// challenge an attacker can anticipate is a challenge they can pre-sign.
+  nonce String @db.Text
+
+  issuedAt DateTime @map("issued_at") @db.Timestamptz(3)
+  /// Exclusive boundary, per the existing WP-23 doctrine.
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  enrolmentRequest EdgeEnrolmentRequest @relation(fields: [enrolmentRequestId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  verifications EdgePossessionVerification[]
+
+  /// C16-08's candidate key, for Edge. A verification names a challenge, a
+  /// request and a tenant; without this key those are three independent scalars
+  /// that only a service compares, so a verdict could be written against a
+  /// challenge belonging to ANOTHER request or ANOTHER tenant and the database
+  /// would accept it. With the composite reference the inconsistent tuple
+  /// cannot be stored at all.
+  @@unique([id, organisationId, enrolmentRequestId], map: "edge_possession_challenge_request_tuple_key")
+  @@index([organisationId, enrolmentRequestId])
+  @@map("edge_possession_challenges")
+}
+
+/// THE SERVER'S BOUND VERDICT — never a naked boolean (C15-03).
+///
+/// `verified` is a real, recordable answer and `false` is a real verdict; but it
+/// is never readable on its own. Every column beside it is a BINDING, so a
+/// verdict produced for another challenge, another request, another request
+/// fingerprint, another key or another signature profile is STRUCTURALLY
+/// unusable here rather than merely wrong.
+///
+/// `verified_at` is THE SERVER'S verification instant. Freshness is judged on
+/// it and never on anything the Edge reported about when it signed.
+///
+/// CEREMONY STATE — composite tenant-aware relations, Restrict.
+model EdgePossessionVerification {
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  challengeId String @map("challenge_id") @db.Uuid
+  enrolmentRequestId String @map("enrolment_request_id") @db.Uuid
+
+  /// The fingerprint of the request this verdict was produced against.
+  enrolmentRequestFingerprint String @map("enrolment_request_fingerprint") @db.Text
+  /// The OFFERED key's identity, so a verdict for another key cannot be
+  /// borrowed. This is the column that makes "a wrong-key proof" unusable:
+  /// activation compares it against the request's own thumbprint.
+  publicKeyThumbprint String @map("public_key_thumbprint") @db.Text
+  /// The exact canonical possession statement the signature was checked over.
+  possessionStatementFingerprint String @map("possession_statement_fingerprint") @db.Text
+  /// The SERVER-selected profile the check actually ran under (C15-01).
+  signatureProfile String @map("signature_profile") @db.Text
+
+  verified Boolean
+  verifiedAt DateTime @map("verified_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  enrolmentRequest EdgeEnrolmentRequest @relation(fields: [enrolmentRequestId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  /// The DATABASE holds the verification tuple together: a verdict naming a
+  /// challenge from another request or another tenant is a foreign-key
+  /// violation, not a service oversight.
+  challenge EdgePossessionChallenge @relation(fields: [challengeId, organisationId, enrolmentRequestId], references: [id, organisationId, enrolmentRequestId], onDelete: Restrict, onUpdate: Cascade)
+
+  /// ONE VERDICT PER CHALLENGE. A challenge that could accumulate verdicts is a
+  /// challenge that can be answered until one of the answers is `true`.
+  @@unique([organisationId, challengeId], map: "edge_possession_verification_challenge_key")
+  @@map("edge_possession_verifications")
+}
+
+// ===========================================================================
+// THE REGISTRY
+// ===========================================================================
+
+/// THE RECORD `evaluateOfflineOperationAdmissibility` RESOLVES TO.
+///
+/// This is the durable server side of the frozen `EdgeRegistryKeyRecordSchema`.
+/// Every column exists because that contract reads it, and the mapping is
+/// one-to-one apart from `authorised_site_ids`, which is derived from the
+/// owning `EdgeNode`'s single site (see this file's header) rather than stored
+/// twice — a second copy of a tenancy fact is a second thing to disagree with.
+/// `edge_trust` likewise lives on the `EdgeNode`, because it is the PRINCIPAL's
+/// trust and not the key's: C15-02 keeps them apart and so does this schema.
+///
+/// A ROW HERE MEANS POSSESSION WAS PROVED. There is no lifecycle state for
+/// "offered but unverified" — that claim lives on the enrolment request — so
+/// every row parses as the frozen record and the evaluator never sees a key
+/// nobody demonstrated they hold.
+///
+/// LIVE WHILE IT LASTS, HISTORICAL FOREVER AFTER. A withdrawn key must stay
+/// resolvable: `deviceKeyStatePermitsHistoricalVerification` admits a ROTATED
+/// key precisely so a receipt it legitimately signed can still be checked, and
+/// deleting the row would make a shift's worth of Edge receipts unverifiable
+/// after the fact.
+///
+/// LIVE STATE — composite tenant-aware relations, Restrict.
+model EdgeRegistryKey {
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  /// `@db.Uuid`, matching `edges.id`. A TEXT column here against a UUID target
+  /// makes the composite foreign key below unbuildable, and Postgres rejects it
+  /// at apply time rather than at generate time.
+  edgeId String @map("edge_id") @db.Uuid
+
+  /// The ceremony that produced this key, so the registry can always name the
+  /// authority and the human behind any key in the estate.
+  enrolmentRequestId String @map("enrolment_request_id") @db.Uuid
+
+  /// The key's own identity, SERVER-generated. An Edge that picked its own key
+  /// identity would shape registry history (D24-10A).
+  edgeKeyId String @map("edge_key_id") @db.Text
+  edgeKeyVersion Int @map("edge_key_version")
+
+  /// THE ACTUAL KEY: the canonical uncompressed SEC1 point, base64url, exactly
+  /// as `DeviceP256PublicKeySchema` defines it.
+  ///
+  /// A THUMBPRINT ALONE CANNOT VERIFY AN ECDSA SIGNATURE, and a registry that
+  /// cannot verify is not a registry — C15-02, verbatim. The digest below is a
+  /// convenience name for this value, refused unless it equals the value
+  /// DERIVED from it, and never a substitute for this column.
+  publicKey String @map("public_key") @db.Text
+  publicKeyThumbprint String @map("public_key_thumbprint") @db.Text
+
+  /// SERVER-selected. A receipt's `claimed_edge_signature_profile` is bound to
+  /// this and refused as EDGE_SIGNATURE_PROFILE_CLAIM_MISMATCH on a mismatch.
+  signatureProfile String @map("signature_profile") @db.Text
+
+  /// CURRENT | ROTATED | REVOKED | COMPROMISED — `DeviceKeyLifecycleStateSchema`,
+  /// the same four states a device key uses, because the questions asked of
+  /// them are the same questions.
+  status String @db.Text
+
+  registeredAt DateTime @map("registered_at") @db.Timestamptz(3)
+  /// When this key became usable. Equal to `registered_at` on the enrolment
+  /// path and kept separate anyway, because a rotation records the two at
+  /// different moments and a column that means two things is a column nobody
+  /// can query.
+  activatedAt DateTime @map("activated_at") @db.Timestamptz(3)
+
+  /// TWO SEPARATE COLUMNS, DELIBERATELY — D24-09, applied to Edge.
+  ///
+  /// `rotated_at` records that a routine rotation superseded this version;
+  /// `revoked_at` records that the credential was withdrawn or declared
+  /// compromised. Collapsing them into one "ended_at" would make a rotated key
+  /// and a stolen key indistinguishable after the fact, and they are the two
+  /// facts an incident investigation most needs to tell apart.
+  ///
+  /// C15-R4-final: `status` and `revoked_at` are asked INDEPENDENTLY at
+  /// runtime, because they do not move atomically. The frozen evaluator refuses
+  /// EDGE_CREDENTIAL_REVOKED on the instant alone, whatever the status says.
+  rotatedAt DateTime? @map("rotated_at") @db.Timestamptz(3)
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  edge EdgeNode @relation(fields: [edgeId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  enrolmentRequest EdgeEnrolmentRequest @relation(fields: [enrolmentRequestId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
+  /// A KEY VERSION IS NEVER REUSED. With this constraint a second registration
+  /// at an existing version is a unique violation rather than a second
+  /// credential competing to be believed.
+  @@unique([organisationId, edgeId, edgeKeyVersion], map: "edge_registry_key_version_key")
+  /// A key id resolves to exactly one key within a tenant: the lookup performed
+  /// when a receipt names the credential it signed with.
+  @@unique([organisationId, edgeKeyId], map: "edge_registry_key_id_key")
+  /// THE TUPLE A RECEIPT NAMES. `DeviceEdgeReceipt` carries `edge_id`,
+  /// `edge_key_id` and `edge_key_version` together, and the frozen evaluator
+  /// refuses EDGE_KEY_NOT_USABLE unless the registry record matches all three.
+  /// The two uniques above constrain those facts SEPARATELY; this one ties the
+  /// whole tuple, so a record naming one Edge while carrying another's key
+  /// cannot exist for the evaluator to be handed.
+  @@unique([organisationId, edgeId, edgeKeyId, edgeKeyVersion], map: "edge_registry_key_identity_tuple_key")
+  /// ONE KEY PER CEREMONY, enforced below the service layer — the
+  /// `devices_enrollment_request_key` argument exactly. A duplicate activation,
+  /// a retried request racing itself or a crashed transaction re-driven CANNOT
+  /// mint a second active key off one proved possession; an exact retry
+  /// converges on the same registry identity.
+  @@unique([organisationId, enrolmentRequestId], map: "edge_registry_key_enrolment_request_key")
+  /// AT MOST ONE `CURRENT` KEY PER (tenant, Edge), ENFORCED BY THE DATABASE.
+  ///
+  /// PRISMA CANNOT MODEL A PARTIAL UNIQUE INDEX, and an unconditional unique on
+  /// (organisation_id, edge_id) would forbid an Edge from ever holding a second
+  /// key version at all — the opposite of what rotation requires. So the
+  /// constraint is expressed in the migration SQL and THE SQL IS AUTHORITATIVE:
+  ///
+  ///     CREATE UNIQUE INDEX "edge_registry_keys_one_current_key"
+  ///       ON "edge_registry_keys"("organisation_id","edge_id")
+  ///       WHERE "status" = 'CURRENT';
+  ///
+  /// Declared here as a comment rather than silently omitted, following
+  /// `device_keys_one_current_key`, so a reader of this file learns the index
+  /// exists. `prisma migrate diff` will not reproduce it and it must be carried
+  /// forward by hand if these tables are ever regenerated.
+  @@map("edge_registry_keys")
+}
+
+// ===========================================================================
+// HISTORICAL ARTEFACT — append-only
+// ===========================================================================
+
+/// The Edge enrolment and lifecycle trail.
+///
+/// HISTORICAL ARTEFACT — NO Edge, Site or User foreign key at all, deliberately,
+/// per the WP-17A doctrine this file's header restates and
+/// `DeviceSecurityEvent` already follows. The `Restrict` relations on the live
+/// tables above refuse an erasing lifecycle change; this table survives one.
+/// Between them the estate can always answer what happened, whether or not the
+/// things it happened to still exist. The identifiers here are the identifiers
+/// AS RECORDED at the time.
+///
+/// `payload` carries D23-14's shape and nothing else: identities, instants,
+/// outcomes and refusal codes. NO raw enrolment secret, no private key, no
+/// challenge nonce, no signature — the same list `DEVICE_AUDIT_FORBIDDEN_FIELDS`
+/// enumerates, and the same reason. An audit trail that discloses the material
+/// it audits is a second copy of the secret.
+model EdgeSecurityEvent {
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+
+  /// NULLABLE plain column: authority issuance legitimately PRECEDES the
+  /// existence of any Edge.
+  edgeId String? @map("edge_id") @db.Uuid
+  /// NULLABLE plain column: the site an event concerns, as recorded.
+  siteId String? @map("site_id") @db.Text
+
+  eventType String @map("event_type") @db.Text
+
+  /// NULLABLE plain column: many of these events have no human actor — an
+  /// expiry is not somebody's action.
+  actorUserId String? @map("actor_user_id") @db.Text
+
+  /// The registry identity an event concerns, where there is one. NEVER key
+  /// material.
+  edgeKeyId String? @map("edge_key_id") @db.Text
+  edgeKeyVersion Int? @map("edge_key_version")
+
+  outcome String? @db.Text
+  refusalCode String? @map("refusal_code") @db.Text
+
+  payload Json @default("{}")
+
+  occurredAt DateTime @map("occurred_at") @db.Timestamptz(3)
+  traceId String @map("trace_id") @db.Text
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  /// "Show me every withdrawal in this tenant" — the event-type sweep.
+  @@index([organisationId, eventType, occurredAt])
+  /// "Show me everything that ever happened to this Edge."
+  @@index([organisationId, edgeId, occurredAt])
+  @@map("edge_security_events")
+}

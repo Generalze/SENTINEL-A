@@ -43,6 +43,8 @@
  * | device.key.rotate  | Authorise a device key rotation                    |
  * | device.revoke      | Revoke / quarantine / declare a device compromised |
  * | device.trust.restore | Restore trust to a SUSPECTED device (contract-named) |
+ * | edge.enrolment.authorise | Issue a one-use Edge enrolment authority for a site |
+ * | edge.revoke        | Withdraw an Edge and revoke its registry key       |
  *
  * §62 role -> action table (source of truth for RBAC; site/clearance/
  * purpose are attribute-based constraints layered on top by AccessGuard,
@@ -52,6 +54,7 @@
  * |---------------------|-------------------------------------------------------------------|
  * | site.commander      | incident.view, incident.close, field.acknowledge, evidence.read  |
  * |                     | ... and all seven device.* actions (WP-24, D24-02/D24-02b)        |
+ * |                     | ... and both edge.* actions (WP-29B); no other role holds either  |
  * | operator            | incident.view, presence.view, event.ingest                       |
  * |                     | ... and device.registry.read, nothing else (WP-24, D24-02)       |
  * | dispatcher          | incident.view, presence.view                                     |
@@ -167,6 +170,35 @@ export const ACTIONS = [
   // Effective authority today is UNCHANGED: site.commander holds both, and no
   // other role holds either.
   'device.trust.restore',
+  // WP-29B/migration 26: EDGE AUTHORITY IS ITS OWN, AND NOT A DEVICE ACTION.
+  //
+  // Two SEPARATE capabilities, because authorising a box into the estate and
+  // withdrawing one are two different powers over the same subject — the same
+  // split D24-02 made for `device.enrollment.issue` and `device.revoke`.
+  //
+  // NEITHER IS `device.enrollment.issue`, AND THE DIFFERENCE IS NOT COSMETIC.
+  // That action authorises a PHONE into one operative's hands, under a named
+  // custody régime, whose every offline operation is still judged against a
+  // policy lease. This one authorises a box in a wiring closet to become the
+  // TIME WITNESS for an entire site: an Edge receipt is what places other
+  // people's offline operations inside their lease windows, so an Edge enrolled
+  // by mistake — or by an attacker who reached an account that could enrol
+  // phones — can vouch for when a whole site's work happened. Folding this into
+  // the device vocabulary would mean everyone who may issue a phone grant
+  // silently acquires that, which is exactly the inheritance D24-02 exists to
+  // prevent and the argument WP-18 made for
+  // incident.field-message.oversight.read.
+  //
+  // AN EDGE CANNOT HOLD EITHER OF THESE. This table is RBAC over `users`, an
+  // Edge is not a user, and `edge_enrolment_authorities.issued_by_user_id` is a
+  // foreign key into `users` — so "the Edge granted itself authority" is not a
+  // state the database can hold, let alone one this table could express.
+  //
+  // Every grant remains organisation- and site-scoped through the existing ABAC
+  // boundary, and the service additionally resolves SITE scope against the row
+  // being acted on, which a decorator cannot.
+  'edge.enrolment.authorise',
+  'edge.revoke',
   'event.ingest',
   'event.read',
   'evidence.ingest',
@@ -202,7 +234,7 @@ export const ROLE_ACTIONS: Readonly<Record<Role, readonly Action[]>> = {
   // whisperActivationApproverIsDistinct, which refuses a creator approving
   // their own version. Splitting the two across roles would have been a
   // different (and unmandated) org design.
-  'site.commander': ['incident.view', 'incident.close', 'incident.silent.approve', 'field.acknowledge', 'field.assignment.manage', 'field.state.read', 'evidence.read', 'event.read', 'hypothesis.read', 'field.message.send', 'field.message.read', 'field.message.acknowledge', 'incident.field-message.oversight.read', 'patrol.route.read', 'patrol.route.manage', 'patrol.run.read', 'patrol.run.manage', 'whisper.signal.read', 'whisper.signal.manage', 'whisper.signal.approve', 'device.registry.read', 'device.enrollment.issue', 'device.enrollment.approve', 'device.trust.manage', 'device.key.rotate', 'device.revoke', 'device.trust.restore'],
+  'site.commander': ['incident.view', 'incident.close', 'incident.silent.approve', 'field.acknowledge', 'field.assignment.manage', 'field.state.read', 'evidence.read', 'event.read', 'hypothesis.read', 'field.message.send', 'field.message.read', 'field.message.acknowledge', 'incident.field-message.oversight.read', 'patrol.route.read', 'patrol.route.manage', 'patrol.run.read', 'patrol.run.manage', 'whisper.signal.read', 'whisper.signal.manage', 'whisper.signal.approve', 'device.registry.read', 'device.enrollment.issue', 'device.enrollment.approve', 'device.trust.manage', 'device.key.rotate', 'device.revoke', 'device.trust.restore', 'edge.enrolment.authorise', 'edge.revoke'],
   // WP-24/D24-02: operator gains device.registry.read and NOTHING else. Seeing
   // that a device exists and where its standing sits is a monitoring need; it
   // is not authority to enrol, approve, re-trust, rotate or revoke anything.

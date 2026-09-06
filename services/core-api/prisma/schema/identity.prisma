@@ -22,6 +22,9 @@ model Organisation {
   /// Required by Prisma for the relation declared in shield.prisma; it adds
   /// no column and no behaviour to Identity.
   devices Device[]
+  /// WP-29B back-relation for the direct tenant FK every Edge carries. Adds no
+  /// column and no behaviour to Identity.
+  edges EdgeNode[]
 
   @@map("organisations")
 }
@@ -69,6 +72,13 @@ model Site {
   deviceEnrollmentRequests EnrollmentRequest[]
   /// C16-01: the server-issued custody-regime catalogue is scoped to one site.
   deviceCustodyRegimes DeviceCustodyRegime[]
+  /// WP-29B back-relations. Required by Prisma for the composite
+  /// (site_id, organisation_id) relations declared in edge.prisma. They add no
+  /// column and no behaviour to Identity, and the direction of ownership is
+  /// unchanged: the Edge registry references the site, never the reverse.
+  edges EdgeNode[]
+  edgeEnrolmentAuthorities EdgeEnrolmentAuthority[]
+  edgeEnrolmentRequests EdgeEnrolmentRequest[]
   /// WP-25 back-relations. Required by Prisma for the composite
   /// (site_id, organisation_id) relations declared in device-gateway.prisma;
   /// they add no column and no behaviour to Identity. Neither is authority: a
@@ -168,6 +178,13 @@ model User {
   /// second operative ride the first one's cached authority. It is still a
   /// binding and never a grant.
   devicePolicyLeases DevicePolicyLease[]
+
+  /// WP-29B back-relations. PROVENANCE ONLY, in the C14-02 spirit these tables
+  /// already follow: being named as the human who authorised an Edge into the
+  /// estate grants nobody anything, and neither list is ever consulted to
+  /// answer a live authorisation question.
+  edgesEnrolled EdgeNode[] @relation("EdgeEnrolledByUser")
+  edgeEnrolmentAuthoritiesIssued EdgeEnrolmentAuthority[] @relation("EdgeEnrolmentAuthorityIssuedBy")
 
   @@unique([organisationId, email])
   /// WP-24 / D24-04a: a candidate key, deliberately redundant with the primary

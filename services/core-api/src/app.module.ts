@@ -23,6 +23,7 @@ import { FieldOfflineModule } from './modules/field-offline/field-offline.module
 import { PatrolModule } from './modules/patrol/patrol.module';
 import { DeviceEnrollmentIngressModule } from './modules/device-enrollment-ingress/device-enrollment-ingress.module';
 import { DeviceGatewayModule } from './modules/device-gateway/device-gateway.module';
+import { EdgeRegistryModule } from './modules/edge-registry/edge-registry.module';
 import { EdgeTrustedTimeModule } from './modules/edge-trusted-time/edge-trusted-time.module';
 import { ShieldModule } from './modules/shield/shield.module';
 import { WhisperModule } from './modules/whisper/whisper.module';
@@ -101,6 +102,14 @@ import { WhisperModule } from './modules/whisper/whisper.module';
     // carrying forward came from central rather than from a file somebody
     // edited. See the module header for why the key provider is not exported.
     EdgeTrustedTimeModule,
+    // WP-29B / migration 26 — the central Edge identity registry and its
+    // enrolment ceremony. Registered for dependency wiring only: the module
+    // declares NO controller, so this adds no HTTP surface. It closes C15-02 —
+    // an Edge receipt nobody can verify is not evidence — by giving
+    // `evaluateOfflineOperationAdmissibility` a registry record to resolve, and
+    // it does so through a ceremony that starts with a human capability rather
+    // than with an Edge turning up.
+    EdgeRegistryModule,
   ],
 })
 export class AppModule {}
