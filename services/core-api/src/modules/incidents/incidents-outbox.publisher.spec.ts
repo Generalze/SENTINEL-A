@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { IntervalOutboxPublishScheduler } from '../../common/scheduling/outbox-publish.scheduler';
 import { IncidentsOutboxPublisher } from './incidents-outbox.publisher';
 
 describe('IncidentsOutboxPublisher', () => {
@@ -17,7 +18,7 @@ describe('IncidentsOutboxPublisher', () => {
     };
     const nc = { publish: vi.fn(), flush: vi.fn().mockRejectedValueOnce(new Error('nats down')) };
     const nats = { isConfigured: vi.fn().mockReturnValue(true), getConnection: vi.fn().mockResolvedValue(nc) };
-    const publisher = new IncidentsOutboxPublisher(repository as never, nats as never);
+    const publisher = new IncidentsOutboxPublisher(repository as never, nats as never, new IntervalOutboxPublishScheduler());
 
     await expect(publisher.sweep()).resolves.toBe(0);
     expect(repository.markOutboxPublished).not.toHaveBeenCalled();
@@ -31,7 +32,7 @@ describe('IncidentsOutboxPublisher', () => {
   it('does nothing when NATS is not configured', async () => {
     const repository = { pendingOutbox: vi.fn(), markOutboxPublished: vi.fn() };
     const nats = { isConfigured: vi.fn().mockReturnValue(false), getConnection: vi.fn() };
-    const publisher = new IncidentsOutboxPublisher(repository as never, nats as never);
+    const publisher = new IncidentsOutboxPublisher(repository as never, nats as never, new IntervalOutboxPublishScheduler());
 
     await expect(publisher.sweep()).resolves.toBe(0);
     expect(repository.pendingOutbox).not.toHaveBeenCalled();
@@ -44,7 +45,7 @@ describe('IncidentsOutboxPublisher', () => {
     });
     const repository = { pendingOutbox: vi.fn().mockReturnValue(rowsPending), markOutboxPublished: vi.fn() };
     const nats = { isConfigured: vi.fn().mockReturnValue(true), getConnection: vi.fn() };
-    const publisher = new IncidentsOutboxPublisher(repository as never, nats as never);
+    const publisher = new IncidentsOutboxPublisher(repository as never, nats as never, new IntervalOutboxPublishScheduler());
 
     const first = publisher.sweep();
     await expect(publisher.sweep()).resolves.toBe(0);
@@ -58,7 +59,7 @@ describe('IncidentsOutboxPublisher', () => {
     vi.useFakeTimers();
     const repository = { pendingOutbox: vi.fn(), markOutboxPublished: vi.fn() };
     const nats = { isConfigured: vi.fn().mockReturnValue(false), getConnection: vi.fn() };
-    const publisher = new IncidentsOutboxPublisher(repository as never, nats as never);
+    const publisher = new IncidentsOutboxPublisher(repository as never, nats as never, new IntervalOutboxPublishScheduler());
     const sweepSpy = vi.spyOn(publisher, 'sweep').mockResolvedValue(0);
 
     await publisher.onApplicationBootstrap();

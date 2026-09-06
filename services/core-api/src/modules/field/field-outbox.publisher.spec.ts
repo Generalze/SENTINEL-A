@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { NatsProvider } from '../../infra/nats.provider';
 import type { PrismaService } from '../../prisma/prisma.service';
+import { NoopOutboxPublishScheduler } from '../../common/scheduling/outbox-publish.scheduler.test-support';
 import { FieldOutboxPublisher } from './field-outbox.publisher';
 import { fieldUpdatedSubject } from './field.constants';
 
@@ -23,7 +24,7 @@ function harness(rows: OutboxRow[]): {
     isConfigured: () => true,
     getConnection: vi.fn().mockResolvedValue({ publish, flush: vi.fn().mockResolvedValue(undefined) }),
   } as unknown as NatsProvider;
-  return { publisher: new FieldOutboxPublisher(prisma, nats), publish, updateMany };
+  return { publisher: new FieldOutboxPublisher(prisma, nats, new NoopOutboxPublishScheduler()), publish, updateMany };
 }
 
 describe('FieldOutboxPublisher (WP-17/D2, D3)', () => {
@@ -57,7 +58,7 @@ describe('FieldOutboxPublisher (WP-17/D2, D3)', () => {
   it('publishes nothing when NATS is not configured', async () => {
     const prisma = { fieldOutbox: { findMany: vi.fn(), updateMany: vi.fn() } } as unknown as PrismaService;
     const nats = { isConfigured: () => false, getConnection: vi.fn() } as unknown as NatsProvider;
-    const publisher = new FieldOutboxPublisher(prisma, nats);
+    const publisher = new FieldOutboxPublisher(prisma, nats, new NoopOutboxPublishScheduler());
 
     expect(await publisher.sweep()).toBe(0);
     expect(prisma.fieldOutbox.findMany).not.toHaveBeenCalled();

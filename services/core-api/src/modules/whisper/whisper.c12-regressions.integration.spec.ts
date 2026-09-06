@@ -17,7 +17,9 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { IncidentsRepository } from '../incidents/incidents.repository';
 import { IncidentsService } from '../incidents/incidents.service';
 import { PATROL_SWEEP_SCHEDULER } from '../patrol/patrol-sweep.scheduler';
+import { OUTBOX_PUBLISH_SCHEDULER } from '../../common/scheduling/outbox-publish.scheduler';
 import { NoopPatrolSweepScheduler } from '../patrol/patrol-sweep.scheduler.test-support';
+import { NoopOutboxPublishScheduler } from '../../common/scheduling/outbox-publish.scheduler.test-support';
 import { WHISPER_DEVICE_KEY_RESOLVER, type WhisperDeviceKeyResolver } from './whisper-key.resolver';
 import { WhisperSignatureVerifier } from './whisper-signature.verifier';
 import { ACTION_WHISPER_DEVICE_ACTION_INVOKE } from './whisper.constants';
@@ -342,6 +344,11 @@ describe('WP-21B C12 audit regressions (live stack)', () => {
       // the DI seam, so no ambient sweep races what this suite drives.
       .overrideProvider(PATROL_SWEEP_SCHEDULER)
       .useClass(NoopPatrolSweepScheduler)
+      // TI-02: and the three outbox publishers, which used to drain every
+      // tenant's pending rows at boot through no seam at all. One token
+      // reaches all three, so a suite need not know how many there are.
+      .overrideProvider(OUTBOX_PUBLISH_SCHEDULER)
+      .useClass(NoopOutboxPublishScheduler)
       .compile();
     app = moduleRef.createNestApplication({ logger: false });
     await app.init();
