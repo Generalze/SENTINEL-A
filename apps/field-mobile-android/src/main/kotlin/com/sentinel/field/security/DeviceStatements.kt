@@ -70,6 +70,21 @@ object DeviceStatements {
      */
     const val PURPOSE_WHISPER_DEVICE_ACTION = "WHISPER_DEVICE_ACTION"
 
+    /**
+     * WP-29A. `DEVICE_QUEUE_ADMISSION_PURPOSE` from
+     * `packages/contracts/src/device-context.ts`, quoted rather than chosen.
+     *
+     * NOT `FIELD_OPERATION`, even though the two currently admit the same trust
+     * states and picking the familiar one would change no behaviour today. The
+     * contract defines this purpose so that "may this device's QUEUED work take
+     * effect?" is asked under its own name and can be tightened later without
+     * also tightening live field operations. A client that minted queue
+     * submissions under the wider purpose would silently opt out of that
+     * tightening on the day it happens — and the purpose is inside the signed
+     * proof, so it cannot be corrected in transit.
+     */
+    const val PURPOSE_OFFLINE_SYNC = "OFFLINE_SYNC"
+
     // -----------------------------------------------------------------------
     // Enrollment: the possession statement (D23-03 / C15-03)
     // -----------------------------------------------------------------------
@@ -231,6 +246,21 @@ object DeviceStatements {
      * something else and have the digest still agree.
      *
      * `DEVICE_ACTION` is WP-27's addition and maps to `DEVICE_ACTION_STATEMENT`.
+     *
+     * `OFFLINE_QUEUE_SUBMIT` is WP-29A's, and it is the odd one out in a way
+     * worth stating. The other five carry an instruction the device is issuing
+     * NOW, and their target is the thing being instructed — an operative, an
+     * assignment, a message. This one carries a statement the device signed
+     * EARLIER, and ITS TARGET IS THE QUEUED OPERATION ITSELF, named by the
+     * `offline_operation_id` inside the signed offline envelope.
+     *
+     * That choice is what binds the freshly proved request to the specific
+     * queued statement it is carrying. If the target were the operative, one
+     * proof would describe any queued operation of that operative equally well,
+     * and a live device could present a statement alongside a proof minted for a
+     * different one. The server refuses a disagreement between its outer
+     * `target_id` and the inner signed id, and this is the client side of that
+     * agreement.
      */
     val TARGET_TYPE_FOR_KIND: Map<String, String> = mapOf(
         "FIELD_STATE_UPDATE" to "FIELD_OPERATIVE_STATE",
@@ -238,6 +268,7 @@ object DeviceStatements {
         "ASSIGNMENT_DECLINE" to "FIELD_ASSIGNMENT",
         "INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE" to "INCIDENT_FIELD_MESSAGE",
         "DEVICE_ACTION" to "DEVICE_ACTION_STATEMENT",
+        "OFFLINE_QUEUE_SUBMIT" to "FIELD_OFFLINE_OPERATION",
     )
 
     /**

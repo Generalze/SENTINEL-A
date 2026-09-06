@@ -41,6 +41,21 @@ export const DEVICE_GATEWAY_REFUSALS = [
   'PROOF_REFUSED',
   /** The frozen `evaluateDeviceOperationPrincipals` refused. Its verdict is appended verbatim. */
   'PRINCIPALS_REFUSED',
+  /**
+   * D29A-27: a QUEUED submission was refused after authentication succeeded.
+   *
+   * It is one code rather than eight for the same reason `PROOF_REFUSED` is one
+   * code: the precise reason belongs in `contract_refusal`, where the frozen
+   * evaluator's own verdict is appended verbatim, and the external answer stays
+   * the single D25-13 refusal whatever happened. What this code adds is the
+   * fact that SOMETHING after authentication refused — which is exactly the
+   * fact the audit trail was missing.
+   *
+   * Before D29A-27 these eight paths wrote no audit row at all, and the trail
+   * still carried the `OPERATION_COMMITTED` that authentication had already
+   * emitted. A refused submission therefore read as a committed one.
+   */
+  'OFFLINE_ENVELOPE_REFUSED',
   /** D25-02: same one-shot identity, different signed semantics. */
   'REPLAY_CONFLICT',
   /**
@@ -184,6 +199,16 @@ export type DeviceContextEstablishmentResult =
        * still carry a fresh hardware-signed possession proof.
        */
       readonly context: unknown;
+      /**
+       * WP-29A / D29A-26 §13 — the offline policy lease minted alongside this
+       * context, or `null` when none could be.
+       *
+       * `unknown` for the same reason `context` is: the controller's job is to
+       * hand it back, not to reason about it. A failure to issue is NOT a
+       * failure to establish — the context remains valid for live operations,
+       * which need no lease — so this is nullable rather than an error.
+       */
+      readonly policyLease: unknown;
     }
   | {
       /**

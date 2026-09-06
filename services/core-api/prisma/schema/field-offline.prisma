@@ -153,6 +153,32 @@ model FieldOfflineOperationReceipt {
   /// which is exactly why the first one is the one worth retaining.
   firstTraceId String @map("first_trace_id") @db.Text
 
+  /// WP-29A / D29A-26 §16 — WHICH CACHED AUTHORITY THIS OPERATION ACTED UNDER.
+  ///
+  /// NULLABLE IN THE DATABASE, MANDATORY IN THE APPLICATION, and the two are
+  /// not in tension. Every receipt written before WP-29A describes an
+  /// operation that predates persisted policy leases entirely; back-filling
+  /// them would be fabricating authority provenance that never existed
+  /// (D29A-26 §20), and forcing NOT NULL would require exactly that. So the
+  /// column admits the legacy era and the application refuses to extend it:
+  /// a receipt created from a `DeviceOfflineOperationEnvelope` MUST carry the
+  /// resolved lease, and the offline-envelope path has no branch that writes
+  /// NULL here.
+  ///
+  /// Read it as an era marker, not a quality flag (D29A-26 §21):
+  ///   NULL     -> created before WP-29A; no lease mechanism existed
+  ///   NOT NULL -> the authority artefact is preserved and still resolvable
+  policyLeaseId String? @map("policy_lease_id") @db.Text
+
+  /// D29A-26 §17. Tenant-composite rather than a bare `id` reference, for the
+  /// same reason every other cross-module relation in this repository is: it
+  /// makes an organisation-A receipt naming an organisation-B lease impossible
+  /// in the database, not merely unlikely in the service. `Restrict` because a
+  /// lease that any receipt cites must never be deletable — expiry and
+  /// revocation are STATES (§9/§26), and losing the row would destroy the
+  /// provenance this column exists to keep.
+  policyLease DevicePolicyLease? @relation(fields: [policyLeaseId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 
@@ -165,5 +191,8 @@ model FieldOfflineOperationReceipt {
   @@unique([organisationId, siteId, userId, deviceId, offlineOperationId], map: "field_offline_receipt_operation_key")
   /// Recovery sweep: find operations left in a non-finalized status.
   @@index([status, updatedAt], map: "field_offline_receipt_recovery_idx")
+  /// D29A-26 §18: the audit lookup this column was added to serve — "what did
+  /// this lease authorise?". One index, for one demonstrated query.
+  @@index([policyLeaseId], map: "field_offline_receipt_policy_lease_idx")
   @@map("field_offline_operation_receipts")
 }

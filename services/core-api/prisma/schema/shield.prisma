@@ -217,6 +217,10 @@ model Device {
   /// answered here, from current trust, on every request.
   contextEstablishmentChallenges DeviceContextEstablishmentChallenge[]
   authenticatedContexts AuthenticatedDeviceContextRecord[]
+  /// WP-29A back-relation. The cached offline authority issued TO this device.
+  /// Holding a lease is not trust: every lease is still judged on its own
+  /// window, its own revocation and the device's CURRENT standing at reconnect.
+  policyLeases DevicePolicyLease[]
 
   /// Candidate key, deliberately redundant with the primary key — it is what
   /// every child table in this file references, so a child binds to THIS
@@ -1126,6 +1130,112 @@ model DeviceNonceConsumption {
   @@unique([organisationId, replayIdentityDigest], map: "device_nonce_consumption_identity_key")
   @@index([organisationId, ceremony, firstSeenAt])
   @@map("device_nonce_consumptions")
+}
+
+/// WP-29A / D29A-26 — THE CACHED AUTHORITY A DISCONNECTED OPERATION ACTED UNDER.
+///
+/// This is the durable server side of the frozen WP-23 `DevicePolicyLease`
+/// contract, and it is the reason an offline operation can be judged at all.
+/// `policy_lease_id` sits INSIDE the signed bytes of every
+/// `DeviceOfflineOperationEnvelope`, so an operation NAMES the authority it
+/// claims to have acted under; this table is what that name resolves to. The
+/// alternative — believing the device's own account of when it acted — is the
+/// backdating hole the envelope contract was built to close.
+///
+/// LIVE WHILE IT LASTS, HISTORICAL FOREVER AFTER. For at most six hours a
+/// lease is live authority: it can be revoked, and central admissibility reads
+/// it on every reconnect. After that it is evidence, and it must stay
+/// resolvable long after the device is revoked, the actor disabled or the
+/// site's permissions rewritten (D29A-26 §10) — otherwise Sentinel loses the
+/// ability to explain what authority a queued operation acted under, which is
+/// the whole point of persisting it.
+///
+/// WHY FOREIGN KEYS HERE, WHEN THE ARTEFACTS BELOW HAVE NONE.
+///
+/// The append-only artefacts above and below carry no Device, User or Site FK
+/// deliberately: they must survive the DELETION of the thing they describe.
+/// This table reaches the same destination from the other side. Every relation
+/// is `onDelete: Restrict`, so the row is never erased by a lifecycle change —
+/// the lifecycle change is REFUSED instead. That buys what a bare column
+/// cannot: the database itself rejects an organisation-A lease naming an
+/// organisation-B device or site, which is D29A-26 §4's requirement and the
+/// D24-04a rule this file already applies to `DeviceSiteScope`.
+///
+/// `authority_basis_id` IS THE ONE EXCEPTION, AND ON PURPOSE (D29A-26 §5).
+///
+/// It records the `user_roles` row whose capability justified issuance. It is
+/// a PLAIN COLUMN with no FK, following `DeviceTrustTransition.authorisedByUserId`
+/// — "the identifier AS RECORDED at decision time". A `Restrict` FK to a role
+/// would be actively harmful: it would make the database refuse to remove a
+/// user's role for as long as any lease named it, so revoking someone's
+/// authority could be blocked for six hours by a queue entry. Authority
+/// revocation must never be hostage to a cached lease, and §10 requires the
+/// lease to survive exactly that change rather than prevent it.
+model DevicePolicyLease {
+  /// The `lease_id` of the frozen contract. `@db.Text`, not `@db.Uuid`: the
+  /// contract types it as `scopedId` like every other identifier in this
+  /// module, and D29A-26 §3 forbids changing the contract's ID representation
+  /// for database convenience.
+  id String @id @db.Text
+
+  organisationId String @map("organisation_id") @db.Text
+
+  /// The lease is issued TO one device identity — never a site-wide permit.
+  ///
+  /// `@db.Uuid`, matching `devices.id`. Not cosmetic: a TEXT column here and a
+  /// UUID target makes the composite foreign key BELOW unbuildable, and
+  /// Postgres rejects it at apply time rather than at generate time — so the
+  /// mistake survives typecheck, survives the datamodel diff, and fails in CI
+  /// against a real database. `site_id` and `actor_user_id` stay TEXT because
+  /// `sites.id` and `users.id` are cuids, not uuids.
+  deviceId String @map("device_id") @db.Uuid
+  siteId   String @map("site_id") @db.Text
+
+  /// C15-06: WHOSE authority was cached. On a CONTROLLED_SHARED device this is
+  /// the whole defence — operative B cannot ride the lease operative A's
+  /// capability produced — and `evaluateOfflineOperationAdmissibility` refuses
+  /// `LEASE_ACTOR_MISMATCH` when the envelope names anyone else.
+  actorUserId String @map("actor_user_id") @db.Text
+
+  /// The specific capability grant issuance rested on, for audit and
+  /// revalidation. Plain column, no FK — see this model's header.
+  authorityBasisId String @map("authority_basis_id") @db.Text
+
+  /// The operation kinds this lease admits, as the contract's own enum values.
+  /// A scalar list rather than JSON (D29A-26 §6): the set is small, closed and
+  /// queryable, and `LEASE_SCOPE_MISMATCH` is a membership test.
+  scope String[] @map("scope")
+
+  /// SERVER-DERIVED, always (D29A-26 §8). A device clock never establishes
+  /// lease validity; the device caches these only to decide what it may queue.
+  /// `expires_at - issued_at` is bounded by the frozen
+  /// DEVICE_OFFLINE_LEASE_MAX_LIFETIME_MS at issuance.
+  issuedAt  DateTime @map("issued_at") @db.Timestamptz(3)
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(3)
+
+  /// Set when the lease is withdrawn BEFORE its natural expiry. Revocation is
+  /// a state, never a deletion (D29A-26 §9/§26): erasing the row would destroy
+  /// the provenance of every operation that already acted under it.
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  device      Device @relation(fields: [deviceId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  site        Site   @relation(fields: [siteId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  actorUser   User   @relation(fields: [actorUserId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+
+  /// WP-29A receipts that recorded this lease as their authority.
+  offlineReceipts FieldOfflineOperationReceipt[]
+
+  /// Makes the tenant-composite receipt relation possible, so an
+  /// organisation-A receipt cannot name an organisation-B lease.
+  @@unique([id, organisationId], map: "device_policy_lease_tenant_key")
+  /// D29A-26 §19: the issuance-time question — "does this device/actor already
+  /// hold a live lease?" Resolution BY `lease_id` is served by the primary key
+  /// and needs no index of its own.
+  @@index([organisationId, deviceId, actorUserId, expiresAt])
+  @@map("device_policy_leases")
 }
 
 // ===========================================================================
