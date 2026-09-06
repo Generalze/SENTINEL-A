@@ -9,7 +9,9 @@ import { traceIdMiddleware } from '../../common/trace-id.middleware';
 import { GlobalValidationPipe } from '../../common/validation.pipe';
 import { PrismaService } from '../../prisma/prisma.service';
 import { PATROL_SWEEP_SCHEDULER } from '../patrol/patrol-sweep.scheduler';
+import { OUTBOX_PUBLISH_SCHEDULER } from '../../common/scheduling/outbox-publish.scheduler';
 import { NoopPatrolSweepScheduler } from '../patrol/patrol-sweep.scheduler.test-support';
+import { NoopOutboxPublishScheduler } from '../../common/scheduling/outbox-publish.scheduler.test-support';
 import { signCanonicalStatement } from '../shield/shield.test-support';
 import {
   ANDROID_ATTESTATION_TRUST_MATERIAL,
@@ -192,6 +194,11 @@ beforeAll(async () => {
   const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
     .overrideProvider(PATROL_SWEEP_SCHEDULER)
     .useClass(NoopPatrolSweepScheduler)
+    // TI-02: and the three outbox publishers, which used to drain every
+    // tenant's pending rows at boot through no seam at all. One token
+    // reaches all three, so a suite need not know how many there are.
+    .overrideProvider(OUTBOX_PUBLISH_SCHEDULER)
+    .useClass(NoopOutboxPublishScheduler)
     // The ONLY injected seam. NOTE what is NOT overridden:
     // `DEVICE_ATTESTATION_EVALUATOR` keeps its real WP-26 provider, so every
     // verdict below is reached by the real evaluator resolving a real artifact.

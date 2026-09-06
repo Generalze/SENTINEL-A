@@ -5,7 +5,9 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { AppModule } from '../../app.module';
 import { PrismaService } from '../../prisma/prisma.service';
 import { PATROL_SWEEP_SCHEDULER } from '../patrol/patrol-sweep.scheduler';
+import { OUTBOX_PUBLISH_SCHEDULER } from '../../common/scheduling/outbox-publish.scheduler';
 import { NoopPatrolSweepScheduler } from '../patrol/patrol-sweep.scheduler.test-support';
+import { NoopOutboxPublishScheduler } from '../../common/scheduling/outbox-publish.scheduler.test-support';
 
 /**
  * Field REST surface end to end, through the real global guard chain
@@ -147,6 +149,11 @@ describe('Field REST surface (live stack, WP-16 AC7 / WP-17 AC6-AC8)', () => {
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
       .overrideProvider(PATROL_SWEEP_SCHEDULER)
       .useClass(NoopPatrolSweepScheduler)
+      // TI-02: and the three outbox publishers, which used to drain every
+      // tenant's pending rows at boot through no seam at all. One token
+      // reaches all three, so a suite need not know how many there are.
+      .overrideProvider(OUTBOX_PUBLISH_SCHEDULER)
+      .useClass(NoopOutboxPublishScheduler)
       .compile();
     app = moduleRef.createNestApplication({ logger: false });
     await app.listen(0, '127.0.0.1');
