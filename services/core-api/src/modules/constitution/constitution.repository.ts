@@ -26,6 +26,7 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
+import { DEFAULT_INTERACTIVE_TRANSACTION_MAX_WAIT_MS } from '../../prisma/transaction-budget';
 import type { Policy } from './constitution.engine';
 import { policyContentSha256 } from './constitution.hash';
 import { SENTINEL_BASELINE_POLICY, policyBody } from './constitution.policy';
@@ -192,7 +193,10 @@ export class ConstitutionPolicyRepository {
         const activated = await tx.constitutionPolicy.findUniqueOrThrow({ where: { version } });
         return toStoredPolicy(activated);
       },
-      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      {
+        isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+        maxWait: DEFAULT_INTERACTIVE_TRANSACTION_MAX_WAIT_MS,
+      },
     );
   }
 
@@ -261,7 +265,10 @@ export class ConstitutionPolicyRepository {
           },
         });
       },
-      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      {
+        isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+        maxWait: DEFAULT_INTERACTIVE_TRANSACTION_MAX_WAIT_MS,
+      },
     );
   }
 }

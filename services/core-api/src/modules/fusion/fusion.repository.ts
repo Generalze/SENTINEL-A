@@ -30,6 +30,7 @@ import {
   type HypothesisTransition as HypothesisTransitionRow,
 } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
+import { DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS } from '../../prisma/transaction-budget';
 import type { CorrelationKey } from './core/correlation';
 import type { IgnoreReason } from './core/eventRules';
 import type { ProcessedSignal, Signal } from './core/threatState';
@@ -289,7 +290,7 @@ export class FusionRepository {
 
       const row = await tx.hypothesis.findUniqueOrThrow({ where: { id: params.hypothesisId } });
       return { status: 'applied', row } as const;
-    }).catch((error: unknown) => {
+    }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS).catch((error: unknown) => {
       if (error instanceof ConcurrentUpdateError) {
         return { status: 'conflict' } as const;
       }

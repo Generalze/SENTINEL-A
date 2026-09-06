@@ -1,6 +1,7 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { Prisma, type IncidentFieldMessage, type IncidentFieldMessageRecipient } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
+import { DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS } from '../../prisma/transaction-budget';
 import { TIMELINE_MESSAGE_ACKNOWLEDGED, TIMELINE_MESSAGE_SENT } from './field-messaging.constants';
 import { OPERATIONAL_ASSIGNMENT_STATUSES } from './field-messaging.eligibility';
 import type { SiteScope } from './field-messaging.types';
@@ -163,7 +164,7 @@ export class FieldMessagingRepository {
         });
 
         return tx.incidentFieldMessage.findUniqueOrThrow({ where: { id: message.id }, include: withRecipients });
-      });
+      }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
       return { message: created, created: true };
     } catch (error) {
       if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== 'P2002') throw error;
@@ -416,6 +417,6 @@ export class FieldMessagingRepository {
       const refreshed = await db.incidentFieldMessage.findUniqueOrThrow({ where: { id: messageId }, include: withRecipients });
       return { kind: 'acknowledged', message: refreshed };
     };
-    return tx ? execute(tx) : this.prisma.$transaction(execute);
+    return tx ? execute(tx) : this.prisma.$transaction(execute, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
   }
 }

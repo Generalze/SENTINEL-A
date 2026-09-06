@@ -2,6 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { Prisma, type Event as EventRow } from '@prisma/client';
 import type { NormalisedEvent } from '@sentinel/contracts';
 import { PrismaService } from '../../prisma/prisma.service';
+import { DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS } from '../../prisma/transaction-budget';
 import { mapNormalisedEventToRow } from './events.mapper';
 import { decodeCursor, encodeCursor } from './pagination.util';
 import type { EventsListFilter } from './events.types';
@@ -83,7 +84,7 @@ export class EventsRepository {
         data: { receivedCount: { increment: 1 } },
       });
       return duplicate;
-    });
+    }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
   }
 
   /**
