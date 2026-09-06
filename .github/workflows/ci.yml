@@ -22,6 +22,27 @@ jobs:
       S3_EVIDENCE_BUCKET: sentinel-evidence
       S3_REGION: us-east-1
       DEV_AUTH_ENABLED: 'true'
+      # WP-29B — the Edge runtime's own identity/binding/endpoint/path keys.
+      #
+      # Declared EXPLICITLY rather than left to whatever the runner happens to
+      # have, so a spec that boots the Edge config gets CI's values and not a
+      # workstation's. They are identity and wiring only: nothing here affects
+      # what Edge is willing to witness, which is hard-wired in
+      # `services/edge-runtime/src/edge-runtime.constants.ts`.
+      EDGE_ORGANISATION_ID: ci-org
+      EDGE_ID: ci-edge
+      EDGE_KEY_ID: ci-edge-key
+      EDGE_KEY_VERSION: '1'
+      EDGE_AUTHORISED_SITE_IDS: ci-site
+      SENTINEL_CENTRAL_URL: http://localhost:3000
+      EDGE_QUEUE_PATH: /tmp/sentinel-edge-queue
+      # DELIBERATELY UNSET, and CI is where that matters most:
+      #   EDGE_TRUSTED_TIME_VERIFICATION_KEYS / _KEYRING_VERSION
+      #   EDGE_TRUSTED_TIME_SIGNER_KEY_ID / _SIGNING_KEY_FILE
+      # Trust material and signing keys are a DEPLOYMENT act. A CI-shaped
+      # default would be a key nobody chose, present in every branch, and the
+      # fail-closed path — no keyring, no signing, no anchors — is precisely
+      # what CI should be exercising by default.
 
     steps:
       - uses: actions/checkout@v4

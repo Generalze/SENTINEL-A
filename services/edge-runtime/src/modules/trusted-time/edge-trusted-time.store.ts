@@ -1,127 +1,190 @@
-import { Injectable } from '@nestjs/common';
-import type { EdgeTrustedTimeAnchorRecord } from './edge-trusted-time.anchor';
+import { randomUUID } from 'node:crypto';
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { Inject, Injectable, Logger, type Provider } from '@nestjs/common';
+import type { SignedEdgeTrustedTimeAnchor } from '@sentinel/contracts';
+import { EdgeConfigService } from '../../config/config.service';
 
 /** DI token for the anchor store. */
 export const EDGE_TRUSTED_TIME_ANCHOR_STORE = Symbol('EDGE_TRUSTED_TIME_ANCHOR_STORE');
 
 /**
- * WP-29B / FW2-11 — ANCHOR PERSISTENCE IS **BLOCKED** PENDING A RULING.
+ * ============================================================================
+ * WP-29B / FW2-11 — WHERE THE SIGNED ANCHOR RESTS.
  *
- * THE STOP, IN ONE SENTENCE
- * -------------------------
- * A persisted trusted-time anchor must be integrity-protected so that it is
- * INDEPENDENTLY VERIFIABLE after a restart, and this repository contains no
- * primitive that can make it so.
+ * Round 1 stopped at this file: an anchor persisted as plain JSON hands anyone
+ * who can write it the power to choose what time Edge believes it is, and there
+ * was no primitive in the repository that could make a persisted anchor
+ * independently verifiable. The ruling supplied one, and this is what changed:
  *
- * WHAT THE SEARCH FOUND
- * ---------------------
- * Every cryptographic operation in production source is VERIFICATION of a
- * client's signature, or hashing. Specifically:
+ *   WHAT IS STORED IS THE SIGNED STATEMENT AND ITS SIGNATURE, BYTE FOR BYTE,
+ *   AND NOTHING DERIVED FROM THEM.
  *
- *   - `P256KeyImporter.verifySignature` (shield) — verifies DEVICE signatures
- *     against a registered public key. There is no signing counterpart.
- *   - `WhisperSignatureVerifier` — Ed25519 verification whose key resolver is a
- *     permanently fail-closed stub returning `null`.
- *   - `AndroidKeyAttestationVerifier` — X.509 chain verification against pinned
- *     public roots.
- *   - `deviceCanonicalDigest` / `computeContentHash` — SHA-256. UNKEYED.
+ * No cached `trusted_now`, no remembered expiry, no pre-computed offset, no
+ * "verified: true" flag. Every one of those would be a value produced BY
+ * verification that would then be trusted WITHOUT verification after a restart
+ * — which is exactly the property the signature exists to remove. The store
+ * therefore has no opinion at all: it is a byte pipe, and
+ * `EdgeTrustedTimeAnchorVerifier` re-runs the entire chain on every load.
  *
- * There is NO `createSign`, no HMAC, no JWT/JWS/PASETO/COSE, no KMS or HSM
- * integration, and no server-held private key or symmetric secret anywhere in
- * the environment schema, the compose files or the filesystem. The only working
- * signing recipe in the tree is `signCanonicalStatement` in
- * `shield.test-support.ts`, which is test-only and takes an in-memory key.
+ * THE STORE IS NOT A TRUST BOUNDARY, AND THAT IS THE ACHIEVEMENT.
  *
- * WHY AN UNKEYED DIGEST DOES NOT CLOSE THIS
- * -----------------------------------------
- * The tempting move is to write the anchor as JSON beside a SHA-256 of itself.
- * That detects bit rot and nothing else. The adversary an integrity-protected
- * anchor defends against is someone who can write the file — and anyone who can
- * write the anchor can write the digest. It would be a checksum wearing the
- * costume of an integrity check, and its presence would make the gap HARDER to
- * see than its absence does.
- *
- * WHY "TRUST THE JSON FILE" IS NOT AN ACCEPTABLE DOWNGRADE
- * -------------------------------------------------------
- * The anchor is the seed of every `edge_trusted_time` Edge ever emits. An
- * attacker who can write an unauthenticated anchor file chooses what time Edge
- * believes it is — with a back-dated `server_time` and a matching
- * `monotonic_at_issue`, every subsequent receipt is genuinely signed by a
- * genuinely TRUSTED Edge and places operations inside whatever lease window the
- * attacker picked. Central cannot detect it: the receipt is well-formed, the
- * Edge key verifies, `edge_trust` is TRUSTED, and the whole ordered refusal
- * chain passes. The forgery would be indistinguishable from correct operation,
- * which is the definition of the failure this whole subsystem exists to prevent.
- *
- * WHAT THIS FILE DOES INSTEAD
- * ---------------------------
- * It defines the seam and provides the only implementation that is safe without
- * a ruling: one that loads nothing and persists nothing. This follows the
- * existing `FailClosedWhisperDeviceKeyResolver` precedent — the shape exists,
- * wired and typed, and it answers "no" until someone with the authority to do
- * so decides how it answers "yes".
- *
- * THE CONSEQUENCE, STATED HONESTLY
- * --------------------------------
- * An Edge that restarts holds no anchor until central re-establishes trusted
- * time. During that window it emits `edge_trusted_time: null` and central
- * refuses the five time-bounded kinds at NO_TRUSTWORTHY_TIME_WITNESS. That is a
- * real operational cost and it is the correct cost: note that FW2-10 already
- * invalidates a persisted anchor across a boot-identity change, so persistence
- * would only ever have helped a restart WITHIN one boot — a much narrower
- * benefit than the risk of an unauthenticated time seed.
- *
- * THE SMALLEST SAFE ADDITION (for the CTO's ruling, not implemented here)
- * ----------------------------------------------------------------------
- * Do not sign the anchor locally at all. Let CENTRAL sign it. Central already
- * owns `server_time`, and the receipt path already proves the repository can
- * verify a P-256 signature over a domain-tagged canonical statement. So:
- *
- *   1. A `sentinel.edge.trusted-time-anchor.v1` domain separator and a
- *      canonical statement builder beside the existing ones in
- *      `device-offline.ts`, using the same `canonicalDeviceJson` recipe.
- *   2. Central signs that statement with a SERVER key at issue. This is the
- *      genuinely new capability: the repository has no server signing key, so
- *      this requires a key-custody decision (where it lives, how it rotates)
- *      and a registry the way `DeviceKey` is one for devices — both of which
- *      are new trust boundaries and, for the registry, a migration.
- *   3. Edge verifies the signature at load with the EXISTING verification
- *      recipe — the `P256KeyImporter` shape, against a public key pinned in
- *      Edge's deployment as trust material, following the fail-closed,
- *      default-absent pattern the `ANDROID_ATTESTATION_*` block already
- *      establishes.
- *
- * Step 3 introduces no new cryptography — it is the verification Sentinel
- * already performs. Steps 1 and 2 are contract and key-custody decisions above
- * this lane's authority, so nothing in this file attempts them.
+ * An attacker with write access to the anchor file can delete it, truncate it,
+ * replace it with an older anchor, or replace it with one issued to a different
+ * Edge. Every one of those is caught: a missing or corrupt file refuses at the
+ * parse, an older anchor refuses at the lifetime check, another Edge's anchor
+ * refuses at the binding check, and any edit whatsoever refuses at the
+ * signature. What they cannot do is make Edge believe a time central never
+ * asserted, and that is the whole point.
+ * ============================================================================
  */
 export interface EdgeTrustedTimeAnchorStore {
-  /** The anchor to resume with, or `null`. `null` is an ordinary answer. */
-  load(): Promise<EdgeTrustedTimeAnchorRecord | null>;
-  /** Persist an anchor central issued. May legitimately do nothing. */
-  save(anchor: EdgeTrustedTimeAnchorRecord): Promise<void>;
+  /**
+   * The candidate to resume with, as UNVERIFIED bytes, or `null`.
+   *
+   * The return type is deliberately `unknown`. Typing it as the parsed anchor
+   * would let a caller skip the verifier and use it — and a store that hands
+   * back something already shaped like a trusted value is a store that invites
+   * exactly that. What comes off a disk is a candidate, and it stays a
+   * candidate until the chain says otherwise.
+   */
+  load(): Promise<unknown>;
+  /** Persist an anchor central signed. May legitimately do nothing. */
+  save(anchor: SignedEdgeTrustedTimeAnchor): Promise<void>;
+  /** Forget the persisted anchor. Never an error when there was none. */
+  clear(): Promise<void>;
 }
 
 /**
- * The only implementation WP-29B is authorised to ship: it holds no anchor
- * across a restart and writes none.
+ * THE VOLATILE STORE, KEPT DELIBERATELY.
  *
- * `save` is a deliberate silent no-op rather than a throw. The caller's job is
- * to keep the site working, and an exception on a path that runs every time
- * central refreshes the anchor would turn a known, accepted limitation into
- * repeated error noise — or, worse, into a `catch {}` somewhere that later
- * hides a real failure. The limitation is documented at the top of this file
- * and asserted in the spec, which is where a reader will actually look.
+ * The ruling is explicit that this must not be deleted because persistence now
+ * exists, and the reason is that it is not a placeholder — it is the ABSENCE OF
+ * TRUST behaviour, and it is the correct configuration for a deployment that
+ * has not pinned a verification keyring, for an Edge whose queue directory is
+ * not on durable storage, and for every test that wants a cold start.
+ *
+ * An Edge wired with this holds trusted time only for as long as its process
+ * lives. That is a real cost and a completely safe one: after a restart it
+ * emits `edge_trusted_time: null`, central refuses the five time-bounded kinds
+ * at NO_TRUSTWORTHY_TIME_WITNESS, and nothing is forged.
  */
 @Injectable()
-export class NonPersistentEdgeTrustedTimeAnchorStore implements EdgeTrustedTimeAnchorStore {
-  async load(): Promise<EdgeTrustedTimeAnchorRecord | null> {
+export class VolatileEdgeTrustedTimeAnchorStore implements EdgeTrustedTimeAnchorStore {
+  async load(): Promise<unknown> {
     return null;
   }
 
-  async save(_anchor: EdgeTrustedTimeAnchorRecord): Promise<void> {
-    // Intentionally nothing. See the FW2-11 note above: writing an
-    // unauthenticated anchor to disk would hand an attacker with file-write
-    // access the ability to choose what time Edge believes it is.
+  async save(_anchor: SignedEdgeTrustedTimeAnchor): Promise<void> {
+    // Intentionally nothing.
+  }
+
+  async clear(): Promise<void> {
+    // Intentionally nothing.
   }
 }
+
+/** The file the persistent store keeps, inside the configured queue directory. */
+export const EDGE_TRUSTED_TIME_ANCHOR_FILENAME = 'trusted-time-anchor.json';
+
+/**
+ * THE PERSISTENT STORE. Same-boot restart recovery, and nothing more.
+ *
+ * WHY THE WRITE IS ATOMIC
+ * -----------------------
+ * Write-to-temp-then-rename, because a partially written anchor is the one
+ * failure mode that costs something real. `rename` within a directory is atomic
+ * on every platform Sentinel targets, so a reader sees either the whole old
+ * anchor or the whole new one. Without it, an Edge power-cycled mid-write would
+ * come back to a truncated file — refused, correctly, but having thrown away a
+ * perfectly good anchor it was holding a moment earlier, and taking the site's
+ * ability to witness with it until central is reachable again.
+ *
+ * WHY A FAILED WRITE IS NOT AN ERROR THE CALLER SEES
+ * --------------------------------------------------
+ * Persistence is an OPTIMISATION over the volatile behaviour: it saves a
+ * re-anchoring round trip after a restart. It is never what makes an anchor
+ * trustworthy — the signature is. So a write that fails is logged and swallowed,
+ * because the alternative is throwing on the path that runs every time central
+ * refreshes the anchor, and an Edge that fell over because its disk was full
+ * would have converted a degraded state into an outage.
+ *
+ * WHY A FAILED READ IS SILENT
+ * ---------------------------
+ * `load` answers `null` for a missing file, an unreadable one, or bytes that
+ * are not JSON. All three mean the same thing to the verifier — there is no
+ * candidate — and distinguishing them for a caller would be an oracle over the
+ * filesystem of a box on a customer LAN.
+ */
+@Injectable()
+export class FileSystemEdgeTrustedTimeAnchorStore implements EdgeTrustedTimeAnchorStore {
+  private readonly logger = new Logger(FileSystemEdgeTrustedTimeAnchorStore.name);
+  private readonly path: string;
+
+  constructor(@Inject(EdgeConfigService) config: EdgeConfigService) {
+    this.path = join(config.values.EDGE_QUEUE_PATH, EDGE_TRUSTED_TIME_ANCHOR_FILENAME);
+  }
+
+  async load(): Promise<unknown> {
+    let raw: string;
+    try {
+      raw = await readFile(this.path, 'utf8');
+    } catch {
+      return null;
+    }
+    try {
+      return JSON.parse(raw);
+    } catch {
+      // Corrupt bytes are not a candidate. They are also not a crisis: the
+      // verifier would refuse them anyway, and Edge simply starts cold.
+      return null;
+    }
+  }
+
+  async save(anchor: SignedEdgeTrustedTimeAnchor): Promise<void> {
+    // The signed pair, verbatim. `JSON.stringify` of the parsed anchor is safe
+    // here in a way it is NOT for a queued operation payload: what is written
+    // is re-PARSED and re-VERIFIED on load, and the verifier re-canonicalises
+    // the statement before checking the signature, so key order in this file
+    // carries no meaning and cannot break anything.
+    const body = JSON.stringify({ statement: anchor.statement, signature: anchor.signature });
+    const temporary = `${this.path}.${randomUUID()}.tmp`;
+    try {
+      await mkdir(dirname(this.path), { recursive: true });
+      await writeFile(temporary, body, { encoding: 'utf8', mode: 0o600 });
+      await rename(temporary, this.path);
+    } catch {
+      // Reason-free on purpose: the path is the deployment's, and a log line is
+      // not the place to disclose it.
+      this.logger.warn('failed to persist the trusted-time anchor; continuing in memory');
+    }
+  }
+
+  async clear(): Promise<void> {
+    try {
+      await writeFile(this.path, '', { encoding: 'utf8', mode: 0o600 });
+    } catch {
+      this.logger.warn('failed to clear the persisted trusted-time anchor');
+    }
+  }
+}
+
+/**
+ * THE BINDING, and the default is the SAFE one.
+ *
+ * Persistence is selected only when this deployment has pinned a verification
+ * keyring, and that conditional is the load-bearing part. A persisted anchor is
+ * worth exactly as much as Edge's ability to verify it: without a keyring,
+ * every loaded anchor refuses at KEYRING_UNAVAILABLE anyway, so writing one
+ * would be storing a private-ish operational record on disk in exchange for
+ * nothing at all. Worse, it would leave a file that LOOKS like trust material
+ * on a box where nothing can check it — the exact shape of the round-1 STOP.
+ */
+export const EDGE_TRUSTED_TIME_ANCHOR_STORE_BINDING: Provider = {
+  provide: EDGE_TRUSTED_TIME_ANCHOR_STORE,
+  inject: [EdgeConfigService],
+  useFactory: (config: EdgeConfigService): EdgeTrustedTimeAnchorStore =>
+    config.values.EDGE_TRUSTED_TIME_VERIFICATION_KEYS === undefined
+      ? new VolatileEdgeTrustedTimeAnchorStore()
+      : new FileSystemEdgeTrustedTimeAnchorStore(config),
+};

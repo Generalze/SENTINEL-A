@@ -3,17 +3,13 @@ import {
   DEVICE_OFFLINE_LEASE_MAX_LIFETIME_MS,
   DEVICE_TIME_NOT_AUTHORITATIVE,
   DevicePolicyLeaseSchema,
+  EdgeTrustedTimeAnchorStatementSchema,
   type DevicePolicyLease,
+  type EdgeTrustedTimeAnchorStatement,
 } from '@sentinel/contracts';
-import {
-  EdgeTrustedTimeAnchor,
-  EdgeTrustedTimeAnchorRecordSchema,
-  readEdgeTrustedTimeAnchor,
-  type EdgeMonotonicReading,
-  type EdgeTrustedTimeAnchorRecord,
-} from './edge-trusted-time.anchor';
+import { EdgeTrustedTimeAnchor, type EdgeMonotonicReading } from './edge-trusted-time.anchor';
 import { EDGE_TRUSTED_TIME_ANCHOR_MAX_HOLDOVER_MS } from '../../edge-runtime.constants';
-import { NonPersistentEdgeTrustedTimeAnchorStore } from './edge-trusted-time.store';
+import { VolatileEdgeTrustedTimeAnchorStore } from './edge-trusted-time.store';
 
 /**
  * WP-29B / EDGE-C Crucible — the trusted-time anchor.
@@ -29,15 +25,34 @@ const BOOT_ID = 'boot-4f2a';
 const HOUR = 3_600_000;
 const MINUTE = 60_000;
 
-function anchorRecord(overrides: Partial<EdgeTrustedTimeAnchorRecord> = {}): EdgeTrustedTimeAnchorRecord {
-  return EdgeTrustedTimeAnchorRecordSchema.parse({
+/**
+ * The anchor is now the FROZEN, centrally signed statement. This helper builds
+ * one that has already been verified — admitting it is
+ * `EdgeTrustedTimeAnchorVerifier`'s job and has its own Crucible. What is under
+ * test here is the arithmetic and the boundaries, unchanged from round 1.
+ *
+ * `holdoverMs` becomes the distance between the two signed instants, so the
+ * old `holdover_ms` cases below are expressed as a `server_valid_until`.
+ */
+function anchorRecord(overrides: Record<string, unknown> = {}): EdgeTrustedTimeAnchorStatement {
+  return EdgeTrustedTimeAnchorStatementSchema.parse({
     schema_version: 1,
-    server_time: SERVER_TIME,
-    monotonic_at_issue: 1_000_000,
-    boot_id: BOOT_ID,
-    holdover_ms: EDGE_TRUSTED_TIME_ANCHOR_MAX_HOLDOVER_MS,
+    anchor_id: '9c4e1f80-1a2b-4c3d-8e5f-6a7b8c9d0e1f',
+    edge_id: 'edge-17',
+    organisation_id: 'org-1',
+    site_id: 'site-1',
+    edge_boot_id: BOOT_ID,
+    edge_monotonic_at_anchor: 1_000_000,
+    server_issued_at: SERVER_TIME,
+    server_valid_until: iso(EDGE_TRUSTED_TIME_ANCHOR_MAX_HOLDOVER_MS),
+    signer_key_id: 'central-tta-2026-01',
     ...overrides,
   });
+}
+
+/** Expresses an old `holdover_ms` case as the signed window it now is. */
+function holdover(ms: number): Record<string, unknown> {
+  return { server_valid_until: iso(ms) };
 }
 
 /** A reading `elapsedMs` after the anchor was issued, in the same boot. */
@@ -67,43 +82,47 @@ function lease(overrides: Partial<DevicePolicyLease> = {}): DevicePolicyLease {
 
 // ---------------------------------------------------------------------------
 
-describe('the anchor record refuses what central may not issue', () => {
-  it('accepts the frozen lease ceiling as a holdover', () => {
-    expect(anchorRecord().holdover_ms).toBe(DEVICE_OFFLINE_LEASE_MAX_LIFETIME_MS);
+describe('the signed anchor refuses what central may not issue', () => {
+  it('accepts the frozen lease ceiling as a lifetime', () => {
+    expect(new EdgeTrustedTimeAnchor(anchorRecord()).lifetimeMs).toBe(DEVICE_OFFLINE_LEASE_MAX_LIFETIME_MS);
   });
 
-  it('refuses a holdover one millisecond above the ceiling', () => {
+  it('refuses a lifetime one millisecond above the ceiling', () => {
     // Refused rather than clamped: silently shortening an over-long anchor
-    // would hide a central-side defect behind an Edge that looks healthy.
-    const result = EdgeTrustedTimeAnchorRecordSchema.safeParse({
+    // would hide a central-side defect behind an Edge that looks healthy. And
+    // because central parses before it signs, such an anchor never acquires a
+    // signature in the first place.
+    const result = EdgeTrustedTimeAnchorStatementSchema.safeParse({
       ...anchorRecord(),
-      holdover_ms: EDGE_TRUSTED_TIME_ANCHOR_MAX_HOLDOVER_MS + 1,
+      server_valid_until: iso(EDGE_TRUSTED_TIME_ANCHOR_MAX_HOLDOVER_MS + 1),
     });
     expect(result.success).toBe(false);
   });
 
-  it('accepts a SHORTER holdover, because central may choose one', () => {
-    expect(anchorRecord({ holdover_ms: 5 * MINUTE }).holdover_ms).toBe(5 * MINUTE);
+  it('accepts a SHORTER lifetime, because central may choose one', () => {
+    expect(new EdgeTrustedTimeAnchor(anchorRecord(holdover(5 * MINUTE))).lifetimeMs).toBe(5 * MINUTE);
   });
 
-  it('refuses a zero or negative holdover', () => {
-    for (const holdover_ms of [0, -1]) {
-      expect(EdgeTrustedTimeAnchorRecordSchema.safeParse({ ...anchorRecord(), holdover_ms }).success).toBe(false);
+  it('refuses a zero-length or inverted window', () => {
+    for (const validUntil of [SERVER_TIME, iso(-1)]) {
+      expect(
+        EdgeTrustedTimeAnchorStatementSchema.safeParse({ ...anchorRecord(), server_valid_until: validUntil }).success,
+      ).toBe(false);
     }
   });
 
   it('refuses an anchor carrying a field central could use to relax a rule', () => {
-    for (const field of ['allow_wall_clock', 'edge_trust', 'trusted', 'override_holdover', 'fallback_time']) {
-      expect(EdgeTrustedTimeAnchorRecordSchema.safeParse({ ...anchorRecord(), [field]: true }).success).toBe(false);
+    for (const field of ['allow_wall_clock', 'edge_trust', 'trusted', 'override_holdover', 'fallback_time', 'holdover_ms']) {
+      expect(EdgeTrustedTimeAnchorStatementSchema.safeParse({ ...anchorRecord(), [field]: true }).success).toBe(false);
     }
   });
 
   it('reads a bad anchor as no anchor rather than throwing', () => {
     // The caller's correct response to a bad anchor is identical to its
-    // response to no anchor, so the reader must not force a try/catch that a
-    // future call site could forget.
-    expect(readEdgeTrustedTimeAnchor({ nonsense: true })).toBeNull();
-    expect(readEdgeTrustedTimeAnchor(anchorRecord())).not.toBeNull();
+    // response to no anchor. The safe parse is the reader now — there is no
+    // local shape left for a hand-rolled one to read.
+    expect(EdgeTrustedTimeAnchorStatementSchema.safeParse({ nonsense: true }).success).toBe(false);
+    expect(EdgeTrustedTimeAnchorStatementSchema.safeParse(anchorRecord()).success).toBe(true);
   });
 });
 
@@ -175,7 +194,7 @@ describe('expiry at exactly the ceiling', () => {
   });
 
   it('honours a SHORTER central-issued holdover at its own exact boundary', () => {
-    const anchor = new EdgeTrustedTimeAnchor(anchorRecord({ holdover_ms: 5 * MINUTE }));
+    const anchor = new EdgeTrustedTimeAnchor(anchorRecord(holdover(5 * MINUTE)));
     expect(anchor.classify(reading(5 * MINUTE - 1))).toBe('VALID');
     expect(anchor.classify(reading(5 * MINUTE))).toBe('ANCHOR_EXPIRED');
   });
@@ -220,7 +239,12 @@ describe('a boot identity change invalidates the anchor', () => {
 
   it('recovers only when central re-establishes an anchor for the NEW boot', () => {
     const reestablished = new EdgeTrustedTimeAnchor(
-      anchorRecord({ boot_id: 'boot-NEW', monotonic_at_issue: 500, server_time: iso(2 * HOUR) }),
+      anchorRecord({
+        edge_boot_id: 'boot-NEW',
+        edge_monotonic_at_anchor: 500,
+        server_issued_at: iso(2 * HOUR),
+        server_valid_until: iso(2 * HOUR + EDGE_TRUSTED_TIME_ANCHOR_MAX_HOLDOVER_MS),
+      }),
     );
     expect(reestablished.classify({ monotonic_ms: 500 + MINUTE, boot_id: 'boot-NEW' })).toBe('VALID');
     expect(reestablished.trustedNow({ monotonic_ms: 500 + MINUTE, boot_id: 'boot-NEW' })).toBe(iso(2 * HOUR + MINUTE));
@@ -246,7 +270,8 @@ describe('the null-emission path', () => {
     const anchor = new EdgeTrustedTimeAnchor(null);
     expect(anchor.classify(reading(0))).toBe('NO_ANCHOR');
     expect(anchor.trustedNow(reading(0))).toBeNull();
-    expect(anchor.holdoverMs).toBeNull();
+    expect(anchor.lifetimeMs).toBeNull();
+    expect(anchor.statement).toBeNull();
   });
 
   it('emits null rather than substituting the anchor instant when the anchor has expired', () => {
@@ -262,7 +287,7 @@ describe('the null-emission path', () => {
   it('emits null on an unreadable server_time rather than comparing NaN', () => {
     // C15-07: every comparison against NaN is false, so a bare `Date.parse`
     // comparison would silently answer "not expired".
-    const anchor = new EdgeTrustedTimeAnchor({ ...anchorRecord(), server_time: 'not-a-time' });
+    const anchor = new EdgeTrustedTimeAnchor({ ...anchorRecord(), server_issued_at: 'not-a-time' });
     expect(anchor.classify(reading(MINUTE))).toBe(DEVICE_TIME_NOT_AUTHORITATIVE);
     expect(anchor.trustedNow(reading(MINUTE))).toBeNull();
   });
@@ -273,7 +298,7 @@ describe('the null-emission path', () => {
       [new EdgeTrustedTimeAnchor(anchorRecord()), reading(EDGE_TRUSTED_TIME_ANCHOR_MAX_HOLDOVER_MS)],
       [new EdgeTrustedTimeAnchor(anchorRecord()), reading(MINUTE, 'boot-NEW')],
       [new EdgeTrustedTimeAnchor(anchorRecord()), reading(-1)],
-      [new EdgeTrustedTimeAnchor({ ...anchorRecord(), server_time: 'nope' }), reading(MINUTE)],
+      [new EdgeTrustedTimeAnchor({ ...anchorRecord(), server_issued_at: 'nope' }), reading(MINUTE)],
     ];
     for (const [anchor, at] of cases) {
       expect(anchor.classify(at)).not.toBe('VALID');
@@ -294,7 +319,7 @@ describe('an operation needs BOTH a valid anchor and a live lease', () => {
   it('refuses a live lease when the anchor has expired', () => {
     // Edge has no trustworthy instant to judge the lease AT, and does not
     // fabricate one to find out.
-    const anchor = new EdgeTrustedTimeAnchor(anchorRecord({ holdover_ms: 5 * MINUTE }));
+    const anchor = new EdgeTrustedTimeAnchor(anchorRecord(holdover(5 * MINUTE)));
     const decision = anchor.evaluateOperationWitness(lease(), reading(10 * MINUTE));
     expect(decision).toEqual({ witnessable: false, reason: 'ANCHOR_EXPIRED' });
   });
@@ -333,7 +358,7 @@ describe('an operation needs BOTH a valid anchor and a live lease', () => {
   it('never exposes a trusted_now on a refusal', () => {
     // The conjunction is structural: there is no shape in which an instant is
     // available without the lease having been judged at it.
-    const anchor = new EdgeTrustedTimeAnchor(anchorRecord({ holdover_ms: MINUTE }));
+    const anchor = new EdgeTrustedTimeAnchor(anchorRecord(holdover(MINUTE)));
     const decision = anchor.evaluateOperationWitness(lease(), reading(2 * MINUTE));
     expect(decision.witnessable).toBe(false);
     expect(decision).not.toHaveProperty('trusted_now');
@@ -346,12 +371,12 @@ describe('FW2-11: anchor persistence is blocked, and blocked loudly', () => {
     // persisted anchor independently verifiable after a restart, and an
     // unauthenticated anchor file hands an attacker with file-write access the
     // ability to choose what time Edge believes it is.
-    const store = new NonPersistentEdgeTrustedTimeAnchorStore();
+    const store = new VolatileEdgeTrustedTimeAnchorStore();
     return expect(store.load()).resolves.toBeNull();
   });
 
   it('does not persist an anchor it is given, and does not throw about it', () => {
-    const store = new NonPersistentEdgeTrustedTimeAnchorStore();
+    const store = new VolatileEdgeTrustedTimeAnchorStore();
     return expect(store.save(anchorRecord())).resolves.toBeUndefined();
   });
 
@@ -359,7 +384,7 @@ describe('FW2-11: anchor persistence is blocked, and blocked loudly', () => {
     // The consequence, asserted rather than described: after a restart Edge
     // emits `edge_trusted_time: null` and central refuses the time-bounded
     // kinds at NO_TRUSTWORTHY_TIME_WITNESS until an anchor is re-established.
-    const store = new NonPersistentEdgeTrustedTimeAnchorStore();
+    const store = new VolatileEdgeTrustedTimeAnchorStore();
     const resumed = new EdgeTrustedTimeAnchor(await store.load());
     expect(resumed.classify(reading(0))).toBe('NO_ANCHOR');
     expect(resumed.trustedNow(reading(0))).toBeNull();

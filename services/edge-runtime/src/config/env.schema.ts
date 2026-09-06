@@ -120,6 +120,43 @@ export const envSchema = z.object({
   EDGE_QUEUE_PATH: z
     .string({ required_error: 'EDGE_QUEUE_PATH is required' })
     .min(1, 'EDGE_QUEUE_PATH is required'),
+  // -------------------------------------------------------------------------
+  // WP-29B/FW2-11 — THE TRUSTED-TIME VERIFICATION KEYRING.
+  //
+  // PUBLIC TRUST MATERIAL, INLINE, DEFAULT-ABSENT, FAIL-CLOSED — the
+  // `ANDROID_ATTESTATION_*` pattern, and inline is correct here for the same
+  // reason it is correct there: every byte of it is a PUBLIC key. The private
+  // counterpart lives at central and never comes near an Edge.
+  //
+  // These are not an exception to the doctrine above. They do not tell Edge
+  // what it may witness or for how long; they tell it WHOSE SIGNATURE COUNTS,
+  // which is a binding, exactly like `EDGE_ID`. And unlike a policy knob they
+  // cannot fail open: a wrong key verifies nothing, a missing key verifies
+  // nothing, and both leave Edge emitting `edge_trusted_time: null` and central
+  // refusing at NO_TRUSTWORTHY_TIME_WITNESS.
+  //
+  // Both are OPTIONAL together. Absence means this Edge cannot verify a
+  // persisted anchor, so it does not persist one — see
+  // `EDGE_TRUSTED_TIME_ANCHOR_STORE_BINDING`, where the volatile store stays
+  // the default.
+  //
+  // There is deliberately no key-fetch URL, no keyring-refresh interval and no
+  // "trust any signer" key. A keyring Edge downloaded would be unavailable
+  // exactly when it is needed — with the WAN down — and one it cached would sit
+  // on the same disk as the anchor, where whoever could rewrite the anchor
+  // could rewrite the key that verifies it.
+  // -------------------------------------------------------------------------
+  /**
+   * JSON array of 1-2 pinned verification keys:
+   *   [{"signer_key_id":"...","public_key":"<base64url SEC1 point>","role":"ACTIVE"}]
+   *
+   * One ACTIVE, optionally one PREVIOUS. Malformed, empty, duplicated,
+   * off-curve or ambiguous material refuses the WHOLE set — never a smaller
+   * one. See `modules/trusted-time/edge-trusted-time.keyring.ts`.
+   */
+  EDGE_TRUSTED_TIME_VERIFICATION_KEYS: z.string().min(1, 'EDGE_TRUSTED_TIME_VERIFICATION_KEYS must not be empty').optional(),
+  /** Names the keyring a verification decision was reached against, for audit. */
+  EDGE_TRUSTED_TIME_KEYRING_VERSION: z.string().min(1, 'EDGE_TRUSTED_TIME_KEYRING_VERSION must not be empty').optional(),
   PORT: z.coerce
     .number({ invalid_type_error: 'PORT must be a number' })
     .int('PORT must be an integer')

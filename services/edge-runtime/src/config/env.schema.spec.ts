@@ -78,6 +78,11 @@ describe('security-relevant policy is NEVER an env var', () => {
     'EDGE_FALLBACK_TO_SYSTEM_CLOCK',
     'EDGE_SIGNING_KEY',
     'EDGE_PRIVATE_KEY',
+    'EDGE_TRUSTED_TIME_SIGNING_KEY',
+    'EDGE_TRUSTED_TIME_SIGNING_KEY_FILE',
+    'EDGE_TRUSTED_TIME_KEY_FETCH_URL',
+    'EDGE_TRUSTED_TIME_KEYRING_REFRESH_MS',
+    'EDGE_TRUST_ANY_SIGNER',
     'DATABASE_URL',
   ] as const;
 
@@ -125,5 +130,41 @@ describe('toEdgeIdentityContext', () => {
     for (const field of ['edge_trust', 'trust', 'trusted', 'private_key', 'signing_key', 'public_key']) {
       expect(identity[field]).toBeUndefined();
     }
+  });
+});
+
+/**
+ * WP-29B/FW2-11. The keyring is PUBLIC trust material and it is configuration
+ * for the same reason the pinned Google attestation roots are: it says WHOSE
+ * SIGNATURE COUNTS, which is a binding rather than a policy, and it cannot fail
+ * open — a wrong or missing key verifies nothing at all.
+ */
+describe('the trusted-time verification keyring', () => {
+  it('is optional, and absent by default', () => {
+    const config = loadConfig(validEnv);
+    expect(config.EDGE_TRUSTED_TIME_VERIFICATION_KEYS).toBeUndefined();
+    expect(config.EDGE_TRUSTED_TIME_KEYRING_VERSION).toBeUndefined();
+  });
+
+  it('is carried through verbatim when supplied', () => {
+    const keys = '[{"signer_key_id":"k1","public_key":"p","role":"ACTIVE"}]';
+    const config = loadConfig({ ...validEnv, EDGE_TRUSTED_TIME_VERIFICATION_KEYS: keys, EDGE_TRUSTED_TIME_KEYRING_VERSION: 'v1' });
+    expect(config.EDGE_TRUSTED_TIME_VERIFICATION_KEYS).toBe(keys);
+    expect(config.EDGE_TRUSTED_TIME_KEYRING_VERSION).toBe('v1');
+  });
+
+  it('refuses an empty value rather than treating it as absent', () => {
+    // A blank value is a deployment that TRIED and got it wrong; it must be a
+    // configuration error at boot, not a mystery refusal in production.
+    expect(() => loadConfig({ ...validEnv, EDGE_TRUSTED_TIME_VERIFICATION_KEYS: '' })).toThrow(ConfigValidationError);
+    expect(() => loadConfig({ ...validEnv, EDGE_TRUSTED_TIME_KEYRING_VERSION: '' })).toThrow(ConfigValidationError);
+  });
+
+  it('has NO key by which Edge could sign an anchor of its own', () => {
+    // Edge verifies; it never signs. An Edge that could author its own anchor
+    // could choose what time it believed it was.
+    const shape = Object.keys(envSchema.shape);
+    expect(shape.filter((key) => key.includes('SIGNING'))).toEqual([]);
+    expect(shape.filter((key) => key.includes('PRIVATE'))).toEqual([]);
   });
 });

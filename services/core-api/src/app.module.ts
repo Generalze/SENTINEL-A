@@ -23,6 +23,7 @@ import { FieldOfflineModule } from './modules/field-offline/field-offline.module
 import { PatrolModule } from './modules/patrol/patrol.module';
 import { DeviceEnrollmentIngressModule } from './modules/device-enrollment-ingress/device-enrollment-ingress.module';
 import { DeviceGatewayModule } from './modules/device-gateway/device-gateway.module';
+import { EdgeTrustedTimeModule } from './modules/edge-trusted-time/edge-trusted-time.module';
 import { ShieldModule } from './modules/shield/shield.module';
 import { WhisperModule } from './modules/whisper/whisper.module';
 
@@ -92,6 +93,14 @@ import { WhisperModule } from './modules/whisper/whisper.module';
     // Command-side transport for bootstrap issuance and approval, so Shield
     // keeps its property of having zero controllers (D24-13/D26-09).
     DeviceEnrollmentIngressModule,
+    // WP-29B/FW2-11 Edge trusted-time anchors. Registered for dependency wiring
+    // only: the module declares NO controller, so this adds no HTTP surface. It
+    // holds the first and only private key this service has ever had, and it
+    // signs exactly one statement type — `sentinel.edge.trusted-time-anchor.v1`
+    // — so that an Edge can prove, after a restart, that the trusted time it is
+    // carrying forward came from central rather than from a file somebody
+    // edited. See the module header for why the key provider is not exported.
+    EdgeTrustedTimeModule,
   ],
 })
 export class AppModule {}

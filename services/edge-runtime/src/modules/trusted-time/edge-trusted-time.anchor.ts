@@ -2,10 +2,11 @@ import { z } from 'zod';
 import {
   DEVICE_TIME_NOT_AUTHORITATIVE,
   classifyDevicePolicyLease,
-  parseAuthoritativeInstant,
+  isExpiredAt,
+  parseAuthoritativeInstants,
   type DevicePolicyLease,
+  type EdgeTrustedTimeAnchorStatement,
 } from '@sentinel/contracts';
-import { EDGE_TRUSTED_TIME_ANCHOR_MAX_HOLDOVER_MS } from '../../edge-runtime.constants';
 
 /**
  * WP-29B / EDGE-C, FW2-10 — WHERE EDGE'S TRUSTED TIME COMES FROM, AND WHERE IT
@@ -20,7 +21,8 @@ import { EDGE_TRUSTED_TIME_ANCHOR_MAX_HOLDOVER_MS } from '../../edge-runtime.con
  *
  * THE ONE FORMULA
  * ---------------
- *      trusted_now = anchor.server_time + (monotonic_now − anchor.monotonic_at_issue)
+ *      trusted_now = statement.server_issued_at
+                    + (monotonic_now − statement.edge_monotonic_at_anchor)
  *
  * Central's authoritative instant, carried forward by an interval measured on a
  * clock that only counts. Nothing else is admissible, and the exclusions are
@@ -55,6 +57,22 @@ import { EDGE_TRUSTED_TIME_ANCHOR_MAX_HOLDOVER_MS } from '../../edge-runtime.con
  * not a testing convenience — it is what makes "Edge never reads the wall
  * clock" a property a reader can verify by looking, rather than a claim about
  * code that could always grow one more import.
+ *
+ * WHAT CHANGED UNDER THE FW2-11 RULING
+ * ------------------------------------
+ * Round 1 held a locally-shaped anchor record. It now holds the FROZEN
+ * `EdgeTrustedTimeAnchorStatement` — the exact object central signed — and
+ * nothing else. The arithmetic and every boundary below are unchanged; what
+ * changed is that BOTH operands of the subtraction are now inside a signature.
+ * That matters more than it looks: an attacker who could not touch
+ * `server_issued_at` but could edit a local monotonic field would move every
+ * derived instant forward by however much they chose, with the signature
+ * intact. There is deliberately no local anchor shape left for such a field to
+ * live in.
+ *
+ * THIS CLASS ASSUMES THE STATEMENT HAS ALREADY BEEN VERIFIED. Admitting one is
+ * `EdgeTrustedTimeAnchorVerifier`'s job, and it is the only thing that
+ * constructs this with a non-null statement.
  */
 
 /**
@@ -74,40 +92,6 @@ export interface EdgeMonotonicReading {
 }
 
 /**
- * What central issues, and the only thing Edge is allowed to build trusted time
- * from.
- *
- * `holdover_ms` is CENTRAL'S choice, bounded by the frozen ceiling. Central may
- * issue shorter — a site under investigation, a newly registered Edge, a
- * deployment tightening after an incident — and Edge honours whatever it is
- * given. It may never issue longer, and the schema refuses it rather than
- * clamping: silently shortening an over-long anchor would hide a central-side
- * defect behind an Edge that appears to be working.
- *
- * `.strict()` for the same reason every other structure in this system has it.
- * There is no field in which central could tell Edge to relax a rule, and there
- * is no field for a wall-clock reading Edge could substitute.
- */
-export const EdgeTrustedTimeAnchorRecordSchema = z
-  .object({
-    schema_version: z.literal(1),
-    /** Central's authoritative instant at issue. The only wall-clock value in the system. */
-    server_time: z.string().datetime(),
-    /** Edge's monotonic reading at the moment it received `server_time`. */
-    monotonic_at_issue: z.number().int().nonnegative(),
-    /** The boot this reading belongs to. An anchor is meaningless outside it. */
-    boot_id: z.string().min(1).max(256),
-    /** How long central permits Edge to carry this anchor forward. */
-    holdover_ms: z
-      .number()
-      .int()
-      .positive()
-      .max(EDGE_TRUSTED_TIME_ANCHOR_MAX_HOLDOVER_MS, 'anchor holdover may never exceed the frozen offline lease ceiling'),
-  })
-  .strict();
-export type EdgeTrustedTimeAnchorRecord = z.infer<typeof EdgeTrustedTimeAnchorRecordSchema>;
-
-/**
  * Why Edge does or does not have trusted time. Every non-VALID member is a
  * distinct fact an operator needs to be able to tell apart, and every one of
  * them produces `null` rather than a guess.
@@ -116,7 +100,7 @@ export const EdgeTrustedTimeStandingSchema = z.enum([
   'VALID',
   /** No anchor at all — Edge has never been given one, or a persisted one was refused. */
   'NO_ANCHOR',
-  /** The anchor exists but its holdover has run out. */
+  /** The anchor exists but `server_valid_until` has been reached. */
   'ANCHOR_EXPIRED',
   /** The machine rebooted. See `classify` for why this invalidates rather than degrades. */
   'BOOT_IDENTITY_CHANGED',
@@ -139,19 +123,32 @@ export type EdgeOperationWitnessDecision =
   | { readonly witnessable: false; readonly reason: EdgeTrustedTimeStanding | 'LEASE_NOT_IN_FORCE' };
 
 /**
- * THE TRUSTED-TIME ANCHOR. Pure logic over an injected reading.
+ * THE TRUSTED-TIME ANCHOR. Pure logic over a VERIFIED statement and an injected
+ * reading.
  *
- * Constructed with the anchor record central issued, or `null` when there is
- * none. Holding `null` is an ordinary, expected state — a freshly booted Edge
- * that has not yet reached central is in it, and so is an Edge whose persisted
- * anchor was refused at load.
+ * Constructed with the statement central signed, or `null` when there is none.
+ * Holding `null` is an ordinary, expected state — a freshly booted Edge that
+ * has not yet reached central is in it, and so is an Edge whose persisted
+ * anchor was refused at load, which after a host reboot is the NORMAL case.
  */
 export class EdgeTrustedTimeAnchor {
-  constructor(private readonly anchor: EdgeTrustedTimeAnchorRecord | null) {}
+  constructor(private readonly anchor: EdgeTrustedTimeAnchorStatement | null) {}
 
-  /** The anchor's own holdover, or `null`. Exposed for diagnostics, never for arithmetic. */
-  get holdoverMs(): number | null {
-    return this.anchor?.holdover_ms ?? null;
+  /** The verified statement, or `null`. Read-only, for diagnostics and re-persistence. */
+  get statement(): EdgeTrustedTimeAnchorStatement | null {
+    return this.anchor;
+  }
+
+  /**
+   * The anchor's usable lifetime in milliseconds, derived from the two signed
+   * instants, or `null`. Diagnostics only — the expiry decision below works
+   * from the instants themselves, so this can never become a second, drifting
+   * opinion about when an anchor ends.
+   */
+  get lifetimeMs(): number | null {
+    if (this.anchor === null) return null;
+    const instants = parseAuthoritativeInstants({ issued: this.anchor.server_issued_at, valid: this.anchor.server_valid_until });
+    return instants === null ? null : instants.valid - instants.issued;
   }
 
   /**
@@ -162,7 +159,7 @@ export class EdgeTrustedTimeAnchor {
    *  1. NO ANCHOR is not a failure, it is the starting state.
    *
    *  2. BOOT IDENTITY BEFORE EVERYTHING ELSE. If the OS boot id has changed,
-   *     the anchor's `monotonic_at_issue` refers to a counter that no longer
+   *     the anchor's `edge_monotonic_at_anchor` refers to a counter that no longer
    *     exists — the new boot's counter started at zero. Subtracting the two
    *     produces an interval that is not merely wrong but ARBITRARILY wrong,
    *     and in the common case (new counter smaller than the old one) it is
@@ -180,28 +177,35 @@ export class EdgeTrustedTimeAnchor {
    *     test double. Failing closed here is what stops that mistake from
    *     becoming a receipt.
    *
-   *  4. C15-07: an unreadable `server_time` answers TIME_NOT_AUTHORITATIVE
+   *  4. C15-07: an unreadable signed instant answers TIME_NOT_AUTHORITATIVE
    *     rather than being compared as `NaN`, because every comparison against
    *     `NaN` is `false` and a bare comparison would silently answer "not
-   *     expired". The frozen `parseAuthoritativeInstant` is used rather than a
+   *     expired". The frozen `parseAuthoritativeInstants` is used rather than a
    *     local `Date.parse` for exactly that reason.
    *
-   *  5. Expiry is EXCLUSIVE, matching `isExpiredAt` everywhere else in the
-   *     system: elapsed EQUAL to the holdover is already expired. At the
-   *     boundary the two possible mistakes are not symmetrical — refusing one
-   *     millisecond early costs a refusal an operator can see, admitting one
-   *     millisecond late vouches for time nobody re-established.
+   *  5. Expiry is judged on the DERIVED instant against the signed
+   *     `server_valid_until`, through the shared `isExpiredAt`, so the boundary
+   *     is EXCLUSIVE exactly as it is everywhere else: `trusted_now >=
+   *     server_valid_until` is expired. At the boundary the two possible
+   *     mistakes are not symmetrical — refusing one millisecond early costs a
+   *     refusal an operator can see, admitting one millisecond late vouches for
+   *     time nobody re-established.
+   *
+   *     Note what is NOT consulted: the host clock plays no part in expiry
+   *     either. An NTP rollback or a wall-clock jump cannot extend an anchor,
+   *     because the only thing that advances is the monotonic reading.
    */
   classify(reading: EdgeMonotonicReading): EdgeTrustedTimeStanding {
     const anchor = this.anchor;
     if (anchor === null) return 'NO_ANCHOR';
-    if (anchor.boot_id !== reading.boot_id) return 'BOOT_IDENTITY_CHANGED';
+    if (anchor.edge_boot_id !== reading.boot_id) return 'BOOT_IDENTITY_CHANGED';
 
-    const elapsedMs = reading.monotonic_ms - anchor.monotonic_at_issue;
+    const elapsedMs = reading.monotonic_ms - anchor.edge_monotonic_at_anchor;
     if (elapsedMs < 0) return 'MONOTONIC_NOT_MONOTONIC';
 
-    if (parseAuthoritativeInstant(anchor.server_time) === null) return DEVICE_TIME_NOT_AUTHORITATIVE;
-    if (elapsedMs >= anchor.holdover_ms) return 'ANCHOR_EXPIRED';
+    const instants = parseAuthoritativeInstants({ issued: anchor.server_issued_at, valid: anchor.server_valid_until });
+    if (instants === null) return DEVICE_TIME_NOT_AUTHORITATIVE;
+    if (isExpiredAt(instants.issued + elapsedMs, instants.valid)) return 'ANCHOR_EXPIRED';
     return 'VALID';
   }
 
@@ -216,7 +220,7 @@ export class EdgeTrustedTimeAnchor {
    *
    * That refusal is the CORRECT OUTCOME and must never be traded for a guess.
    * Every available substitute — the host clock, the last known good time, the
-   * anchor's own `server_time` used as though no time had passed, the device's
+   * anchor's own `server_issued_at` used as though no time had passed, the device's
    * `created_at` — turns a refusal an operator can see into a receipt that
    * looks exactly like a real one, signed by a genuinely trusted Edge, placing
    * an operation in a window nobody witnessed. A visible gap in evidence is
@@ -227,13 +231,13 @@ export class EdgeTrustedTimeAnchor {
     if (anchor === null) return null;
     if (this.classify(reading) !== 'VALID') return null;
 
-    const serverMs = parseAuthoritativeInstant(anchor.server_time);
+    const instants = parseAuthoritativeInstants({ issued: anchor.server_issued_at, valid: anchor.server_valid_until });
     // Unreachable while `classify` answers VALID; kept because a future edit to
     // `classify` must not be able to turn this into a `NaN` timestamp.
-    if (serverMs === null) return null;
+    if (instants === null) return null;
 
-    const elapsedMs = reading.monotonic_ms - anchor.monotonic_at_issue;
-    return new Date(serverMs + elapsedMs).toISOString();
+    const elapsedMs = reading.monotonic_ms - anchor.edge_monotonic_at_anchor;
+    return new Date(instants.issued + elapsedMs).toISOString();
   }
 
   /**
@@ -279,19 +283,4 @@ export class EdgeTrustedTimeAnchor {
 
     return { witnessable: true, trusted_now: trustedNow };
   }
-}
-
-/**
- * Build an anchor from what central said, refusing anything the schema will not
- * accept — an over-long holdover above all.
- *
- * Returns `null` rather than throwing, because the caller's correct response to
- * a bad anchor is identical to its response to no anchor: hold none, emit
- * `edge_trusted_time: null`, and wait for central. An exception here would have
- * to be caught and turned back into that same state at every call site, and one
- * missed catch would take down an Edge that was supposed to keep working.
- */
-export function readEdgeTrustedTimeAnchor(value: unknown): EdgeTrustedTimeAnchorRecord | null {
-  const parsed = EdgeTrustedTimeAnchorRecordSchema.safeParse(value);
-  return parsed.success ? parsed.data : null;
 }
