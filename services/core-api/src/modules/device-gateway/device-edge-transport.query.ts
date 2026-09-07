@@ -145,10 +145,20 @@ export class DeviceEdgeTransportQueryService {
       expires_at: contextRow.expiresAt.toISOString(),
     };
 
-    // §9: the ordinary one-shot device nonce. `peek` classifies without
-    // creating an effect -- a descriptor read must not consume or mint a domain
-    // operation identity. A lost response is answered by a NEW proof and a new
-    // nonce, not by convergence on a stored outcome that does not exist.
+    // §9 — ONE-SHOT, AND THE NONCE IS ACTUALLY SPENT.
+    //
+    // An earlier revision only PEEKED here. It classified the identity, judged
+    // it FIRST_SEEN, and never wrote anything -- so the same signed proof
+    // worked a second time, and a captured descriptor request could be replayed
+    // indefinitely. The regression below caught it; nothing else would have,
+    // because every individual response looked correct.
+    //
+    // Consuming is NOT the same as minting a domain operation identity, which
+    // is what §9 forbids. This spends a TRANSPORT nonce in the replay store and
+    // creates no operation, no target and no stored outcome to converge on. A
+    // lost response is answered by a NEW proof with a NEW nonce -- transport
+    // anti-replay and domain idempotency stay separate mechanisms, which is
+    // exactly why the descriptor has no `stored_outcome_ref` to offer.
     const peeked = await this.repository.readOnly((tx) =>
       this.replay.peek(tx, { organisationId: contextRow.organisationId, replayKey }),
     );
@@ -222,6 +232,27 @@ export class DeviceEdgeTransportQueryService {
     const requestedSite = request.siteId ?? proof.site_id;
     if (!contextSiteIds.includes(requestedSite)) return refuse('SITE_NOT_RESOLVED', subject);
     if (!actor.gatewaySiteIds.includes(requestedSite)) return refuse('SITE_NOT_RESOLVED', subject);
+
+    // SPEND THE IDENTITY BEFORE ANSWERING. A unique violation here means a
+    // concurrent request already spent it, which is a replay by definition.
+    try {
+      await this.repository.transaction(async (tx) =>
+        this.replay.consume(tx, {
+          organisationId: contextRow.organisationId,
+          ceremony: 'EDGE_TRANSPORT_DESCRIPTOR',
+          replayKey,
+          statementFingerprint: fingerprint,
+          // No effect to converge on, and no pretence of one. The descriptor is
+          // recomputed from current state on every attempt, so the identity is
+          // spent against the proof's own fingerprint rather than against a
+          // stored outcome that does not exist.
+          candidateOutcomeRef: fingerprint,
+          traceId: request.traceId,
+        }),
+      );
+    } catch {
+      return refuse('PROOF_REPLAYED', subject);
+    }
 
     // -- THE DESCRIPTOR ----------------------------------------------------
     const response = await this.descriptors.issue(context, requestedSite);

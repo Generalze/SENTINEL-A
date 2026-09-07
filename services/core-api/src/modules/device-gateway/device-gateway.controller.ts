@@ -172,7 +172,11 @@ const CompleteEstablishmentSchema = z
 const EdgeTransportRequestSchema = z
   .object({
     site_id: z.string().min(1).max(256).optional(),
-    proof: z.unknown(),
+    // `z.unknown()` would accept an ABSENT proof, because unknown is optional
+    // by default in Zod. A request with no proof is a shape complaint about the
+    // caller's own bytes and must fail as one, rather than travelling into the
+    // authenticator to be refused there as though it had been judged.
+    proof: z.custom<unknown>((value) => value !== undefined, { message: 'proof is required' }),
   })
   .strict();
 

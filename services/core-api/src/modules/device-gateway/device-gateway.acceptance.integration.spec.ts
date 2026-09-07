@@ -2769,3 +2769,343 @@ describe('WP-29A/D29A-27 queued submission audit truth (live stack)', () => {
   }, 180_000);
 });
 
+// ===========================================================================
+// M3B §11 — THE EDGE TRANSPORT DESCRIPTOR, AND EVERY WAY IT MUST REFUSE
+//
+// The descriptor is the only thing standing between a Field handset and
+// whatever answers first on a hostile site LAN. It is also a NON-OPERATION:
+// it selects no target, causes no domain effect and holds no required action.
+// Both properties are asserted here, because the second is the one that would
+// erode quietly.
+// ===========================================================================
+/**
+ * The digest a descriptor request binds.
+ *
+ * A descriptor query has no body beyond the proof itself, so the proof binds
+ * the canonical empty payload. It still binds SOMETHING: a proof with no
+ * payload binding would be a proof that could be lifted onto any request that
+ * happened to want the same purpose.
+ */
+function emptyPayloadDigest(): string {
+  return deviceCanonicalDigest({});
+}
+
+describe('M3B §11 Edge transport descriptor', () => {
+  const EDGE_TRANSPORT = `${GATEWAY}/edge-transport`;
+
+  /** A CURRENT transport identity for the seeded site, with a valid pin. */
+  async function seedTransportIdentity(
+    overrides: Record<string, unknown> = {},
+  ): Promise<{ id: string; edgeId: string }> {
+    const prisma = app.get(PrismaService);
+    const edge = await prisma.edgeNode.create({
+      data: {
+        organisationId: A.organisationId,
+        siteId: A.siteId,
+        enrolmentState: 'ACTIVE',
+        edgeTrust: 'TRUSTED',
+        enrolledByUserId: A.issuer.user.id,
+        activatedAt: new Date('2026-09-01T00:00:00.000Z'),
+      },
+    });
+    const identity = await prisma.edgeTransportIdentity.create({
+      data: {
+        organisationId: A.organisationId,
+        siteId: A.siteId,
+        edgeId: edge.id,
+        transportKeyVersion: 1,
+        transportPublicKey: 'BOGUS_PUBLIC_POINT_FOR_TEST',
+        tlsSpkiSha256: 'a'.repeat(64),
+        httpsEndpoint: 'https://edge-1.site-1.sentinel.internal:8443',
+        status: 'CURRENT',
+        registeredAt: new Date('2026-09-01T00:00:00.000Z'),
+        activatedAt: new Date('2026-09-01T00:00:00.000Z'),
+        ...overrides,
+      },
+    });
+    return { id: identity.id, edgeId: edge.id };
+  }
+
+  async function clearTransport(): Promise<void> {
+    const prisma = app.get(PrismaService);
+    await prisma.edgeTransportIdentity.deleteMany({ where: { organisationId: A.organisationId } });
+    await prisma.edgeNode.deleteMany({ where: { organisationId: A.organisationId } });
+  }
+
+  function descriptorProof(
+    context: IssuedContext,
+    device: EnrolledDevice,
+    overrides: { purpose?: DeviceRequestPurpose; nonce?: string; siteId?: string } = {},
+  ): Record<string, unknown> {
+    return signProof(device.keyPair, {
+      contextId: context.context_id,
+      organisationId: context.organisation_id,
+      siteId: overrides.siteId ?? A.siteId,
+      actorUserId: context.actor_user_id,
+      deviceId: context.device_id,
+      keyId: context.key_id,
+      keyVersion: context.key_version,
+      purpose: overrides.purpose ?? 'EDGE_TRANSPORT_DESCRIPTOR',
+      payloadDigest: emptyPayloadDigest(),
+      nonce: overrides.nonce,
+    });
+  }
+
+  async function ask(
+    body: Record<string, unknown>,
+    session: string | null,
+  ): Promise<HttpResult> {
+    return post(EDGE_TRANSPORT, body, session === null ? {} : asSession(session));
+  }
+
+  afterEach(async () => {
+    await clearTransport();
+  });
+
+  it('issues a central-resolved descriptor and files an audit row', async () => {
+    const identity = await seedTransportIdentity();
+    const device = await enrol();
+    const { context } = await establish(device);
+
+    const response = await ask({ proof: descriptorProof(context, device) }, context.actor_user_id);
+
+    expect(response.status).toBe(201);
+    const descriptor = (response.body as { descriptor: Record<string, unknown> }).descriptor;
+    // EVERY FIELD IS CENTRAL-RESOLVED. None of these was in the request.
+    expect(descriptor.edge_id).toBe(identity.edgeId);
+    expect(descriptor.site_id).toBe(A.siteId);
+    expect(descriptor.transport_identity_id).toBe(identity.id);
+    expect(descriptor.tls_spki_sha256).toBe('a'.repeat(64));
+    expect(descriptor.https_endpoint).toBe('https://edge-1.site-1.sentinel.internal:8443');
+    // Bounded, never open-ended.
+    expect(Date.parse(String(descriptor.expires_at))).toBeGreaterThan(Date.parse(String(descriptor.issued_at)));
+
+    const prisma = app.get(PrismaService);
+    const events = await prisma.deviceSecurityEvent.findMany({
+      where: { organisationId: A.organisationId, eventType: 'DEVICE_EDGE_TRANSPORT_DESCRIPTOR_ISSUED' },
+    });
+    expect(events).toHaveLength(1);
+    // §10: identifiers and provenance only. A payload that carried the proof,
+    // the signature or the nonce would be a second copy of the secret.
+    const payload = events[0]?.payload as Record<string, unknown>;
+    expect(Object.keys(payload).sort()).toEqual(
+      ['context_id', 'descriptor_fingerprint', 'edge_id', 'site_id', 'transport_identity_id', 'transport_key_version'].sort(),
+    );
+  });
+
+  it('never outlives the authenticated context', async () => {
+    await seedTransportIdentity();
+    const device = await enrol();
+    const { context } = await establish(device);
+
+    const response = await ask({ proof: descriptorProof(context, device) }, context.actor_user_id);
+    const descriptor = (response.body as { descriptor: Record<string, unknown> }).descriptor;
+    expect(Date.parse(String(descriptor.expires_at))).toBeLessThanOrEqual(Date.parse(context.expires_at));
+  });
+
+  // -- THE SESSION HALF ----------------------------------------------------
+  it('refuses with no human session at all', async () => {
+    await seedTransportIdentity();
+    const device = await enrol();
+    const { context } = await establish(device);
+    const response = await ask({ proof: descriptorProof(context, device) }, null);
+    expect(response.status).toBe(401);
+  });
+
+  it('refuses a valid proof carried by a DIFFERENT authenticated human', async () => {
+    await seedTransportIdentity();
+    const device = await enrol();
+    const { context } = await establish(device);
+    // Possession and identity are two facts. Holding the hardware does not make
+    // the caller the operative the context is bound to (C17-01).
+    const response = await ask({ proof: descriptorProof(context, device) }, A.issuer.user.id);
+    expect(response.status).toBe(403);
+  });
+
+  // -- THE PROOF HALF ------------------------------------------------------
+  it('refuses an absent proof', async () => {
+    await seedTransportIdentity();
+    const device = await enrol();
+    const { context } = await establish(device);
+    const response = await ask({}, context.actor_user_id);
+    expect(response.status).toBe(400);
+  });
+
+  it('refuses a malformed proof', async () => {
+    await seedTransportIdentity();
+    const device = await enrol();
+    const { context } = await establish(device);
+    const response = await ask({ proof: { schema_version: 1 } }, context.actor_user_id);
+    expect(response.status).toBe(403);
+  });
+
+  it('refuses a proof signed by a different device key', async () => {
+    await seedTransportIdentity();
+    const device = await enrol();
+    const other = await enrol();
+    const { context } = await establish(device);
+    const proof = signProof(other.keyPair, {
+      contextId: context.context_id,
+      organisationId: context.organisation_id,
+      siteId: A.siteId,
+      actorUserId: context.actor_user_id,
+      deviceId: context.device_id,
+      keyId: context.key_id,
+      keyVersion: context.key_version,
+      purpose: 'EDGE_TRANSPORT_DESCRIPTOR',
+      payloadDigest: emptyPayloadDigest(),
+    });
+    const response = await ask({ proof }, context.actor_user_id);
+    expect(response.status).toBe(403);
+  });
+
+  it('refuses a proof whose signature has been tampered with', async () => {
+    await seedTransportIdentity();
+    const device = await enrol();
+    const { context } = await establish(device);
+    const proof = descriptorProof(context, device);
+    const response = await ask(
+      { proof: { ...proof, payload_digest: 'a'.repeat(43) } },
+      context.actor_user_id,
+    );
+    expect(response.status).toBe(403);
+  });
+
+  // -- THE PURPOSE, WHICH IS THE WHOLE REASON IT IS NOT AN OPERATION KIND ---
+  it('refuses a proof minted for a Field operation', async () => {
+    await seedTransportIdentity();
+    const device = await enrol();
+    const { context } = await establish(device);
+    const response = await ask(
+      { proof: descriptorProof(context, device, { purpose: 'FIELD_OPERATION' }) },
+      context.actor_user_id,
+    );
+    expect(response.status).toBe(403);
+  });
+
+  it('refuses a proof minted for offline sync, whose trust row is identical', async () => {
+    // The trust posture is deliberately the same. That is exactly why the
+    // PURPOSE has to be distinct: identical trust must not mean interchangeable
+    // proofs.
+    await seedTransportIdentity();
+    const device = await enrol();
+    const { context } = await establish(device);
+    const response = await ask(
+      { proof: descriptorProof(context, device, { purpose: 'OFFLINE_SYNC' }) },
+      context.actor_user_id,
+    );
+    expect(response.status).toBe(403);
+  });
+
+  it('refuses a replayed descriptor proof', async () => {
+    await seedTransportIdentity();
+    const device = await enrol();
+    const { context } = await establish(device);
+    const nonce = randomBytes(24).toString('base64url');
+    const first = await ask({ proof: descriptorProof(context, device, { nonce }) }, context.actor_user_id);
+    expect(first.status).toBe(201);
+    const second = await ask({ proof: descriptorProof(context, device, { nonce }) }, context.actor_user_id);
+    expect(second.status).not.toBe(201);
+  });
+
+  // -- SITE RESOLUTION, AND THE D25-13 PROPERTY ----------------------------
+  it('gives BYTE-IDENTICAL answers for a nonexistent site and a foreign one', async () => {
+    await seedTransportIdentity();
+    const device = await enrol();
+    const { context } = await establish(device);
+
+    const nonexistent = await ask(
+      { site_id: 'site-that-does-not-exist', proof: descriptorProof(context, device) },
+      context.actor_user_id,
+    );
+    const foreign = await ask(
+      { site_id: B.siteId, proof: descriptorProof(context, device) },
+      context.actor_user_id,
+    );
+
+    // If these ever diverge, this endpoint has become a site-enumeration
+    // oracle for the whole estate.
+    //
+    // `trace_id` is stripped before comparison: it is per-request by design and
+    // is the ONE field that legitimately differs. Everything else must match
+    // byte for byte.
+    const withoutTrace = (body: unknown): string =>
+      JSON.stringify({ ...(body as Record<string, unknown>), trace_id: undefined });
+    expect(nonexistent.status).toBe(foreign.status);
+    expect(withoutTrace(nonexistent.body)).toBe(withoutTrace(foreign.body));
+  });
+
+  // -- THE EDGE AND ITS TRANSPORT IDENTITY ---------------------------------
+  it('refuses when the site has no trusted Edge at all', async () => {
+    const device = await enrol();
+    const { context } = await establish(device);
+    const response = await ask({ proof: descriptorProof(context, device) }, context.actor_user_id);
+    expect(response.status).toBe(403);
+  });
+
+  it('refuses rather than choosing when two CURRENT identities somehow exist', async () => {
+    // The partial unique index makes this unreachable through normal writes;
+    // the service must still refuse if it ever sees it, because picking one
+    // would let row ordering decide the fleet's trust anchor.
+    const prisma = app.get(PrismaService);
+    const INDEX = 'edge_transport_identities_one_current_per_site';
+
+    // try/finally, NOT a straight line. If the assertion below fails, the index
+    // must still be restored -- otherwise one red test silently disarms the
+    // invariant for every test that runs after it, and the suite starts
+    // agreeing with a database that no longer enforces anything.
+    try {
+      await seedTransportIdentity();
+      await prisma.$executeRawUnsafe(`DROP INDEX IF EXISTS "${INDEX}"`);
+      await seedTransportIdentity({ transportKeyVersion: 2, tlsSpkiSha256: 'b'.repeat(64) });
+
+      const device = await enrol();
+      const { context } = await establish(device);
+      const response = await ask({ proof: descriptorProof(context, device) }, context.actor_user_id);
+      expect(response.status).toBe(403);
+    } finally {
+      // The rows go BEFORE the index returns: a unique index cannot be built
+      // over data that already violates it.
+      await clearTransport();
+      await prisma.$executeRawUnsafe(
+        `CREATE UNIQUE INDEX IF NOT EXISTS "${INDEX}" ON "edge_transport_identities"("organisation_id","site_id") WHERE "status" = 'CURRENT'`,
+      );
+    }
+  });
+
+  it('refuses a revoked transport identity still marked CURRENT', async () => {
+    await seedTransportIdentity({ revokedAt: new Date('2026-09-02T00:00:00.000Z') });
+    const device = await enrol();
+    const { context } = await establish(device);
+    const response = await ask({ proof: descriptorProof(context, device) }, context.actor_user_id);
+    expect(response.status).toBe(403);
+  });
+
+  it('refuses when the Edge itself has been revoked', async () => {
+    const identity = await seedTransportIdentity();
+    const prisma = app.get(PrismaService);
+    await prisma.edgeNode.update({ where: { id: identity.edgeId }, data: { edgeTrust: 'REVOKED' } });
+    const device = await enrol();
+    const { context } = await establish(device);
+    const response = await ask({ proof: descriptorProof(context, device) }, context.actor_user_id);
+    expect(response.status).toBe(403);
+  });
+
+  // -- AND THE PROPERTY THAT MAKES THE PURPOSE WORTH HAVING ----------------
+  it('a descriptor proof CANNOT authenticate any domain operation', async () => {
+    await seedTransportIdentity();
+    const device = await enrol();
+    const { context } = await establish(device);
+
+    for (const kind of ['FIELD_STATE_UPDATE', 'ASSIGNMENT_ACCEPT', 'OFFLINE_QUEUE_SUBMIT'] as const) {
+      const response = await post(
+        ROUTE[kind]('some-target'),
+        { proof: descriptorProof(context, device), payload: {} },
+        asSession(context.actor_user_id),
+      );
+      // Exactly one purpose is admissible per evaluation (C15-04), so a proof
+      // minted for a descriptor lookup is inert everywhere else.
+      expect(response.status, kind).not.toBe(201);
+    }
+  });
+});

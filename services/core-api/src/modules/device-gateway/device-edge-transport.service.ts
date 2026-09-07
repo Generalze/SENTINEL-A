@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import {
   DEVICE_OFFLINE_LEASE_MAX_LIFETIME_MS,
   DeviceEdgeTransportDescriptorSchema,
@@ -43,7 +43,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 export class DeviceEdgeTransportService {
   private readonly logger = new Logger(DeviceEdgeTransportService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
 
   async issue(
     context: AuthenticatedDeviceContext,
