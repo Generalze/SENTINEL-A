@@ -1,4 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
+import type { AuthenticatedDeviceContext } from '@sentinel/contracts';
 import { PrismaService } from '../../prisma/prisma.service';
 
 /**
@@ -59,20 +60,40 @@ export class EdgeWitnessCorrelationService {
    * has not reconnected yet, or because the device reached central directly.
    * None of those is an error and none of them refuses the replay.
    */
-  async resolve(input: {
-    readonly organisationId: string;
-    readonly siteId: string;
-    readonly deviceId: string;
-    readonly offlineOperationId: string;
-    readonly operationFingerprint: string;
-  }): Promise<ResolvedEdgeWitness | null> {
+  async resolve(
+    /**
+     * C17-02 — THE TENANT AND DEVICE COME FROM THE AUTHENTICATED CONTEXT.
+     *
+     * An earlier revision took `organisationId` as a loose string, and the
+     * architecture tripwire caught it. It was right to: a caller could then
+     * have passed a CLAIMED tenant, and this lookup would have selected rows
+     * with it. The identical defect was found in `DevicePolicyLeaseService`
+     * during WP-29A, and the fix there was the same -- take the context, not
+     * the ids, so the wrong thing cannot be passed rather than merely should
+     * not be.
+     *
+     * `siteId` remains a parameter because a context authorises SEVERAL sites
+     * and the caller has already bound the one being replayed; it is checked
+     * for membership below rather than trusted.
+     */
+    context: AuthenticatedDeviceContext,
+    input: {
+      readonly siteId: string;
+      readonly offlineOperationId: string;
+      readonly operationFingerprint: string;
+    },
+  ): Promise<ResolvedEdgeWitness | null> {
+    // The site must be one this context actually authorises. Without this the
+    // caller could name any site and read its witnesses.
+    if (!context.authorised_site_ids.includes(input.siteId)) return null;
+
     const observation = await this.prisma.edgeReceiptObservation.findFirst({
       // EVERY correlating fact is in the WHERE clause rather than checked
       // afterwards. A post-hoc comparison is a place where one `if` can be
       // dropped and the query still returns a row; this cannot return the
       // wrong row at all.
       where: {
-        organisationId: input.organisationId,
+        organisationId: context.organisation_id,
         siteId: input.siteId,
         offlineOperationId: input.offlineOperationId,
         witnessedOperationFingerprint: input.operationFingerprint,
