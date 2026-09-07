@@ -7,6 +7,7 @@ import { EdgeConfigModule } from './config/config.module';
 import { EdgeConfigService } from './config/config.service';
 import { EdgeHealthModule } from './health/health.module';
 import { EdgeQueueModule } from './modules/queue/edge-queue.module';
+import { FieldIngressModule } from './modules/ingress/field-ingress.module';
 import { EdgeTrustedTimeModule } from './modules/trusted-time/trusted-time.module';
 
 /**
@@ -44,6 +45,7 @@ import { EdgeTrustedTimeModule } from './modules/trusted-time/trusted-time.modul
       }),
     }),
     EdgeQueueModule,
+    FieldIngressModule,
     EdgeHealthModule,
     EdgeTrustedTimeModule,
   ],

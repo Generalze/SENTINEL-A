@@ -1,0 +1,53 @@
+{
+  // ==========================================================================
+  // TYPECHECK FOR THE WAN-LOSS HARNESS.
+  //
+  // WHY THIS FILE EXISTS: `pnpm -r typecheck` walks WORKSPACE MEMBERS, and
+  // `tests/` is not one — `pnpm-workspace.yaml` lists `apps/*`, `services/*`
+  // and `packages/*`. So nothing under `tests/` is typechecked by any CI gate
+  // today, `tests/integration/proof-a.test.ts` included. Vitest transpiles
+  // without checking, which means a type error in a harness surfaces as a
+  // runtime failure inside a scenario — attributed to the system under test
+  // rather than to the harness measuring it.
+  //
+  // That is a bad failure mode anywhere and a much worse one here: this
+  // harness is the instrument Proof D's credibility rests on, and an
+  // instrument nobody checks is an instrument nobody should cite. The WP-30 CI
+  // job runs `tsc -p tests/wan-loss --noEmit` as its own step.
+  //
+  // It does NOT make `tests/` a workspace package. That would pull it into
+  // `pnpm -r test` — the exact sweep this suite must stay out of.
+  // ==========================================================================
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // ESM: the harness uses `import.meta.url` to locate the repository root,
+    // and vitest runs these files as modules.
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "noEmit": true,
+    // `tsconfig.base.json` sets `rootDir: ./src` and emit options for a
+    // service package. Neither applies to a harness that lives under `tests/`
+    // and emits nothing, so both are overridden rather than worked around.
+    "rootDir": "../..",
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false,
+    // pnpm does not hoist, so the ambient Node types this harness needs are in
+    // core-api's tree rather than the repository root's.
+    "typeRoots": ["../../services/core-api/node_modules/@types"],
+    // Mirrors `vitest.wan-loss.config.ts`'s alias. Both exist for the same
+    // reason and must agree: `@prisma/client` lives in core-api's
+    // `node_modules`, and pnpm does not hoist it anywhere `tests/` can resolve
+    // it. If one is changed without the other, the suite runs and the
+    // typecheck does not — or the reverse.
+    "baseUrl": ".",
+    "paths": {
+      "@prisma/client": ["../../services/core-api/node_modules/@prisma/client"],
+      "vitest": ["../../services/core-api/node_modules/vitest"],
+      "@sentinel/contracts": ["../../services/core-api/node_modules/@sentinel/contracts"]
+    }
+  },
+  "include": ["**/*.ts"]
+}
