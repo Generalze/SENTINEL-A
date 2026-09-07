@@ -85,9 +85,24 @@ services:
     #
     # A named volume rather than a bind mount, because a bind mount imports the
     # host's UID ownership and the container runs as 10001; a fresh named
-    # volume inherits the ownership the image set on the directory. A real Edge
-    # appliance will likely bind-mount a specific disk instead, and it must
-    # then `chown 10001:10001` that path first.
+    # volume inherits the ownership the image set on the directory.
+    #
+    # M3B §6 — THIS FILE IS DEVELOPMENT STORAGE AND IS NOT AT-REST ENCRYPTION.
+    #
+    # A named volume lives under the Docker root and inherits whatever
+    # filesystem that happens to be, which is usually an unencrypted one. It has
+    # the SHAPE of durable storage without the property, and it must never be
+    # cited as evidence of at-rest encryption.
+    #
+    # Production replaces this with an explicit host path on a device proven to
+    # be dm-crypt/LUKS:
+    #
+    #     scripts/edge-storage-preflight.sh /var/lib/sentinel-edge
+    #     docker compose -f docker-compose.edge.yml     #                    -f docker-compose.edge.production.yml up -d
+    #
+    # The preflight must exit 0 BEFORE the Edge starts. Compose cannot check
+    # what a block device is and would happily start an Edge on a plaintext
+    # disk while reporting success.
     #
     # Note the volume mounts UNDER a read_only root filesystem: `read_only`
     # governs the image's own layers, and explicit volume/tmpfs mounts stay
