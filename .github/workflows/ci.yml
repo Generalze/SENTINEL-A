@@ -1,12 +1,43 @@
 name: CI
 
+# TI-04 - STACKED CANDIDATES MUST BE REACHABLE BY THIS WORKFLOW.
+#
+# `pull_request` used to carry `branches: [main]`, so this workflow fired only
+# for pull requests whose BASE was `main`. Stacked candidates -- a work package
+# opened against the branch below it rather than against `main` -- therefore
+# received Android CI and nothing else, and the gap did not close on its own:
+# when the parent landed, the stacked branch needed no new commit, so no
+# `synchronize` fired, and there was no `workflow_dispatch` to fall back on.
+#
+# The practical consequence was that a candidate could sit MERGEABLE with a
+# green checks list that had never run the repository's main suite against it.
+# A missing required check is a safer failure than a false one, but neither is
+# acceptable at a merge gate.
+#
+# `edited` is in the list on purpose: it is the event a BASE CHANGE raises, and
+# a stacked PR whose parent has just merged has changed base without changing
+# head. Without it, exactly the candidate most in need of re-qualification is
+# the one that would not be re-qualified.
+#
+# `workflow_dispatch` exists so a qualification can be demanded rather than
+# waited for.
+#
+# Android CI already had the correct broad trigger and is deliberately not
+# touched here.
 on:
   push:
     branches:
       - main
+
   pull_request:
-    branches:
-      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+      - edited
+
+  workflow_dispatch:
 
 jobs:
   build:
@@ -24,7 +55,31 @@ jobs:
       DEV_AUTH_ENABLED: 'true'
 
     steps:
-      - uses: actions/checkout@v4
+      # TI-04: AT THE EXACT CANDIDATE SHA, for the same reason Android CI
+      # already does this. `actions/checkout` defaults on a `pull_request` to
+      # the ephemeral MERGE commit of head into base -- a revision that exists
+      # nowhere in the repository, that nobody is being asked to approve, and
+      # that silently folds in whatever the base branch happens to contain at
+      # the moment the job starts.
+      #
+      # That made this workflow qualify the PR INTEGRATION TREE while Android
+      # CI qualified the CANDIDATE. Two required checks answering two different
+      # questions, with only one of them the question a merge gate asks.
+      #
+      # Qualifications recorded before this change remain valid for what they
+      # actually tested; they are simply not exact-head qualifications.
+      - name: Check out the candidate revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      # The evidence line. A qualification that cannot say which revision it
+      # qualified is not evidence, and this is the cheapest possible way to
+      # make the answer readable in the log rather than inferred from it.
+      - name: Report the revision under test
+        run: |
+          echo "workflow ref:  ${{ github.ref }}"
+          echo "candidate SHA: $(git rev-parse HEAD)"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
