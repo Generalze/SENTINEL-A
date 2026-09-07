@@ -1,5 +1,6 @@
 import { readFileSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 /**
@@ -27,7 +28,10 @@ import { describe, expect, it } from 'vitest';
  * this shows the module cannot reach the machinery at all.
  */
 
-const EDGE_GATEWAY_DIR = join(__dirname);
+// `import.meta.url` rather than `__dirname`: this package is ESM, and the lint
+// rules say so. Resolving from the module's own URL keeps the test anchored to
+// the directory it guards even if it is ever run from elsewhere.
+const EDGE_GATEWAY_DIR = dirname(fileURLToPath(import.meta.url));
 
 /**
  * The domain-effect entry points, by the names an import would have to use.
