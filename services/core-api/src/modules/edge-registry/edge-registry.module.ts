@@ -4,6 +4,7 @@ import { ShieldModule } from '../shield/shield.module';
 import { EdgeEnrolmentService } from './edge-enrolment.service';
 import { EdgeRegistryRepository } from './edge-registry.repository';
 import { EdgeRegistryService } from './edge-registry.service';
+import { EdgeTransportEnrolmentService } from './edge-transport-enrolment.service';
 
 /**
  * WP-29B / migration 26 — the central Edge identity registry.
@@ -35,7 +36,7 @@ import { EdgeRegistryService } from './edge-registry.service';
  */
 @Module({
   imports: [PrismaModule, ShieldModule],
-  providers: [EdgeRegistryRepository, EdgeEnrolmentService, EdgeRegistryService],
+  providers: [EdgeTransportEnrolmentService, EdgeRegistryRepository, EdgeEnrolmentService, EdgeRegistryService],
   // WP-29B EDGE-B: the REPOSITORY is exported so the Edge transport boundary
   // can resolve a key across tenants and file its audit rows through the ONE
   // door to these tables, rather than opening a second one beside it. That is
@@ -43,6 +44,6 @@ import { EdgeRegistryService } from './edge-registry.service';
   // protecting: the repository holds no rules, so exporting it hands out no
   // authority — every judgement still lives in a service or in a frozen
   // contract, and the transport boundary owns none of them.
-  exports: [EdgeEnrolmentService, EdgeRegistryService, EdgeRegistryRepository],
+  exports: [EdgeTransportEnrolmentService, EdgeEnrolmentService, EdgeRegistryService, EdgeRegistryRepository],
 })
 export class EdgeRegistryModule {}
