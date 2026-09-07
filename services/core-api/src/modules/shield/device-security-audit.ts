@@ -62,6 +62,45 @@ export type DeviceSecurityEventPayload = Readonly<Record<string, string | number
  */
 export type DeviceSecurityEventInput =
   | {
+      /**
+       * M3B §10 — a device was told which Edge to trust.
+       *
+       * IDENTIFIERS AND PROVENANCE ONLY. There is no field for a raw proof, a
+       * signature, a nonce, a session credential or certificate contents, and
+       * the allowlisted builder below cannot emit one: an audit trail that
+       * discloses the material it audits is a second copy of the secret
+       * (D23-14).
+       *
+       * The SPKI digest is not itself secret and is still not copied here. The
+       * transport identity and version name the same fact without moving trust
+       * material into a second store, which is the weaker of the two available
+       * options only if you never have to revoke anything.
+       */
+      readonly type: 'DEVICE_EDGE_TRANSPORT_DESCRIPTOR_ISSUED';
+      readonly contextId: string;
+      readonly siteId: string;
+      readonly edgeId: string;
+      readonly transportIdentityId: string;
+      readonly transportKeyVersion: number;
+      readonly descriptorFingerprint: string;
+    }
+  | {
+      /**
+       * M3B §10 — a descriptor was refused.
+       *
+       * `refusal` is the INTERNAL reason, which is richer than the external
+       * answer on purpose: the caller learns one coarse code (D25-13) while the
+       * operator can tell an expired context from a revoked transport identity.
+       * `siteId` is nullable because a refusal can happen before any site has
+       * been resolved, and recording a site nobody established would be a
+       * guess written into an audit trail.
+       */
+      readonly type: 'DEVICE_EDGE_TRANSPORT_DESCRIPTOR_REFUSED';
+      readonly contextId: string | null;
+      readonly siteId: string | null;
+      readonly refusal: string;
+    }
+  | {
       readonly type: 'BOOTSTRAP_ISSUED';
       readonly grantId: string;
       readonly siteId: string;
@@ -228,6 +267,21 @@ export type DeviceSecurityEventInput =
  */
 export function buildDeviceSecurityEventPayload(input: DeviceSecurityEventInput): DeviceSecurityEventPayload {
   switch (input.type) {
+    case 'DEVICE_EDGE_TRANSPORT_DESCRIPTOR_ISSUED':
+      return {
+        context_id: input.contextId,
+        site_id: input.siteId,
+        edge_id: input.edgeId,
+        transport_identity_id: input.transportIdentityId,
+        transport_key_version: input.transportKeyVersion,
+        descriptor_fingerprint: input.descriptorFingerprint,
+      };
+    case 'DEVICE_EDGE_TRANSPORT_DESCRIPTOR_REFUSED':
+      return {
+        context_id: input.contextId,
+        site_id: input.siteId,
+        refusal: input.refusal,
+      };
     case 'BOOTSTRAP_ISSUED':
       return {
         grant_id: input.grantId,
