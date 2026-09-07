@@ -310,6 +310,46 @@ class OfflineOutbox(
         }
 
     /**
+     * Files the Edge witness for this entry, WITHOUT changing anything else
+     * about it.
+     *
+     * THE ENTRY STAYS QUEUED. An Edge receipt is not an answer about the
+     * operation and this method is deliberately incapable of ending one: it
+     * writes one local field and touches neither [OfflineEntryState] nor the
+     * sequence counter. D23-10 is the whole reason — "Edge may witness, Edge may
+     * not authorize" — and a box on a site LAN that could settle a queue entry
+     * would be a box that can make a Field operative's acknowledgement vanish
+     * before central ever learns it existed. Only a proven central answer ends
+     * an entry, and [markTerminal] and [remove] are the only ways to say so.
+     *
+     * THE FIRST WITNESS WINS, AND A SECOND ONE IS DECLINED RATHER THAN
+     * OVERWRITTEN.
+     *
+     * This is the rule worth being careful about, because "keep the newest"
+     * is the reflex and it is wrong here. The receipt's value is
+     * `edge_trusted_time` — an independent clock reading placing the operation
+     * inside its policy lease window. The FIRST Edge to see the envelope saw it
+     * closest to the moment the operative acted; a receipt minted an hour later
+     * by the same or another Edge witnesses a strictly later instant, and for a
+     * time-bounded kind that later instant is the one that can fall outside the
+     * lease. Overwriting would therefore let a re-submission on a slow evening
+     * quietly destroy the evidence that would have admitted the operation, and
+     * nobody would find out until the refusal arrived at reconciliation.
+     *
+     * Answers false when there is no such entry OR when one is already
+     * witnessed, and the caller must not read a false as a failure to record —
+     * see `EdgeSubmission`, which treats both as "this entry holds a witness".
+     */
+    fun recordEdgeReceipt(offlineOperationId: String, receiptCanonicalJson: String): Boolean {
+        require(receiptCanonicalJson.isNotBlank()) {
+            "an Edge receipt is stored as canonical JSON text; a blank string is not one"
+        }
+        val existing = find(offlineOperationId) ?: return false
+        if (existing.edgeReceiptJson != null) return false
+        return mutate(offlineOperationId) { entry -> entry.copy(edgeReceiptJson = receiptCanonicalJson) }
+    }
+
+    /**
      * Records that the SERVER answered terminally about this envelope.
      *
      * Recorded as its own write, before [remove], and the two-step is the point:
