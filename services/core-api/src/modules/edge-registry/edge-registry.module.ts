@@ -36,6 +36,13 @@ import { EdgeRegistryService } from './edge-registry.service';
 @Module({
   imports: [PrismaModule, ShieldModule],
   providers: [EdgeRegistryRepository, EdgeEnrolmentService, EdgeRegistryService],
-  exports: [EdgeEnrolmentService, EdgeRegistryService],
+  // WP-29B EDGE-B: the REPOSITORY is exported so the Edge transport boundary
+  // can resolve a key across tenants and file its audit rows through the ONE
+  // door to these tables, rather than opening a second one beside it. That is
+  // the `ShieldRepository` precedent, and it costs nothing this module was
+  // protecting: the repository holds no rules, so exporting it hands out no
+  // authority — every judgement still lives in a service or in a frozen
+  // contract, and the transport boundary owns none of them.
+  exports: [EdgeEnrolmentService, EdgeRegistryService, EdgeRegistryRepository],
 })
 export class EdgeRegistryModule {}

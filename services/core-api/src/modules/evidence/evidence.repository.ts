@@ -1,6 +1,7 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { Prisma, type Evidence as EvidenceRow, type EvidenceCustodyEvent as CustodyRow, type Event as EventRow } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
+import { DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS } from '../../prisma/transaction-budget';
 import type { EvidenceListFilter } from './evidence.types';
 
 /**
@@ -36,7 +37,7 @@ export class EvidenceRepository {
       const row = await tx.evidence.create({ data: evidence });
       await tx.evidenceCustodyEvent.create({ data: { ...custody, evidenceId: row.id } });
       return row;
-    });
+    }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
   }
 
   /** Tenant-scoped lookup — `organisationId` is part of the WHERE, not checked after the fact. */

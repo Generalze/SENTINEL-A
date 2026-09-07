@@ -1,0 +1,109 @@
+# =============================================================================
+# BUILD CONTEXT EXCLUSIONS FOR `services/core-api/Dockerfile`.
+#
+# WHY A SECOND IGNORE FILE INSTEAD OF EDITING THE ROOT `.dockerignore`.
+# --------------------------------------------------------------------
+# BuildKit looks for `<dockerfile-path>.dockerignore` FIRST and, when it finds
+# one, uses it INSTEAD of the root `.dockerignore` — not in addition to it. So
+# this file is the complete rule set for this one build and the Edge's rules
+# are untouched.
+#
+# That is the point. The root `.dockerignore` is deny-by-default and admits
+# exactly `packages/contracts` and `services/edge-runtime`; a central build
+# needs `services/core-api` admitted instead. Editing the root file to admit
+# both would mean every future Edge image carried core-api — the whole Prisma
+# toolchain, every module, every migration — into the build context of a box in
+# a customer's wiring closet, in order to build a service that does not use any
+# of it. Two builds with genuinely different needs get two rule sets.
+#
+# Same discipline as the root file, and for the same reason: EXCLUDE
+# EVERYTHING, admit by name what the Dockerfile needs, then re-exclude the
+# dangerous things that live inside the admitted directories. Later patterns
+# win. A file added to this repository can never widen this image by accident —
+# it can only be admitted by an edit here, which is a reviewable diff.
+# =============================================================================
+
+# ---- 1. Nothing is in the context unless named below. -----------------------
+*
+
+# ---- 2. Workspace metadata pnpm needs for a frozen, filtered install. -------
+!package.json
+!pnpm-workspace.yaml
+!pnpm-lock.yaml
+!tsconfig.base.json
+
+# ---- 3. The only two workspace members central is built from. ---------------
+# NOT apps/, NOT services/edge-runtime, NOT tests/, NOT docs/, NOT .github/,
+# NOT scripts/, NOT infrastructure/ — none of which are excluded by a rule
+# naming them, but by never having been admitted. `.git` is in that same set:
+# the whole history, every branch, and every secret ever committed and later
+# removed is the single largest thing a careless container build leaks. It is
+# not here.
+!packages/contracts
+!services/core-api
+
+# ---- 4. Re-exclusions INSIDE the two admitted directories. ------------------
+
+# Host-built artefacts. `node_modules` from a Windows/macOS dev machine carries
+# platform-specific binaries — Prisma's query engine above all — that would
+# silently poison a linux/amd64 image; `dist` from a dev machine is code nobody
+# can attribute to a commit. Both are rebuilt inside the build stage from the
+# lockfile, which is the point.
+**/node_modules
+**/dist
+**/build
+**/coverage
+**/.turbo
+**/*.tsbuildinfo
+
+# Package-manager caches. A pnpm/npm store inside a layer is tens of megabytes
+# of tarballs the runtime cannot use and an attacker can read for an exact
+# dependency inventory of the box.
+**/.pnpm-store
+**/.npm
+**/node_modules/.cache
+
+# TEST TOOLING. Specs never run in the image. `*.test-support.ts` is called out
+# separately because it is NOT matched by tsconfig's `**/*.spec.ts` exclusion
+# and would therefore be COMPILED into `dist` — and in this service those files
+# are not inert: `modules/edge-trusted-time/edge-trusted-time.test-support.ts`
+# generates P-256 anchor signing keypairs. Nothing outside a spec imports any
+# of them, so their absence cannot break the build.
+**/*.spec.ts
+**/*.test.ts
+**/*.test-support.ts
+**/test-integration-support.ts
+**/vitest.config.*
+**/__tests__
+**/__fixtures__
+services/core-api/test
+
+# SECRETS. Belt and braces: nothing under the admitted directories should ever
+# be a key, and if one appears there anyway it does not reach the daemon. The
+# central trusted-time signing key arrives by MOUNT at runtime — see the
+# Dockerfile's `/run/secrets` note — and has no business in a layer.
+**/*.pem
+**/*.key
+**/*.p8
+**/*.p12
+**/*.pfx
+**/*.jks
+**/*.keystore
+**/id_rsa*
+**/.env
+**/.env.*
+!**/.env.example
+**/secrets
+**/*.secret
+
+# Editor / OS noise that would otherwise bust the layer cache on every commit.
+**/.DS_Store
+**/Thumbs.db
+**/*.swp
+**/.idea
+**/.vscode
+
+# The Dockerfile and this file. Both are read by the frontend before the
+# context is assembled, so neither is ever needed inside it.
+services/core-api/Dockerfile
+services/core-api/Dockerfile.dockerignore
