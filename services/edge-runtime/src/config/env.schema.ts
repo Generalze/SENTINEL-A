@@ -55,11 +55,20 @@ import { EDGE_SIGNATURE_PROFILE } from '../edge-runtime.constants';
  *       clock, and it would be switched on by the first operator who found the
  *       refusals inconvenient.
  *
- *   EDGE_SIGNING_KEY / EDGE_PRIVATE_KEY
- *       Not because key material is unimportant, but because WP-29B has no
- *       ruling on where the Edge signing key lives (see the FW2-11 report).
- *       Inventing an env var for it here would settle that question by
- *       accident, in the least reviewable place available.
+ *   EDGE_SIGNING_KEY / EDGE_PRIVATE_KEY  (the MATERIAL, still forbidden)
+ *       A key in an environment variable is a key in every process listing,
+ *       every crash dump and every `docker inspect`. `EDGE_SIGNING_KEY_FILE`
+ *       below names a PATH and never the bytes -- the same shape central uses
+ *       for its own trusted-time signing key, for the same reason.
+ *
+ *       This was previously excluded entirely, because WP-29B had no ruling on
+ *       where the Edge signing key lives and inventing an env var would have
+ *       settled that question by accident. M3B §6 has since ruled: Edge state
+ *       lives on a LUKS/dm-crypt volume proven by
+ *       `scripts/edge-storage-preflight.sh` before the Edge starts. That gives
+ *       a mounted key file a custody story it did not previously have, and the
+ *       preflight refuses if key-shaped files sit inside the volume they
+ *       unlock.
  *
  *   DATABASE_URL
  *       Edge has no database and must not acquire one by configuration.
@@ -106,6 +115,20 @@ export const envSchema = z.object({
    */
   EDGE_AUTHORISED_SITE_IDS: csvList,
   /** WHERE DO I TALK. Endpoint only; reachability is a readiness question. */
+  /**
+   * PATH to a mounted PKCS#8 P-256 private key. NEVER the key itself.
+   *
+   * The Edge signs its request proofs with this. It is OPTIONAL because an
+   * Edge that only buffers locally needs no outbound identity, and an Edge
+   * with no key must fail CLOSED at the moment it tries to forward rather than
+   * refuse to boot -- a site that cannot reach central must still queue.
+   *
+   * PURPOSE-SEPARATED from the TLS key (M3B §2): "may sign statements" and
+   * "may terminate TLS" are two capabilities and two keypairs, so one
+   * compromise is not both.
+   */
+  EDGE_SIGNING_KEY_FILE: z.string().min(1, 'EDGE_SIGNING_KEY_FILE must not be empty').optional(),
+
   SENTINEL_CENTRAL_URL: z
     .string({ required_error: 'SENTINEL_CENTRAL_URL is required' })
     .min(1, 'SENTINEL_CENTRAL_URL is required')
