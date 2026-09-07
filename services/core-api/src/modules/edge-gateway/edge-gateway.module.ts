@@ -1,6 +1,10 @@
 import { Module } from '@nestjs/common';
+import { PrismaModule } from '../../prisma/prisma.module';
 import { EdgeRegistryModule } from '../edge-registry/edge-registry.module';
+import { EdgeTrustedTimeModule } from '../edge-trusted-time/edge-trusted-time.module';
 import { ShieldModule } from '../shield/shield.module';
+import { EdgeGatewayController } from './edge-gateway.controller';
+import { EdgeReceiptObservationService } from './edge-receipt-observation.service';
 import { EdgeAuthenticationService } from './edge-authentication.service';
 import { EdgeWitnessService } from './edge-witness.service';
 
@@ -43,8 +47,13 @@ import { EdgeWitnessService } from './edge-witness.service';
  * which is how a stateless proof becomes a session.
  */
 @Module({
-  imports: [EdgeRegistryModule, ShieldModule],
-  providers: [EdgeAuthenticationService, EdgeWitnessService],
-  exports: [EdgeAuthenticationService, EdgeWitnessService],
+  imports: [PrismaModule, EdgeRegistryModule, ShieldModule, EdgeTrustedTimeModule],
+  // M3B: THE CONTROLLER NOW EXISTS, because a handler that enforces the
+  // two-layer rule now exists. See `edge-gateway.controller.ts`, which
+  // authenticates the caller BEFORE it reads the receipt, and which explains
+  // at its foot why the domain-submission step is deliberately absent.
+  controllers: [EdgeGatewayController],
+  providers: [EdgeAuthenticationService, EdgeWitnessService, EdgeReceiptObservationService],
+  exports: [EdgeAuthenticationService, EdgeWitnessService, EdgeReceiptObservationService],
 })
 export class EdgeGatewayModule {}
