@@ -1,0 +1,183 @@
+# =============================================================================
+# SENTINEL EDGE — LOCAL COMPOSE, AND THE DEPLOYMENT POSTURE IT DOCUMENTS.
+#
+# Separate from `docker-compose.dev.yml` on purpose. That file starts the
+# BACKING SERVICES a developer's core-api talks to; this one starts an
+# APPLICATION built from this repository. Merging them would mean every
+# `docker compose up` for a database migration also rebuilt and restarted an
+# Edge, and it would make one file mean two different things.
+#
+#   docker compose -f infrastructure/compose/docker-compose.edge.yml up --build
+#
+# THIS FILE IS ALSO THE DEFAULT HARDENING POSTURE IN WRITING. A Dockerfile can
+# only decide what is IN an image; almost every property that matters for a box
+# in a wiring closet — privilege, capabilities, namespaces, whether the root
+# filesystem can be written — is decided at RUN time, by whoever starts the
+# container. Stating those defaults here means the next deployment target
+# (systemd unit, an appliance image, whatever WP-30 brings) is copied from a
+# posture that is already correct rather than from a bare `docker run`.
+# =============================================================================
+
+services:
+  edge-runtime:
+    build:
+      # Context is the REPOSITORY ROOT — a pnpm workspace member cannot be
+      # built from its own directory, because the lockfile that makes the build
+      # reproducible lives at the root.
+      context: ../..
+      dockerfile: services/edge-runtime/Dockerfile
+    image: sentinel-edge-runtime:local
+    container_name: sentinel-edge-runtime
+
+    # -------------------------------------------------------------------------
+    # NETWORK EXPOSURE. 127.0.0.1 only, following the convention every service
+    # in `docker-compose.dev.yml` already sets. A bare `'3100:3100'` binds
+    # 0.0.0.0 and publishes a developer's Edge to their coffee shop's wifi.
+    # -------------------------------------------------------------------------
+    ports:
+      - '127.0.0.1:3100:3100'
+
+    # -------------------------------------------------------------------------
+    # DEFAULT POSTURE — every line here is a capability NOT granted.
+    #
+    #   privileged            never set. It is not in this file at all, because
+    #                         the safest form of "we do not use privileged
+    #                         mode" is a file in which the word does not appear
+    #                         as anything but this comment.
+    #   /var/run/docker.sock  never mounted. A container that can reach the
+    #                         Docker socket is root on the host, and an Edge
+    #                         has no reason to start containers.
+    #   pid / ipc / network:  host namespaces are never joined. Edge sees its
+    #                         own processes and gets its own network stack.
+    #
+    # cap_drop ALL: Nest binds 3100, which is above 1024, so the process needs
+    # no capability at all — not even NET_BIND_SERVICE. Nothing is added back.
+    #
+    # no-new-privileges stops a setuid binary inside the image from ever
+    # raising privilege, which closes the standard escape from an unprivileged
+    # RCE to root-in-container even if a future base image ships one.
+    #
+    # read_only makes the ENTIRE root filesystem immutable at runtime, which
+    # generalises the Dockerfile's root-owned `/app`: an attacker cannot write
+    # anywhere, not just nowhere in the application. The two tmpfs mounts are
+    # the deliberate exceptions — /tmp because Node and its libraries assume a
+    # writable temp dir, and both are `noexec,nosuid` so a dropped payload
+    # cannot be executed from them. Sizes are capped so a bug that writes in a
+    # loop exhausts a 64MB tmpfs instead of the Edge's RAM.
+    # -------------------------------------------------------------------------
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    init: true
+
+    # -------------------------------------------------------------------------
+    # DURABLE STATE. The named volume is the point of this whole service block.
+    #
+    # `EDGE_QUEUE_PATH` (/var/lib/sentinel-edge/queue) holds Field operations
+    # that exist NOWHERE ELSE while the WAN is down, and — when a verification
+    # keyring is configured — the persisted trusted-time anchor beside them. In
+    # the container's writable layer those bytes die with `docker rm` during a
+    # routine image upgrade, silently. On a volume they survive the container.
+    #
+    # A named volume rather than a bind mount, because a bind mount imports the
+    # host's UID ownership and the container runs as 10001; a fresh named
+    # volume inherits the ownership the image set on the directory. A real Edge
+    # appliance will likely bind-mount a specific disk instead, and it must
+    # then `chown 10001:10001` that path first.
+    #
+    # Note the volume mounts UNDER a read_only root filesystem: `read_only`
+    # governs the image's own layers, and explicit volume/tmpfs mounts stay
+    # writable. That is exactly the intended shape — one writable path, and it
+    # is the one holding evidence.
+    # -------------------------------------------------------------------------
+    volumes:
+      - edge_queue_data:/var/lib/sentinel-edge
+
+    # -------------------------------------------------------------------------
+    # CONFIGURATION. Everything comes from the operator's environment, with no
+    # defaults, because `env.schema.ts` refuses to boot on a missing value and
+    # that refusal is the feature: an Edge that guessed its own EDGE_ID would
+    # sign receipts central attributes to the wrong box.
+    #
+    # `?err` on each: compose fails BEFORE starting the container, with the
+    # variable's name, rather than starting an Edge that crash-loops.
+    #
+    # EDGE_TRUSTED_TIME_VERIFICATION_KEYS / _KEYRING_VERSION are optional and
+    # PUBLIC (see the schema's note on why inline is correct for public trust
+    # material). Absent, Edge verifies no anchor, persists none, and central
+    # refuses at NO_TRUSTWORTHY_TIME_WITNESS — fail-closed, and the correct
+    # default for a file in version control.
+    #
+    # THE LIST FORM IS LOAD-BEARING FOR THOSE TWO, and this was found by
+    # rendering the file rather than by reading it. The mapping form
+    # `KEY: ${VAR:-}` always sets the variable, to an empty string when VAR is
+    # unset — and the schema declares both as `.min(1).optional()`, so an empty
+    # string is PRESENT-AND-INVALID, not absent. Edge would refuse to boot with
+    # "must not be empty" on a deployment that had simply not configured a
+    # keyring, which is the supported default. A bare `- NAME` entry passes the
+    # variable through only if the operator actually set it, which is what
+    # "optional" has to mean.
+    #
+    # EDGE_QUEUE_PATH is NOT set here: the image already sets it to the
+    # directory it created, chowned and declared as a volume, and a second
+    # source of truth for that path is how a queue ends up written somewhere
+    # nobody mounted.
+    #
+    # NO SECRET APPEARS IN THIS FILE, AND NONE MAY. Compose `environment:` ends
+    # up in `docker inspect` and in every developer's shell history.
+    # -------------------------------------------------------------------------
+    environment:
+      - EDGE_ORGANISATION_ID=${EDGE_ORGANISATION_ID:?set EDGE_ORGANISATION_ID}
+      - EDGE_ID=${EDGE_ID:?set EDGE_ID}
+      - EDGE_KEY_ID=${EDGE_KEY_ID:?set EDGE_KEY_ID}
+      - EDGE_KEY_VERSION=${EDGE_KEY_VERSION:?set EDGE_KEY_VERSION}
+      - EDGE_AUTHORISED_SITE_IDS=${EDGE_AUTHORISED_SITE_IDS:?set EDGE_AUTHORISED_SITE_IDS}
+      - SENTINEL_CENTRAL_URL=${SENTINEL_CENTRAL_URL:?set SENTINEL_CENTRAL_URL}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      # Pass-through only. No `=`, so unset means ABSENT, not empty.
+      - EDGE_TRUSTED_TIME_VERIFICATION_KEYS
+      - EDGE_TRUSTED_TIME_KEYRING_VERSION
+
+    # -------------------------------------------------------------------------
+    # SECRETS — DELIBERATELY NOT WIRED, AND THIS IS THE REASON.
+    #
+    # `services/edge-runtime/src/config/env.schema.ts` states that WP-29B has
+    # NOT ruled on where the Edge receipt-signing key lives, and that inventing
+    # a variable for it would settle that question "in the least reviewable
+    # place available". A compose file is such a place. So this lane leaves the
+    # question open and leaves the shape of the answer written down instead:
+    #
+    #   secrets:
+    #     edge_signing_key:
+    #       file: ./secrets/edge-signing-key.pem   # gitignored: *.pem, secrets/
+    #   ...
+    #   services:
+    #     edge-runtime:
+    #       secrets:
+    #         - source: edge_signing_key
+    #           target: edge-signing-key.pem       # -> /run/secrets/, 0400
+    #
+    # The key then arrives as a read-only file at RUN time, in a tmpfs the
+    # daemon mounts, and appears in no layer, no build arg, no `docker history`
+    # and no `docker inspect`. The image already provides `/run/secrets` as an
+    # empty root-owned mountpoint for exactly this.
+    #
+    # THE CENTRAL TRUSTED-TIME SIGNING KEY MUST NEVER BE MOUNTED HERE. It is
+    # central's, held by `MountedEdgeTrustedTimeSigningKeyProvider`, and an
+    # Edge that held it could author its own anchor — which is to say, choose
+    # what time it believed it was.
+    # -------------------------------------------------------------------------
+
+    # `unless-stopped`, not `always`: an operator who deliberately stops an Edge
+    # to look at its disk should not have the daemon start it again underneath
+    # them on the next reboot. The image's HEALTHCHECK reports liveness only,
+    # so an unhealthy container here means the process is gone or wedged, never
+    # that the WAN is down — Edge existing while the WAN is down is its job.
+    restart: unless-stopped
+
+volumes:
+  edge_queue_data:

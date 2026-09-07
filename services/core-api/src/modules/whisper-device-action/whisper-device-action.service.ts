@@ -20,6 +20,7 @@ import {
 } from '@sentinel/contracts';
 import { createHash } from 'node:crypto';
 import { PrismaService } from '../../prisma/prisma.service';
+import { DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS } from '../../prisma/transaction-budget';
 import { DeviceReplayService } from '../shield/device-replay.service';
 import { P256KeyImporter } from '../shield/p256-key.importer';
 import { WHISPER_DEVICE_ACTION_V2_CEREMONY } from './whisper-device-action.constants';
@@ -320,8 +321,9 @@ export class WhisperDeviceActionService {
       whisperDeviceActionV2StatementInput(submission, WHISPER_DEVICE_ACTION_V2_PROFILE),
     );
 
-    const peeked = await this.prisma.$transaction(async (tx) =>
-      this.replay.peek(tx, { organisationId: input.organisationId, replayKey }),
+    const peeked = await this.prisma.$transaction(
+      async (tx) => this.replay.peek(tx, { organisationId: input.organisationId, replayKey }),
+      DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS,
     );
     if (peeked === null) return null;
     // All three must agree: the same identity, the same bytes, and the same

@@ -23,6 +23,7 @@ import { FieldOfflineModule } from './modules/field-offline/field-offline.module
 import { PatrolModule } from './modules/patrol/patrol.module';
 import { DeviceEnrollmentIngressModule } from './modules/device-enrollment-ingress/device-enrollment-ingress.module';
 import { DeviceGatewayModule } from './modules/device-gateway/device-gateway.module';
+import { EdgeGatewayModule } from './modules/edge-gateway/edge-gateway.module';
 import { EdgeRegistryModule } from './modules/edge-registry/edge-registry.module';
 import { EdgeTrustedTimeModule } from './modules/edge-trusted-time/edge-trusted-time.module';
 import { ShieldModule } from './modules/shield/shield.module';
@@ -110,6 +111,12 @@ import { WhisperModule } from './modules/whisper/whisper.module';
     // it does so through a ceremony that starts with a human capability rather
     // than with an Edge turning up.
     EdgeRegistryModule,
+    // WP-29B EDGE-B — the Edge->Central transport boundary. Registered for
+    // dependency wiring only: like the registry it declares NO controller, so
+    // this adds no HTTP surface. It owns the authentication half of every Edge
+    // request and the two-layer rule that keeps a verified Edge receipt from
+    // ever being mistaken for an authenticated caller.
+    EdgeGatewayModule,
   ],
 })
 export class AppModule {}

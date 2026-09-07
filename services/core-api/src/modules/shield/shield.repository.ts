@@ -1,6 +1,7 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
+import { DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS } from '../../prisma/transaction-budget';
 
 /**
  * WP-24 Shield persistence primitives.
@@ -272,7 +273,7 @@ export class ShieldRepository {
    * that moved underneath it.
    */
   async transaction<T>(work: (tx: Tx) => Promise<T>): Promise<T> {
-    return this.prisma.$transaction(work);
+    return this.prisma.$transaction(work, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
   }
 
   /**

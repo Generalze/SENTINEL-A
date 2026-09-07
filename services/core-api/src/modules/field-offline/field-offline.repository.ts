@@ -2,6 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { MAX_OFFLINE_DEVICE_SEQUENCE, type OfflineReplayNamespace } from '@sentinel/contracts';
 import { PrismaService } from '../../prisma/prisma.service';
+import { DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS } from '../../prisma/transaction-budget';
 import {
   AUDIT_OFFLINE_OPERATION_FINALIZED,
   AUDIT_OFFLINE_OPERATION_RECEIVED,
@@ -196,7 +197,7 @@ export class FieldOfflineRepository {
    * authorised.
    */
   async transaction<T>(work: (tx: Tx) => Promise<T>): Promise<T> {
-    return this.prisma.$transaction(work);
+    return this.prisma.$transaction(work, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
   }
 
   /**
@@ -393,7 +394,7 @@ export class FieldOfflineRepository {
       // fencing token no write could ever match.
       if (claimed === null) throw new Error('offline receipt vanished inside its own claim transaction');
       return claimed.attemptCount;
-    });
+    }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
   }
 
   /**
@@ -470,7 +471,7 @@ export class FieldOfflineRepository {
       });
 
       return { kind: 'finalized', finalizedAt, lastFinalizedSequence: nullableSequenceFromDb(cursor?.lastFinalizedSequence ?? null) };
-    });
+    }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
   }
 
   /**
@@ -506,7 +507,7 @@ export class FieldOfflineRepository {
         trace_id: input.traceId,
       });
       return { kind: 'marked' };
-    });
+    }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
   }
 
   /**
