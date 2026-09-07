@@ -38,6 +38,13 @@ import type { AdmittedEdgeWitness } from './edge-witness.service';
  * the honest outcome for "no evidence arrived, or it did not verify", and it is
  * recorded as NULL rather than as the Edge's unverified claim.
  */
+/**
+ * What happened to the evidence, in the vocabulary the effectively-once model
+ * already uses. `NOT_RECORDED` is a truthful fourth answer: the write failed
+ * and the caller must not report a witness central does not hold.
+ */
+export type EdgeObservationOutcome = 'FIRST_SEEN' | 'CONVERGED' | 'CONFLICT' | 'NOT_RECORDED';
+
 @Injectable()
 export class EdgeReceiptObservationService {
   private readonly logger = new Logger(EdgeReceiptObservationService.name);
@@ -65,8 +72,51 @@ export class EdgeReceiptObservationService {
     readonly verifiedTime: VerifiedEdgeTrustedTimeEvidence | null;
     readonly offlineOperationId: string | null;
     readonly traceId: string | null;
-  }): Promise<void> {
+  }): Promise<EdgeObservationOutcome> {
     const { witness, verifiedTime } = input;
+
+    // §5 — THREE IDEMPOTENCIES, KEPT APART.
+    //
+    //     Edge transport anti-replay   a fresh request_id per HTTP attempt
+    //     EVIDENCE identity            this: one witness, recorded once
+    //     device domain replay         the human-authenticated path's own
+    //
+    // Collapsing any two would mean a retried HTTP attempt looked like a second
+    // witness, or a second witness looked like a retried attempt. The check
+    // below is on the EVIDENCE identity only.
+    const existing = await this.prisma.edgeReceiptObservation.findUnique({
+      where: {
+        organisationId_receiptFingerprint: {
+          organisationId: witness.organisationId,
+          receiptFingerprint: witness.receiptFingerprint,
+        },
+      },
+      select: { witnessedOperationFingerprint: true, offlineOperationId: true },
+    });
+
+    if (existing !== null) {
+      // THE SAME EVIDENCE IDENTITY MUST NOT CARRY CHANGED SEMANTICS.
+      //
+      // `receipt_fingerprint` digests the Edge's signed statement, so a
+      // re-signed receipt arrives under a different identity and is a second
+      // observation, correctly. What this catches is the SAME signed receipt
+      // arriving bound to a DIFFERENT envelope -- the operation id and the
+      // witnessed fingerprint come from bytes the receipt does not itself
+      // cover, so that substitution is possible and must be refused rather
+      // than silently converged.
+      const semanticsChanged =
+        existing.witnessedOperationFingerprint !== witness.witnessedOperationFingerprint ||
+        (existing.offlineOperationId !== null &&
+          input.offlineOperationId !== null &&
+          existing.offlineOperationId !== input.offlineOperationId);
+      if (semanticsChanged) {
+        this.logger.warn(
+          `edge receipt observation conflict: organisation_id=${witness.organisationId} edge_id=${witness.edgeId}`,
+        );
+        return 'CONFLICT';
+      }
+      return 'CONVERGED';
+    }
 
     try {
       await this.prisma.edgeReceiptObservation.upsert({
@@ -115,6 +165,9 @@ export class EdgeReceiptObservationService {
         `edge receipt observation not recorded: organisation_id=${witness.organisationId} edge_id=${witness.edgeId} ` +
           `reason=${error instanceof Error ? error.name : 'unknown'}`,
       );
+      return 'NOT_RECORDED';
     }
+
+    return 'FIRST_SEEN';
   }
 }

@@ -4,6 +4,7 @@ import { EdgeRegistryModule } from '../edge-registry/edge-registry.module';
 import { EdgeTrustedTimeModule } from '../edge-trusted-time/edge-trusted-time.module';
 import { ShieldModule } from '../shield/shield.module';
 import { EdgeGatewayController } from './edge-gateway.controller';
+import { EdgeEvidenceStandingService } from './edge-evidence-standing.service';
 import { EdgeReceiptObservationService } from './edge-receipt-observation.service';
 import { EdgeAuthenticationService } from './edge-authentication.service';
 import { EdgeWitnessService } from './edge-witness.service';
@@ -53,7 +54,7 @@ import { EdgeWitnessService } from './edge-witness.service';
   // authenticates the caller BEFORE it reads the receipt, and which explains
   // at its foot why the domain-submission step is deliberately absent.
   controllers: [EdgeGatewayController],
-  providers: [EdgeAuthenticationService, EdgeWitnessService, EdgeReceiptObservationService],
-  exports: [EdgeAuthenticationService, EdgeWitnessService, EdgeReceiptObservationService],
+  providers: [EdgeAuthenticationService, EdgeWitnessService, EdgeReceiptObservationService, EdgeEvidenceStandingService],
+  exports: [EdgeAuthenticationService, EdgeWitnessService, EdgeReceiptObservationService, EdgeEvidenceStandingService],
 })
 export class EdgeGatewayModule {}

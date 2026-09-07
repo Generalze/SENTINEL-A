@@ -1,10 +1,21 @@
-import { BadRequestException, Body, Controller, ForbiddenException, Inject, Post, Req } from '@nestjs/common';
+import {
+  BadRequestException,
+  Body,
+  ConflictException,
+  Controller,
+  ForbiddenException,
+  Inject,
+  Post,
+  Req,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { DeviceEdgeReceiptSchema } from '@sentinel/contracts';
 import { z } from 'zod';
 import type { RequestWithTraceId } from '../../common/http-types';
 import { Public } from '../../common/security/requires-action.decorator';
 import { CentralEdgeTrustedTimeVerifier } from '../edge-trusted-time/central-edge-trusted-time.verifier';
 import { EdgeAuthenticationService } from './edge-authentication.service';
+import { EdgeEvidenceStandingService } from './edge-evidence-standing.service';
 import { EdgeReceiptObservationService } from './edge-receipt-observation.service';
 import { EdgeWitnessService } from './edge-witness.service';
 
@@ -65,6 +76,7 @@ export class EdgeGatewayController {
     @Inject(EdgeWitnessService) private readonly witness: EdgeWitnessService,
     @Inject(CentralEdgeTrustedTimeVerifier) private readonly trustedTime: CentralEdgeTrustedTimeVerifier,
     @Inject(EdgeReceiptObservationService) private readonly observations: EdgeReceiptObservationService,
+    @Inject(EdgeEvidenceStandingService) private readonly standing: EdgeEvidenceStandingService,
   ) {}
 
   /**
@@ -124,19 +136,34 @@ export class EdgeGatewayController {
     const timeVerification = this.trustedTime.verify(context, parsed.data.trusted_time_evidence, claimedTime);
 
     // -- §8: THE CENTRAL-SIDE RECORD PROOF D READS -------------------------
-    await this.observations.record({
+    const offlineOperationId = readClaimedOperationId(parsed.data.envelope);
+    const recorded = await this.observations.record({
       witness: admission.witness,
       verifiedTime: timeVerification.ok ? timeVerification.evidence : null,
-      offlineOperationId: readClaimedOperationId(parsed.data.envelope),
+      offlineOperationId,
       traceId,
     });
 
-    // The Edge learns that its witness was recorded and whether central could
-    // stand behind the time. It learns nothing about the domain operation,
-    // because this route does not decide one.
+    // §5: the same evidence identity carrying changed semantics is a CONFLICT,
+    // never a convergence. Refusing is the only safe answer -- accepting would
+    // let one signed receipt be re-bound to a different operation.
+    if (recorded === 'CONFLICT') throw new ConflictException({ error: 'EDGE_EVIDENCE_CONFLICT' });
+    // A write that failed must not be reported as a held witness.
+    if (recorded === 'NOT_RECORDED') throw new ServiceUnavailableException({ error: 'EDGE_EVIDENCE_NOT_RECORDED' });
+
+    // -- §6: THE CURRENT AUTHORITATIVE STANDING ----------------------------
+    // Read from the DEVICE's replay record, never from the evidence just
+    // written. An Edge that delivered evidence learns where the operation
+    // actually stands; it does not learn a standing its own delivery created.
+    const standing = await this.standing.standingOf(context.organisationId, offlineOperationId);
+
     return {
-      witness: 'RECORDED',
+      evidence: recorded,
       trusted_time: timeVerification.ok ? 'VERIFIED' : 'UNVERIFIED',
+      // The Edge maps this into its own queue vocabulary. EVIDENCE_RECORDED is
+      // the honest answer while the Field device has not reconnected, and the
+      // Edge queue's own transitions forbid it becoming a terminal state.
+      standing,
     };
   }
 }
