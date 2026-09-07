@@ -1,0 +1,460 @@
+# =============================================================================
+# WP-30 — THE WAN-LOSS TOPOLOGY. A SEVERABLE BOUNDARY, WHICH THIS REPOSITORY
+# HAS NEVER HAD.
+#
+# THE PROBLEM THIS FILE SOLVES.
+# -----------------------------
+# `docker-compose.dev.yml` starts postgres, nats, redis and minio. It declares
+# no networks, contains no core-api, and every live suite in the repository
+# boots `AppModule` inside the vitest process on the developer's host and talks
+# to those containers over loopback.
+#
+# That topology has one property that makes Proof D unreachable: THERE IS
+# NOTHING TO DISCONNECT. Central, Edge and the test are all the same host, in
+# the same network namespace, reaching each other through 127.0.0.1. A "WAN
+# outage" written against it can only ever be a flag, a stub, or a mocked
+# method call — exactly the three things the Proof-D acceptance definition
+# names and refuses.
+#
+# So this file builds the boundary. Four network segments, three of which are
+# never touched and one of which can be severed:
+#
+#     ┌────────────┐  field   ┌──────┐   wan    ┌──────────┐  central  ┌─────────┐
+#     │ field-lan- │──────────│ edge │──────────│ wan-link │───────────│ central │
+#     │  witness   │   (LAN)  │      │  (CUT)   │  (proxy) │           │ core-api│
+#     └────────────┘          └──────┘          └──────────┘           └────┬────┘
+#                                 │                                         │
+#                            edge_queue                              postgres/nats/
+#                            (volume)                                redis/minio
+#
+# `wan` IS THE ONLY SEVERABLE SEGMENT, AND EVERY OTHER PROPERTY OF THE TOPOLOGY
+# EXISTS TO MAKE THE CUT MEAN WHAT IT CLAIMS TO MEAN:
+#
+#   * The Edge's LAN attachment is on `field`, a DIFFERENT network, so severing
+#     the WAN cannot take the site's local connectivity with it.
+#   * The Edge's durable store is a named volume, which no network operation
+#     can reach, so severing the WAN cannot take the queue with it.
+#   * The Edge PROCESS is never stopped, restarted or signalled by the cut. The
+#     cut is `docker network disconnect`, which detaches an interface from a
+#     running container and nothing else.
+#   * Central's datastores are on `central` with the Edge on neither, so the
+#     Edge cannot reach the database by some route around the severed link.
+#
+# If the cut killed the Edge, the scenario would prove nothing: an Edge that is
+# not running has trivially failed to continue local operation, and every
+# assertion downstream would be vacuous. The whole shape of this file is the
+# argument that it does not.
+#
+# WHAT THE CUT IS, PHYSICALLY.
+# ----------------------------
+#     docker network disconnect sentinel-wp30_wan sentinel-wp30-edge
+#     docker network connect    sentinel-wp30_wan sentinel-wp30-edge
+#
+# driven by `tests/wan-loss/harness/wan-control.ts`. Not a proxy toggle, not an
+# environment variable, not a flag any process under test can observe or set.
+# The interface is gone.
+#
+# WHY THE EDGE PINS THE WAN ENDPOINT IN `/etc/hosts`.
+# ---------------------------------------------------
+# Detaching a container from a Docker network also removes that network's names
+# from its embedded DNS, so an unpinned cut fails at RESOLUTION — `ENOTFOUND`,
+# instantly. That is a weaker and less honest outage than the real thing. A
+# severed WAN uplink does not un-name the datacentre; packets simply stop
+# arriving, and the client learns this from a connect timeout.
+#
+# The distinction is not academic. `ENOTFOUND` and `ETIMEDOUT` are routed
+# differently by every retry/backoff classifier ever written, and an Edge whose
+# offline detection was only ever exercised against a DNS failure would be an
+# Edge nobody had tested against a WAN failure. So `wan` gets a fixed subnet,
+# `wan-link` gets a fixed address in it, and the Edge carries that address in
+# `/etc/hosts` — a FILE, which survives the interface being detached. After the
+# cut the name still resolves and the route is gone, which is a black hole:
+# exactly what the real failure looks like from inside.
+#
+# ISOLATION FROM THE SHARED DEV STACK — DELIBERATE AND COMPLETE.
+# --------------------------------------------------------------
+# Other work runs against `sentinel-postgres` / `sentinel-nats` /
+# `sentinel-redis` / `sentinel-minio` on `docker-compose.dev.yml`. This file
+# touches NONE of them. Every container name is prefixed `sentinel-wp30-`,
+# every volume is its own, every published port is distinct, and the project
+# name is pinned so `docker compose down -v` here can never reach the shared
+# stack's volumes. The database is a SEPARATE POSTGRES INSTANCE: a suite that
+# repeatedly severs networks and restarts services has no business sharing a
+# database with suites that are trying to run.
+#
+#   docker compose -p sentinel-wp30 \
+#     -f infrastructure/compose/docker-compose.wan-loss.yml up -d --build --wait
+#   docker compose -p sentinel-wp30 \
+#     -f infrastructure/compose/docker-compose.wan-loss.yml down -v
+#
+# The project name is not optional. Compose would otherwise derive it from the
+# directory (`compose`), which is the SAME name `docker-compose.dev.yml`
+# derives, and the two files' resources would collide.
+# =============================================================================
+
+name: sentinel-wp30
+
+networks:
+  # ---------------------------------------------------------------------------
+  # `field` — THE SITE LAN. Never severed, and that is its entire purpose.
+  #
+  # Proof D requires that "Edge continues authorised critical local functions"
+  # during the outage. A topology in which cutting the WAN also cut Field from
+  # Edge could not distinguish "the Edge kept serving the site" from "nothing
+  # could reach the Edge to find out", and would quietly assert the weaker
+  # claim while appearing to assert the stronger one.
+  # ---------------------------------------------------------------------------
+  field:
+    driver: bridge
+
+  # ---------------------------------------------------------------------------
+  # `wan` — THE SEVERABLE SEGMENT. The only one the harness ever cuts.
+  #
+  # The explicit subnet is what makes the cut a black hole rather than a DNS
+  # failure: `wan-link` takes a fixed address in it, the Edge pins that address
+  # in `/etc/hosts`, and the name therefore outlives the interface. 172.30.30/24
+  # is inside RFC-1918 space Docker does not hand out by default, chosen to be
+  # unlikely to collide with a developer's corporate VPN — a collision here
+  # does not fail the suite, it silently blackholes the DEVELOPER's traffic,
+  # which is a far worse outcome than a failed test.
+  # ---------------------------------------------------------------------------
+  wan:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.30.0/24
+
+  # ---------------------------------------------------------------------------
+  # `central` — the datacentre side. Central and its datastores, and nothing
+  # else. The Edge is not on this network and must never be added to it: an
+  # Edge that could reach postgres directly would have a route around the very
+  # link the scenario severs, and every recovery assertion would be worthless.
+  # ---------------------------------------------------------------------------
+  central:
+    driver: bridge
+
+volumes:
+  wp30_postgres_data:
+  wp30_nats_data:
+  wp30_minio_data:
+  # The Edge's durable store. Named — not anonymous — because the harness
+  # restarts the Edge container and asserts the store survived, and an
+  # anonymous volume would be silently replaced on recreate, turning a real
+  # durability assertion into one that could never fail.
+  wp30_edge_queue:
+
+services:
+  # ===========================================================================
+  # CENTRAL SIDE
+  # ===========================================================================
+
+  postgres:
+    image: postgis/postgis:16-3.4
+    container_name: sentinel-wp30-postgres
+    environment:
+      POSTGRES_DB: sentinel
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: sentinel
+    # Published so the harness can run `prisma migrate deploy` from the host,
+    # exactly as CI does — migrations are an operator action and this image
+    # deliberately does not run them for itself. 5453 rather than 5433: the
+    # shared dev stack owns 5433, and a suite that reached it would be running
+    # its outage against other lanes' data.
+    ports:
+      - '127.0.0.1:5453:5432'
+    volumes:
+      - wp30_postgres_data:/var/lib/postgresql/data
+    networks: [central]
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U sentinel']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  nats:
+    image: nats:2.10-alpine
+    container_name: sentinel-wp30-nats
+    command: ['-js', '-sd', '/data', '-m', '8222']
+    volumes:
+      - wp30_nats_data:/data
+    networks: [central]
+    healthcheck:
+      test: ['CMD', 'wget', '-q', '-O', '-', 'http://localhost:8222/healthz']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7
+    container_name: sentinel-wp30-redis
+    networks: [central]
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    container_name: sentinel-wp30-minio
+    environment:
+      MINIO_ROOT_USER: sentinel
+      MINIO_ROOT_PASSWORD: sentinel123
+    command: server /data --console-address ":9001"
+    volumes:
+      - wp30_minio_data:/data
+    networks: [central]
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:9000/minio/health/live']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ---------------------------------------------------------------------------
+  # CENTRAL — core-api, in a container, on its own network.
+  #
+  # THIS SERVICE IS THE POINT OF THE WHOLE FILE. Once central is a process that
+  # sits somewhere, "central is unreachable" becomes a statement about routing
+  # that can be made true and then made false again. While central was a Nest
+  # application inside the test runner, it could not be.
+  #
+  # The port is published for the HARNESS ONLY, and that is a deliberate
+  # asymmetry rather than an oversight. The harness must be able to ask central
+  # what it committed WHILE the WAN is cut — a witness that lost its view of
+  # the system at the moment the interesting thing happened is not a witness.
+  # Published ports bypass the user-defined networks entirely, so this access
+  # path is unaffected by the cut and is available to nothing inside the
+  # topology. The EDGE reaches central only through `wan-link`, over `wan`, and
+  # `SENTINEL_CENTRAL_URL` below says so.
+  # ---------------------------------------------------------------------------
+  central:
+    build:
+      # Context is the REPOSITORY ROOT — a pnpm workspace member cannot be
+      # built from its own directory, because the lockfile that makes the build
+      # reproducible lives at the root.
+      context: ../..
+      dockerfile: services/core-api/Dockerfile
+    image: sentinel-core-api:wp30
+    container_name: sentinel-wp30-central
+    depends_on:
+      postgres: { condition: service_healthy }
+      nats: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      minio: { condition: service_healthy }
+    environment:
+      # Service names, not localhost: these resolve on the `central` network.
+      DATABASE_URL: postgresql://sentinel:sentinel@postgres:5432/sentinel
+      NATS_URL: nats://nats:4222
+      REDIS_URL: redis://redis:6379
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: sentinel
+      S3_SECRET_KEY: sentinel123
+      S3_BUCKET: sentinel-dev
+      S3_EVIDENCE_BUCKET: sentinel-evidence
+      S3_REGION: us-east-1
+      PORT: '3000'
+      LOG_LEVEL: info
+      # -----------------------------------------------------------------------
+      # DEV AUTH, ON, AND WHY THAT IS ACCEPTABLE HERE AND NOWHERE ELSE.
+      #
+      # `DevAuthGuard` trusts an `x-dev-user-id` header outright. It is on here
+      # for the same reason CI turns it on for the Proof-A live run: WP-30 is
+      # proving NETWORK RECOVERY, and standing up an authentication ceremony
+      # inside a WAN-loss harness would test authentication rather than
+      # recovery. The image does not default it — `env.schema.ts` defaults it
+      # to false and the Dockerfile sets no value — so this line is the whole
+      # of the decision, in one reviewable place, on a stack that binds every
+      # port to 127.0.0.1 and is torn down with the suite.
+      #
+      # It is NOT a shortcut around the device boundary. Nothing in this
+      # topology forges a device identity, signs on a device's behalf, or
+      # constructs an authenticated device context. The scenarios that need a
+      # genuine authenticated device are marked pending, because a harness that
+      # faked one would be the precise defect Proof C and Proof D exist to
+      # prevent.
+      # -----------------------------------------------------------------------
+      DEV_AUTH_ENABLED: 'true'
+    ports:
+      - '127.0.0.1:3230:3000'
+    networks: [central]
+    # `no`, not `unless-stopped`. If central dies the suite must FAIL, loudly,
+    # on the assertion that noticed. A restart policy would have the daemon
+    # quietly resurrect it and turn a real defect into an intermittent one —
+    # and this repository has already spent three work items removing
+    # intermittency from its suites.
+    restart: 'no'
+
+  # ===========================================================================
+  # THE WAN
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # WAN-LINK — the controllable segment, and the harness's witness.
+  #
+  # Attached to BOTH `wan` and `central`, so it is the ONLY path from the Edge
+  # side to the central side. Nothing else bridges those two networks; that is
+  # what makes the Edge's route to central a single severable thing.
+  #
+  # It runs a stock Node image with one bind-mounted, dependency-free source
+  # file. No image is built for it on purpose: the file you can read is
+  # verbatim the bytes that run, with no build step, no layer cache and no
+  # published artefact in between. The mount is read-only, so the process
+  # cannot rewrite its own behaviour.
+  #
+  # WHY IT IS HERE AT ALL, GIVEN THE NETWORK CUT ALREADY WORKS: a blunt
+  # disconnect is symmetric — it stops the request as well as the response —
+  # and therefore cannot express the phase the whole idempotency argument
+  # exists for: the request ARRIVES, central COMMITS, and the response is LOST.
+  # Producing that requires something on the path that treats the two
+  # directions differently. See `infrastructure/wan-link/wan-link.mjs`.
+  # ---------------------------------------------------------------------------
+  wan-link:
+    image: node:24.18.0-bookworm-slim
+    container_name: sentinel-wp30-wan-link
+    depends_on:
+      central: { condition: service_healthy }
+    volumes:
+      - ../wan-link/wan-link.mjs:/srv/wan-link.mjs:ro
+    environment:
+      WAN_LINK_DATA_PORT: '8080'
+      WAN_LINK_CONTROL_PORT: '8081'
+      WAN_LINK_UPSTREAM_HOST: central
+      WAN_LINK_UPSTREAM_PORT: '3000'
+    # Exec form, so node is PID 1 and receives SIGTERM directly rather than
+    # having a shell swallow it — teardown then takes milliseconds instead of
+    # the full 10-second kill timer on every harness run.
+    entrypoint: ['node', '/srv/wan-link.mjs']
+    ports:
+      # DATA plane, published so the harness can play the part of a client
+      # BEHIND the WAN — which is how the asymmetric phase-8 case is driven.
+      - '127.0.0.1:3240:8080'
+      # CONTROL plane, published for the harness alone. Note that it is on the
+      # `central` network's side of the topology in effect: the Edge has no
+      # route to it. A node under test must not be able to operate the
+      # instrument measuring it.
+      - '127.0.0.1:3241:8081'
+    networks:
+      wan:
+        # THE FIXED ADDRESS. The Edge pins this in `/etc/hosts` below, so the
+        # WAN endpoint's NAME survives the interface being detached and the cut
+        # manifests as a black hole rather than a DNS failure. Changing this
+        # value means changing the `extra_hosts` entry with it.
+        ipv4_address: 172.30.30.10
+      central: {}
+    restart: 'no'
+
+  # ===========================================================================
+  # SITE SIDE
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # EDGE — the real `@sentinel/edge-runtime`, built from this repository.
+  #
+  # It is attached to `field` and `wan`, and it is `wan` that the harness
+  # detaches. Everything that must survive the cut is on the other side of that
+  # boundary by construction: the LAN attachment is a different network, the
+  # durable store is a volume, and the process is never signalled.
+  #
+  # THE RUNTIME POSTURE BELOW IS COPIED FROM `docker-compose.edge.yml`, NOT
+  # RELAXED FOR TESTING. `read_only`, `cap_drop: ALL`, `no-new-privileges` and
+  # the `noexec,nosuid` tmpfs are the deployment defaults for a box in a
+  # customer's wiring closet, and a harness that quietly dropped them would be
+  # proving recovery for a container nobody will ever ship. The one addition is
+  # `extra_hosts`, which grants nothing.
+  #
+  # WHAT THIS EDGE CAN AND CANNOT DO TODAY IS NOT THIS FILE'S CHOICE. It runs
+  # whatever `services/edge-runtime` actually implements — presently config,
+  # identity, health and trusted time. Scenarios needing an offline queue or a
+  # reconnect protocol are marked PENDING in the suite with the lane that owns
+  # them, rather than being served by a stand-in. A mock Edge inside a Proof-D
+  # harness is the exact defect the whole witness argument exists to prevent.
+  # ---------------------------------------------------------------------------
+  edge:
+    build:
+      context: ../..
+      dockerfile: services/edge-runtime/Dockerfile
+    image: sentinel-edge-runtime:wp30
+    container_name: sentinel-wp30-edge
+    depends_on:
+      wan-link: { condition: service_started }
+    # The pinned WAN endpoint. `/etc/hosts` is a file, so this name still
+    # resolves after `docker network disconnect` removes the interface — which
+    # is what turns the cut into a connect timeout instead of an `ENOTFOUND`.
+    # The address must match `wan-link`'s `ipv4_address` above.
+    extra_hosts:
+      - 'sentinel-wan:172.30.30.10'
+    environment:
+      # A deployment identity, not an authority. Central holds the
+      # authoritative trust state, key record and authorised-site list and
+      # refuses against ITS copy; nothing here can grant this Edge anything.
+      # The values are harness-scoped and deliberately self-describing.
+      EDGE_ORGANISATION_ID: wp30_org
+      EDGE_ID: wp30_edge
+      EDGE_KEY_ID: wp30_edge_key
+      EDGE_KEY_VERSION: '1'
+      EDGE_AUTHORISED_SITE_IDS: wp30_site
+      # THROUGH THE WAN, ALWAYS. Not `http://central:3000` — the Edge is not on
+      # the `central` network and must never be given a second route, because a
+      # second route is a route around the cut.
+      SENTINEL_CENTRAL_URL: http://sentinel-wan:8080
+      LOG_LEVEL: info
+      # EDGE_TRUSTED_TIME_VERIFICATION_KEYS / _KEYRING_VERSION are deliberately
+      # ABSENT, not empty. The schema declares them `.min(1).optional()`, so an
+      # empty string is present-and-invalid and the Edge would refuse to boot.
+      # Absent means this Edge verifies no anchor and persists none — fail
+      # closed, which is the correct default for a file in version control.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - 'no-new-privileges:true'
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    init: true
+    volumes:
+      # The durable store, on a named volume. This is what the cut must not
+      # reach and what an Edge restart must not lose, and both are asserted.
+      - wp30_edge_queue:/var/lib/sentinel-edge
+    ports:
+      # Published for the harness. Note this survives the cut: a published port
+      # is a host-side mapping, not a route on `wan`. That is deliberate — the
+      # harness has to be able to ask the Edge how it is doing DURING the
+      # outage, which is the entire question.
+      - '127.0.0.1:3210:3100'
+    networks: [field, wan]
+    # `no`, for the same reason as central: a restart policy would let the
+    # daemon paper over a crash the suite is supposed to notice. It also
+    # protects the central claim of this topology — if a cut ever DID kill the
+    # Edge, the harness must see a dead Edge, not a quietly resurrected one.
+    restart: 'no'
+
+  # ---------------------------------------------------------------------------
+  # FIELD-LAN WITNESS — A NETWORK PROBE. NOT A FIELD CLIENT.
+  #
+  # READ THIS BEFORE USING IT FOR ANYTHING. This container runs `sleep
+  # infinity` and holds no application code. Its ONLY purpose is to occupy the
+  # Field device's NETWORK POSITION — on `field`, not on `wan` — so the harness
+  # can execute a probe from there and answer one question: after the WAN is
+  # cut, can something on the site LAN still reach the Edge?
+  #
+  # It does not enrol, authenticate, sign, queue, sync or report degraded
+  # state, and it must never be extended to appear to. WP-26's Field client is
+  # an Android application and its restart is a MANUAL, DOCUMENTED step (see
+  # `docs/execution/WP-30-WAN-LOSS-HARNESS.md`), not something a compose file
+  # can stand in for. Every scenario that needs genuine Field BEHAVIOUR is
+  # marked pending on the lane that owns it.
+  #
+  # The distinction is the whole reason Proof D exists. A harness that let a
+  # `sleep infinity` container grow into a pretend Field app would be
+  # manufacturing the evidence it was built to gather.
+  # ---------------------------------------------------------------------------
+  field-lan-witness:
+    image: node:24.18.0-bookworm-slim
+    container_name: sentinel-wp30-field-lan-witness
+    entrypoint: ['sleep', 'infinity']
+    networks: [field]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - 'no-new-privileges:true'
+    init: true
+    restart: 'no'

@@ -124,3 +124,143 @@ jobs:
       - name: Stop Proof-A live stack
         if: always()
         run: docker compose -f infrastructure/compose/docker-compose.dev.yml down -v
+
+  # ===========================================================================
+  # WP-30 — WAN-LOSS RECOVERY. A SEPARATE JOB, NOT A STEP IN `build`.
+  #
+  # WHY A JOB AND NOT A STEP.
+  # -------------------------
+  # The `build` job runs `pnpm -r test` and the Proof-A live suite against
+  # `docker-compose.dev.yml`'s shared stack. This suite starts its OWN postgres,
+  # nats, redis, minio, a containerised central, a WAN-link proxy and an Edge,
+  # and then severs Docker networks and restarts services.
+  #
+  # Three reasons that cannot share a job with the ordinary sweep:
+  #
+  #   1. DATABASE CONTENTION. `MILESTONE-3-ROADMAP.md` already records
+  #      "shared-Postgres live-suite contention" as engineering debt — twelve
+  #      live suites against one database, one intermittent failure per full
+  #      local run. A suite that restarts services would make that worse and
+  #      much harder to attribute. This one runs its own postgres on its own
+  #      port with its own volume, and touches nothing the other job uses.
+  #   2. HOST NETWORK MUTATION. `docker network disconnect` is not scoped to a
+  #      test process, and must not run alongside suites that assume a stable
+  #      network.
+  #   3. RUNTIME. Two image builds plus nine containers is minutes. The
+  #      ordinary sweep is a fast feedback loop and stays one.
+  #
+  # A separate job gets its own runner, its own Docker daemon and its own
+  # failure line in the checks list — so a WAN-loss failure is legible as a
+  # WAN-loss failure rather than as "CI is red".
+  #
+  # `needs: build` is deliberate. This job is expensive, and there is no value
+  # in severing networks for twenty minutes to discover the typecheck was
+  # broken all along.
+  # ===========================================================================
+  wan-loss:
+    name: WP-30 WAN-loss recovery
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: '10.34.5'
+
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: |
+          echo "STORE_PATH=$(pnpm store path)" >> $GITHUB_OUTPUT
+
+      - name: Setup pnpm cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      # The harness runs vitest on the RUNNER and drives containers from it, so
+      # the runner needs the workspace installed. It also needs the generated
+      # Prisma client: the harness seeds each scenario's own (org, site, user)
+      # namespace directly, because every identity endpoint is guarded and
+      # `DevAuthGuard` resolves its principal from the database — the first user
+      # cannot be created through an API that requires a user to exist.
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build contracts prerequisite
+        run: pnpm --filter @sentinel/contracts build
+
+      - name: Generate Prisma client prerequisite
+        run: pnpm --filter @sentinel/core-api exec prisma generate --schema prisma/schema
+
+      # `pnpm -r typecheck` and `pnpm -r lint` walk WORKSPACE MEMBERS, and
+      # `tests/` is not one — so nothing under it is checked by any gate today,
+      # `tests/integration/proof-a.test.ts` included. Vitest transpiles without
+      # checking, so a type error in a harness surfaces as a runtime failure
+      # inside a scenario and gets attributed to the system under test rather
+      # than to the instrument measuring it. This harness is what Proof D's
+      # credibility rests on; an instrument nobody checks is one nobody should
+      # cite. Checked here rather than by making `tests/` a workspace package,
+      # which would pull it into the `pnpm -r test` sweep it must stay out of.
+      - name: Typecheck the WAN-loss harness
+        run: pnpm exec tsc -p tests/wan-loss --noEmit
+
+      - name: Lint the WAN-loss harness and the WAN-link proxy
+        run: pnpm exec eslint tests/wan-loss infrastructure/wan-link
+
+      # Explicit, not folded into the suite's globalSetup. `up --wait` blocks on
+      # the containers' own healthchecks, so when this step returns, central is
+      # answering. A failure here is a topology failure and reads as one.
+      - name: Start WAN-loss topology
+        run: |
+          docker compose -p sentinel-wp30 \
+            -f infrastructure/compose/docker-compose.wan-loss.yml \
+            up -d --build --wait
+
+      # Migrations are an operator action with their own authority, run as a
+      # discrete step exactly as the `build` job does. The central image ships
+      # no Prisma CLI and does not migrate itself: a service that migrates on
+      # boot races the day two replicas start together.
+      #
+      # WP-30 ADDS NO MIGRATION. This deploys the existing chain unchanged
+      # against a database that started EMPTY — a from-zero deploy, and the
+      # work package's migration delta is zero.
+      - name: Deploy database migrations
+        env:
+          DATABASE_URL: postgresql://sentinel:sentinel@127.0.0.1:5453/sentinel
+        run: pnpm --filter @sentinel/core-api exec prisma migrate deploy --schema prisma/schema
+
+      - name: WAN-loss recovery suite
+        env:
+          WP30_WAN_LOSS_LIVE: '1'
+        run: pnpm --filter @sentinel/core-api exec vitest run --config ../../vitest.wan-loss.config.ts
+
+      # A failed run's logs are the only account of what the containers did,
+      # and they are gone the moment the stack comes down. Dumped BEFORE the
+      # teardown, and only on failure so a green run stays readable.
+      - name: Topology logs on failure
+        if: failure()
+        run: |
+          docker compose -p sentinel-wp30 \
+            -f infrastructure/compose/docker-compose.wan-loss.yml logs --no-color --tail 400
+
+      # `-v` is safe ONLY because `-p sentinel-wp30` is pinned. Without it
+      # compose would derive the project name from the compose file's DIRECTORY
+      # — the same name `docker-compose.dev.yml` derives — and this teardown
+      # would delete the shared dev stack's volumes.
+      - name: Stop WAN-loss topology
+        if: always()
+        run: |
+          docker compose -p sentinel-wp30 \
+            -f infrastructure/compose/docker-compose.wan-loss.yml down -v --remove-orphans
