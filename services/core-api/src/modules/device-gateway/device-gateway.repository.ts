@@ -1,6 +1,10 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
+import {
+  DEFAULT_INTERACTIVE_TRANSACTION_MAX_WAIT_MS,
+  DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS,
+} from '../../prisma/transaction-budget';
 import { DEVICE_GATEWAY_EVENT_OUTCOME, buildDeviceGatewayEventPayload, type DeviceGatewayEventEnvelope, type DeviceGatewayEventInput } from './device-gateway.audit';
 
 /**
@@ -95,10 +99,19 @@ export class DeviceGatewayRepository {
    * replay identity and then calls a domain service that does its own locked
    * read-check-write. A transaction that times out mid-flight rolls back, which
    * is safe — but a gateway that intermittently rolls back sound requests under
-   * ordinary load is a gateway whose refusals stop meaning anything.
+   * ordinary load is a gateway whose refusals stop meaning anything. That is an EXECUTION
+   * budget and it stays local and unchanged: TI-03 made ACQUISITION uniform, not execution.
+   *
+   * The `maxWait` this call site already carried was 10s — the same value, for the same
+   * reason, as the ledger precedent TI-03 promoted — so it is no longer written out here.
+   * It reads the shared constant, and a future change to the service-wide acquisition budget
+   * reaches the gateway rather than silently passing it by.
    */
   async transaction<T>(work: (tx: GatewayTx) => Promise<T>): Promise<T> {
-    return this.prisma.$transaction(work, { timeout: 20_000, maxWait: 10_000 });
+    return this.prisma.$transaction(work, {
+      timeout: 20_000,
+      maxWait: DEFAULT_INTERACTIVE_TRANSACTION_MAX_WAIT_MS,
+    });
   }
 
   /**
@@ -128,7 +141,7 @@ export class DeviceGatewayRepository {
 
   /** A read-only transaction, so the preflight replay PEEK observes one snapshot. */
   async readOnly<T>(work: (tx: GatewayTx) => Promise<T>): Promise<T> {
-    return this.prisma.$transaction(work);
+    return this.prisma.$transaction(work, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
   }
 
   // -------------------------------------------------------------------------

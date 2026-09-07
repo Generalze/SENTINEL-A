@@ -12,6 +12,7 @@ import {
   type PatrolRunStatus,
 } from '@sentinel/contracts';
 import { PrismaService } from '../../prisma/prisma.service';
+import { DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS } from '../../prisma/transaction-budget';
 import {
   AUDIT_PATROL_CHECKPOINT_MISSED,
   AUDIT_PATROL_CHECKPOINT_VERIFIED,
@@ -369,7 +370,7 @@ export class PatrolRepository {
           orderBy: runCheckpointOrder,
         });
         return { route, checkpoints };
-      });
+      }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
       return { kind: 'created', result: created };
     } catch (error) {
       if (!isUniqueViolation(error)) throw error;
@@ -495,7 +496,7 @@ export class PatrolRepository {
         orderBy: runCheckpointOrder,
       });
       return { kind: 'created', result: { route: updated, checkpoints: created } };
-    });
+    }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
   }
 
   async getRoute(organisationId: string, routeId: string, siteScope: SiteScope): Promise<RouteWithCheckpoints | null> {
@@ -594,7 +595,7 @@ export class PatrolRepository {
         });
         await this.signalRunUpdated(tx, row);
         return { kind: 'created', run: row };
-      });
+      }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
       if (outcome.kind !== 'created') return outcome;
       return { kind: 'created', result: { run: outcome.run, checkpoints: [] } };
     } catch (error) {
@@ -724,7 +725,7 @@ export class PatrolRepository {
         });
         await this.signalRunUpdated(tx, run);
         return { kind: 'updated', run: updated, checkpoints: await this.runCheckpoints(tx, run.id) };
-      });
+      }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
     } catch (error) {
       if (error instanceof PatrolVersionIntegrityError) return { kind: 'version_integrity' };
       throw error;
@@ -762,7 +763,7 @@ export class PatrolRepository {
       await this.timeline(tx, run.incidentId, input.actorUserId, TIMELINE_PATROL_RUN_CANCELLED, { patrol_run_id: run.id, trace_id: input.traceId });
       await this.signalRunUpdated(tx, run);
       return { kind: 'updated', run: updated, checkpoints: [] };
-    });
+    }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
   }
 
   /**
@@ -844,7 +845,7 @@ export class PatrolRepository {
       });
       await this.signalRunUpdated(tx, run);
       return { kind: 'updated', run: updated, checkpoints: await this.runCheckpoints(tx, run.id) };
-    });
+    }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
   }
 
   // -------------------------------------------------------------------------
@@ -994,7 +995,7 @@ export class PatrolRepository {
         runCheckpoint: resolved,
         runStatus: completed ? 'COMPLETED' : (run.status as PatrolRunStatus),
       };
-    });
+    }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
   }
 
   // -------------------------------------------------------------------------
@@ -1053,7 +1054,7 @@ export class PatrolRepository {
         await this.signalRunUpdated(tx, run);
         await this.completeIfFinished(tx, run.id, now, checkpoint.traceId);
         return true;
-      });
+      }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
       if (changed) transitioned += 1;
     }
     return transitioned;
