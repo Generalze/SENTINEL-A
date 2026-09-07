@@ -115,41 +115,34 @@ RUN --mount=type=cache,id=sentinel-pnpm-store,target=/pnpm/store \
     pnpm install --frozen-lockfile --filter @sentinel/edge-runtime...
 
 # -----------------------------------------------------------------------------
-# NODE'S OWN TYPES, MADE VISIBLE TO THE CONTRACTS COMPILE. A BUILD-STAGE-ONLY
-# SYMLINK, AND A DOCUMENTED PIECE OF LATENT DEBT.
+# NODE'S OWN TYPES COME FROM THE PACKAGE THAT USES THEM.
 #
-# `@sentinel/contracts` imports `node:crypto` and uses `Buffer`, but declares no
-# `@types/node` of its own. On a developer machine and in CI it compiles anyway
-# — ACCIDENTALLY. Its `*.test.ts` files are inside its `tsconfig` `include`
-# (unlike edge-runtime, contracts excludes nothing), those files import
-# `vitest`, and vitest's own `.d.ts` drags `@types/node` into the program as a
-# transitive peer. So the package's Node globals are supplied, today, by its
-# test files.
+# This stage used to build a symlink here, pointing `/repo/node_modules/@types/node`
+# at the copy the lockfile had resolved for edge-runtime. That existed because
+# `@sentinel/contracts` imported `node:crypto` while declaring no `@types/node`
+# of its own, and compiled anyway ONLY because its test files import vitest and
+# vitest drags the typings in as a transitive peer. This image excludes test
+# files, which removed the accident and broke the contracts compile.
 #
-# This image excludes test files from the build context on purpose — compiled
-# test code has no business in a wiring closet, and `pnpm deploy` would copy
-# contracts' `dist` wholesale into the runtime image. Removing them removes the
-# accident with them, and the contracts build fails on `Cannot find module
-# 'node:crypto'`.
+# THAT DEBT IS PAID. `packages/contracts/package.json` now declares
+# `@types/node: ^22` as a devDependency, so the filtered install above places
+# real, locked typings in `packages/contracts/node_modules/@types/node` and the
+# compile resolves them the ordinary way.
 #
-# The fix is confined to this stage and touches no package in the repository:
-# link the `@types/node` the lockfile already resolved for edge-runtime into
-# `/repo/node_modules/@types`, which is an ancestor `typeRoots` directory for
-# every workspace member. Contracts then compiles against declared, locked
-# types instead of against a side effect of its test runner, and the shipped
-# `dist` contains no test output at all.
+# The symlink is REMOVED rather than left as harmless belt-and-braces. It
+# resolved a path out of another package's tree, so it would have quietly gone
+# on working if contracts' own declaration were ever deleted -- reintroducing
+# the exact accident it was documenting, in a place nobody would look. The
+# assertion below is what replaces it: the build fails loudly if contracts
+# stops owning its types, instead of silently borrowing somebody else's.
 #
-# THE PROPER FIX IS A `@types/node` DEVDEPENDENCY ON `packages/contracts`, with
-# the lockfile change that implies. That is a shared-package edit and belongs
-# to whoever owns contracts, not to the lane that introduced a Dockerfile.
-# `readlink -f` resolves the pnpm symlink so the link survives into a stage
-# where the store layout is not guaranteed; the pipeline fails loudly here if
-# the package ever stops being installed.
+# `--filter @sentinel/edge-runtime...` includes contracts as a workspace
+# dependency, and pnpm installs a workspace package's devDependencies unless
+# `--prod` is passed. Nothing here passes it; the runtime image is produced by
+# `pnpm deploy` from the built output, not by installing this tree.
 # -----------------------------------------------------------------------------
-RUN mkdir -p /repo/node_modules/@types \
- && ln -s "$(readlink -f /repo/services/edge-runtime/node_modules/@types/node)" \
-      /repo/node_modules/@types/node \
- && test -f /repo/node_modules/@types/node/package.json
+RUN test -f /repo/packages/contracts/node_modules/@types/node/package.json \
+ || (echo "@sentinel/contracts must declare its own @types/node; it imports node: builtins" >&2 && exit 1)
 
 # Sources. `.dockerignore` has already stripped the specs, the `.test.ts`
 # files, the test-support anchor-signing helper, host `node_modules` and host

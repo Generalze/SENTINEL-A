@@ -179,3 +179,161 @@ jobs:
       - name: Stop Proof-A live stack
         if: always()
         run: docker compose -f infrastructure/compose/docker-compose.dev.yml down -v
+
+  # ===========================================================================
+  # WP-29B — THE EDGE DEPLOYMENT ARTIFACT, QUALIFIED LIKE EVERYTHING ELSE.
+  #
+  # WHY THIS JOB EXISTS
+  # -------------------
+  # The Edge image is the thing that actually ships to a wiring closet, and
+  # until now nothing in CI built it. The repository could therefore be green
+  # while the artifact intended for the physical Edge did not build at all --
+  # which is exactly what happened: the Dockerfile carried a `@types/node`
+  # symlink workaround for a defect that had since been fixed properly in
+  # `packages/contracts`, and no gate would have noticed if that workaround had
+  # broken.
+  #
+  # A ONE-TIME SHELL EXPERIMENT PROVES A MOMENT; A JOB PROVES EVERY COMMIT.
+  #
+  # It is a separate job rather than a step in `build` because it needs no
+  # database, no NATS and no Redis, and because an image-build failure should
+  # be legible as an image-build failure rather than as "CI is red".
+  # ===========================================================================
+  edge-image:
+    name: WP-29B Edge deployment artifact
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the candidate revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Report the revision under test
+        run: echo "candidate SHA: $(git rev-parse HEAD)"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 1. THE BUILD. From the repository ROOT, because the Dockerfile needs the
+      #    workspace and the lockfile, not just one package directory.
+      - name: Build the Edge image
+        run: |
+          docker build \
+            -f services/edge-runtime/Dockerfile \
+            --build-arg GIT_REVISION="$(git rev-parse HEAD)" \
+            -t sentinel-edge-runtime:ci \
+            .
+
+      # 2. PROVENANCE. An image that cannot say which revision produced it is an
+      #    image nobody can trace back to a review.
+      - name: The image names the exact candidate revision
+        run: |
+          EXPECTED="$(git rev-parse HEAD)"
+          ACTUAL="$(docker image inspect sentinel-edge-runtime:ci \
+            --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
+          echo "expected=${EXPECTED} actual=${ACTUAL}"
+          test "${ACTUAL}" = "${EXPECTED}"
+
+      # 3. NON-ROOT. A site appliance that runs as root turns any RCE into host
+      #    compromise, and the queue's 0700 ownership assumes this uid.
+      - name: The runtime user is non-root
+        run: |
+          USER_SPEC="$(docker image inspect sentinel-edge-runtime:ci --format '{{ .Config.User }}')"
+          echo "image user: ${USER_SPEC}"
+          test "${USER_SPEC}" = "10001:10001"
+
+      # The build stage installs `@types/node` for contracts from its OWN
+      # declaration; the runtime image must contain no typings at all. Asserting
+      # the absence stops a future change from shipping the build tree.
+      - name: No development typings are shipped
+        run: |
+          docker run --rm --entrypoint sh sentinel-edge-runtime:ci -c \
+            'test ! -d /app/node_modules/@types' \
+            || (echo "runtime image contains @types" >&2 && exit 1)
+
+      # 4/5/6. IT BOOTS, IT IS HEALTHY, AND IT IS READY.
+      #
+      # EPHEMERAL KEY MATERIAL, GENERATED HERE. A private key committed so an
+      # image can boot is a private key in the repository forever, and the fact
+      # that it is "only for tests" is not a property anyone can verify later.
+      - name: Boot the image and probe health and readiness
+        run: |
+          openssl ecparam -name prime256v1 -genkey -noout \
+            | openssl pkcs8 -topk8 -nocrypt -out "${RUNNER_TEMP}/edge-signing-key.pem"
+          chmod 0400 "${RUNNER_TEMP}/edge-signing-key.pem"
+
+          docker volume create ci-edge-state
+          docker run -d --name ci-edge \
+            -e EDGE_ORGANISATION_ID=ci-org \
+            -e EDGE_ID=ci-edge \
+            -e EDGE_AUTHORISED_SITE_IDS=ci-site \
+            -e EDGE_KEY_ID=ci-key \
+            -e EDGE_KEY_VERSION=1 \
+            -e SENTINEL_CENTRAL_URL=https://central.invalid \
+            -e EDGE_SIGNING_KEY_FILE=/run/secrets/edge-signing-key.pem \
+            -e LOG_LEVEL=error \
+            -v ci-edge-state:/var/lib/sentinel-edge \
+            -v "${RUNNER_TEMP}/edge-signing-key.pem:/run/secrets/edge-signing-key.pem:ro" \
+            -p 13100:3100 \
+            sentinel-edge-runtime:ci
+
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:13100/health >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+
+          echo "--- /health ---"
+          curl -fsS http://127.0.0.1:13100/health
+          echo "--- /health/ready ---"
+          curl -fsS http://127.0.0.1:13100/health/ready
+
+      # THE NEGATIVE HALF, AND THE MORE IMPORTANT ONE. An Edge that cannot write
+      # its durable queue must not run: starting anyway would mean accepting
+      # Field work it cannot persist, which is the one failure the whole offline
+      # design exists to prevent. It must FAIL, not degrade.
+      - name: An Edge with unwritable queue state refuses to run
+        run: |
+          docker run -d --name ci-edge-readonly \
+            -e EDGE_ORGANISATION_ID=ci-org \
+            -e EDGE_ID=ci-edge \
+            -e EDGE_AUTHORISED_SITE_IDS=ci-site \
+            -e EDGE_KEY_ID=ci-key \
+            -e EDGE_KEY_VERSION=1 \
+            -e SENTINEL_CENTRAL_URL=https://central.invalid \
+            -e LOG_LEVEL=error \
+            --tmpfs /var/lib/sentinel-edge:ro,size=1m \
+            sentinel-edge-runtime:ci
+          sleep 10
+          RUNNING="$(docker inspect -f '{{ .State.Running }}' ci-edge-readonly)"
+          echo "container running with read-only state: ${RUNNING}"
+          test "${RUNNING}" = "false"
+
+      # 7. NO PRODUCTION SECRET IS BAKED IN. The key above was mounted at RUN
+      #    time into a tmpfs path and is not part of the image; this proves the
+      #    image graph carries neither it nor any build-arg secret.
+      - name: No secret material is baked into the image
+        run: |
+          if docker image inspect sentinel-edge-runtime:ci \
+               --format '{{ json .Config.Env }}' | grep -Eiq '(PRIVATE KEY|SECRET|PASSWORD|TOKEN=)'; then
+            echo "image environment carries secret-shaped values" >&2
+            exit 1
+          fi
+          docker run --rm --entrypoint sh sentinel-edge-runtime:ci -c \
+            'find / -xdev \( -name "*.pem" -o -name "*.key" \) 2>/dev/null | head -1' > /tmp/keys.txt
+          if [ -s /tmp/keys.txt ]; then
+            echo "key-shaped files in image:" >&2 && cat /tmp/keys.txt >&2 && exit 1
+          fi
+          echo "no key material in the image"
+
+      - name: Container logs on failure
+        if: failure()
+        run: |
+          docker logs ci-edge 2>&1 | tail -50 || true
+          docker logs ci-edge-readonly 2>&1 | tail -20 || true
+
+      - name: Tear down
+        if: always()
+        run: |
+          docker rm -f ci-edge ci-edge-readonly 2>/dev/null || true
+          docker volume rm -f ci-edge-state 2>/dev/null || true
