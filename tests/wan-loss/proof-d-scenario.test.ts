@@ -130,9 +130,15 @@ describeLive('WP-30 — Proof D scenario against a genuinely severable WAN', () 
 
     // And the Edge's own account of its durable store — the one dependency
     // whose failure must take it out of service.
-    const readiness = await fetch(`${ENDPOINTS.edge}/health/ready`);
-    const body = (await readiness.json()) as { dependencies: Record<string, string> };
-    expect(body.dependencies.queue_storage).toBe('up');
+    //
+    // ASKED FROM THE SITE LAN, like the probe above. A host fetch would go
+    // through the PUBLISHED port, whose DNAT rule can die with the `wan`
+    // network the cut detaches — reporting the Edge as down when the site can
+    // still reach it perfectly. That measures the harness's vantage point
+    // rather than the Edge.
+    const readiness = await edgeQueueDepth();
+    expect(readiness.reachable).toBe(true);
+    expect(readiness.storage).toBe('up');
 
     // THE HONEST LIMIT OF THIS ASSERTION, STATED HERE SO NOBODY LATER READS IT
     // AS MORE THAN IT IS: this proves the Edge PROCESS and its STORE survive
@@ -273,9 +279,8 @@ describeLive('WP-30 — Proof D scenario against a genuinely severable WAN', () 
     // volume is NAMED in the compose file precisely so this assertion can
     // fail: an anonymous volume would be silently replaced on recreate and
     // this check could never detect a lost queue.
-    const readiness = await fetch(`${ENDPOINTS.edge}/health/ready`);
-    const body = (await readiness.json()) as { dependencies: Record<string, string> };
-    expect(body.dependencies.queue_storage).toBe('up');
+    const readiness = await edgeQueueDepth();
+    expect(readiness.storage).toBe('up');
 
     const lanToEdge = await probeFrom(CONTAINERS.fieldLanWitness, { host: CONTAINERS.edge, port: 3100, path: '/health' });
     expect(lanToEdge.outcome).toBe('REACHABLE');

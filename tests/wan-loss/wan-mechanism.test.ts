@@ -35,6 +35,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { CONTAINERS, attachedNetworks, containerFacts, probeFrom, WAN_NETWORK } from './harness/docker';
 import { ENDPOINTS, assertSchemaDeployed } from './harness/topology';
+import { edgeQueueDepth } from './harness/edge-queue';
 import { WanControl } from './harness/wan-control';
 
 /**
@@ -140,15 +141,23 @@ describeLive('WP-30 — WAN cut/restore mechanism (qualifies the harness itself)
       //    failure takes Edge out of service. Reading the Edge's own readiness
       //    is a stronger claim than the harness inspecting a volume: it is the
       //    Edge saying it can still keep an operation safe.
-      const readiness = await fetch(`${ENDPOINTS.edge}/health/ready`);
-      const body = (await readiness.json()) as { status: string; dependencies: Record<string, string> };
-      expect(body.dependencies.queue_storage).toBe('up');
+      //    ASKED FROM THE SITE LAN. A host fetch reaches the PUBLISHED port,
+      //    whose DNAT rule can die with the `wan` network this very test has
+      //    just detached -- so it would report the Edge as down while the site
+      //    still reaches it perfectly, and the test would "fail" by measuring
+      //    the harness's own vantage point.
+      const readiness = await edgeQueueDepth();
+      expect(readiness.storage).toBe('up');
 
       // 4. AND THE EDGE IS STILL SERVING AT ALL. Liveness touches no
       //    dependency, so this is specifically "the process is answering",
       //    which is the claim "Edge continues operating" rests on.
-      const liveness = await fetch(`${ENDPOINTS.edge}/health`);
-      expect(liveness.status).toBe(200);
+      const liveness = await probeFrom(CONTAINERS.fieldLanWitness, {
+        host: CONTAINERS.edge,
+        port: 3100,
+        path: '/health',
+      });
+      expect(liveness.outcome).toBe('REACHABLE');
     } finally {
       await wan.restore();
     }
