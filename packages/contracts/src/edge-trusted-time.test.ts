@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 import {
   EDGE_TRUSTED_TIME_ANCHOR_DOMAIN,
   EDGE_TRUSTED_TIME_ANCHOR_FORBIDDEN_FIELDS,
+  EDGE_TRUSTED_TIME_EVIDENCE_FORBIDDEN_FIELDS,
   EdgeTrustedTimeAnchorClaimSchema,
+  EdgeTrustedTimeEvidenceSchema,
   EdgeTrustedTimeAnchorStatementSchema,
   SignedEdgeTrustedTimeAnchorSchema,
   canonicalEdgeTrustedTimeAnchorStatement,
@@ -297,3 +299,77 @@ function bigIntTo32Bytes(value: bigint): Buffer {
   const hex = value.toString(16).padStart(64, '0');
   return Buffer.from(hex, 'hex');
 }
+
+/**
+ * The evidence that turns "this Edge says it is 14:03" into something central
+ * can check. These tests defend the SHAPE only; whether a given evidence
+ * verifies is the central verifier's question, and it is asserted there. The
+ * split matters: a contract that could decide verification would be a contract
+ * the Edge gets to influence.
+ */
+describe('EdgeTrustedTimeEvidence v1', () => {
+  const evidence = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+    schema_version: 1,
+    signed_anchor: { statement: statement(), signature: SIGNATURE },
+    edge_boot_id: 'boot-4f2a',
+    edge_monotonic_at_observation: 1_030_000,
+    ...overrides,
+  });
+
+  it('accepts evidence carrying a signed anchor and the two readings needed to derive from it', () => {
+    expect(EdgeTrustedTimeEvidenceSchema.safeParse(evidence()).success).toBe(true);
+  });
+
+  // The whole point of the structure. Without the signed anchor there is
+  // nothing central signed, and therefore nothing to verify against.
+  it('refuses evidence with no signed anchor', () => {
+    const { signed_anchor: _dropped, ...rest } = evidence();
+    expect(EdgeTrustedTimeEvidenceSchema.safeParse(rest).success).toBe(false);
+  });
+
+  // Central compares this against the anchor's own boot id and requires
+  // equality; it cannot do that if the Edge never sends it.
+  it('refuses evidence with no observation boot id', () => {
+    const { edge_boot_id: _dropped, ...rest } = evidence();
+    expect(EdgeTrustedTimeEvidenceSchema.safeParse(rest).success).toBe(false);
+  });
+
+  // The minuend of the derivation. Absent, no time can be derived at all.
+  it('refuses evidence with no observation reading', () => {
+    const { edge_monotonic_at_observation: _dropped, ...rest } = evidence();
+    expect(EdgeTrustedTimeEvidenceSchema.safeParse(rest).success).toBe(false);
+  });
+
+  it('refuses a negative or non-integer monotonic reading', () => {
+    expect(EdgeTrustedTimeEvidenceSchema.safeParse(evidence({ edge_monotonic_at_observation: -1 })).success).toBe(false);
+    expect(EdgeTrustedTimeEvidenceSchema.safeParse(evidence({ edge_monotonic_at_observation: 1.5 })).success).toBe(false);
+  });
+
+  // Every one of these is a way of saying "accept this without doing the
+  // derivation". A verifier that reads `verified: true` off the thing it is
+  // verifying has stopped being a verifier.
+  it.each(EDGE_TRUSTED_TIME_EVIDENCE_FORBIDDEN_FIELDS)('refuses evidence carrying %s', (field) => {
+    expect(EdgeTrustedTimeEvidenceSchema.safeParse(evidence({ [field]: true })).success).toBe(false);
+  });
+
+  it('refuses an unknown field', () => {
+    expect(EdgeTrustedTimeEvidenceSchema.safeParse(evidence({ invented_later: 1 })).success).toBe(false);
+  });
+
+  // A high-S signature cannot reach a parsed anchor, and therefore cannot
+  // reach parsed evidence either. Malleability is refused at the boundary
+  // rather than deep inside the verifier.
+  it('inherits the anchor signature branding rather than re-checking it', () => {
+    // Built by hand rather than through the encoder, because the encoder
+    // itself refuses high-S -- the malleable form has to be forged to prove
+    // the schema rejects it.
+    const highS = Buffer.concat([
+      Buffer.from(encodeCanonicalP256Signature(12345n, 1n), 'base64url').subarray(0, 32),
+      bigIntTo32Bytes(P256_CURVE_ORDER - 1n),
+    ]).toString('base64url');
+    const parsed = EdgeTrustedTimeEvidenceSchema.safeParse(
+      evidence({ signed_anchor: { statement: statement(), signature: highS } }),
+    );
+    expect(parsed.success).toBe(false);
+  });
+});
