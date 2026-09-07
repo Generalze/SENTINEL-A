@@ -222,24 +222,55 @@ jobs:
       # Explicit, not folded into the suite's globalSetup. `up --wait` blocks on
       # the containers' own healthchecks, so when this step returns, central is
       # answering. A failure here is a topology failure and reads as one.
-      - name: Start WAN-loss topology
+      # THE THREE-PHASE START. THIS ORDER IS LOAD-BEARING.
+      #
+      # An earlier version of this job brought the whole topology up in one
+      # `up -d --build --wait` and deployed migrations afterwards. It failed on
+      # its first hosted run, and it failed for the right reason:
+      #
+      #   sentinel-wp30-central | Failed to start application:
+      #   Invalid `prisma.constitutionPolicy.count()` invocation:
+      #   The table `public.constitution_policies` does not exist ...
+      #   dependency failed to start: container sentinel-wp30-central exited (1)
+      #
+      # Central does not come up degraded against an empty schema. Its
+      # constitution module queries `constitution_policies` during bootstrap
+      # and the process exits 1. That is the fail-closed behaviour this system
+      # is supposed to have, and it must not be softened to make a pipeline
+      # green. Migrations are therefore not something that can be applied to a
+      # RUNNING stack; they are a PRECONDITION of it.
+      #
+      # `tests/wan-loss/harness/topology.ts` already documented and implemented
+      # this exact sequence for local runs. This job contradicted it. It now
+      # mirrors it, which is also the shape the `build` job above already has:
+      # start the datastores, deploy the chain, start the services.
+      #
+      # The central image ships no Prisma CLI and does not migrate itself,
+      # because a service that migrates on boot races the day two replicas
+      # start together. Migration stays a discrete operator step with its own
+      # authority.
+      - name: Start WAN-loss datastores
         run: |
           docker compose -p sentinel-wp30 \
             -f infrastructure/compose/docker-compose.wan-loss.yml \
-            up -d --build --wait
+            up -d --wait postgres nats redis minio
 
-      # Migrations are an operator action with their own authority, run as a
-      # discrete step exactly as the `build` job does. The central image ships
-      # no Prisma CLI and does not migrate itself: a service that migrates on
-      # boot races the day two replicas start together.
-      #
       # WP-30 ADDS NO MIGRATION. This deploys the existing chain unchanged
-      # against a database that started EMPTY — a from-zero deploy, and the
+      # against a database that started EMPTY - a from-zero deploy, and the
       # work package's migration delta is zero.
       - name: Deploy database migrations
         env:
           DATABASE_URL: postgresql://sentinel:sentinel@127.0.0.1:5453/sentinel
         run: pnpm --filter @sentinel/core-api exec prisma migrate deploy --schema prisma/schema
+
+      # `--build` because the images are built from this repository, and a
+      # harness that silently ran a stale central would be proving things about
+      # code that is no longer in the tree.
+      - name: Start WAN-loss services
+        run: |
+          docker compose -p sentinel-wp30 \
+            -f infrastructure/compose/docker-compose.wan-loss.yml \
+            up -d --build --wait
 
       - name: WAN-loss recovery suite
         env:
