@@ -1,7 +1,11 @@
-import { randomUUID } from 'node:crypto';
+import { createSign, generateKeyPairSync, randomUUID } from 'node:crypto';
 import { Test, type TestingModule } from '@nestjs/testing';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
+  P256_CURVE_ORDER,
+  P256_HALF_CURVE_ORDER,
+  canonicalEdgeTrustedTimeAnchorStatement,
+  encodeCanonicalP256Signature,
   canonicalDeviceEdgeReceiptStatement,
   canonicalEdgeEnrolmentPossessionStatement,
   canonicalEdgeRequestStatement,
@@ -24,6 +28,9 @@ import { EdgeRegistryService } from '../edge-registry/edge-registry.service';
 import { EDGE_SERVER_SELECTED_SIGNATURE_PROFILE, EDGE_TRUST_SUSPENDED } from '../edge-registry/edge-registry.constants';
 import { EdgeAuthenticationService, type AuthenticatedEdgeContext } from './edge-authentication.service';
 import { EdgeGatewayModule } from './edge-gateway.module';
+import { CentralEdgeTrustedTimeVerifier } from '../edge-trusted-time/central-edge-trusted-time.verifier';
+import { CentralTrustedTimeKeyringProvider } from '../edge-trusted-time/central-trusted-time-verification.keyring';
+import { P256KeyImporter } from '../shield/p256-key.importer';
 import { EdgeEvidenceStandingService } from './edge-evidence-standing.service';
 import { EdgeReceiptObservationService } from './edge-receipt-observation.service';
 import { EdgeWitnessService } from './edge-witness.service';
@@ -786,6 +793,106 @@ describe('M3B \u00a715 Edge evidence relay causes no domain effect', () => {
 
     const stored = await prisma.edgeReceiptObservation.count({ where: { organisationId: ORG } });
     expect(stored).toBeGreaterThan(0);
+  });
+
+
+  /**
+   * The §15 case that needs REAL verified evidence rather than a null.
+   *
+   * A fully verified, central-signed trusted time is the strongest thing this
+   * channel can carry. It still causes no domain effect, and that is the point:
+   * the strength of the EVIDENCE has no bearing on whether an operation is
+   * AUTHORISED, because those are different questions asked of different
+   * principals.
+   */
+  it('a fully VERIFIED central trusted time still causes no domain effect', async () => {
+    const edge = await enrolEdge();
+    const context = await authenticated(edge);
+    const before = await domainReceiptCount(ORG);
+
+    // A real anchor, signed by a real key, verified by the real verifier --
+    // constructed here rather than faked, because a stubbed
+    // `VerifiedEdgeTrustedTimeEvidence` would prove nothing about the path.
+    const signingPair = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+    const jwk = signingPair.publicKey.export({ format: 'jwk' }) as { x: string; y: string };
+    const publicKey = Buffer.concat([
+      Buffer.from([0x04]),
+      Buffer.from(jwk.x, 'base64url'),
+      Buffer.from(jwk.y, 'base64url'),
+    ]).toString('base64url');
+
+    const anchorStatement = {
+      schema_version: 1 as const,
+      anchor_id: randomUUID(),
+      edge_id: context.edgeId,
+      organisation_id: context.organisationId,
+      site_id: context.siteId,
+      edge_boot_id: 'boot-a',
+      edge_monotonic_at_anchor: 1_000_000,
+      server_issued_at: '2026-09-07T00:00:00.000Z',
+      server_valid_until: '2026-09-07T06:00:00.000Z',
+      signer_key_id: 'central-tta-test',
+    };
+
+    const canonical = canonicalEdgeTrustedTimeAnchorStatement(anchorStatement as never);
+    const signer = createSign('sha256');
+    signer.update(Buffer.from(canonical, 'utf8'));
+    signer.end();
+    const raw = signer.sign({ key: signingPair.privateKey, dsaEncoding: 'ieee-p1363' });
+    const r = BigInt(`0x${raw.subarray(0, 32).toString('hex')}`);
+    const rawS = BigInt(`0x${raw.subarray(32, 64).toString('hex')}`);
+    const lowS = rawS > P256_HALF_CURVE_ORDER ? P256_CURVE_ORDER - rawS : rawS;
+    const anchorSignature = encodeCanonicalP256Signature(r, lowS);
+
+    const derivedIso = new Date(Date.parse(anchorStatement.server_issued_at) + 30_000).toISOString();
+    const verifier = new CentralEdgeTrustedTimeVerifier(
+      new CentralTrustedTimeKeyringProvider({
+        values: {
+          EDGE_TRUSTED_TIME_VERIFICATION_KEYS: JSON.stringify([
+            { signer_key_id: 'central-tta-test', public_key: publicKey, role: 'ACTIVE' },
+          ]),
+        },
+      } as never),
+      moduleRef.get(P256KeyImporter),
+    );
+
+    const verification = verifier.verify(
+      context,
+      {
+        schema_version: 1,
+        signed_anchor: { statement: anchorStatement, signature: anchorSignature },
+        edge_boot_id: 'boot-a',
+        edge_monotonic_at_observation: 1_030_000,
+      },
+      derivedIso,
+    );
+    expect(verification.ok, 'the anchor should have verified').toBe(true);
+    if (!verification.ok) return;
+
+    const admission = await witness.admitReceiptForAudit(context, buildReceipt(edge), randomUUID());
+    expect(admission.outcome).toBe('ADMITTED');
+    if (admission.outcome !== 'ADMITTED') return;
+
+    const operationId = randomUUID();
+    await observations.record({
+      witness: admission.witness,
+      verifiedTime: verification.evidence,
+      offlineOperationId: operationId,
+      traceId: randomUUID(),
+    });
+
+    // The verified time IS recorded, with its provenance.
+    const stored = await prisma.edgeReceiptObservation.findFirst({
+      where: { organisationId: ORG, offlineOperationId: operationId },
+      select: { verifiedEdgeTrustedTime: true, trustedTimeAnchorId: true },
+    });
+    expect(stored?.verifiedEdgeTrustedTime?.toISOString()).toBe(derivedIso);
+    expect(stored?.trustedTimeAnchorId).toBe(anchorStatement.anchor_id);
+
+    // AND STILL NO DOMAIN EFFECT. The strongest possible evidence does not
+    // authorise anything.
+    expect(await domainReceiptCount(ORG)).toBe(before);
+    expect(await standing.standingOf(ORG, operationId)).toBe('EVIDENCE_RECORDED');
   });
 
   it('a valid Edge receipt ALONE is not human authority', async () => {
