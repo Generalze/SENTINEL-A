@@ -1,0 +1,98 @@
+# ============================================================================
+# M3B §6 — THE PRODUCTION EDGE STORAGE SHAPE.
+#
+# HOW TO USE IT
+#
+#     scripts/edge-storage-preflight.sh /var/lib/sentinel-edge   # MUST exit 0
+#     docker compose \
+#       -f infrastructure/compose/docker-compose.edge.yml \
+#       -f infrastructure/compose/docker-compose.edge.production.yml \
+#       up -d
+#
+# The preflight is not advisory and it is not part of compose. Compose cannot
+# check what a block device is; it would happily start an Edge on a plaintext
+# disk and report success. The gate has to run BEFORE, on the host, and refuse.
+#
+# WHY THIS FILE EXISTS AT ALL
+# ---------------------------
+# `docker-compose.edge.yml` uses a NAMED VOLUME. That is right for development
+# and it is NOT at-rest encryption: a named volume lives under the Docker root
+# and inherits whatever filesystem that happens to be — usually an unencrypted
+# one. It has the shape of durable storage without the property.
+#
+# The distinction matters because the Edge queue holds Field operations that
+# exist NOWHERE ELSE while the WAN is down. An appliance in a site cupboard is
+# physically reachable by anyone who reaches the cupboard, and "the container
+# had a volume" is not an answer to a stolen disk.
+#
+# So production replaces the volume with an explicit host path whose backing
+# device the preflight has PROVEN is dm-crypt/LUKS. One encrypted filesystem
+# covers the SQLite rows, its indexes, the journal and WAL, the payloads,
+# envelopes, receipts, queue metadata and the persisted trusted-time material
+# as a single boundary — which is why column-level encryption in Node was
+# rejected: it would protect the payload while leaving the index keys, the
+# ordering and the journal in clear text.
+#
+# WHAT THIS FILE DELIBERATELY DOES NOT CONTAIN
+# --------------------------------------------
+#   no EDGE_STORAGE_IS_ENCRYPTED flag   — a boolean can lie, and would lie in
+#                                         exactly the case it exists to catch
+#   no disk encryption key              — never in Git, never in an image,
+#                                         never in the container environment
+#   no unlock command                   — the volume is unlocked by the host
+#                                         before Docker starts, by an operator
+#                                         or by a TPM2-sealed key
+#
+# The encryption key's custody is a HOST concern. This file cannot improve it
+# and must not pretend to.
+# ============================================================================
+
+services:
+  edge-runtime:
+    # ------------------------------------------------------------------------
+    # THE SUBSTITUTION THAT IS THE POINT OF THIS FILE.
+    #
+    # A bind mount, not a named volume, so the path is one a human can point at
+    # and a preflight can interrogate. `docker volume inspect` gives you a
+    # mountpoint under the Docker root; `findmnt` on THIS path gives you the
+    # block device, and `lsblk` on that gives you whether it is dm-crypt.
+    #
+    # OWNERSHIP IS THE OPERATOR'S JOB. A bind mount imports the host's UID
+    # ownership, and the container runs as 10001 — unlike a fresh named volume,
+    # which inherits the image's ownership. The preflight checks this (uid, gid
+    # AND mode 0700) and refuses rather than letting the Edge start and fail on
+    # its first write, which would look like a queue fault.
+    # ------------------------------------------------------------------------
+    volumes:
+      - ${EDGE_STORAGE_PATH:-/var/lib/sentinel-edge}:/var/lib/sentinel-edge
+
+    # ------------------------------------------------------------------------
+    # NO PUBLISHED PORTS.
+    #
+    # The base file publishes the Edge's port for local development. In
+    # production the Field LAN reaches the Edge over TLS on the site network,
+    # pinned by the descriptor central distributes (M3B §2). A published port on
+    # the host's default bridge would be a second, UNPINNED way in — one that no
+    # device is told to trust and no descriptor names, which is precisely the
+    # kind of path an attacker prefers.
+    #
+    # `!reset` clears the base file's list rather than appending to it. Without
+    # it compose MERGES port lists and the development port survives into
+    # production, which is the failure mode this line exists to prevent.
+    # ------------------------------------------------------------------------
+    ports: !reset []
+
+    # ------------------------------------------------------------------------
+    # The Edge is an appliance. If it dies at 03:00 in a site cupboard nobody
+    # is going to notice until a shift cannot queue work, so it comes back by
+    # itself. `always` rather than the base file's `unless-stopped`: a
+    # deliberate operator stop should survive a reboot in development, and
+    # should NOT survive one in production, where a stopped Edge means a site
+    # silently has no offline capability.
+    # ------------------------------------------------------------------------
+    restart: always
+
+# The base file's named volume is not declared here, and that is intentional:
+# the bind mount above replaces its use entirely. Leaving the declaration out
+# means a mis-typed override that fails to apply produces a compose error about
+# an undefined volume, rather than quietly falling back to unencrypted storage.

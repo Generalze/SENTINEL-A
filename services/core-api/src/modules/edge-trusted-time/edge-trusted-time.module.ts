@@ -1,4 +1,7 @@
 import { Module } from '@nestjs/common';
+import { ShieldModule } from '../shield/shield.module';
+import { CentralEdgeTrustedTimeVerifier } from './central-edge-trusted-time.verifier';
+import { CentralTrustedTimeKeyringProvider } from './central-trusted-time-verification.keyring';
 import { CentralTrustedTimeAnchorSigner } from './edge-trusted-time-anchor.signer';
 import { EDGE_TRUSTED_TIME_SIGNING_KEY_PROVIDER_BINDING } from './edge-trusted-time-signing-key.provider';
 
@@ -32,9 +35,28 @@ import { EDGE_TRUSTED_TIME_SIGNING_KEY_PROVIDER_BINDING } from './edge-trusted-t
  * touching). Those all point inward: they are credentials of principals
  * Sentinel does not control. This one points outward and is the only key
  * Sentinel signs with.
+ *
+ * M3B §7 — THE VERIFIER LIVES HERE TOO, AND HOLDS NO PRIVATE KEY.
+ *
+ * `CentralEdgeTrustedTimeVerifier` is exported because the Edge ingress path
+ * needs it; the SIGNING provider above is still exported nowhere. Signing and
+ * verifying are deliberately asymmetric in reach: one module can mint anchors,
+ * any module that must check one can check it, and neither capability leaks
+ * into the other. The verifier reads only the public keyring, so exporting it
+ * widens nothing.
+ *
+ * It depends on `ShieldModule` for `P256KeyImporter` rather than importing
+ * `node:crypto` directly, so every signature check in this service goes
+ * through one auditable seam (D24-05).
  */
 @Module({
-  providers: [EDGE_TRUSTED_TIME_SIGNING_KEY_PROVIDER_BINDING, CentralTrustedTimeAnchorSigner],
-  exports: [CentralTrustedTimeAnchorSigner],
+  imports: [ShieldModule],
+  providers: [
+    EDGE_TRUSTED_TIME_SIGNING_KEY_PROVIDER_BINDING,
+    CentralTrustedTimeAnchorSigner,
+    CentralTrustedTimeKeyringProvider,
+    CentralEdgeTrustedTimeVerifier,
+  ],
+  exports: [CentralTrustedTimeAnchorSigner, CentralEdgeTrustedTimeVerifier],
 })
 export class EdgeTrustedTimeModule {}

@@ -280,21 +280,32 @@ describe('WP-25/C17-01 no gateway route exempts itself from human authentication
       // reviewer looks, so that deleting its session requirement is a visible
       // diff rather than a quiet one.
       "@Post('operations/offline-queue')",
+      // M3B §6. An AUTHENTICATED QUERY rather than an effect operation: it
+      // selects no target and causes no domain effect. It is enumerated here
+      // for the same reason as the others -- it consumes a device possession
+      // proof, so removing its session requirement must be a visible diff.
+      "@Post('edge-transport')",
     ]) {
       expect(controller.includes(route), route).toBe(true);
     }
-    // Seven routes, and exactly THREE handlers that reach a service without
-    // going through `run` - the two establishment steps and WP-29A's offline
-    // submission - so four `requirePrincipal` call sites cover all seven.
+    // Eight routes, and exactly FOUR handlers that reach a service without
+    // going through `run` - the two establishment steps, WP-29A's offline
+    // submission and M3B's Edge transport query - so five `requirePrincipal`
+    // call sites cover all eight.
     //
     // The count is asserted rather than the mere presence of the call, because
     // presence is satisfied by any one route having it. A route added without
     // one would leave this number unchanged and the suite green.
-    expect(controller.split('requirePrincipal(req)').length - 1).toBe(4);
+    expect(controller.split('requirePrincipal(req)').length - 1).toBe(5);
     // The principal is PASSED, never re-derived inside the services.
     expect(controller).toContain('this.gateway.execute(principal,');
     expect(controller).toContain('this.contexts.completeEstablishment(principal,');
     expect(controller).toContain('this.contexts.requestEstablishment(principal,');
+    // M3B: the descriptor query takes the human explicitly too. It terminates
+    // after authenticated site/context validation and never enters the
+    // domain-effect path, but it still requires the SESSION -- a device holding
+    // a perfectly good key is not sufficient to be told which Edge to trust.
+    expect(controller).toContain('this.edgeTransportQuery.read(principal,');
     // WP-29A: the queued-submission path takes the human explicitly too. It
     // does not go through `run`, so it would otherwise be the one route on
     // which the session could be inferred rather than established.

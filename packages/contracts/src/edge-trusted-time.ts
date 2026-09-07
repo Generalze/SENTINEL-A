@@ -243,3 +243,102 @@ export const SignedEdgeTrustedTimeAnchorSchema = z
   })
   .strict();
 export type SignedEdgeTrustedTimeAnchor = z.infer<typeof SignedEdgeTrustedTimeAnchorSchema>;
+
+/**
+ * M3B §7 — THE EVIDENCE THAT LETS CENTRAL VERIFY, RATHER THAN BELIEVE, A TIME.
+ *
+ * WHAT WAS WRONG
+ * --------------
+ * `classifyEdgeRequestTrustedTimeClaim` in `edge-request.ts` decides whether an
+ * Edge's claimed `edge_trusted_time` is PLAUSIBLE: not stale, not implausibly
+ * future. That is a useful triage and it is not proof of anything. A compromised
+ * Edge that simply asserts a well-shaped, recent timestamp passes it, because
+ * nothing in that path ever asks the question that matters:
+ *
+ *     did CENTRAL sign the anchor this time was derived from?
+ *
+ * Until something asks that, an Edge-claimed instant must not influence whether
+ * a time-bounded offline operation is admissible.
+ *
+ * WHY THIS IS A SEPARATE STRUCTURE AND NOT A RECEIPT FIELD
+ * -------------------------------------------------------
+ * `DeviceEdgeReceiptSchema` is v1 and FROZEN. It is also the wrong home: the
+ * receipt is the EDGE's statement about a device operation, signed by the Edge,
+ * and the device may hold it across an outage. This evidence is about the
+ * EDGE's own clock provenance, is meaningful only to central, and is produced
+ * at forwarding time — a different author, a different audience and a different
+ * lifetime. Folding it into the receipt would also mean re-signing a frozen
+ * artefact to add a field that the device can neither produce nor check.
+ *
+ * So it travels BESIDE the receipt in the Edge -> central request body. The
+ * outer authenticated Edge request proof binds the exact body digest
+ * (`edgeRequestBodyDigest`), so this evidence cannot be swapped, stripped or
+ * replanted in transit without invalidating the request itself. It needs no
+ * signature of its own: the anchor inside it is already signed by central, and
+ * the two unsigned readings beside it are bound by that outer proof.
+ *
+ * WHY THE TWO EXTRA FIELDS EXIST
+ * ------------------------------
+ * The anchor alone cannot produce a current time. It fixes one point --
+ * `server_issued_at` at `edge_monotonic_at_anchor` -- and central derives
+ * forward from it:
+ *
+ *     expected = server_issued_at
+ *              + (edge_monotonic_at_observation - edge_monotonic_at_anchor)
+ *
+ * `edge_monotonic_at_observation` is the minuend of that subtraction, so it
+ * must be transmitted. `edge_boot_id` must be transmitted separately from the
+ * anchor's copy so central can require them EQUAL: a monotonic counter is only
+ * comparable within one boot, and an observation from a later boot measured
+ * against an earlier boot's anchor is arithmetic on unrelated origins. Central
+ * checks that rather than trusting the Edge to have noticed.
+ *
+ * NOTHING HERE IS TRUSTED ON ARRIVAL. This schema's job is to carry the claim
+ * intact; `VerifiedEdgeTrustedTimeEvidence` on the server is what a verified
+ * one becomes, and only the central verifier can construct that.
+ */
+export const EDGE_TRUSTED_TIME_EVIDENCE_DOMAIN = 'sentinel.edge.trusted-time-evidence.v1';
+
+export const EdgeTrustedTimeEvidenceSchema = z
+  .object({
+    schema_version: z.literal(1),
+    /**
+     * Central's own signed statement, returned to it. The signature over this
+     * is the only reason anything else in this object is worth reading.
+     */
+    signed_anchor: SignedEdgeTrustedTimeAnchorSchema,
+    /**
+     * The boot the OBSERVATION was taken in. Compared for equality against
+     * `signed_anchor.statement.edge_boot_id`; a mismatch means the monotonic
+     * readings have different origins and no derivation is possible.
+     */
+    edge_boot_id: scopedId,
+    /**
+     * The monotonic reading at the moment the receipt was witnessed. Must be
+     * at or after the anchor's reading -- a counter that went backwards inside
+     * one boot is not a counter, and central refuses rather than taking an
+     * absolute value.
+     */
+    edge_monotonic_at_observation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  })
+  .strict();
+export type EdgeTrustedTimeEvidence = z.infer<typeof EdgeTrustedTimeEvidenceSchema>;
+
+/**
+ * Shapes this evidence must never carry.
+ *
+ * Same reasoning as `EDGE_TRUSTED_TIME_ANCHOR_FORBIDDEN_FIELDS`: every one of
+ * these is a way of saying "accept this without doing the derivation". A
+ * verifier that reads a field like `verified: true` from the thing it is
+ * verifying has stopped being a verifier. `.strict()` already rejects unknown
+ * keys, so these are asserted by test as a statement of intent -- the list
+ * exists so a future author has to argue with it.
+ */
+export const EDGE_TRUSTED_TIME_EVIDENCE_FORBIDDEN_FIELDS = [
+  'verified',
+  'trusted',
+  'skip_verification',
+  'derived_time',
+  'edge_trusted_time',
+  'server_signature_optional',
+] as const;

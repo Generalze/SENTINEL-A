@@ -143,6 +143,20 @@ export const DEVICE_REQUEST_PURPOSES = [
   'RECONNECT_HANDSHAKE',
   'WHISPER_DEVICE_ACTION',
   'DEVICE_KEY_ROTATION',
+  /**
+   * M3B §1 — ASKING WHICH EDGE TO TRUST, WHICH IS NOT A DOMAIN OPERATION.
+   *
+   * A CTO-authorised additive extension. It exists so the possession proof for
+   * a descriptor lookup is cryptographically UNUSABLE as a Field operation, a
+   * Whisper action or an offline submission -- the W21-10 property, applied to
+   * a request that causes no domain effect and therefore has no operation kind.
+   *
+   * Reusing `FIELD_OPERATION` or `OFFLINE_SYNC` because their trust rows happen
+   * to be convenient would mean a proof captured from a descriptor lookup could
+   * be replayed as an operation. A proof's purpose has to say what the proof is
+   * actually for.
+   */
+  'EDGE_TRANSPORT_DESCRIPTOR',
 ] as const;
 export const DeviceRequestPurposeSchema = z.enum(DEVICE_REQUEST_PURPOSES);
 export type DeviceRequestPurpose = z.infer<typeof DeviceRequestPurposeSchema>;
@@ -418,12 +432,29 @@ export type DeviceRequestProofRefusal = z.infer<typeof DeviceRequestProofRefusal
  *
  * WIDENING ANY ROW IS A SECURITY-CONTRACT CHANGE.
  */
+const DEVICE_OFFLINE_SYNC_PERMITTED_TRUST = ['TRUSTED', 'DEGRADED'] as const satisfies readonly DeviceTrust[];
+
 export const DEVICE_PURPOSE_PERMITTED_TRUST: Readonly<Record<DeviceRequestPurpose, readonly DeviceTrust[]>> = {
   FIELD_OPERATION: ['TRUSTED', 'DEGRADED'],
-  OFFLINE_SYNC: ['TRUSTED', 'DEGRADED'],
+  OFFLINE_SYNC: DEVICE_OFFLINE_SYNC_PERMITTED_TRUST,
   RECONNECT_HANDSHAKE: ['TRUSTED', 'DEGRADED', 'SUSPICIOUS', 'OFFLINE'],
   WHISPER_DEVICE_ACTION: ['TRUSTED'],
   DEVICE_KEY_ROTATION: ['TRUSTED', 'DEGRADED'],
+  /**
+   * DERIVED FROM THE OFFLINE-SYNC ROW, NOT COPIED FROM IT.
+   *
+   * M3B §2 requires this posture to be the offline-sync posture, and the
+   * relationship is expressed rather than duplicated so the two cannot drift:
+   * narrowing `OFFLINE_SYNC` narrows this automatically, and a future author
+   * cannot loosen one while believing they match.
+   *
+   * It is NOT weaker than offline-sync merely because a descriptor causes no
+   * immediate domain effect. The descriptor distributes the endpoint and the
+   * TLS trust anchor that offline operations then travel over, so a device we
+   * would not accept queued work from is a device we will not tell which Edge
+   * to trust. Revoked, compromised and quarantined hardware still refuses.
+   */
+  EDGE_TRANSPORT_DESCRIPTOR: DEVICE_OFFLINE_SYNC_PERMITTED_TRUST,
 };
 
 export function deviceTrustPermitsPurpose(trust: DeviceTrust, purpose: DeviceRequestPurpose): boolean {

@@ -142,6 +142,9 @@ model EdgeNode {
   enrolledByUser User @relation("EdgeEnrolledByUser", fields: [enrolledByUserId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
 
   registryKeys      EdgeRegistryKey[]
+  /// M3B back-relation for the TLS transport identity. Separate credential,
+  /// separate lifecycle; see `EdgeTransportIdentity`.
+  transportIdentities EdgeTransportIdentity[]
   enrolmentRequests EdgeEnrolmentRequest[]
 
   /// Candidate key, deliberately redundant with the primary key — it is what
@@ -518,6 +521,115 @@ model EdgeRegistryKey {
   @@map("edge_registry_keys")
 }
 
+
+/// M3B §3 — THE EDGE'S TLS IDENTITY, KEPT SEPARATE FROM ITS SIGNING IDENTITY.
+///
+/// WHY THIS IS NOT A COLUMN ON `EdgeRegistryKey`
+/// ---------------------------------------------
+/// `EdgeRegistryKey` answers "may this Edge SIGN this statement". This answers
+/// "may this Edge TERMINATE THIS TLS CONNECTION". Storing both against one row
+/// would make them one credential, so a stolen TLS key would also be a valid
+/// receipt-signing key and a signing-key rotation would silently invalidate
+/// every pinned client on the site. They rotate on different schedules, for
+/// different reasons, with different blast radii. Purpose separation is the
+/// whole point of the M3B §2 trust model and it has to exist in the schema,
+/// not just in the service that reads it.
+///
+/// THERE IS NO PRIVATE KEY COLUMN AND THERE MUST NEVER BE ONE.
+/// The Edge generates its TLS keypair locally and proves possession during
+/// enrolment. Central stores only the public representation and the digest
+/// devices pin against. A central that held Edge TLS private keys would be a
+/// single row whose disclosure impersonates every Edge in the estate.
+model EdgeTransportIdentity {
+  /// SERVER-GENERATED, like every other principal identity in this file. An
+  /// Edge that chose its own transport identity id could name one that already
+  /// exists and inherit the pins already distributed for it.
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  /// `@db.Text` because `sites.id` is a cuid. A `@db.Uuid` here makes the
+  /// composite foreign key unbuildable, and Postgres rejects that at APPLY
+  /// time rather than at generate time -- the exact mistake WP-29A made once.
+  siteId String @map("site_id") @db.Text
+  /// `@db.Uuid`, matching `edges.id`, for the same reason inverted.
+  edgeId String @map("edge_id") @db.Uuid
+
+  /// Rotation position. A device compares this to tell a legitimate re-pin
+  /// from a replayed older descriptor.
+  transportKeyVersion Int @map("transport_key_version")
+
+  /// The canonical public representation of the TLS key, kept for the same
+  /// reason `EdgeRegistryKey.public_key` is: a digest alone cannot verify
+  /// anything, and an identity store that cannot verify is not one (C15-02).
+  transportPublicKey String @map("transport_public_key") @db.Text
+  /// THE VALUE DEVICES ACTUALLY PIN: SHA-256 over the DER SubjectPublicKeyInfo,
+  /// lower-case hex. SPKI rather than a whole-certificate digest so routine
+  /// certificate renewal on the same keypair does not force a fleet re-pin,
+  /// while a KEY change still moves it.
+  tlsSpkiSha256 String @map("tls_spki_sha256") @db.Text
+
+  /// WHERE DEVICES ARE TOLD TO CONNECT, AND IT IS CONTROL-PLANE CONFIGURED.
+  ///
+  /// This column is authoritative precisely because the Edge does not write
+  /// it. An Edge that could assert its own address during enrolment could tell
+  /// every device on the site that it lives at `attacker.example`, and the pin
+  /// would faithfully protect the connection to the wrong host.
+  httpsEndpoint String @map("https_endpoint") @db.Text
+
+  /// CURRENT | ROTATED | REVOKED | COMPROMISED -- the same four states, and the
+  /// same reasoning, as `EdgeRegistryKey.status`.
+  status String @db.Text
+
+  registeredAt DateTime @map("registered_at") @db.Timestamptz(3)
+  /// When this identity became usable for issuing descriptors. Kept separate
+  /// from `registered_at` because a rotation records the two at different
+  /// moments.
+  activatedAt DateTime? @map("activated_at") @db.Timestamptz(3)
+
+  /// TWO SEPARATE COLUMNS -- D24-09, as on `EdgeRegistryKey`. A routinely
+  /// rotated transport key and a compromised one must remain distinguishable
+  /// after the fact; that distinction is the first thing an incident asks for.
+  rotatedAt DateTime? @map("rotated_at") @db.Timestamptz(3)
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  edge EdgeNode @relation(fields: [edgeId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  site Site @relation(fields: [siteId, organisationId], references: [id, organisationId], onDelete: Restrict, onUpdate: Cascade)
+  organisation Organisation @relation(fields: [organisationId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// A TRANSPORT KEY VERSION IS NEVER REUSED for one Edge.
+  @@unique([organisationId, edgeId, transportKeyVersion], map: "edge_transport_identity_version_key")
+  /// The lookup the descriptor endpoint performs: resolve a site to its current
+  /// ingress identity.
+  @@index([organisationId, siteId, status])
+  /// AT MOST ONE `CURRENT` TRANSPORT IDENTITY PER (tenant, SITE), ENFORCED BY
+  /// THE DATABASE.
+  ///
+  /// PER SITE, not per Edge, and that is the load-bearing choice. M3B §2 locks
+  /// "exactly one CURRENT Field-ingress Edge transport identity per org/site"
+  /// so the descriptor endpoint can never face two candidates and pick one.
+  /// If it could, the fleet's trust anchor would be decided by row ordering and
+  /// half a site could end up pinned to a different key than the other half
+  /// with nothing recording that it happened. The service refuses with
+  /// AMBIGUOUS_TRANSPORT_IDENTITY; this index means the ambiguity cannot be
+  /// created in the first place.
+  ///
+  /// PRISMA CANNOT MODEL A PARTIAL UNIQUE INDEX, so it lives in the migration
+  /// SQL and THE SQL IS AUTHORITATIVE:
+  ///
+  ///     CREATE UNIQUE INDEX "edge_transport_identities_one_current_per_site"
+  ///       ON "edge_transport_identities"("organisation_id","site_id")
+  ///       WHERE "status" = 'CURRENT';
+  ///
+  /// Recorded here as a comment, following `edge_registry_keys_one_current_key`,
+  /// so a reader of this file learns it exists. `prisma migrate diff` will not
+  /// reproduce it and it must be carried forward by hand.
+  @@map("edge_transport_identities")
+}
+
+
 // ===========================================================================
 // HISTORICAL ARTEFACT — append-only
 // ===========================================================================
@@ -573,4 +685,86 @@ model EdgeSecurityEvent {
   /// "Show me everything that ever happened to this Edge."
   @@index([organisationId, edgeId, occurredAt])
   @@map("edge_security_events")
+}
+
+
+/// M3B §3 / §8 — WHAT CENTRAL VERIFIED, WRITTEN DOWN WHERE PROOF D CAN READ IT.
+///
+/// HISTORICAL ARTEFACT — append-only, and NO foreign key to Edge, Site or User,
+/// deliberately, exactly as `EdgeSecurityEvent` above. The identifiers are the
+/// identifiers AS RECORDED. An Edge that is later withdrawn, or a site that is
+/// later closed, must not be able to erase the evidence that an operation was
+/// witnessed during an outage -- that evidence is often the only thing placing
+/// a shift's offline work inside its lease window.
+///
+/// WHAT THIS ROW MEANS, AND WHAT IT EMPHATICALLY DOES NOT
+/// -----------------------------------------------------
+///     it means:      CENTRAL VERIFIED THIS EDGE WITNESS
+///     it DOES NOT
+///     mean:          CENTRAL AUTHORISED THE OPERATION
+///
+/// The operation itself still goes through the existing central offline replay
+/// and authority checks, and may be refused there after this row exists. A
+/// reader that treats the presence of an observation as an admission decision
+/// has confused "we can prove when this was witnessed" with "this was allowed",
+/// which are the two facts the whole offline design keeps apart.
+///
+/// WHY IT EXISTS AT ALL. Before this table, WP-31's collector had no
+/// central-side Edge source: it could only report SOURCE_NOT_PRESENT and refuse
+/// eligibility. The alternative -- trusting an Edge-local log as proof that
+/// central received something -- would let the party being evidenced write its
+/// own evidence.
+model EdgeReceiptObservation {
+  id String @id @default(uuid()) @db.Uuid
+
+  organisationId String @map("organisation_id") @db.Text
+  siteId String @map("site_id") @db.Text
+  edgeId String @map("edge_id") @db.Text
+  /// The credential that signed the receipt, as the receipt named it and as
+  /// central resolved it. Text, not a foreign key: see the header.
+  edgeKeyId String @map("edge_key_id") @db.Text
+  edgeKeyVersion Int @map("edge_key_version")
+
+  /// The DOMAIN identity of the operation witnessed -- the device's own
+  /// offline operation id where one is claimed. Nullable because a receipt can
+  /// legitimately witness an operation whose claimed id central could not
+  /// resolve, and recording the observation with an honest gap is better than
+  /// refusing to record that a verified witness arrived.
+  offlineOperationId String? @map("offline_operation_id") @db.Text
+
+  /// DIGESTS, NOT CONTENTS. `witnessed_operation_fingerprint` is what the
+  /// receipt attested to; `receipt_fingerprint` identifies the receipt itself,
+  /// so an exact retransmission converges rather than accumulating rows.
+  witnessedOperationFingerprint String @map("witnessed_operation_fingerprint") @db.Text
+  receiptFingerprint String @map("receipt_fingerprint") @db.Text
+
+  /// THE PROVENANCE OF THE TIME, not merely the time.
+  ///
+  /// A bare timestamp column would record what the Edge said. These four record
+  /// which central-signed anchor the value was DERIVED from and what central
+  /// independently computed, so a later reader can tell a verified instant from
+  /// a claimed one without re-running the verifier.
+  trustedTimeAnchorId String? @map("trusted_time_anchor_id") @db.Text
+  trustedTimeAnchorFingerprint String? @map("trusted_time_anchor_fingerprint") @db.Text
+  /// NULL when no trusted-time evidence accompanied the receipt, or when the
+  /// evidence failed verification. NULL therefore means "central could not
+  /// establish a trustworthy witness time", which is a first-class truthful
+  /// outcome and not a gap to be filled in later.
+  verifiedEdgeTrustedTime DateTime? @map("verified_edge_trusted_time") @db.Timestamptz(3)
+  /// The Edge's monotonic position, which survives a wall clock that does not.
+  edgeMonotonicPosition Int? @map("edge_monotonic_position")
+
+  /// Central's own instant. The one reading in this row that no Edge influenced.
+  observedAt DateTime @default(now()) @map("observed_at") @db.Timestamptz(3)
+  /// Correlation only. Never an authorisation input.
+  traceId String? @map("trace_id") @db.Text
+
+  /// AN EXACT RETRANSMISSION CONVERGES. A lost response makes the Edge forward
+  /// the same receipt again; without this the audit trail would grow a second
+  /// observation of one witness and Proof D would count it twice.
+  @@unique([organisationId, receiptFingerprint], map: "edge_receipt_observation_receipt_key")
+  /// The collector's read: everything this site's Edges witnessed in a window.
+  @@index([organisationId, siteId, observedAt])
+  @@index([organisationId, edgeId, observedAt])
+  @@map("edge_receipt_observations")
 }

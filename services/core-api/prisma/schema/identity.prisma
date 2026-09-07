@@ -25,6 +25,8 @@ model Organisation {
   /// WP-29B back-relation for the direct tenant FK every Edge carries. Adds no
   /// column and no behaviour to Identity.
   edges EdgeNode[]
+  /// M3B: same shape, for the Edge TLS transport identity. Back-relation only.
+  edgeTransportIdentities EdgeTransportIdentity[]
 
   @@map("organisations")
 }
@@ -77,6 +79,7 @@ model Site {
   /// column and no behaviour to Identity, and the direction of ownership is
   /// unchanged: the Edge registry references the site, never the reverse.
   edges EdgeNode[]
+  edgeTransportIdentities EdgeTransportIdentity[]
   edgeEnrolmentAuthorities EdgeEnrolmentAuthority[]
   edgeEnrolmentRequests EdgeEnrolmentRequest[]
   /// WP-25 back-relations. Required by Prisma for the composite

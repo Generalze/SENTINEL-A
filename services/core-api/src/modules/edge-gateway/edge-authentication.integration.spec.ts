@@ -1,7 +1,11 @@
-import { randomUUID } from 'node:crypto';
+import { createSign, generateKeyPairSync, randomUUID } from 'node:crypto';
 import { Test, type TestingModule } from '@nestjs/testing';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
+  P256_CURVE_ORDER,
+  P256_HALF_CURVE_ORDER,
+  canonicalEdgeTrustedTimeAnchorStatement,
+  encodeCanonicalP256Signature,
   canonicalDeviceEdgeReceiptStatement,
   canonicalEdgeEnrolmentPossessionStatement,
   canonicalEdgeRequestStatement,
@@ -24,6 +28,11 @@ import { EdgeRegistryService } from '../edge-registry/edge-registry.service';
 import { EDGE_SERVER_SELECTED_SIGNATURE_PROFILE, EDGE_TRUST_SUSPENDED } from '../edge-registry/edge-registry.constants';
 import { EdgeAuthenticationService, type AuthenticatedEdgeContext } from './edge-authentication.service';
 import { EdgeGatewayModule } from './edge-gateway.module';
+import { CentralEdgeTrustedTimeVerifier } from '../edge-trusted-time/central-edge-trusted-time.verifier';
+import { CentralTrustedTimeKeyringProvider } from '../edge-trusted-time/central-trusted-time-verification.keyring';
+import { P256KeyImporter } from '../shield/p256-key.importer';
+import { EdgeEvidenceStandingService } from './edge-evidence-standing.service';
+import { EdgeReceiptObservationService } from './edge-receipt-observation.service';
 import { EdgeWitnessService } from './edge-witness.service';
 
 /**
@@ -718,5 +727,327 @@ describe('WP-29B EDGE-B an authenticated caller does NOT get its receipts believ
     const events = await prisma.edgeSecurityEvent.findMany({ where: { organisationId: ORG, eventType: 'EDGE_RECEIPT_ADMITTED' } });
     expect(events).toHaveLength(1);
     expect(events[0]?.edgeKeyId).toBe(edge.edgeKeyId);
+  });
+});
+
+// ===========================================================================
+// M3B §15 — THE EDGE IS A WITNESS, NOT A PROXY HUMAN.
+//
+// Every test here exists to prove ONE property from a different angle:
+//
+//     EDGE RECOVERY DOES NOT ERASE HUMAN AUTHORITY
+//
+// The Edge can authenticate perfectly, carry a perfectly valid device
+// envelope, present a perfectly valid receipt and a perfectly verified
+// central-signed time anchor -- and still cause no domain effect. C17-01 is
+// preserved by construction, and these assert it rather than trusting it.
+// ===========================================================================
+describe('M3B \u00a715 Edge evidence relay causes no domain effect', () => {
+  let observations: EdgeReceiptObservationService;
+  let standing: EdgeEvidenceStandingService;
+
+  beforeAll(() => {
+    observations = moduleRef.get(EdgeReceiptObservationService);
+    standing = moduleRef.get(EdgeEvidenceStandingService);
+  });
+
+  /** Records one witness exactly as the ingress does, and reports the outcome. */
+  async function relay(
+    context: AuthenticatedEdgeContext,
+    receipt: unknown,
+    overrides: { offlineOperationId?: string | null } = {},
+  ): Promise<{ outcome: string; standing: string }> {
+    const admission = await witness.admitReceiptForAudit(context, receipt, randomUUID());
+    expect(admission.outcome).toBe('ADMITTED');
+    if (admission.outcome !== 'ADMITTED') throw new Error('unreachable');
+
+    const offlineOperationId = overrides.offlineOperationId === undefined ? randomUUID() : overrides.offlineOperationId;
+    const outcome = await observations.record({
+      witness: admission.witness,
+      // Verified time is exercised separately; the point of THIS suite is that
+      // even a fully verified relay changes nothing in the domain.
+      verifiedTime: null,
+      offlineOperationId,
+      traceId: randomUUID(),
+    });
+    const current = await standing.standingOf(context.organisationId, offlineOperationId);
+    return { outcome, standing: current };
+  }
+
+  async function domainReceiptCount(organisationId: string): Promise<number> {
+    return prisma.fieldOfflineOperationReceipt.count({ where: { organisationId } });
+  }
+
+  it('persists the observation and causes NO domain effect, with no human anywhere', async () => {
+    const edge = await enrolEdge();
+    const context = await authenticated(edge);
+    const before = await domainReceiptCount(ORG);
+
+    const result = await relay(context, buildReceipt(edge));
+
+    expect(result.outcome).toBe('FIRST_SEEN');
+    // The honest answer while the Field device has not reconnected.
+    expect(result.standing).toBe('EVIDENCE_RECORDED');
+    // THE LOAD-BEARING ASSERTION. No authoritative replay record was created.
+    expect(await domainReceiptCount(ORG)).toBe(before);
+
+    const stored = await prisma.edgeReceiptObservation.count({ where: { organisationId: ORG } });
+    expect(stored).toBeGreaterThan(0);
+  });
+
+
+  /**
+   * The §15 case that needs REAL verified evidence rather than a null.
+   *
+   * A fully verified, central-signed trusted time is the strongest thing this
+   * channel can carry. It still causes no domain effect, and that is the point:
+   * the strength of the EVIDENCE has no bearing on whether an operation is
+   * AUTHORISED, because those are different questions asked of different
+   * principals.
+   */
+  it('a fully VERIFIED central trusted time still causes no domain effect', async () => {
+    const edge = await enrolEdge();
+    const context = await authenticated(edge);
+    const before = await domainReceiptCount(ORG);
+
+    // A real anchor, signed by a real key, verified by the real verifier --
+    // constructed here rather than faked, because a stubbed
+    // `VerifiedEdgeTrustedTimeEvidence` would prove nothing about the path.
+    const signingPair = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+    const jwk = signingPair.publicKey.export({ format: 'jwk' }) as { x: string; y: string };
+    const publicKey = Buffer.concat([
+      Buffer.from([0x04]),
+      Buffer.from(jwk.x, 'base64url'),
+      Buffer.from(jwk.y, 'base64url'),
+    ]).toString('base64url');
+
+    const anchorStatement = {
+      schema_version: 1 as const,
+      anchor_id: randomUUID(),
+      edge_id: context.edgeId,
+      organisation_id: context.organisationId,
+      site_id: context.siteId,
+      edge_boot_id: 'boot-a',
+      edge_monotonic_at_anchor: 1_000_000,
+      server_issued_at: '2026-09-07T00:00:00.000Z',
+      server_valid_until: '2026-09-07T06:00:00.000Z',
+      signer_key_id: 'central-tta-test',
+    };
+
+    const canonical = canonicalEdgeTrustedTimeAnchorStatement(anchorStatement as never);
+    const signer = createSign('sha256');
+    signer.update(Buffer.from(canonical, 'utf8'));
+    signer.end();
+    const raw = signer.sign({ key: signingPair.privateKey, dsaEncoding: 'ieee-p1363' });
+    const r = BigInt(`0x${raw.subarray(0, 32).toString('hex')}`);
+    const rawS = BigInt(`0x${raw.subarray(32, 64).toString('hex')}`);
+    const lowS = rawS > P256_HALF_CURVE_ORDER ? P256_CURVE_ORDER - rawS : rawS;
+    const anchorSignature = encodeCanonicalP256Signature(r, lowS);
+
+    const derivedIso = new Date(Date.parse(anchorStatement.server_issued_at) + 30_000).toISOString();
+    const verifier = new CentralEdgeTrustedTimeVerifier(
+      new CentralTrustedTimeKeyringProvider({
+        values: {
+          EDGE_TRUSTED_TIME_VERIFICATION_KEYS: JSON.stringify([
+            { signer_key_id: 'central-tta-test', public_key: publicKey, role: 'ACTIVE' },
+          ]),
+        },
+      } as never),
+      moduleRef.get(P256KeyImporter),
+    );
+
+    const verification = verifier.verify(
+      context,
+      {
+        schema_version: 1,
+        signed_anchor: { statement: anchorStatement, signature: anchorSignature },
+        edge_boot_id: 'boot-a',
+        edge_monotonic_at_observation: 1_030_000,
+      },
+      derivedIso,
+    );
+    expect(verification.ok, 'the anchor should have verified').toBe(true);
+    if (!verification.ok) return;
+
+    const admission = await witness.admitReceiptForAudit(context, buildReceipt(edge), randomUUID());
+    expect(admission.outcome).toBe('ADMITTED');
+    if (admission.outcome !== 'ADMITTED') return;
+
+    const operationId = randomUUID();
+    await observations.record({
+      witness: admission.witness,
+      verifiedTime: verification.evidence,
+      offlineOperationId: operationId,
+      traceId: randomUUID(),
+    });
+
+    // The verified time IS recorded, with its provenance.
+    const stored = await prisma.edgeReceiptObservation.findFirst({
+      where: { organisationId: ORG, offlineOperationId: operationId },
+      select: { verifiedEdgeTrustedTime: true, trustedTimeAnchorId: true },
+    });
+    expect(stored?.verifiedEdgeTrustedTime?.toISOString()).toBe(derivedIso);
+    expect(stored?.trustedTimeAnchorId).toBe(anchorStatement.anchor_id);
+
+    // AND STILL NO DOMAIN EFFECT. The strongest possible evidence does not
+    // authorise anything.
+    expect(await domainReceiptCount(ORG)).toBe(before);
+    expect(await standing.standingOf(ORG, operationId)).toBe('EVIDENCE_RECORDED');
+  });
+
+  it('a valid Edge receipt ALONE is not human authority', async () => {
+    const edge = await enrolEdge();
+    const context = await authenticated(edge);
+    const before = await domainReceiptCount(ORG);
+    await relay(context, buildReceipt(edge));
+    expect(await domainReceiptCount(ORG)).toBe(before);
+  });
+
+  it('the observation never advances a device cursor', async () => {
+    const edge = await enrolEdge();
+    const context = await authenticated(edge);
+    const cursorsBefore = await prisma.fieldOfflineDeviceCursor.count({ where: { organisationId: ORG } }).catch(() => 0);
+    await relay(context, buildReceipt(edge));
+    const cursorsAfter = await prisma.fieldOfflineDeviceCursor.count({ where: { organisationId: ORG } }).catch(() => 0);
+    expect(cursorsAfter).toBe(cursorsBefore);
+  });
+
+  it('the SAME evidence arriving again CONVERGES rather than duplicating', async () => {
+    const edge = await enrolEdge();
+    const context = await authenticated(edge);
+    const receipt = buildReceipt(edge);
+    const operationId = randomUUID();
+
+    const first = await relay(context, receipt, { offlineOperationId: operationId });
+    const second = await relay(context, receipt, { offlineOperationId: operationId });
+
+    expect(first.outcome).toBe('FIRST_SEEN');
+    expect(second.outcome).toBe('CONVERGED');
+    // One witness, one row. A lost response is the NORMAL case, and Proof D
+    // would count a single witnessed operation twice if this ever diverged.
+    //
+    // Scoped to THIS operation, not to the tenant: earlier tests in this block
+    // legitimately leave their own observations behind, and a tenant-wide count
+    // would make this assertion depend on execution order rather than on
+    // convergence.
+    const rows = await prisma.edgeReceiptObservation.count({
+      where: { organisationId: ORG, offlineOperationId: operationId },
+    });
+    expect(rows).toBe(1);
+  });
+
+  it('the same evidence identity bound to a DIFFERENT operation is a CONFLICT', async () => {
+    const edge = await enrolEdge();
+    const context = await authenticated(edge);
+    const receipt = buildReceipt(edge);
+
+    const first = await relay(context, receipt, { offlineOperationId: randomUUID() });
+    expect(first.outcome).toBe('FIRST_SEEN');
+
+    // `receipt_fingerprint` digests the Edge's signed statement, but the
+    // operation id comes from envelope bytes the receipt does not cover -- so
+    // one signed receipt CAN be re-bound to another operation. That must be
+    // refused, never silently converged.
+    const second = await relay(context, receipt, { offlineOperationId: randomUUID() });
+    expect(second.outcome).toBe('CONFLICT');
+  });
+
+  it('reports EVIDENCE_RECORDED when the envelope carried no correlatable id', async () => {
+    const edge = await enrolEdge();
+    const context = await authenticated(edge);
+    // Not UNKNOWN: we know exactly what we hold and exactly what we lack.
+    const result = await relay(context, buildReceipt(edge), { offlineOperationId: null });
+    expect(result.standing).toBe('EVIDENCE_RECORDED');
+  });
+
+  it('reports the AUTHORITATIVE standing once a real replay record exists', async () => {
+    const edge = await enrolEdge();
+    const context = await authenticated(edge);
+    const operationId = randomUUID();
+    await relay(context, buildReceipt(edge), { offlineOperationId: operationId });
+
+    // Written directly here to stand in for the human-authenticated replay
+    // path, which this suite deliberately does not invoke: the point is that
+    // the standing is read from the DEVICE's record, whoever wrote it.
+    await prisma.fieldOfflineOperationReceipt.create({
+      data: {
+        organisationId: ORG,
+        siteId: SITE,
+        userId: COMMANDER,
+        deviceId: randomUUID(),
+        deviceSequence: BigInt(1),
+        offlineOperationId: operationId,
+        operationKind: 'INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE',
+        requestFingerprint: 'a'.repeat(64),
+        downstreamIdempotencyKey: randomUUID(),
+        clientCreatedAt: new Date(),
+        firstReceivedAt: new Date(),
+        firstTraceId: randomUUID(),
+        status: 'APPLIED',
+        outcome: 'APPLIED',
+      },
+    });
+
+    const current = await standing.standingOf(ORG, operationId);
+    expect(current).toBe('AUTHORITATIVE_REPLAY_APPLIED');
+  });
+
+  it('a REJECTED row with no finalised outcome is UNKNOWN, not terminal', async () => {
+    const operationId = randomUUID();
+    await prisma.fieldOfflineOperationReceipt.create({
+      data: {
+        organisationId: ORG,
+        siteId: SITE,
+        userId: COMMANDER,
+        deviceId: randomUUID(),
+        deviceSequence: BigInt(2),
+        offlineOperationId: operationId,
+        operationKind: 'INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE',
+        requestFingerprint: 'b'.repeat(64),
+        downstreamIdempotencyKey: randomUUID(),
+        clientCreatedAt: new Date(),
+        firstReceivedAt: new Date(),
+        firstTraceId: randomUUID(),
+        status: 'REJECTED',
+        outcome: null,
+      },
+    });
+
+    // The Edge must not prune an entry central may still apply.
+    expect(await standing.standingOf(ORG, operationId)).toBe('UNKNOWN');
+  });
+
+  it('correlates EXACTLY, never by nearest match', async () => {
+    const edge = await enrolEdge();
+    const context = await authenticated(edge);
+    await relay(context, buildReceipt(edge), { offlineOperationId: randomUUID() });
+
+    // A different operation id in the same tenant must not inherit a standing.
+    expect(await standing.standingOf(ORG, randomUUID())).toBe('EVIDENCE_RECORDED');
+  });
+
+  it('does not read another tenant\'s replay record', async () => {
+    const operationId = randomUUID();
+    await prisma.fieldOfflineOperationReceipt.create({
+      data: {
+        organisationId: ORG,
+        siteId: SITE,
+        userId: COMMANDER,
+        deviceId: randomUUID(),
+        deviceSequence: BigInt(3),
+        offlineOperationId: operationId,
+        operationKind: 'INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE',
+        requestFingerprint: 'c'.repeat(64),
+        downstreamIdempotencyKey: randomUUID(),
+        clientCreatedAt: new Date(),
+        firstReceivedAt: new Date(),
+        firstTraceId: randomUUID(),
+        status: 'APPLIED',
+        outcome: 'APPLIED',
+      },
+    });
+
+    // Same operation id, foreign tenant: the applied outcome must be invisible.
+    expect(await standing.standingOf(OTHER_ORG, operationId)).toBe('EVIDENCE_RECORDED');
   });
 });

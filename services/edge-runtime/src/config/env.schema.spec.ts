@@ -160,11 +160,49 @@ describe('the trusted-time verification keyring', () => {
     expect(() => loadConfig({ ...validEnv, EDGE_TRUSTED_TIME_KEYRING_VERSION: '' })).toThrow(ConfigValidationError);
   });
 
-  it('has NO key by which Edge could sign an anchor of its own', () => {
-    // Edge verifies; it never signs. An Edge that could author its own anchor
-    // could choose what time it believed it was.
+  it('has NO key by which Edge could sign an ANCHOR of its own', () => {
+    // THE PROPERTY, UNCHANGED: Edge verifies anchors and never authors one. An
+    // Edge that could sign its own anchor could choose what time it believed
+    // it was, which is the whole reason the anchor is central-signed.
+    //
+    // This used to deny any key containing "SIGNING". M3B added
+    // `EDGE_SIGNING_KEY_FILE`, which signs REQUEST PROOFS -- a different
+    // capability, and one the Edge has always needed to authenticate itself.
+    // The substring was a proxy for the property, and the proxy stopped
+    // matching it.
+    //
+    // So this is now an ALLOWLIST, which is strictly stronger: a second
+    // signing key added later fails here even if nobody remembers this rule.
+    // The anchor property is asserted directly beneath it.
     const shape = Object.keys(envSchema.shape);
-    expect(shape.filter((key) => key.includes('SIGNING'))).toEqual([]);
+    expect(shape.filter((key) => key.includes('SIGNING'))).toEqual(['EDGE_SIGNING_KEY_FILE']);
     expect(shape.filter((key) => key.includes('PRIVATE'))).toEqual([]);
+
+    // No anchor-signing capability, by name or by shape.
+    expect(shape.filter((key) => key.includes('ANCHOR') && key.includes('SIGN'))).toEqual([]);
+    expect(shape).not.toContain('EDGE_TRUSTED_TIME_SIGNING_KEY_FILE');
+    expect(shape).not.toContain('EDGE_TRUSTED_TIME_SIGNER_KEY_ID');
+  });
+
+  it('names a PATH for the request-signing key, never the material', () => {
+    // A key in an environment variable is a key in every process listing,
+    // every crash dump and every `docker inspect`. The `_FILE` suffix is the
+    // contract; `EDGE_SIGNING_KEY` without it must never appear.
+    const shape = Object.keys(envSchema.shape);
+    expect(shape).toContain('EDGE_SIGNING_KEY_FILE');
+    expect(shape).not.toContain('EDGE_SIGNING_KEY');
+    expect(shape).not.toContain('EDGE_PRIVATE_KEY');
+  });
+
+  it('possessing the request-signing key still cannot forge an anchor', () => {
+    // Structural, not aspirational: an anchor verifies against the PUBLIC
+    // keyring central's keys are pinned in. The Edge's own signing key is a
+    // different keypair whose public half is not in that ring, so holding it
+    // buys nothing against the anchor path.
+    const shape = Object.keys(envSchema.shape);
+    expect(shape).toContain('EDGE_TRUSTED_TIME_VERIFICATION_KEYS');
+    // Verification keys are public and inline; the signing key is a path.
+    // If these two ever became the same shape, the separation would be gone.
+    expect(shape).toContain('EDGE_SIGNING_KEY_FILE');
   });
 });
