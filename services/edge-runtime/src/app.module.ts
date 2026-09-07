@@ -6,15 +6,19 @@ import type { RequestWithTraceId } from './common/http-types';
 import { EdgeConfigModule } from './config/config.module';
 import { EdgeConfigService } from './config/config.service';
 import { EdgeHealthModule } from './health/health.module';
+import { EdgeQueueModule } from './modules/queue/edge-queue.module';
 import { EdgeTrustedTimeModule } from './modules/trusted-time/trusted-time.module';
 
 /**
  * WP-29B / EDGE-A — the Edge runtime's root module.
  *
  * What is NOT here is as deliberate as what is. There is no PrismaModule and no
- * database: Edge's durable store is a local queue, not a relational database,
- * and an Edge holding a DB connection would be an Edge that stops working when
- * the WAN does — which is the one thing it exists not to do. There is no
+ * CONNECTION to a database: Edge's durable store is `EdgeQueueModule`, an
+ * embedded SQLite file on the box itself, and an Edge holding a connection to
+ * central's PostgreSQL would be an Edge that stops working when the WAN does —
+ * which is the one thing it exists not to do. `DATABASE_URL` stays on
+ * `env.schema.ts`'s forbidden list for exactly that reason: the queue's
+ * durability must never become reachability. There is no
  * ThrottlerModule yet because Edge has no effect-causing route yet; it arrives
  * with EDGE-B's ingress, alongside the authentication argument for it.
  */
@@ -39,6 +43,7 @@ import { EdgeTrustedTimeModule } from './modules/trusted-time/trusted-time.modul
         },
       }),
     }),
+    EdgeQueueModule,
     EdgeHealthModule,
     EdgeTrustedTimeModule,
   ],
