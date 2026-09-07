@@ -45,7 +45,8 @@
     "baseUrl": ".",
     "paths": {
       "@prisma/client": ["../../services/core-api/node_modules/@prisma/client"],
-      "vitest": ["../../services/core-api/node_modules/vitest"]
+      "vitest": ["../../services/core-api/node_modules/vitest"],
+      "@sentinel/contracts": ["../../services/core-api/node_modules/@sentinel/contracts"]
     }
   },
   "include": ["**/*.ts"]

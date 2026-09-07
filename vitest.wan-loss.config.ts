@@ -55,6 +55,11 @@ export default defineConfig({
       '@prisma/client': resolve('../../services/core-api/node_modules/@prisma/client'),
       '@nestjs/core': resolve('../../services/core-api/node_modules/@nestjs/core'),
       '@nestjs/platform-express': resolve('../../services/core-api/node_modules/@nestjs/platform-express'),
+      // WP-30: the harness builds Field envelopes and must digest their
+      // payloads with the CONTRACT's own canonicalisation. A local
+      // reimplementation would drift, and the Edge would then refuse
+      // submissions for a reason unrelated to the scenario under test.
+      '@sentinel/contracts': resolve('../../services/core-api/node_modules/@sentinel/contracts'),
     },
   },
 

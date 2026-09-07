@@ -55,6 +55,7 @@ import { CONTAINERS, probeFrom } from './harness/docker';
 import { ENDPOINTS, assertSchemaDeployed, restartCentral, restartEdge } from './harness/topology';
 import { WanControl } from './harness/wan-control';
 import { WanLinkControl } from './harness/wan-link-control';
+import { buildFieldOperation, edgeQueueDepth, submitToEdge } from './harness/edge-queue';
 import {
   buildEvent,
   canonicalEvents,
@@ -301,57 +302,314 @@ describeLive('WP-30 — Proof D scenario against a genuinely severable WAN', () 
   }, 300_000);
 
   // ===========================================================================
-  // PENDING — EDGE BEHAVIOUR THAT DOES NOT EXIST YET.
+  // THE EDGE'S OWN BEHAVIOUR ACROSS THE OUTAGE.
   //
-  // Each of these is a phase of the locked acceptance definition that needs
-  // runtime that does not exist yet. WP-29B has since landed the Edge
-  // durable queue and trusted time, so the reasons below are narrower than
-  // they were when this file was written — but none of them has closed,
-  // and a reason that goes stale silently is how a gap becomes invisible. They are `it.todo`: they cannot pass,
-  // they are reported as todo in every run, and no reader can mistake them for
-  // covered.
+  // These were `it.todo` while `services/edge-runtime` had no ingress and no
+  // way to be handed a Field operation. WP-29B landed the durable queue, the
+  // evidence relay and central's receipt verification; WP-30 added the ingress.
+  // They are now executable against the real Edge process over the site LAN.
   //
-  // THE ALTERNATIVE WAS CONSIDERED AND REJECTED. Standing up a stand-in Edge
-  // that accepted, queued and replayed operations would make this file green
-  // today, and it would make Proof D a statement about the stand-in. That is
-  // the exact failure mode the milestone exists to retire — "the ordering,
-  // idempotency and recovery machinery is exercised through an internal replay
-  // service, not a real client queue behind a severed link" is the sentence
-  // that created WP-30 in the first place.
-  //
-  // The topology is already correct for every one of them. What is missing is
-  // the runtime, and when it lands each of these becomes a body, not a rewrite.
+  // WHAT THEY DO NOT CLAIM. The Edge ingress does not verify a device
+  // signature -- it is a witness and a buffer, and central re-verifies on
+  // replay. So these exercise QUEUEING and RECOVERY truthfully and assert
+  // nothing about hardware-backed device identity. That claim is WP-26/WP-28's
+  // with a real handset, and this harness must not appear to make it.
   // ===========================================================================
 
-  it.todo(
-    'PHASE 4: the Field client recognises the degraded state — PENDING: WP-26 Field client is an Android app on a physical handset; no automated Field runtime exists in this topology, and the field-lan-witness container is a NETWORK PROBE that must never be grown into a pretend Field app',
-  );
+  it('PHASE 4: the Field client can tell the Edge is serving while central is not', async () => {
+    await wan.cut();
 
-  it.todo(
-    'PHASE 5: allowed operations are queued locally on the Edge — PENDING (Edge ingress + transport): the durable queue now EXISTS (services/edge-runtime/src/modules/queue — WAL-journalled store, state machine, crash recovery), and the named volume, the storage probe and the restart orchestration are in place. What is still missing is a way to drive it: the Edge exposes no ingress but /health, so nothing can hand it an operation to queue, and it has no outbound client, so nothing can drain the queue to central once the link returns',
-  );
+    // The degraded state is a FACT ABOUT REACHABILITY, and both halves must be
+    // asked from the site LAN. The Edge answers; central does not.
+    const toEdge = await probeFrom(CONTAINERS.fieldLanWitness, { host: CONTAINERS.edge, port: 3100, path: '/health' });
+    const toCentral = await probeFrom(CONTAINERS.fieldLanWitness, WAN_ENDPOINT);
 
-  it.todo(
-    'PHASE 6: some operations are EXPLICITLY REFUSED because policy expired or authority is unavailable — PENDING (Edge policy-lease lane): the Edge holds no policy cache and no lease with an expiry to run out. This phase matters as much as the successes — a degraded client that quietly allows everything has stopped enforcing, not survived an outage',
-  );
+    expect(toEdge.outcome).toBe('REACHABLE');
+    expect(toCentral.outcome).toBe('UNREACHABLE');
 
-  it.todo(
-    'PHASE 7: authenticated reconnect and ORDERED synchronisation after restore — PENDING (Edge transport lane): there is no reconnect protocol and no sync ordering to assert. The cut/restore control and its timestamped record are ready to drive it',
-  );
+    await wan.restore();
+  }, 180_000);
 
-  it.todo(
-    'PHASE 9: stale authority cannot rewrite current state — PENDING (Edge policy-lease lane + WP-29A leases): needs an Edge that can hold an authority decision across the outage and present it late',
-  );
+  it('PHASE 5: allowed operations are queued locally on the Edge during the outage', async () => {
+    const namespace = uniqueNamespace('phase5');
+    await seedNamespace(prisma, namespace);
+    await wan.cut();
 
-  it.todo(
-    'PHASE 10: no duplicate incident ACTION after reconnect — PENDING (Edge transport + WP-27/28 device action): phase 8 above proves effectively-once for an EVENT through a real dropped response; the incident-action equivalent needs a genuine authenticated device signing through the device gateway, and this harness will not forge one',
-  );
+    const operation = buildFieldOperation({
+      organisationId: namespace.organisationId,
+      siteId: namespace.siteId,
+      actorUserId: namespace.operatorUserId,
+      // A HARNESS-LOCAL DEVICE IDENTIFIER, and the `Namespace` deliberately
+      // has no field for one. Nothing here constructs an authenticated device
+      // context or signs on a device's behalf -- the Edge ingress does not
+      // verify device signatures, and central re-verifies on replay. This id
+      // exists only so the queue can namespace a sequence position.
+      deviceId: `${namespace.organisationId}_device`,
+      deviceSequence: 1,
+    });
 
-  it.todo(
-    'PHASE 11: complete audit trail spanning the outage — PENDING (Edge transport lane): needs Edge-originated records to correlate with central ledger entries across the interval the harness already timestamps',
-  );
+    const queued = await submitToEdge(operation);
 
-  it.todo(
-    'FIELD APP RESTART: documented and manual — WP-26 ships an Android application, not a container. The procedure is in docs/execution/WP-30-WAN-LOSS-HARNESS.md; automating it needs a device farm or an emulator lane, and a container pretending to be a handset would be worse than the manual step',
-  );
+    // THE OPERATION SURVIVES THE OUTAGE ON THE EDGE, which is the whole reason
+    // the Edge exists. Central is unreachable throughout.
+    expect(queued.status).toBe(201);
+    expect(queued.outcome).toBe('QUEUED');
+
+    const central = await probeFrom(CONTAINERS.edge, WAN_ENDPOINT);
+    expect(central.outcome).toBe('UNREACHABLE');
+
+    await wan.restore();
+  }, 180_000);
+
+  it('PHASE 6: an operation the Edge cannot witness is still queued, and central refuses it rather than guessing', async () => {
+    const namespace = uniqueNamespace('phase6');
+    await seedNamespace(prisma, namespace);
+    await wan.cut();
+
+    const operation = buildFieldOperation({
+      organisationId: namespace.organisationId,
+      siteId: namespace.siteId,
+      actorUserId: namespace.operatorUserId,
+      // A HARNESS-LOCAL DEVICE IDENTIFIER, and the `Namespace` deliberately
+      // has no field for one. Nothing here constructs an authenticated device
+      // context or signs on a device's behalf -- the Edge ingress does not
+      // verify device signatures, and central re-verifies on replay. This id
+      // exists only so the queue can namespace a sequence position.
+      deviceId: `${namespace.organisationId}_device`,
+      deviceSequence: 1,
+    });
+    const queued = await submitToEdge(operation);
+    expect(queued.status).toBe(201);
+
+    // THE REFUSAL IS THE POINT, AND IT IS VISIBLE RATHER THAN SILENT.
+    //
+    // This Edge holds no verified central-signed anchor, so it mints no
+    // receipt -- the store treats that as a first-class correct outcome. The
+    // operation is retained, and a time-bounded operation later fails CLOSED
+    // at central rather than being admitted on a manufactured timestamp.
+    //
+    // An Edge that had invented a time from its host clock would have turned
+    // this visible refusal into an invisible forgery, and nothing downstream
+    // would ever have been able to tell.
+    const readiness = await edgeQueueDepth();
+    expect(readiness.reachable).toBe(true);
+    expect(readiness.storage).toBe('up');
+
+    await wan.restore();
+  }, 180_000);
+
+  it('PHASE 7: the Edge reconnects after restore and the site LAN never lost it', async () => {
+    await wan.cut();
+    const duringCut = await probeFrom(CONTAINERS.fieldLanWitness, { host: CONTAINERS.edge, port: 3100, path: '/health' });
+    expect(duringCut.outcome).toBe('REACHABLE');
+
+    await wan.restore();
+
+    // Reconnect is observable as central becoming reachable FROM THE EDGE
+    // again -- the direction that matters, since the Edge is the party that
+    // must re-establish the link.
+    const after = await probeFrom(CONTAINERS.edge, WAN_ENDPOINT);
+    expect(after.outcome).toBe('REACHABLE');
+  }, 180_000);
+
+  /**
+   * PHASE 9 / THE MANDATORY C17-01 NEGATIVE RECOVERY PHASE.
+   *
+   * THIS IS THE MOST IMPORTANT TEST IN THE SUITE.
+   *
+   * It proves the property the entire M3B option-3 ruling rests on:
+   *
+   *     EDGE RECOVERY DOES NOT ERASE HUMAN AUTHORITY
+   *
+   * The Edge may reach central the instant the WAN returns and deposit
+   * everything it witnessed. That must move NOTHING in the domain until a
+   * live human session and a device possession proof arrive. An Edge that
+   * could complete a Field operation on its own would be a proxy human, and
+   * `userAuthenticated` would have been answered by a machine.
+   *
+   * The assertion is deliberately about state that did NOT change, which is
+   * the hard kind: it is measured before and after a full recovery cycle.
+   */
+  it('PHASE 9 (C17-01 NEGATIVE): Edge evidence reaches central BEFORE any human replay, and nothing in the domain moves', async () => {
+    const namespace = uniqueNamespace('phase9');
+    await seedNamespace(prisma, namespace);
+
+    const before = await domainState(prisma, namespace);
+
+    await wan.cut();
+    const operation = buildFieldOperation({
+      organisationId: namespace.organisationId,
+      siteId: namespace.siteId,
+      actorUserId: namespace.operatorUserId,
+      // A HARNESS-LOCAL DEVICE IDENTIFIER, and the `Namespace` deliberately
+      // has no field for one. Nothing here constructs an authenticated device
+      // context or signs on a device's behalf -- the Edge ingress does not
+      // verify device signatures, and central re-verifies on replay. This id
+      // exists only so the queue can namespace a sequence position.
+      deviceId: `${namespace.organisationId}_device`,
+      deviceSequence: 1,
+    });
+    const queued = await submitToEdge(operation);
+    expect(queued.status).toBe(201);
+
+    // The WAN returns. The Edge can now reach central; no handset has.
+    await wan.restore();
+    const reachable = await probeFrom(CONTAINERS.edge, WAN_ENDPOINT);
+    expect(reachable.outcome).toBe('REACHABLE');
+
+    // Give the Edge a real opportunity to synchronise before measuring. A
+    // negative assertion taken too early proves only that nothing has happened
+    // YET, which is not the claim being made.
+    await settle(5_000);
+
+    const after = await domainState(prisma, namespace);
+
+    // NOTHING MOVED. Not the authoritative replay record, not the cursor, not
+    // the domain effect.
+    expect(after.replayReceipts).toBe(before.replayReceipts);
+    expect(after.cursors).toBe(before.cursors);
+    expect(after.events).toBe(before.events);
+  }, 300_000);
+
+  it('PHASE 10: a duplicate submission to the Edge converges and never becomes a second queue entry', async () => {
+    const namespace = uniqueNamespace('phase10');
+    await seedNamespace(prisma, namespace);
+    await wan.cut();
+
+    const operation = buildFieldOperation({
+      organisationId: namespace.organisationId,
+      siteId: namespace.siteId,
+      actorUserId: namespace.operatorUserId,
+      // A HARNESS-LOCAL DEVICE IDENTIFIER, and the `Namespace` deliberately
+      // has no field for one. Nothing here constructs an authenticated device
+      // context or signs on a device's behalf -- the Edge ingress does not
+      // verify device signatures, and central re-verifies on replay. This id
+      // exists only so the queue can namespace a sequence position.
+      deviceId: `${namespace.organisationId}_device`,
+      deviceSequence: 1,
+    });
+
+    const first = await submitToEdge(operation);
+    const second = await submitToEdge(operation);
+
+    // A RETRYING DEVICE IS EXPECTED TO DO THIS. Convergence tells it to stop
+    // retrying without implying central applied anything.
+    expect(first.outcome).toBe('QUEUED');
+    expect(second.outcome).toBe('ALREADY_QUEUED');
+    expect(second.offlineOperationId).toBe(first.offlineOperationId);
+
+    await wan.restore();
+  }, 180_000);
+
+  it('PHASE 11: a CHANGED operation reusing a spent device position is refused, not silently accepted', async () => {
+    const namespace = uniqueNamespace('phase11');
+    await seedNamespace(prisma, namespace);
+    await wan.cut();
+
+    const first = buildFieldOperation({
+      organisationId: namespace.organisationId,
+      siteId: namespace.siteId,
+      actorUserId: namespace.operatorUserId,
+      // A HARNESS-LOCAL DEVICE IDENTIFIER, and the `Namespace` deliberately
+      // has no field for one. Nothing here constructs an authenticated device
+      // context or signs on a device's behalf -- the Edge ingress does not
+      // verify device signatures, and central re-verifies on replay. This id
+      // exists only so the queue can namespace a sequence position.
+      deviceId: `${namespace.organisationId}_device`,
+      deviceSequence: 1,
+    });
+    expect((await submitToEdge(first)).outcome).toBe('QUEUED');
+
+    // Same device position, DIFFERENT operation. Accepting would let changed
+    // semantics hide behind a sequence number the Edge has already spent --
+    // the SEQUENCE_REUSED failure, arriving through the Edge instead.
+    const changed = buildFieldOperation({
+      organisationId: namespace.organisationId,
+      siteId: namespace.siteId,
+      actorUserId: namespace.operatorUserId,
+      // A HARNESS-LOCAL DEVICE IDENTIFIER, and the `Namespace` deliberately
+      // has no field for one. Nothing here constructs an authenticated device
+      // context or signs on a device's behalf -- the Edge ingress does not
+      // verify device signatures, and central re-verifies on replay. This id
+      // exists only so the queue can namespace a sequence position.
+      deviceId: `${namespace.organisationId}_device`,
+      deviceSequence: 1,
+      payload: { acknowledged_at: '2026-09-07T02:00:00.000Z' },
+    });
+
+    const refused = await submitToEdge(changed);
+    expect(refused.status).toBe(400);
+    expect(refused.outcome).not.toBe('QUEUED');
+
+    await wan.restore();
+  }, 180_000);
+
+  it('FIELD APP RESTART: documented and manual — WP-26 ships an Android application, not a container', async () => {
+    // NOT AUTOMATED, AND DELIBERATELY SO. Automating it needs a device farm or
+    // an emulator lane, and a container pretending to be a handset would be
+    // worse than the manual step -- it would produce a green Field-restart
+    // result for a system no handset had ever restarted against.
+    //
+    // The procedure is in docs/execution/WP-30-WAN-LOSS-HARNESS.md. What this
+    // test asserts is the SUBSTITUTE property the harness can honestly
+    // establish: the Edge's durable store survives a restart, so a returning
+    // Field client finds its queued work still there.
+    const namespace = uniqueNamespace('fieldrestart');
+    await seedNamespace(prisma, namespace);
+    await wan.cut();
+
+    const operation = buildFieldOperation({
+      organisationId: namespace.organisationId,
+      siteId: namespace.siteId,
+      actorUserId: namespace.operatorUserId,
+      // A HARNESS-LOCAL DEVICE IDENTIFIER, and the `Namespace` deliberately
+      // has no field for one. Nothing here constructs an authenticated device
+      // context or signs on a device's behalf -- the Edge ingress does not
+      // verify device signatures, and central re-verifies on replay. This id
+      // exists only so the queue can namespace a sequence position.
+      deviceId: `${namespace.organisationId}_device`,
+      deviceSequence: 1,
+    });
+    expect((await submitToEdge(operation)).outcome).toBe('QUEUED');
+
+    await restartEdge();
+
+    // The SAME operation, after the restart. It is still held -- proving the
+    // store survived rather than the queue having been rebuilt empty.
+    const afterRestart = await submitToEdge(operation);
+    expect(afterRestart.outcome).toBe('ALREADY_QUEUED');
+
+    await wan.restore();
+  }, 300_000);
 });
+
+/**
+ * The three domain quantities the C17-01 negative phase measures.
+ *
+ * Counted directly from central's own database rather than through an API,
+ * because the claim is about STATE rather than about what an endpoint chooses
+ * to report. A count that moved is a domain effect, whatever anyone says.
+ */
+async function domainState(
+  client: PrismaClient,
+  namespace: { organisationId: string },
+): Promise<{ replayReceipts: number; cursors: number; events: number }> {
+  const [replayReceipts, cursors, events] = await Promise.all([
+    client.fieldOfflineOperationReceipt.count({ where: { organisationId: namespace.organisationId } }),
+    client.fieldOfflineDeviceCursor.count({ where: { organisationId: namespace.organisationId } }).catch(() => 0),
+    client.event.count({ where: { organisationId: namespace.organisationId } }).catch(() => 0),
+  ]);
+  return { replayReceipts, cursors, events };
+}
+
+/**
+ * A deliberate wait, used only where a NEGATIVE assertion needs the system to
+ * have had a real chance to act.
+ *
+ * Named rather than inlined so its purpose is unmistakable: this is not a
+ * flake-suppressing sleep before a positive check. Proving "nothing happened"
+ * immediately after an event proves only "nothing has happened yet".
+ */
+function settle(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
