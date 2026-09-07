@@ -179,6 +179,24 @@ export const envSchema = z.object({
   /** PATH to a mounted PKCS#8 P-256 private key. Never the key itself. */
   EDGE_TRUSTED_TIME_SIGNING_KEY_FILE: z.string().min(1, 'EDGE_TRUSTED_TIME_SIGNING_KEY_FILE must not be empty').optional(),
   /**
+   * M3B §7 — THE PUBLIC COUNTERPART, SO CENTRAL CAN VERIFY WHAT CENTRAL SIGNED.
+   *
+   * Same JSON shape as Edge's `EDGE_TRUSTED_TIME_VERIFICATION_KEYS`, and
+   * deliberately so: it is the same key list, deployed to both ends. Central
+   * needs it for a reason that is easy to miss -- it cannot simply derive the
+   * public key from its CURRENT signing key, because an anchor minted before a
+   * rotation was signed by the PREVIOUS one and must still verify afterwards.
+   * A verifier that could only check the active key would start silently
+   * refusing every in-flight anchor at each rotation.
+   *
+   * PUBLIC MATERIAL ONLY. The entry schema is strict and has no field a
+   * private key could arrive in.
+   */
+  EDGE_TRUSTED_TIME_VERIFICATION_KEYS: z
+    .string()
+    .min(1, 'EDGE_TRUSTED_TIME_VERIFICATION_KEYS must not be empty')
+    .optional(),
+  /**
    * C13-01: there is deliberately NO patrol sweep interval key here.
    *
    * MISSED is a server-owned verdict (WP-19 s.3), so the cadence that reaches
