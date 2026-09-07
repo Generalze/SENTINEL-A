@@ -1,6 +1,8 @@
 import { Module } from '@nestjs/common';
+import { EdgeQueueModule } from '../modules/queue/edge-queue.module';
 import { EdgeHealthController } from './health.controller';
 import { EdgeHealthService, EDGE_READINESS_PROBES } from './health.service';
+import { EdgeQueueCapacityProbe } from './queue-capacity.probe';
 import { EdgeQueueStorageProbe } from './queue-storage.probe';
 
 /**
@@ -9,13 +11,15 @@ import { EdgeQueueStorageProbe } from './queue-storage.probe';
  * health service never learns what any dependency IS.
  */
 @Module({
+  imports: [EdgeQueueModule],
   controllers: [EdgeHealthController],
   providers: [
     EdgeQueueStorageProbe,
+    EdgeQueueCapacityProbe,
     {
       provide: EDGE_READINESS_PROBES,
-      inject: [EdgeQueueStorageProbe],
-      useFactory: (queueStorage: EdgeQueueStorageProbe) => [queueStorage],
+      inject: [EdgeQueueStorageProbe, EdgeQueueCapacityProbe],
+      useFactory: (queueStorage: EdgeQueueStorageProbe, queueCapacity: EdgeQueueCapacityProbe) => [queueStorage, queueCapacity],
     },
     EdgeHealthService,
   ],

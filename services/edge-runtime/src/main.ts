@@ -32,11 +32,13 @@ async function bootstrap(): Promise<void> {
    * GRACEFUL SHUTDOWN IS NOT COSMETIC ON AN EDGE.
    *
    * Edge holds queued Field operations that exist nowhere else while the WAN is
-   * down. A process killed mid-write can leave a queue entry half-persisted,
-   * and a half-persisted entry is one whose payload no longer digests to the
-   * value the device signature covers — refused, hours later, with the original
-   * bytes unrecoverable. Shutdown hooks give the queue lane an `onModuleDestroy`
-   * in which to finish what it started.
+   * down. The durable queue now makes a KILLED process safe rather than lossy —
+   * a transaction that never committed leaves nothing behind at all, which
+   * `edge-queue.crash.spec.ts` proves against a real SIGKILL mid-write — but
+   * safe and tidy are different things. `EdgeQueueShutdownHook` closes the
+   * database on the way out, so the next boot opens one checkpointed file
+   * instead of replaying a journal, and so an orderly stop is distinguishable
+   * in the logs from a power cut.
    */
   app.enableShutdownHooks();
 
