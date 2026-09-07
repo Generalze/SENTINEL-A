@@ -10,6 +10,7 @@ import { DeviceGatewayDomainAdapters } from './device-gateway.adapters';
 import { DeviceGatewayRepository } from './device-gateway.repository';
 import { DeviceGatewayService } from './device-gateway.service';
 import { DeviceOfflineIngressService } from './device-offline-ingress.service';
+import { DeviceEdgeTransportService } from './device-edge-transport.service';
 import { DevicePolicyLeaseService } from './device-policy-lease.service';
 import { FieldOfflineModule } from '../field-offline/field-offline.module';
 
@@ -101,7 +102,14 @@ import { FieldOfflineModule } from '../field-offline/field-offline.module';
     DeviceGatewayService,
     DevicePolicyLeaseService,
     DeviceOfflineIngressService,
+    DeviceEdgeTransportService,
   ],
-  exports: [DeviceContextService, DeviceGatewayService, DevicePolicyLeaseService, DeviceOfflineIngressService],
+  exports: [
+    DeviceContextService,
+    DeviceGatewayService,
+    DevicePolicyLeaseService,
+    DeviceOfflineIngressService,
+    DeviceEdgeTransportService,
+  ],
 })
 export class DeviceGatewayModule {}

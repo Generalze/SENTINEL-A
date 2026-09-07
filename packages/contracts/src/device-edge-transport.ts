@@ -114,10 +114,16 @@ export const DeviceEdgeTransportDescriptorSchema = z
     /**
      * The site this descriptor is FOR.
      *
-     * Central-resolved from the authenticated context, never a request
-     * parameter. A device that could name its own site could ask for the
-     * transport identity of a site it has no authority over, which would turn
-     * this surface into a site-enumeration oracle (D25-13).
+     * A device context authorises a LIST of sites (`authorised_site_ids`), so
+     * "the device's site" is not a single value and central cannot always infer
+     * one. The caller may therefore name a site, and central checks MEMBERSHIP
+     * of the authenticated context's own list -- the same rule
+     * `DevicePolicyLeaseService` already applies.
+     *
+     * That is not an enumeration oracle: membership is already known to
+     * whoever holds the context. What preserves D25-13 is that "no such site"
+     * and "a site you have no authority over" return the SAME coarse refusal,
+     * so the answer discloses nothing the caller did not already have.
      */
     site_id: scopedId,
     /** The transport identity being pinned -- distinct from any signing key identity. */
@@ -201,6 +207,14 @@ export const DEVICE_EDGE_TRANSPORT_DESCRIPTOR_FORBIDDEN_FIELDS = [
  * the other half with nothing in the system recording that it happened.
  */
 export const DeviceEdgeTransportRefusalSchema = z.enum([
+  /**
+   * The request did not resolve to exactly one site this context authorises --
+   * either it named none and the context authorises several, or it named one
+   * the context does not authorise. DELIBERATELY ONE CODE FOR BOTH: splitting
+   * them would let a caller distinguish "that site does not exist" from "that
+   * site exists and is not yours", which is the enumeration D25-13 forbids.
+   */
+  'SITE_NOT_RESOLVED',
   'NO_TRUSTED_EDGE_FOR_SITE',
   'EDGE_NOT_AVAILABLE',
   'TRANSPORT_IDENTITY_NOT_ACTIVE',
