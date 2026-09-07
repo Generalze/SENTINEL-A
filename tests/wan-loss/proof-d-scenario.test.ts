@@ -304,7 +304,10 @@ describeLive('WP-30 — Proof D scenario against a genuinely severable WAN', () 
   // PENDING — EDGE BEHAVIOUR THAT DOES NOT EXIST YET.
   //
   // Each of these is a phase of the locked acceptance definition that needs
-  // runtime another lane is building. They are `it.todo`: they cannot pass,
+  // runtime that does not exist yet. WP-29B has since landed the Edge
+  // durable queue and trusted time, so the reasons below are narrower than
+  // they were when this file was written — but none of them has closed,
+  // and a reason that goes stale silently is how a gap becomes invisible. They are `it.todo`: they cannot pass,
   // they are reported as todo in every run, and no reader can mistake them for
   // covered.
   //
@@ -325,7 +328,7 @@ describeLive('WP-30 — Proof D scenario against a genuinely severable WAN', () 
   );
 
   it.todo(
-    'PHASE 5: allowed operations are queued locally on the Edge — PENDING (Edge store lane): services/edge-runtime has no durable offline queue yet; it has config, identity, health and trusted time. The named volume, the storage probe and the restart orchestration this needs are already in place',
+    'PHASE 5: allowed operations are queued locally on the Edge — PENDING (Edge ingress + transport): the durable queue now EXISTS (services/edge-runtime/src/modules/queue — WAL-journalled store, state machine, crash recovery), and the named volume, the storage probe and the restart orchestration are in place. What is still missing is a way to drive it: the Edge exposes no ingress but /health, so nothing can hand it an operation to queue, and it has no outbound client, so nothing can drain the queue to central once the link returns',
   );
 
   it.todo(
