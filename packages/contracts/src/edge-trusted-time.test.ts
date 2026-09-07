@@ -307,6 +307,13 @@ function bigIntTo32Bytes(value: bigint): Buffer {
  * split matters: a contract that could decide verification would be a contract
  * the Edge gets to influence.
  */
+/** Drops one key. A required field's absence is a distinct failure from a wrong value. */
+function withoutKey(source: Record<string, unknown>, key: string): Record<string, unknown> {
+  const copy = { ...source };
+  delete copy[key];
+  return copy;
+}
+
 describe('EdgeTrustedTimeEvidence v1', () => {
   const evidence = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
     schema_version: 1,
@@ -323,21 +330,20 @@ describe('EdgeTrustedTimeEvidence v1', () => {
   // The whole point of the structure. Without the signed anchor there is
   // nothing central signed, and therefore nothing to verify against.
   it('refuses evidence with no signed anchor', () => {
-    const { signed_anchor: _dropped, ...rest } = evidence();
-    expect(EdgeTrustedTimeEvidenceSchema.safeParse(rest).success).toBe(false);
+    expect(EdgeTrustedTimeEvidenceSchema.safeParse(withoutKey(evidence(), 'signed_anchor')).success).toBe(false);
   });
 
   // Central compares this against the anchor's own boot id and requires
   // equality; it cannot do that if the Edge never sends it.
   it('refuses evidence with no observation boot id', () => {
-    const { edge_boot_id: _dropped, ...rest } = evidence();
-    expect(EdgeTrustedTimeEvidenceSchema.safeParse(rest).success).toBe(false);
+    expect(EdgeTrustedTimeEvidenceSchema.safeParse(withoutKey(evidence(), 'edge_boot_id')).success).toBe(false);
   });
 
   // The minuend of the derivation. Absent, no time can be derived at all.
   it('refuses evidence with no observation reading', () => {
-    const { edge_monotonic_at_observation: _dropped, ...rest } = evidence();
-    expect(EdgeTrustedTimeEvidenceSchema.safeParse(rest).success).toBe(false);
+    expect(
+      EdgeTrustedTimeEvidenceSchema.safeParse(withoutKey(evidence(), 'edge_monotonic_at_observation')).success,
+    ).toBe(false);
   });
 
   it('refuses a negative or non-integer monotonic reading', () => {
