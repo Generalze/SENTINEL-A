@@ -91,7 +91,7 @@ class OfflineOutboxEntryTest {
      * field arriving without this list changing is the case worth catching.
      */
     @Test
-    fun `the persisted field list is exactly the envelope plus four local values`() {
+    fun `the persisted field list is exactly the envelope plus five local values`() {
         assertEquals(
             listOf(
                 "offline_operation_id",
@@ -114,6 +114,7 @@ class OfflineOutboxEntryTest {
                 "local_attempt_count",
                 "local_last_attempt_at",
                 "local_state",
+                "local_edge_receipt_json",
             ),
             OfflineOutboxEntry.PERSISTED_FIELDS,
         )
@@ -123,7 +124,13 @@ class OfflineOutboxEntryTest {
     fun `every local field is prefixed so it cannot be read as a signed one`() {
         val signedFields = OfflineOutboxEntry.PERSISTED_FIELDS.filter { !it.startsWith("local_") }
         assertEquals(16, signedFields.size)
-        assertEquals(4, OfflineOutboxEntry.PERSISTED_FIELDS.size - signedFields.size)
+        // WP-29B added `local_edge_receipt_json`, so the local count moved from
+        // four to five. THE SIXTEEN SIGNED FIELDS DID NOT MOVE, and that is the
+        // half of this assertion that is load-bearing: an Edge receipt is
+        // collected long after the envelope was signed, so it CANNOT be inside
+        // the signature, and the day it appears without a `local_` prefix is
+        // the day a reader starts believing the device attested to it.
+        assertEquals(5, OfflineOutboxEntry.PERSISTED_FIELDS.size - signedFields.size)
     }
 
     // -----------------------------------------------------------------------
@@ -151,6 +158,44 @@ class OfflineOutboxEntryTest {
         assertEquals(0, restored.attemptCount)
     }
 
+    /**
+     * The Edge witness survives the round trip, and its absence survives it too.
+     *
+     * The receipt is the ONLY evidence of an independent clock that will ever
+     * exist for an operation queued on a disconnected handset, and it exists on
+     * a LAN the device may never see again. An entry that lost it on the next
+     * restart would reach central with nothing to place the operation inside
+     * its lease.
+     */
+    @Test
+    fun `an edge receipt round trips, and no receipt round trips as no receipt`() {
+        val receipt = """{"edge_id":"edge-17","schema_version":1}"""
+        val witnessed = entry().copy(edgeReceiptJson = receipt)
+        assertEquals(receipt, OfflineOutboxEntry.fromJson(witnessed.toJson()).edgeReceiptJson)
+        assertNull(OfflineOutboxEntry.fromJson(entry().toJson()).edgeReceiptJson)
+    }
+
+    /**
+     * D23-10, as a property of the STORED shape.
+     *
+     * `EdgeReceipt` refuses a receipt carrying any of these on the way in. This
+     * asserts the other half: the queue entry has no field they could be
+     * written to even if one got past, because the entry stores the receipt as
+     * ONE opaque text member and has no per-field surface at all.
+     */
+    @Test
+    fun `no persisted field could carry an Edge authorisation`() {
+        val forbidden = listOf("approval", "decision", "device_trust", "operation_permitted", "vouches")
+        for (field in OfflineOutboxEntry.PERSISTED_FIELDS) {
+            for (word in forbidden) {
+                assertFalse(
+                    "'$field' is persisted by a queue entry and names an Edge verdict ('$word')",
+                    field.lowercase().contains(word),
+                )
+            }
+        }
+    }
+
     @Test
     fun `the written field names are exactly the persisted list`() {
         assertEquals(OfflineOutboxEntry.PERSISTED_FIELDS.toSet(), entry().toJson().keys)
@@ -164,9 +209,14 @@ class OfflineOutboxEntryTest {
     fun `a missing field is refused rather than defaulted`() {
         val complete = entry().toJson()
         for (field in OfflineOutboxEntry.PERSISTED_FIELDS) {
-            // `local_last_attempt_at` is the one field that is legitimately
-            // absent: a never-attempted entry has no instant to record.
+            // Two fields are legitimately absent, and both are absences that
+            // mean something rather than gaps: a never-attempted entry has no
+            // instant to record, and an entry no Edge has witnessed holds no
+            // receipt. The second is the ordinary case for a handset that was
+            // simply out of coverage, and reading it as a malformed document
+            // would refuse the whole queue over the normal state of affairs.
             if (field == OfflineOutboxEntry.FIELD_LAST_ATTEMPT_AT) continue
+            if (field == OfflineOutboxEntry.FIELD_EDGE_RECEIPT_JSON) continue
             val without = Json.parseToJsonElement(
                 complete.toString(),
             ).jsonObject.filterKeys { it != field }
@@ -220,6 +270,14 @@ class OfflineOutboxEntryTest {
         assertTrue(described.contains("seq=17"))
         assertTrue(described.contains("INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE"))
         assertTrue(described.contains("lease-1"))
+        assertTrue("an unwitnessed entry says so", described.contains("witness=none"))
+        assertTrue(
+            "a witnessed entry says so and never prints the receipt",
+            entry().copy(edgeReceiptJson = """{"edge_id":"edge-17"}""").describe().contains("witness=edge"),
+        )
+        assertFalse(
+            entry().copy(edgeReceiptJson = """{"edge_id":"edge-17"}""").describe().contains("edge-17"),
+        )
         assertFalse(described.contains("message_id"))
         assertFalse(described.contains("22222222-2222-4222-8222-222222222222"))
     }

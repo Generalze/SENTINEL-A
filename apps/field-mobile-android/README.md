@@ -247,6 +247,61 @@ own: there is no device token, no device session cookie and no header this
 client sends that any controller reads as a device credential (D25-01). When
 real authentication replaces that guard, one constant in `SentinelHttp` changes.
 
+## The site Edge path (WP-29B), and the one sublane that is stopped
+
+A queued operation can be offered to a **site Edge** before it drains to
+central, so that something other than this handset's clock can say when the
+operative acted. `EdgeSubmission` posts the *same* `{ envelope, payload }` pair
+`OfflineSubmission` posts to central — `OfflineEnvelope.submissionJson`,
+verbatim, never an Edge-specific variant — and asks for one thing back: a
+`DeviceEdgeReceipt`. The receipt is stored on the queue entry as
+`local_edge_receipt_json` and travels home with it.
+
+Three rules govern the whole path, and each is enforced rather than documented:
+
+* **The receipt is evidence, never authority.** Holding one makes an entry no
+  more admissible here and exempts it from no local check. Central re-resolves
+  the witnessing Edge in its own registry, verifies the Edge signature against
+  the key *it* holds, and reads `edge_trust` from its own record. `EdgeReceipt`
+  refuses any of `DEVICE_EDGE_RECEIPT_FORBIDDEN_FIELDS`, and any unknown member.
+* **Edge may witness; Edge may not end an operation** (D23-10). `EdgeWitness`
+  has two outcomes and no `REFUSED` — an Edge 4xx is a fact about that Edge's
+  ingress, not about whether the acknowledgement happened — and there is no
+  `remove(`, `markTerminal(` or `markAttempt(` anywhere on the path.
+  `EdgeSubmissionTest` asserts that as a source fact.
+* **The first witness wins.** A later receipt witnesses a strictly later
+  instant, which for a time-bounded kind is the one that can fall outside the
+  lease, so `OfflineOutbox.recordEdgeReceipt` declines to overwrite.
+
+### What is NOT built, and what would unblock it
+
+**There is no `EdgeTransport` implementation, deliberately.** A handset cannot
+today learn *which* Edge to talk to or *what TLS identity to trust for it*:
+nothing on the wire names an Edge (`DevicePolicyLease` has nine members and none
+is an endpoint; `EdgeIdentityContext` is what an Edge knows about itself and is
+never sent to a device), and `EdgeRegistryKeyRecord` holds the Edge's
+*receipt-signing* key at central, which is neither published to devices nor the
+right key for a transport identity. Without an anchor, every way to open the
+connection is a defect — a permissive `TrustManager`, trust-on-first-use, or the
+public trust store plus a hostname — so none was written.
+
+The **smallest missing seam**: the device-context response
+(`POST /api/v1/device-gateway/contexts`, which already returns
+`{ context, policy_lease }` over the authenticated session) would carry, per
+authorised site, the Edge's address and a **pinned trust anchor** for its TLS
+identity — an SPKI digest is enough and discloses nothing. **Central** is the
+party that can supply it: it already runs the Edge enrolment ceremony and so
+knows which Edges exist, at which site, and whether each is still trusted. It
+needs no new channel, and the anchor expires with the context, so a suspended
+Edge stops being reachable at the next issuance. That is a shared-contract and
+core-api change, which is why it is reported rather than written here.
+
+Until then `EdgeTransport.NotConfigured` answers status 0 — "no answer arrived"
+— the entry stays queued, and the operation drains to central with no witness.
+For `INCIDENT_FIELD_MESSAGE_ACKNOWLEDGE`, which is stale-tolerant, that is
+admissible; for a time-bounded kind it is a **visible** refusal at
+`NO_TRUSTWORTHY_TIME_WITNESS`, which is the designed outcome.
+
 ## Physical-device acceptance
 
 The full procedure — Google trust anchors, revocation snapshot, the acceptance
