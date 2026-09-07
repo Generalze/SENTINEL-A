@@ -18,5 +18,6 @@ export * from './device-offline.js';
 export * from './edge-runtime.js';
 export * from './edge-trusted-time.js';
 export * from './edge-enrolment.js';
+export * from './edge-request.js';
 export * from './device-key-rotation.js';
 export * from './whisper-device-action-v2.js';

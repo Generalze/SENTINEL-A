@@ -271,6 +271,30 @@ export class EdgeRegistryRepository {
     return client.edgeRegistryKey.findUnique({ where: { organisationId_edgeKeyId: { organisationId, edgeKeyId } } });
   }
 
+  /**
+   * WP-29B EDGE-B — THE LOOKUP AN AUTHENTICATING EDGE PERFORMS, AND THE ONLY
+   * QUERY IN THIS FILE WITH NO TENANT ON THE LEFT-HAND SIDE.
+   *
+   * A device request resolves its context under the SESSION's tenant (C17-02).
+   * An Edge has no session, so there is no server-established tenant to resolve
+   * under — and a tenant taken from the request would be exactly the defect
+   * C17-02 corrected, arriving through a different door. The tenant is
+   * therefore an OUTPUT of this lookup, derived from the row, and the caller
+   * must not have been able to influence which row that is.
+   *
+   * `edge_registry_key_id_key` is unique per TENANT, not globally, so this
+   * query cannot assume uniqueness — it asks for two rows and refuses unless
+   * exactly one came back. `edge_key_id` is a server-minted `randomUUID`, so
+   * two tenants sharing one is not a situation that arises; if it ever did, the
+   * honest answer is "this names no key" rather than a coin toss between two
+   * tenants' credentials. It fails CLOSED, and it takes no second opinion.
+   */
+  async findRegistryKeyByKeyIdAcrossTenants(edgeKeyId: string, tx?: EdgeTx) {
+    const client = tx ?? this.prisma;
+    const rows = await client.edgeRegistryKey.findMany({ where: { edgeKeyId }, take: 2 });
+    return rows.length === 1 ? (rows[0] ?? null) : null;
+  }
+
   async findCurrentRegistryKey(organisationId: string, edgeId: string, tx?: EdgeTx) {
     const client = tx ?? this.prisma;
     // RELIES on the partial unique index `edge_registry_keys_one_current_key`
@@ -325,6 +349,41 @@ export class EdgeRegistryRepository {
     },
   ): Promise<void> {
     await tx.edgeSecurityEvent.create({ data: input });
+  }
+
+  /**
+   * WP-29B EDGE-B — the same audit row, for a decision that has no transaction
+   * to join.
+   *
+   * An authentication refusal commits nothing, so there is no effect for the
+   * event to be atomic with; writing it inside a transaction opened purely to
+   * hold it would be ceremony, and worse, a transaction that rolled back would
+   * ERASE the record of a refused request — which is the one record an
+   * investigation needs. It mirrors `appendOperationEventOutsideTransaction` on
+   * the device gateway for exactly that reason.
+   *
+   * IT STILL REQUIRES A TENANT, and the caller must have ESTABLISHED that
+   * tenant from server state. There is deliberately no nullable-organisation
+   * overload: a refusal taken before any registry row resolved has no tenant at
+   * all, and filing it under an invented one would corrupt every tenant-scoped
+   * audit query in the estate. Those refusals are logged and not filed — see
+   * `EdgeAuthenticationService`.
+   */
+  async appendSecurityEventOutsideTransaction(input: {
+    organisationId: string;
+    edgeId: string | null;
+    siteId: string | null;
+    eventType: string;
+    actorUserId: string | null;
+    edgeKeyId: string | null;
+    edgeKeyVersion: number | null;
+    outcome: string | null;
+    refusalCode: string | null;
+    payload: Prisma.InputJsonValue;
+    occurredAt: Date;
+    traceId: string;
+  }): Promise<void> {
+    await this.prisma.edgeSecurityEvent.create({ data: input });
   }
 }
 
