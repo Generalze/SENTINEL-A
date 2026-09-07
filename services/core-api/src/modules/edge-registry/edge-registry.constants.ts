@@ -54,6 +54,21 @@ export const EDGE_SECURITY_EVENT_TYPES = [
   'EDGE_ENROLLED',
   'EDGE_WITHDRAWN',
   'EDGE_REPLAY_CONFLICT',
+  // WP-29B EDGE-B — the transport boundary's own vocabulary, in the SAME
+  // enumeration rather than in a second one beside it. An operator asking
+  // "what has this Edge done?" runs one query over `edge_security_events`; a
+  // parallel event vocabulary would mean the answer depends on which list they
+  // knew about.
+  //
+  // NOTE THE FOUR, AND THE FACT THAT THEY ARE FOUR. Authenticating a caller
+  // and admitting a receipt are separate events because they are separate
+  // decisions — that is the two-layer rule written into the audit trail, so an
+  // investigator can see an authenticated Edge whose receipt was refused, and
+  // a receipt that never got as far as being looked at.
+  'EDGE_REQUEST_AUTHENTICATED',
+  'EDGE_REQUEST_REFUSED',
+  'EDGE_RECEIPT_ADMITTED',
+  'EDGE_RECEIPT_REFUSED',
 ] as const;
 export type EdgeSecurityEventType = (typeof EDGE_SECURITY_EVENT_TYPES)[number];
 
