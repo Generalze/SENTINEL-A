@@ -119,12 +119,19 @@ SOURCE_NOT_READABLE        the source exists; this collector cannot read it
 WITHHELD_BY_PRIVACY_RULE   collectable, and deliberately not collected
 ```
 
-The last three are what "degrade honestly" means in practice. Other lanes are
-building the Edge transport, the Edge durable queue and the outage harness
-concurrently; an unbuilt source produces a fact naming the source and the
-question it would have answered, never a silently dropped field. An
-arrived-but-unrecognised source produces the opposite statement, because
-reporting a capability the system now has as one it lacks is also a lie.
+The last three are what "degrade honestly" means in practice. An unbuilt
+source produces a fact naming the source and the question it would have
+answered, never a silently dropped field. An arrived-but-unrecognised source
+produces the opposite statement, because reporting a capability the system
+now has as one it lacks is also a lie.
+
+That second rule now applies to this document. When it was written, the Edge
+transport, the Edge durable queue and the outage harness were all in flight.
+Two of the three have since landed on this branch — the durable queue
+(`services/edge-runtime/src/modules/queue`) and the WAN-loss harness
+(`tests/wan-loss`). The Edge transport has not, and it is the one that still
+gates Proof D: with no outbound client there is nothing to drain the queue to
+central, and so no Edge-originated record for the collector to read.
 
 ### Delivered — the sign-off document you are reading
 
@@ -244,9 +251,12 @@ Proof D                     Requires ALL of:
                                 because policy expired or authority was
                                 unavailable;
                               - authenticated reconnect and ordered sync;
-                              - the Edge durable queue and Edge receipt source
-                                (WP-29B/WP-30) landed, so Edge-side persistence
-                                can be evidenced rather than attested.
+                              - an Edge RECEIPT SOURCE, so Edge-side persistence
+                                can be evidenced rather than attested. The Edge
+                                durable queue (WP-29B) and the outage harness
+                                (WP-30) have landed; the Edge transport that
+                                would carry a receipt to central has not, and
+                                nothing persists one centrally today.
                             The collector is ready. The run is not possible yet.
 ```
 
