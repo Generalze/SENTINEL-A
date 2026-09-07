@@ -2,6 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { Prisma, type FieldAssignment, type FieldOperativeCurrentState } from '@prisma/client';
 import { canTransitionFieldAssignmentStatus, FieldAssignmentSchema, FieldOperativeStateUpdateSchema, type FieldAssignmentStatus } from '@sentinel/contracts';
 import { PrismaService } from '../../prisma/prisma.service';
+import { DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS } from '../../prisma/transaction-budget';
 import type { FieldAssignmentAction, SiteScope } from './field.types';
 
 export function isUniqueViolation(error: unknown): boolean {
@@ -151,7 +152,7 @@ export class FieldRepository {
           },
         });
         return row;
-      });
+      }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
       this.assertAssignmentContract(assignment);
       return { assignment, created: true };
     } catch (error) {
@@ -305,7 +306,7 @@ export class FieldRepository {
       this.assertAssignmentContract(updated);
       return { kind: 'updated', assignment: updated };
     };
-    return tx ? execute(tx) : this.prisma.$transaction(execute);
+    return tx ? execute(tx) : this.prisma.$transaction(execute, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
   }
 
   /**
@@ -406,7 +407,7 @@ export class FieldRepository {
       });
       return { state: current, created: true };
     };
-    return tx ? execute(tx) : this.prisma.$transaction(execute);
+    return tx ? execute(tx) : this.prisma.$transaction(execute, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
   }
 
   /** `assigneeUserId` narrows the read to one operative's own assignments (WP-17/D5). */

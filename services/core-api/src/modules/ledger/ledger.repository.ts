@@ -1,6 +1,7 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { Prisma, type DecisionLedgerEntry as LedgerRow } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
+import { DEFAULT_INTERACTIVE_TRANSACTION_MAX_WAIT_MS } from '../../prisma/transaction-budget';
 import { decodeCursor, encodeCursor } from './ledger.pagination';
 import type { LedgerApproval, LedgerEntry, LedgerListFilter } from './ledger.types';
 
@@ -80,6 +81,16 @@ export class LedgerRepository {
    * defaults (`maxWait` 2s, `timeout` 5s) are sized for independent transactions, not a
    * deliberately-serialised queue, so both are raised here to accommodate a legitimate burst
    * rather than surfacing it as a spurious "unable to start a transaction" error.
+   *
+   * TI-03 promoted the `maxWait` half of that reasoning out of this method: every
+   * `$transaction` in core-api shares one pool, so every one of them can be the caller left
+   * waiting behind a legitimate burst — it was never a ledger-specific problem. The 10s value
+   * measured here is now DEFAULT_INTERACTIVE_TRANSACTION_MAX_WAIT_MS and is read from there,
+   * so this call site cannot drift away from the policy it originated.
+   *
+   * The `timeout` stays local and stays 20s: that is an EXECUTION budget for this specific
+   * lock-serialised critical section, and TI-03 deliberately did not make execution budgets
+   * uniform.
    */
   async append(data: InsertLedgerEntryData): Promise<LedgerEntry> {
     const row = await this.prisma.$transaction(
@@ -115,7 +126,7 @@ export class LedgerRepository {
           },
         });
       },
-      { maxWait: 10_000, timeout: 20_000 },
+      { maxWait: DEFAULT_INTERACTIVE_TRANSACTION_MAX_WAIT_MS, timeout: 20_000 },
     );
 
     return toLedgerEntry(row);

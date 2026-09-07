@@ -8,6 +8,7 @@ import {
   type WhisperReplayIdentity,
 } from '@sentinel/contracts';
 import { PrismaService } from '../../prisma/prisma.service';
+import { DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS } from '../../prisma/transaction-budget';
 import type { SiteScope } from '../identity/list-pagination';
 import {
   AUDIT_WHISPER_ACTIVATED,
@@ -480,7 +481,7 @@ export class WhisperRepository {
         },
       });
       return { kind: 'written', row };
-    });
+    }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
   }
 
   async findVersion(
@@ -582,7 +583,7 @@ export class WhisperRepository {
       if (updated.count !== 1) return { kind: 'status-conflict', currentStatus: current.status };
       const row = await tx.whisperSignalVersion.findUniqueOrThrow({ where: { id: current.id } });
       return { kind: 'written', row };
-    });
+    }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
   }
 
   /**
@@ -640,7 +641,7 @@ export class WhisperRepository {
         },
       });
       return { kind: 'written', row };
-    });
+    }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
   }
 
   /**
@@ -788,7 +789,7 @@ export class WhisperRepository {
       });
 
       return { kind: 'written', row: { activated, rotatedVersions: incumbents.map((row) => row.signalVersion) } };
-    });
+    }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
   }
 
   // ---------------------------------------------------------------------------
@@ -903,7 +904,7 @@ export class WhisperRepository {
       // that no subsequent write could ever match.
       if (claimed === null) throw new Error('whisper recognition receipt vanished inside its own claim transaction');
       return claimed.attemptCount;
-    });
+    }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
   }
 
   /**
@@ -934,7 +935,7 @@ export class WhisperRepository {
       if (fenced.count === 0) return 'lost';
       await this.writeAudit(tx, input.audit);
       return 'finalized';
-    });
+    }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
   }
 
   /**

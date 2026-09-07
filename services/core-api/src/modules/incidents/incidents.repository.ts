@@ -1,6 +1,7 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { Prisma, type Incident, type ResponseTask } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
+import { DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS } from '../../prisma/transaction-budget';
 import type { CreateIncidentInput, IncidentListFilter, OpenWhisperSilentIncidentInput } from './incidents.types';
 import type { SiteScope } from '../identity/list-pagination';
 import {
@@ -64,7 +65,7 @@ export class IncidentsRepository {
         });
         await tx.incidentUpdateOutbox.create({ data: { incidentId: row.id, organisationId: input.organisationId, payload: { id: row.id, organisation_id: input.organisationId, kind: 'INCIDENT_OPENED' } } });
         return row;
-      });
+      }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
       return { incident, created: true };
     } catch (error) {
       if (!isUniqueViolation(error)) throw error;
@@ -155,7 +156,7 @@ export class IncidentsRepository {
           },
         });
         return row;
-      });
+      }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
       return { incident, created: true };
     } catch (error) {
       if (!isUniqueViolation(error)) throw error;
@@ -257,7 +258,7 @@ export class IncidentsRepository {
       } } });
       await tx.incidentUpdateOutbox.create({ data: { incidentId: current.id, organisationId: current.organisationId, payload: { id: current.id, organisation_id: current.organisationId, kind: 'HYPOTHESIS_UPDATED' } } });
       return { incident: updated, startedProofA };
-    });
+    }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
   }
 
   async findForHypothesis(hypothesisId: string, organisationId: string): Promise<Incident | null> {
@@ -281,7 +282,7 @@ export class IncidentsRepository {
         await tx.responseTaskSilentApproval.create({ data: { taskId, userId, claimedRole: 'site.commander' } });
         await tx.incidentTimelineEntry.create({ data: { incidentId: task.incidentId, kind: 'SILENT_APPROVAL_RECORDED', actorUserId: userId, payload: { task_id: taskId, claimed_role: 'site.commander' } } });
         await tx.incidentUpdateOutbox.create({ data: { incidentId: task.incidentId, organisationId: task.incident.organisationId, payload: { id: task.incidentId, organisation_id: task.incident.organisationId, kind: 'SILENT_APPROVAL_RECORDED' } } });
-      });
+      }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
       return true;
     } catch (error) {
       if (!isUniqueViolation(error)) throw error;
@@ -294,7 +295,7 @@ export class IncidentsRepository {
       const task = await tx.responseTask.findUniqueOrThrow({ where: { id: taskId }, include: { incident: true } });
       await tx.incidentTimelineEntry.create({ data: { incidentId: task.incidentId, kind, payload } });
       await tx.incidentUpdateOutbox.create({ data: { incidentId: task.incidentId, organisationId: task.incident.organisationId, payload: { id: task.incidentId, organisation_id: task.incident.organisationId, kind } } });
-    });
+    }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
   }
 
   async listSilentApprovals(taskId: string): Promise<Array<{ userId: string; claimedRole: string; approvedAt: Date }>> {
@@ -309,7 +310,7 @@ export class IncidentsRepository {
       await tx.incidentTimelineEntry.create({ data: { incidentId: task.incidentId, kind: 'FIELD_DISPATCH_ACKNOWLEDGED', actorUserId, payload: { task_id: taskId, acknowledged_at: at.toISOString() } } });
       await tx.incidentUpdateOutbox.create({ data: { incidentId: task.incidentId, organisationId: task.incident.organisationId, payload: { id: task.incidentId, organisation_id: task.incident.organisationId, kind: 'FIELD_DISPATCH_ACKNOWLEDGED' } } });
       return updated;
-    });
+    }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
   }
 
   async createLocalDispatchHandoff(taskId: string, responseMode: string): Promise<ResponseTask | null> {
@@ -324,7 +325,7 @@ export class IncidentsRepository {
         await tx.incidentTimelineEntry.create({ data: { incidentId: task.incidentId, kind: 'FIELD_DISPATCH_DELIVERED', payload: { task_id: taskId, response_mode: responseMode, destination: 'local:field-dispatch-inbox' } } });
         await tx.incidentUpdateOutbox.create({ data: { incidentId: task.incidentId, organisationId: task.incident.organisationId, payload: { id: task.incidentId, organisation_id: task.incident.organisationId, kind: 'FIELD_DISPATCH_DELIVERED' } } });
         return tx.responseTask.findUnique({ where: { id: taskId } });
-      });
+      }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
     } catch (error) {
       if (!isUniqueViolation(error)) throw error;
       return this.prisma.responseTask.findUnique({ where: { id: taskId } });
@@ -345,7 +346,7 @@ export class IncidentsRepository {
       const kind = evidenceSnapshotId ? 'EVIDENCE_SNAPSHOT_PRESERVED' : 'EVIDENCE_SNAPSHOT_SKIPPED';
       await tx.incidentTimelineEntry.create({ data: { incidentId: task.incidentId, kind, payload: evidenceSnapshotId ? { task_id: taskId, evidence_id: evidenceSnapshotId } : { task_id: taskId, detail } } });
       await tx.incidentUpdateOutbox.create({ data: { incidentId: task.incidentId, organisationId: task.incident.organisationId, payload: { id: task.incidentId, organisation_id: task.incident.organisationId, kind } } });
-    });
+    }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
   }
 
   async transitionIncidentStatus(
@@ -364,7 +365,7 @@ export class IncidentsRepository {
       await tx.incidentTimelineEntry.create({ data: { incidentId, kind: `INCIDENT_${status.toUpperCase()}`, actorUserId, payload: { from_status: expectedStatus, to_status: status } } });
       await tx.incidentUpdateOutbox.create({ data: { incidentId, organisationId, payload: { id: incidentId, organisation_id: organisationId, kind: `INCIDENT_${status.toUpperCase()}` } } });
       return incident;
-    });
+    }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
   }
 
   async appendTimeline(incidentId: string, kind: string, payload: Prisma.InputJsonValue, actorUserId: string | null = null): Promise<void> {
@@ -374,7 +375,7 @@ export class IncidentsRepository {
       await tx.incidentUpdateOutbox.create({
         data: { incidentId, organisationId: incident.organisationId, payload: { id: incidentId, organisation_id: incident.organisationId, kind } },
       });
-    });
+    }, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
   }
 
   async pendingOutbox(limit = 100) {
