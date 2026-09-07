@@ -157,6 +157,17 @@ export const DEVICE_SECURITY_EVENT_TYPES = [
   'KEY_REVOKED',
   'KEY_COMPROMISED',
   'REPLAY_CONFLICT',
+  /**
+   * M3B §10 — asking which Edge to trust, and being told or refused.
+   *
+   * These live with the DEVICE SECURITY events rather than with the gateway
+   * OPERATION events, because a descriptor lookup is not an operation: it
+   * selects no target, causes no domain effect and carries no payload digest.
+   * Filing it as an operation would make the audit trail claim an operation
+   * occurred when Sentinel only returned trust material.
+   */
+  'DEVICE_EDGE_TRANSPORT_DESCRIPTOR_ISSUED',
+  'DEVICE_EDGE_TRANSPORT_DESCRIPTOR_REFUSED',
 ] as const;
 
 export type DeviceSecurityEventType = (typeof DEVICE_SECURITY_EVENT_TYPES)[number];

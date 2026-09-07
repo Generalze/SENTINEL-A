@@ -14,7 +14,15 @@ import { ConfigValidationError } from './config/env.schema';
 export const JSON_BODY_LIMIT = '1mb';
 
 async function bootstrap(): Promise<void> {
-  const app = await NestFactory.create<NestExpressApplication>(AppModule, { bufferLogs: true });
+  // `rawBody` — M3B: THE EDGE SIGNS BYTES, NOT AN OBJECT.
+  //
+  // An Edge request proof binds `edgeRequestBodyDigest` over the EXACT bytes it
+  // sent. Digesting a re-serialisation of the parsed object would compute the
+  // digest over what WE produced rather than over what THEY signed, and would
+  // then pass or fail on whitespace and key order -- a signature check that is
+  // really a formatting check. This keeps the original buffer available so the
+  // comparison is against the wire.
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, { bufferLogs: true, rawBody: true });
 
   // WP-14/M7: explicit JSON/urlencoded body-size limit (default is Express's
   // 100kb, but set it explicitly so the bound is intentional and auditable).

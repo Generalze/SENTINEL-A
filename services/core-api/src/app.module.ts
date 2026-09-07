@@ -23,6 +23,9 @@ import { FieldOfflineModule } from './modules/field-offline/field-offline.module
 import { PatrolModule } from './modules/patrol/patrol.module';
 import { DeviceEnrollmentIngressModule } from './modules/device-enrollment-ingress/device-enrollment-ingress.module';
 import { DeviceGatewayModule } from './modules/device-gateway/device-gateway.module';
+import { EdgeGatewayModule } from './modules/edge-gateway/edge-gateway.module';
+import { EdgeRegistryModule } from './modules/edge-registry/edge-registry.module';
+import { EdgeTrustedTimeModule } from './modules/edge-trusted-time/edge-trusted-time.module';
 import { ShieldModule } from './modules/shield/shield.module';
 import { WhisperModule } from './modules/whisper/whisper.module';
 
@@ -92,6 +95,28 @@ import { WhisperModule } from './modules/whisper/whisper.module';
     // Command-side transport for bootstrap issuance and approval, so Shield
     // keeps its property of having zero controllers (D24-13/D26-09).
     DeviceEnrollmentIngressModule,
+    // WP-29B/FW2-11 Edge trusted-time anchors. Registered for dependency wiring
+    // only: the module declares NO controller, so this adds no HTTP surface. It
+    // holds the first and only private key this service has ever had, and it
+    // signs exactly one statement type — `sentinel.edge.trusted-time-anchor.v1`
+    // — so that an Edge can prove, after a restart, that the trusted time it is
+    // carrying forward came from central rather than from a file somebody
+    // edited. See the module header for why the key provider is not exported.
+    EdgeTrustedTimeModule,
+    // WP-29B / migration 26 — the central Edge identity registry and its
+    // enrolment ceremony. Registered for dependency wiring only: the module
+    // declares NO controller, so this adds no HTTP surface. It closes C15-02 —
+    // an Edge receipt nobody can verify is not evidence — by giving
+    // `evaluateOfflineOperationAdmissibility` a registry record to resolve, and
+    // it does so through a ceremony that starts with a human capability rather
+    // than with an Edge turning up.
+    EdgeRegistryModule,
+    // WP-29B EDGE-B — the Edge->Central transport boundary. Registered for
+    // dependency wiring only: like the registry it declares NO controller, so
+    // this adds no HTTP surface. It owns the authentication half of every Edge
+    // request and the two-layer rule that keeps a verified Edge receipt from
+    // ever being mistaken for an authenticated caller.
+    EdgeGatewayModule,
   ],
 })
 export class AppModule {}

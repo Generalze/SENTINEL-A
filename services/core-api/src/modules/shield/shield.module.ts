@@ -118,6 +118,13 @@ import { ShieldRepository } from './shield.repository';
     DeviceKeyService,
     DeviceReplayService,
     P256KeyImporter,
+    // M3B §10: the single security-event writer. Exporting it hands out no
+    // authority -- it takes a transaction client and can only `create` a row
+    // whose payload the allowlisted builder produced. The device gateway's
+    // descriptor query needs to file DEVICE_EDGE_TRANSPORT_DESCRIPTOR_* events,
+    // and the alternative was a second writer, which is exactly what D24-12's
+    // "the single writer, `create` and nothing else, ever" exists to prevent.
+    DeviceSecurityAudit,
   ],
 })
 export class ShieldModule {}

@@ -1,0 +1,35 @@
+{
+  "name": "@sentinel/edge-runtime",
+  "version": "0.0.0",
+  "description": "Sentinel Edge runtime — the site-local time witness and offline queue",
+  "main": "dist/main.js",
+  "type": "commonjs",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/main.js",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@nestjs/common": "^11",
+    "@nestjs/core": "^11",
+    "@nestjs/platform-express": "^11",
+    "@sentinel/contracts": "workspace:*",
+    "nestjs-pino": "^4",
+    "pino": "^10",
+    "pino-http": "^11",
+    "reflect-metadata": "^0.2",
+    "rxjs": "^7",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@nestjs/testing": "^11",
+    "@types/node": "24.13.3",
+    "typescript": "^5",
+    "vitest": "^2"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  }
+}

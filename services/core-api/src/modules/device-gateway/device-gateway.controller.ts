@@ -5,6 +5,7 @@ import { requirePrincipal, type RequestWithPrincipal } from '../../common/securi
 import { DeviceContextService } from './device-context.service';
 import type { DeviceGatewayOperationKind } from './device-gateway.envelope';
 import { DeviceGatewayService } from './device-gateway.service';
+import { DeviceEdgeTransportQueryService } from './device-edge-transport.query';
 import { DeviceOfflineIngressService } from './device-offline-ingress.service';
 import type { DeviceGatewayOperationResult } from './device-gateway.types';
 
@@ -154,12 +155,38 @@ const CompleteEstablishmentSchema = z
   })
   .strict();
 
+
+/**
+ * M3B §6 — the descriptor request body.
+ *
+ * STRICT, and deliberately tiny. There is no `edge_id`, no `endpoint`, no
+ * `tls_spki_sha256`, no `organisation_id` and no `transport_identity_id`:
+ * central resolves every one of those, and a field through which a caller
+ * could name one would be a field through which a caller could ask to be told
+ * that an endpoint of their choosing is trustworthy.
+ *
+ * `site_id` is OPTIONAL because a context that authorises exactly one site
+ * needs no disambiguation. When present it is a CLAIM central checks for
+ * membership of the context's own bindings -- never a selector.
+ */
+const EdgeTransportRequestSchema = z
+  .object({
+    site_id: z.string().min(1).max(256).optional(),
+    // `z.unknown()` would accept an ABSENT proof, because unknown is optional
+    // by default in Zod. A request with no proof is a shape complaint about the
+    // caller's own bytes and must fail as one, rather than travelling into the
+    // authenticator to be refused there as though it had been judged.
+    proof: z.custom<unknown>((value) => value !== undefined, { message: 'proof is required' }),
+  })
+  .strict();
+
 @Controller('api/v1/device-gateway')
 export class DeviceGatewayController {
   constructor(
     @Inject(DeviceContextService) private readonly contexts: DeviceContextService,
     @Inject(DeviceGatewayService) private readonly gateway: DeviceGatewayService,
     @Inject(DeviceOfflineIngressService) private readonly offlineIngress: DeviceOfflineIngressService,
+    @Inject(DeviceEdgeTransportQueryService) private readonly edgeTransportQuery: DeviceEdgeTransportQueryService,
   ) {}
 
   /**
@@ -269,6 +296,47 @@ export class DeviceGatewayController {
     // what a queued operation is allowed to disclose on reconnect, and a second
     // opinion here would be a second disclosure policy.
     return { submission: result.submission };
+  }
+
+
+  /**
+   * M3B §6 — WHICH EDGE SHOULD THIS DEVICE TRUST?
+   *
+   * POST, NOT GET, and not for REST tidiness. Every authenticated device
+   * surface here carries a signed possession proof, and a proof is a body: a
+   * GET would have to move it into a header or a query string, where it would
+   * be logged by every proxy between the handset and this process. The verb
+   * describes the transport, not the semantics -- this creates nothing, changes
+   * nothing and is safe to repeat.
+   *
+   * It does NOT go through `run`. That helper ends in
+   * `DeviceGatewayService.execute`, which is the domain-effect path: it selects
+   * a target, requires a §62 action and opens the effect transaction. This
+   * request has no target and no action, and terminates after authenticated
+   * site and context validation.
+   *
+   * Not `@Public()`, for the reason none of the others are (C17-01): the global
+   * session guard runs first and the operative must be the authenticated human
+   * the context is bound to. A device holding a perfectly good key is not
+   * sufficient on its own.
+   */
+  @Post('edge-transport')
+  async edgeTransport(@Req() req: RequestWithPrincipal, @Body() body: unknown): Promise<unknown> {
+    const principal = requirePrincipal(req);
+    const parsed = EdgeTransportRequestSchema.safeParse(body);
+    if (!parsed.success) throw new BadRequestException(EXTERNAL_MALFORMED);
+
+    const outcome = await this.edgeTransportQuery.read(principal, {
+      proof: parsed.data.proof,
+      siteId: parsed.data.site_id ?? null,
+      traceId: traceIdOf(req),
+    });
+    // ONE EXTERNAL ANSWER for every internal reason (D25-13). A caller cannot
+    // tell an expired context from a revoked transport identity from a site it
+    // has no authority over; the operator can, from the audit row.
+    if (outcome.outcome === 'REFUSED') throw new ForbiddenException(EXTERNAL_REFUSED);
+    if (outcome.response.outcome === 'REFUSED') throw new ForbiddenException(EXTERNAL_REFUSED);
+    return { descriptor: outcome.response.descriptor };
   }
 
   /**

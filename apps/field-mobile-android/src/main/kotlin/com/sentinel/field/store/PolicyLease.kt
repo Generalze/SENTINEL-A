@@ -88,11 +88,39 @@ data class PolicyLease(
      * local refusal. A "true" is not evidence of anything and must never be
      * treated as though the operation is thereby authorised.
      */
-    fun looksUsableAt(now: Instant): Boolean {
-        val issued = parseOrNull(issuedAt) ?: return false
-        val expires = parseOrNull(expiresAt) ?: return false
-        if (now.isBefore(issued)) return false
-        return now.isBefore(expires)
+    fun looksUsableAt(now: Instant): Boolean = standingAt(now) == LeaseStanding.IN_FORCE
+
+    /**
+     * The same judgement as [looksUsableAt], but saying WHICH WAY it failed.
+     *
+     * One parse site, two callers, and the split exists for the operative
+     * rather than for the server. Central collapses all of this into a single
+     * `LEASE_NOT_IN_FORCE` refusal, and it is right to: a refusal that
+     * distinguished "too early" from "too late" would be an oracle about lease
+     * windows offered to whoever is holding the handset. But this is the LOCAL
+     * side of the same question, and locally the two are different situations
+     * with different remedies — an EXPIRED lease means reconnect and be issued
+     * a new one, a NOT_YET_VALID one means this device's clock disagrees with
+     * the server that stamped the lease, and telling an operative "refused" for
+     * both is telling them nothing they can act on.
+     *
+     * FAIL-CLOSED IN EVERY DIRECTION, exactly as before. An unreadable instant
+     * is [LeaseStanding.WINDOW_UNREADABLE], which is not IN_FORCE, which
+     * refuses — mirroring C15-07, where an instant the server cannot parse
+     * answers TIME_NOT_AUTHORITATIVE rather than passing. Expiry is EXCLUSIVE:
+     * at the expiry instant the lease is over.
+     *
+     * [now] is the device clock, which this platform does not trust and which
+     * this method does not redeem. Anything but IN_FORCE is a useful local
+     * refusal; IN_FORCE is evidence of nothing and must never be read as
+     * authorisation.
+     */
+    fun standingAt(now: Instant): LeaseStanding {
+        val issued = parseOrNull(issuedAt) ?: return LeaseStanding.WINDOW_UNREADABLE
+        val expires = parseOrNull(expiresAt) ?: return LeaseStanding.WINDOW_UNREADABLE
+        if (now.isBefore(issued)) return LeaseStanding.NOT_YET_VALID
+        if (now.isBefore(expires)) return LeaseStanding.IN_FORCE
+        return LeaseStanding.EXPIRED
     }
 
     /**
@@ -113,4 +141,28 @@ data class PolicyLease(
     } catch (error: Exception) {
         null
     }
+}
+
+/**
+ * Where the device clock falls against a cached lease's own window.
+ *
+ * Four members, and none of them is "VALID". The name matters: this enum
+ * describes where a clock this platform does not trust sits relative to two
+ * instants a server stamped, and nothing more. `IN_FORCE` is the absence of a
+ * local reason to refuse — it is not a finding that the operation will be
+ * admitted, and the server re-runs the whole judgement against its own record
+ * and its own receipt clock on arrival.
+ */
+enum class LeaseStanding {
+    /** An instant on the cached lease does not parse. Fail-closed; not IN_FORCE. */
+    WINDOW_UNREADABLE,
+
+    /** The device clock is before the instant the server says the lease began. */
+    NOT_YET_VALID,
+
+    /** No local reason to refuse. NOT a prediction that anything will be accepted. */
+    IN_FORCE,
+
+    /** The device clock is at or past the expiry. Expiry is exclusive. */
+    EXPIRED,
 }

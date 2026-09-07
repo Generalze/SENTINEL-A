@@ -7,7 +7,7 @@ import { DEVICE_SECURITY_EVENT_TYPES } from './shield.constants';
  *
  * Two properties, and the second is the one that matters:
  *
- *  1. every one of the eighteen event types D24-12 enumerates has a builder;
+ *  1. every one of the twenty event types D24-12 enumerates has a builder;
  *  2. a builder writes ONLY the fields it names, so a value passed in a field
  *     the builder does not list cannot reach a payload.
  *
@@ -20,6 +20,21 @@ import { DEVICE_SECURITY_EVENT_TYPES } from './shield.constants';
 
 /** One well-formed input per event type, so the sweep below is exhaustive. */
 const SAMPLES: Readonly<Record<(typeof DEVICE_SECURITY_EVENT_TYPES)[number], DeviceSecurityEventInput>> = {
+  DEVICE_EDGE_TRANSPORT_DESCRIPTOR_ISSUED: {
+    type: 'DEVICE_EDGE_TRANSPORT_DESCRIPTOR_ISSUED',
+    contextId: 'ctx-1',
+    siteId: 'site-1',
+    edgeId: 'edge-1',
+    transportIdentityId: 'ti-1',
+    transportKeyVersion: 1,
+    descriptorFingerprint: 'fp-1',
+  },
+  DEVICE_EDGE_TRANSPORT_DESCRIPTOR_REFUSED: {
+    type: 'DEVICE_EDGE_TRANSPORT_DESCRIPTOR_REFUSED',
+    contextId: 'ctx-1',
+    siteId: null,
+    refusal: 'SITE_NOT_RESOLVED',
+  },
   BOOTSTRAP_ISSUED: {
     type: 'BOOTSTRAP_ISSUED',
     grantId: 'grant-1',
@@ -135,11 +150,14 @@ const SAMPLES: Readonly<Record<(typeof DEVICE_SECURITY_EVENT_TYPES)[number], Dev
 const FORBIDDEN_KEY_PATTERN = /private|secret|token|nonce|signature(?!_profile)|password|credential|blob|bearer/iu;
 
 describe('WP-24/D24-12 device security event payloads', () => {
-  it('D24-12 names eighteen event types and every one of them has a builder', () => {
+  it('D24-12 names twenty event types and every one of them has a builder', () => {
     // A guard that silently stops covering the vocabulary is worse than none,
     // because it reads as evidence. The count is asserted so a type added
     // without a sample fails here rather than passing an empty sweep.
-    expect(DEVICE_SECURITY_EVENT_TYPES).toHaveLength(18);
+    // 18 at D24-12, plus the two M3B §10 descriptor events. The count is
+    // asserted rather than derived precisely so that adding a type without a
+    // sample fails HERE -- which is what it did when these two were added.
+    expect(DEVICE_SECURITY_EVENT_TYPES).toHaveLength(20);
     expect(Object.keys(SAMPLES).sort()).toEqual([...DEVICE_SECURITY_EVENT_TYPES].sort());
     for (const type of DEVICE_SECURITY_EVENT_TYPES) {
       const payload = buildDeviceSecurityEventPayload(SAMPLES[type]);

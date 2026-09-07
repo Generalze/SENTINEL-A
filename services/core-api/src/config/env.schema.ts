@@ -144,6 +144,58 @@ export const envSchema = z.object({
     .string()
     .min(1, 'ANDROID_ATTESTATION_SIGNING_DIGESTS must not be empty')
     .optional(),
+  // -------------------------------------------------------------------------
+  // WP-29B/FW2-11 — THE EDGE TRUSTED-TIME SIGNING KEY.
+  //
+  // THE FIRST PRIVATE KEY THIS SERVICE HAS EVER HELD, AND THE ENVIRONMENT
+  // CARRIES A PATH TO IT RATHER THAN THE KEY.
+  //
+  // The `ANDROID_ATTESTATION_*` block above puts trust material INLINE, and
+  // that is correct there because every byte of it is public: pinned roots and
+  // a published revocation list. Inverting that convention for a PRIVATE key
+  // would put it in `docker inspect`, in `/proc/<pid>/environ`, in any crash
+  // dump, in a CI log that echoed the environment, and in the shell history of
+  // whoever set it. So the bytes live wherever the deployment's secret manager
+  // mounts them and only the path appears here.
+  //
+  // Both keys are OPTIONAL and both default to ABSENT, following the same
+  // fail-closed discipline: a deployment that has configured nothing simply
+  // cannot sign, central answers SIGNING_UNAVAILABLE, and no Edge ever receives
+  // an unsigned anchor. A `.default(...)` on either would be a silent
+  // substitution and must never be added.
+  //
+  // Partial configuration is a NAMED REFUSAL rather than a fallback — see
+  // `modules/edge-trusted-time/edge-trusted-time-signing-key.provider.ts`,
+  // which reads them, checks the key is a P-256 private key, and logs a reason
+  // code and never the material.
+  //
+  // There is deliberately no key-CONTENT key, no passphrase key, and no
+  // "allow unsigned anchors" key. The last of those is the one that would end
+  // the whole argument: an anchor without a signature is a value an attacker
+  // with file-write access can author.
+  // -------------------------------------------------------------------------
+  /** Names the key that signs, and the id Edge resolves against its verification keyring. */
+  EDGE_TRUSTED_TIME_SIGNER_KEY_ID: z.string().min(1, 'EDGE_TRUSTED_TIME_SIGNER_KEY_ID must not be empty').optional(),
+  /** PATH to a mounted PKCS#8 P-256 private key. Never the key itself. */
+  EDGE_TRUSTED_TIME_SIGNING_KEY_FILE: z.string().min(1, 'EDGE_TRUSTED_TIME_SIGNING_KEY_FILE must not be empty').optional(),
+  /**
+   * M3B §7 — THE PUBLIC COUNTERPART, SO CENTRAL CAN VERIFY WHAT CENTRAL SIGNED.
+   *
+   * Same JSON shape as Edge's `EDGE_TRUSTED_TIME_VERIFICATION_KEYS`, and
+   * deliberately so: it is the same key list, deployed to both ends. Central
+   * needs it for a reason that is easy to miss -- it cannot simply derive the
+   * public key from its CURRENT signing key, because an anchor minted before a
+   * rotation was signed by the PREVIOUS one and must still verify afterwards.
+   * A verifier that could only check the active key would start silently
+   * refusing every in-flight anchor at each rotation.
+   *
+   * PUBLIC MATERIAL ONLY. The entry schema is strict and has no field a
+   * private key could arrive in.
+   */
+  EDGE_TRUSTED_TIME_VERIFICATION_KEYS: z
+    .string()
+    .min(1, 'EDGE_TRUSTED_TIME_VERIFICATION_KEYS must not be empty')
+    .optional(),
   /**
    * C13-01: there is deliberately NO patrol sweep interval key here.
    *

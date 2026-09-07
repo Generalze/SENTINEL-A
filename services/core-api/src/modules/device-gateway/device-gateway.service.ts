@@ -1,11 +1,6 @@
 import { HttpException, Inject, Injectable } from '@nestjs/common';
 import {
-  DeviceRequestProofSchema,
-  canonicalDeviceRequestProofStatement,
   classifyDeviceNonceConsumption,
-  deviceRequestProofFingerprint,
-  deviceRequestProofReplayKey,
-  deviceRequestProofStatementInput,
   evaluateDeviceOperationPrincipals,
   evaluateDeviceRequestProof,
   type AuthenticatedDeviceContext,
@@ -30,6 +25,11 @@ import {
   type DeviceGatewayOperationKind,
 } from './device-gateway.envelope';
 import { deviceGatewayDomainIdempotencyKey } from './device-gateway.idempotency';
+import {
+  resolveDeviceCredential,
+  resolveProvenContext,
+  verifyDeviceProofPossession,
+} from './device-request-authentication';
 import { composeDeviceGatewayPrincipalFacts, resolveActorAuthority, sessionAuthenticatedBy, type ResolvedActorAuthority } from './device-gateway.principals';
 import { DeviceGatewayRepository, type GatewayTx, type IssuedContextRow } from './device-gateway.repository';
 import { DeviceGatewayTransactionRollback, isDeviceGatewayTransactionRollback } from './device-gateway.rollback';
@@ -698,28 +698,40 @@ export class DeviceGatewayService {
     // PREFLIGHT
     // -----------------------------------------------------------------------
 
-    const parsedProof = DeviceRequestProofSchema.safeParse(request.proof);
-    if (!parsedProof.success) {
-      // A malformed proof is a shape complaint about the caller's own bytes.
-      // The event is still filed, and it is filed under the SESSION's tenant -
-      // a fact the server established rather than one it was told.
-      await audit('PROOF_MALFORMED', null, blank({ targetId: request.targetId }));
+    // M3B §3 — THE SHARED CORE, NOT A SECOND COPY OF IT.
+    //
+    // Proof shape, context resolution by the SESSION's tenant, the claimed-org
+    // equality binding and the session/actor equality binding are identical for
+    // an effect operation and for an authenticated query, so they have exactly
+    // one implementation in `device-request-authentication.ts`. What stays here
+    // is the part that is genuinely operation-shaped: the audit row, which names
+    // a target type and a payload digest that a query does not have.
+    const provenContext = await resolveProvenContext(this.repository, principal, request.proof);
+    if (!provenContext.ok) {
+      // The tenant anchor is still the SESSION's here, because a refusal at this
+      // stage may have resolved no persisted context at all (C17-02).
+      if (provenContext.refusal === 'PROOF_MALFORMED' || provenContext.refusal === 'CONTEXT_NOT_USABLE') {
+        await audit(provenContext.refusal, null, blank({ targetId: request.targetId }));
+      } else {
+        // Past this point a context DID resolve, so the audit row can name it.
+        const resolved = await this.repository.findContext(principal.organisation_id, provenContext.proof?.context_id ?? '');
+        if (resolved !== null) auditOrganisationId = resolved.organisationId;
+        await audit(provenContext.refusal, null, {
+          contextId: resolved?.id ?? null,
+          deviceId: resolved?.deviceId ?? null,
+          actorUserId: resolved?.actorUserId ?? null,
+          siteId: provenContext.proof?.site_id ?? null,
+          targetId: request.targetId ?? resolved?.actorUserId ?? null,
+          payloadDigest: null,
+          effectiveTrust: null,
+        });
+      }
       return { kind: 'REFUSED', result: { outcome: 'REFUSED' } };
     }
-    const proof = parsedProof.data;
 
-    // C17-02: RESOLVED BY THE SESSION'S TENANT, never by `proof.organisation_id`.
-    // The context is resolved by (id, organisation) TOGETHER, so a foreign
-    // context and a context that never existed produce one answer, from one
-    // query, and there is no branch in which they could diverge (D25-13).
-    const contextRow = await this.repository.findContext(principal.organisation_id, proof.context_id);
-    if (contextRow === null) {
-      await audit('CONTEXT_NOT_USABLE', null, blank({ targetId: request.targetId }));
-      return { kind: 'REFUSED', result: { outcome: 'REFUSED' } };
-    }
+    const { proof, contextRow, contextSiteIds } = provenContext;
     // The persisted row's organisation is authoritative from here on.
     auditOrganisationId = contextRow.organisationId;
-    const contextSiteIds = await this.repository.listContextSiteIdsUnlocked(contextRow.organisationId, contextRow.id);
     const seen = {
       contextId: contextRow.id,
       deviceId: contextRow.deviceId,
@@ -729,21 +741,6 @@ export class DeviceGatewayService {
       payloadDigest: null as string | null,
       effectiveTrust: null as string | null,
     };
-
-    // C17-02: the proof's CLAIMED tenant, equality-bound against the persisted
-    // context's. A claim may appear in an internal reason; it may never select
-    // which tenant owns an audit row.
-    if (proof.organisation_id !== contextRow.organisationId) {
-      await audit('PROOF_ORGANISATION_MISMATCH', null, seen);
-      return { kind: 'REFUSED', result: { outcome: 'REFUSED' } };
-    }
-    // C17-01: a valid proof carried by a DIFFERENT authenticated human refuses.
-    // Possession and identity are two facts, and holding the hardware does not
-    // make the caller the operative the context is bound to.
-    if (principal.user.id !== contextRow.actorUserId) {
-      await audit('SESSION_ACTOR_MISMATCH', null, seen);
-      return { kind: 'REFUSED', result: { outcome: 'REFUSED' } };
-    }
 
     const targetId = request.targetId ?? contextRow.actorUserId;
     const envelopeParse = parseOperationEnvelope(
@@ -773,21 +770,13 @@ export class DeviceGatewayService {
     }
     seen.effectiveTrust = preflight.trust;
 
-    const statement = canonicalDeviceRequestProofStatement(
-      deviceRequestProofStatementInput(proof, preflight.registered.signature_profile),
-    );
-    const verified = this.keys.verifySignature({
-      registeredPublicKey: preflight.publicKey,
-      message: statement,
-      signature: proof.signature,
-      serverResolvedProfile: preflight.registered.signature_profile,
-      claimedProfile: proof.claimed_signature_profile,
+    // M3B §3: possession and the two replay identities, from the one shared
+    // implementation. A second signature check would be a second opinion about
+    // what a valid proof is.
+    const { verified, replayKey, fingerprint } = verifyDeviceProofPossession(this.keys, proof, {
+      publicKey: preflight.publicKey,
+      signatureProfile: preflight.registered.signature_profile,
     });
-
-    const replayKey = deviceRequestProofReplayKey(proof);
-    const fingerprint = deviceRequestProofFingerprint(
-      deviceRequestProofStatementInput(proof, preflight.registered.signature_profile),
-    );
     // CLASSIFY WITHOUT CREATING AN EFFECT. `peek` reads what the store already
     // holds for this identity and takes no decision; `consume` — the call that
     // BURNS the identity — happens only inside the final transaction.
@@ -927,7 +916,7 @@ export class DeviceGatewayService {
    */
   private async resolveFacts(
     contextRow: IssuedContextRow,
-    contextSiteIds: string[],
+    contextSiteIds: readonly string[],
     proof: DeviceRequestProof,
     requiredAction: string,
     tx: GatewayTx | undefined,
@@ -948,19 +937,28 @@ export class DeviceGatewayService {
       }
     | { kind: 'REFUSED'; refusal: DeviceGatewayRefusal }
   > {
-    const device = await this.shield.findDevice(contextRow.organisationId, contextRow.deviceId, tx);
-    if (device === null) return { kind: 'REFUSED', refusal: 'DEVICE_NOT_USABLE' };
-    if (device.currentKeyId === null) return { kind: 'REFUSED', refusal: 'REGISTRY_KEY_UNRESOLVABLE' };
-
-    // C17-04: `tx` is threaded. Resolving the registry key on the base client
-    // while the transaction holds the device and key row locks would be reading
-    // a row nothing is holding still, in the transaction that commits on it.
-    const keyRecord = await this.registry.resolveRegistryKeyRecord(contextRow.organisationId, device.currentKeyId, tx);
-    if (keyRecord === null) return { kind: 'REFUSED', refusal: 'REGISTRY_KEY_UNRESOLVABLE' };
-
-    const trust = await this.registry.effectiveDeviceTrust(contextRow.organisationId, device.id, tx);
-    if (trust === null) return { kind: 'REFUSED', refusal: 'DEVICE_NOT_USABLE' };
-    const credentialIntact = await this.registry.credentialAdmitsNewOperations(contextRow.organisationId, device.id, tx);
+    // M3B §3: device, registry key, effective trust and credential integrity
+    // come from the ONE shared resolution. `tx` is threaded through it, so the
+    // under-lock call still reads rows the transaction is holding still
+    // (C17-04); the shared function does not decide when to lock, only what to
+    // read once locking has been decided.
+    const resolved = await resolveDeviceCredential(
+      {
+        findDevice: (organisationId, deviceId, transaction) => this.shield.findDevice(organisationId, deviceId, transaction),
+        resolveRegistryKeyRecord: (organisationId, keyId, transaction) =>
+          this.registry.resolveRegistryKeyRecord(organisationId, keyId, transaction),
+        effectiveDeviceTrust: (organisationId, deviceId, transaction) =>
+          this.registry.effectiveDeviceTrust(organisationId, deviceId, transaction),
+        credentialAdmitsNewOperations: (organisationId, deviceId, transaction) =>
+          this.registry.credentialAdmitsNewOperations(organisationId, deviceId, transaction),
+      },
+      contextRow.organisationId,
+      contextRow.deviceId,
+      tx,
+    );
+    if (!resolved.ok) return { kind: 'REFUSED', refusal: resolved.refusal };
+    const { device, keyRecord, credentialIntact } = resolved;
+    const trust = resolved.trust as DeviceTrust;
 
     const actor = await resolveActorAuthority(
       this.repository,
@@ -1010,7 +1008,11 @@ export class DeviceGatewayService {
         organisation_id: contextRow.organisationId,
         actor_user_id: contextRow.actorUserId,
         device_id: contextRow.deviceId,
-        authorised_site_ids: contextSiteIds,
+        // Copied rather than passed through: the shared resolver returns a
+        // READONLY view, and the frozen context schema owns a mutable field.
+        // Spreading here keeps the shared core's immutability guarantee intact
+        // instead of widening it to suit one consumer.
+        authorised_site_ids: [...contextSiteIds],
         // The frozen schema requires the field and no evaluator reads it. There
         // is deliberately no column for it (see `device-gateway.prisma`): the
         // CURRENT effective standing is filled in here so that no stale

@@ -17,10 +17,36 @@ import kotlinx.serialization.json.put
  * signature over bytes that no longer exist — and the server verifies the bytes,
  * not the intention.
  *
- * Four are LOCAL ONLY. [payloadJson] is the semantic payload this device
- * digested — it travels, but BESIDE the envelope, never inside it — and
+ * Five are LOCAL ONLY. [payloadJson] is the semantic payload this device
+ * digested — it travels, but BESIDE the envelope, never inside it —
  * [attemptCount], [lastAttemptAt] and [state] are this client's own record of
- * what it has tried. None of them is signed and none of them is authority.
+ * what it has tried, and [edgeReceiptJson] is the Edge witness this operation
+ * collected on the way past a site Edge. None of them is signed and none of
+ * them is authority.
+ *
+ * THE EDGE RECEIPT IS EVIDENCE, NOT AUTHORITY, AND IT IS STORED HERE BECAUSE
+ * EVIDENCE HAS TO SURVIVE
+ * ----------------------------------------------------------------------------
+ * D23-10: "Edge may witness. Edge may not authorize." What a receipt says, and
+ * the only thing it can say, is "I, trusted Edge E17, received this
+ * device-signed operation at my trusted time / monotonic position Y". It
+ * carries no approval field, no decision field and no assertion about this
+ * device — `DeviceEdgeReceiptSchema` is `.strict()` and
+ * `DEVICE_EDGE_RECEIPT_FORBIDDEN_FIELDS` names the shapes that cannot be
+ * attached — so holding one confers NOTHING on this client.
+ *
+ * Concretely: an entry that holds a receipt is not more admissible here, is not
+ * eligible for anything the queue would otherwise refuse it, and is not
+ * exempted from a single local check. Central re-resolves the witnessing Edge
+ * in ITS registry, verifies the Edge signature against the key IT holds, and
+ * judges `edge_trust` from its own record — a device that forged, edited or
+ * copied a receipt into this field changes precisely nothing, because none of
+ * those facts is read from the device copy. The receipt is stored for one
+ * reason: it is the only evidence of an independent clock that ever existed,
+ * it existed on a LAN this device may never see again, and if the queue
+ * dropped it on the next restart it would be gone for good. It travels back to
+ * central so central can judge it, and nothing on this side may read it as
+ * permission.
  *
  * WHAT MAY NEVER APPEAR IN THIS CLASS, AND WHY IT IS SAID HERE
  * -----------------------------------------------------------
@@ -116,6 +142,27 @@ data class OfflineOutboxEntry(
     val lastAttemptAt: String? = null,
     /** Local only. See [OfflineEntryState]. */
     val state: OfflineEntryState = OfflineEntryState.QUEUED,
+    /**
+     * Local only. The Edge witness for this exact envelope, as CANONICAL JSON
+     * TEXT, or null when no Edge has witnessed it — which is the ordinary case
+     * for a handset that was simply out of coverage with no site Edge in
+     * reach, and is never a gap to be filled in with something invented.
+     *
+     * WHY TEXT, AND WHY CANONICAL. The same reason [payloadJson] is text: what
+     * is stored is what is later handed on, and a parsed structure written back
+     * out by a serialiser that reorders keys is different bytes. It matters
+     * less here than for the payload — central rebuilds the Edge statement from
+     * NAMED fields before it verifies the Edge signature, so key order does not
+     * decide that verification — and it is done anyway, because "store the
+     * bytes, do not store an opinion about the bytes" is the rule that keeps
+     * being right and the exception is what somebody generalises from later.
+     *
+     * WHY IT IS NOT A PARSED [EdgeReceipt] ON THIS CLASS. This class is the
+     * storage shape and the `store` package must not acquire a dependency on
+     * `net`, exactly as the by-name readers at the foot of this file are kept
+     * here rather than borrowed from the network layer.
+     */
+    val edgeReceiptJson: String? = null,
 ) {
 
     /** True when the server has answered TERMINALLY about this exact envelope. */
@@ -131,7 +178,8 @@ data class OfflineOutboxEntry(
      */
     fun describe(): String =
         "$offlineOperationId  seq=$deviceSequence  $operationKind  $state  " +
-            "attempts=$attemptCount  last=${lastAttemptAt ?: "-"}  site=$siteId  lease=$policyLeaseId"
+            "attempts=$attemptCount  last=${lastAttemptAt ?: "-"}  site=$siteId  lease=$policyLeaseId  " +
+            "witness=${if (edgeReceiptJson == null) "none" else "edge"}"
 
     fun toJson(): JsonObject = buildJsonObject {
         put(FIELD_OFFLINE_OPERATION_ID, offlineOperationId)
@@ -154,6 +202,7 @@ data class OfflineOutboxEntry(
         put(FIELD_ATTEMPT_COUNT, attemptCount)
         put(FIELD_LAST_ATTEMPT_AT, lastAttemptAt)
         put(FIELD_STATE, state.name)
+        put(FIELD_EDGE_RECEIPT_JSON, edgeReceiptJson)
     }
 
     companion object {
@@ -185,6 +234,18 @@ data class OfflineOutboxEntry(
         const val FIELD_STATE = "local_state"
 
         /**
+         * The Edge witness, and the `local_` prefix is doing real work on this
+         * one.
+         *
+         * A reader that met a bare `edge_receipt` beside sixteen signed fields
+         * would have every reason to assume the device signature covered it. It
+         * does not, and it cannot: the envelope was signed hours before any
+         * Edge saw it. The prefix says so at every site that reads the stored
+         * document.
+         */
+        const val FIELD_EDGE_RECEIPT_JSON = "local_edge_receipt_json"
+
+        /**
          * Every field this class persists, in the order it is written.
          *
          * Named as data rather than discovered by reflection, so that the test
@@ -213,6 +274,7 @@ data class OfflineOutboxEntry(
             FIELD_ATTEMPT_COUNT,
             FIELD_LAST_ATTEMPT_AT,
             FIELD_STATE,
+            FIELD_EDGE_RECEIPT_JSON,
         )
 
         /**
@@ -245,6 +307,16 @@ data class OfflineOutboxEntry(
             attemptCount = value.requiredLong(FIELD_ATTEMPT_COUNT).toInt(),
             lastAttemptAt = value.optionalString(FIELD_LAST_ATTEMPT_AT),
             state = OfflineEntryState.parse(value.requiredString(FIELD_STATE)),
+            // OPTIONAL, and the second of the two fields that legitimately may
+            // be absent. An entry no Edge has witnessed is the ordinary entry,
+            // so an absent receipt reads as "no witness" rather than as a
+            // malformed document — the reverse of every field above it, and
+            // stated here so the asymmetry is a decision rather than an
+            // oversight. What must NOT happen is a receipt being invented to
+            // fill the hole; null travels as null and central refuses a
+            // time-bounded operation that arrives with no witness, which is the
+            // designed outcome.
+            edgeReceiptJson = value.optionalString(FIELD_EDGE_RECEIPT_JSON),
         )
     }
 }
