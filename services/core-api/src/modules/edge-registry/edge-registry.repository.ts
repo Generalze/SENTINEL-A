@@ -1,5 +1,6 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
+import { DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS } from '../../prisma/transaction-budget';
 import { PrismaService } from '../../prisma/prisma.service';
 
 export type EdgeTx = Prisma.TransactionClient;
@@ -21,8 +22,22 @@ export type EdgeTx = Prisma.TransactionClient;
 export class EdgeRegistryRepository {
   constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
 
+  /**
+   * TI-03: the service's one acquisition budget, not Prisma's implicit 2000 ms.
+   *
+   * This seam predates the budget policy -- round 3 wrote it before TI-03
+   * landed -- so it inherited a ceiling the system's own p99 transaction
+   * duration (1984 ms) had already grown into. An Edge enrolment ceremony is
+   * exactly the kind of work that loses that race: it runs while unrelated
+   * suites hold pool connections, and it would have failed to START rather
+   * than failing on anything it was trying to do.
+   *
+   * Caught by `transaction-budget.spec.ts` the moment the two branches met,
+   * which is the whole reason that guard rejects the value written as a
+   * literal as well as the implicit default.
+   */
   async transaction<T>(fn: (tx: EdgeTx) => Promise<T>): Promise<T> {
-    return this.prisma.$transaction(fn);
+    return this.prisma.$transaction(fn, DEFAULT_INTERACTIVE_TRANSACTION_OPTIONS);
   }
 
   /** The database's clock, inside the caller's transaction when one is given. */
