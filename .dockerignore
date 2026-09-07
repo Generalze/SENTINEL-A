@@ -1,0 +1,101 @@
+# =============================================================================
+# SENTINEL — BUILD CONTEXT EXCLUSIONS. The repository's first .dockerignore.
+#
+# This file is a SECURITY BOUNDARY, not a build-speed optimisation, and it is
+# written deny-by-default for that reason. A denylist is a list of the secrets
+# somebody happened to think of; the first file this repository grows that is
+# secret in a shape nobody anticipated — a support engineer's `dump.sql`, a
+# `.p8` from a mobile lane, a `kubeconfig` — would be silently uploaded to the
+# daemon and, if any COPY were ever widened, silently baked into a layer that
+# ships to a wiring closet.
+#
+# So: EXCLUDE EVERYTHING, then admit by name exactly the workspace files
+# `services/edge-runtime/Dockerfile` needs, then re-exclude the dangerous
+# things that live INSIDE those admitted directories. Later patterns win.
+#
+# Adding a file to this repository can never widen the image by accident. It
+# can only be admitted by an edit to this file, which is a reviewable diff.
+# =============================================================================
+
+# ---- 1. Nothing is in the context unless named below. -----------------------
+*
+
+# ---- 2. Workspace metadata pnpm needs to resolve a frozen, filtered install. -
+!package.json
+!pnpm-workspace.yaml
+!pnpm-lock.yaml
+!tsconfig.base.json
+
+# ---- 3. The only two workspace members Edge is built from. ------------------
+# NOT apps/, NOT services/core-api, NOT services/*, NOT tests/, NOT docs/,
+# NOT .github/, NOT scripts/, NOT infrastructure/ — none of which are excluded
+# by a rule naming them, but by never having been admitted in the first place.
+# .git is in that same set: the whole history, every branch, and every secret
+# ever committed and later removed, is the single largest thing a careless
+# container build leaks. It is not here.
+!packages/contracts
+!services/edge-runtime
+
+# ---- 4. Re-exclusions INSIDE the two admitted directories. ------------------
+# Everything below is a real file that exists, or will exist, under those paths.
+
+# Host-built artefacts. `node_modules` from a Windows/macOS dev machine carries
+# platform-specific binaries that would silently poison a linux/amd64 image;
+# `dist` from a dev machine is code nobody can attribute to a commit. Both are
+# rebuilt inside the build stage from the lockfile, which is the point.
+**/node_modules
+**/dist
+**/build
+**/coverage
+**/.turbo
+**/*.tsbuildinfo
+
+# Package-manager caches. A pnpm/npm store inside a layer is tens of megabytes
+# of content-addressed tarballs that the runtime cannot use and an attacker can
+# read for the exact dependency inventory of the box.
+**/.pnpm-store
+**/.npm
+**/node_modules/.cache
+
+# TEST TOOLING. Specs never run in the image, and one of these is not merely
+# dead weight: `edge-trusted-time.test-support.ts` GENERATES P-256 ANCHOR
+# SIGNING KEYPAIRS. It is excluded from `tsconfig`'s spec exclusion because it
+# is not a `.spec.ts`, so without this line `tsc` would compile it and a
+# working anchor-forging helper would ship inside every Edge image — on a box
+# whose entire security story is that it CANNOT author its own trusted time.
+# Nothing outside a spec imports it, so its absence cannot break the build.
+**/*.spec.ts
+**/*.test.ts
+**/*.test-support.ts
+**/vitest.config.*
+**/__tests__
+**/__fixtures__
+
+# SECRETS. Belt and braces: nothing under the two admitted directories should
+# ever be a key, and if one appears there anyway it does not reach the daemon.
+# The Edge signing key and the trusted-time keyring arrive by MOUNT at runtime
+# (see the Dockerfile's custody section); neither has any business in a layer.
+**/*.pem
+**/*.key
+**/*.p8
+**/*.p12
+**/*.pfx
+**/*.jks
+**/*.keystore
+**/id_rsa*
+**/.env
+**/.env.*
+!**/.env.example
+**/secrets
+**/*.secret
+
+# Editor / OS noise that would otherwise bust the layer cache on every commit.
+**/.DS_Store
+**/Thumbs.db
+**/*.swp
+**/.idea
+**/.vscode
+
+# The Dockerfile itself. It is read by the frontend before the context is
+# assembled, so it is never needed inside it.
+services/edge-runtime/Dockerfile
