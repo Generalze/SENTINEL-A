@@ -34,7 +34,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { CONTAINERS, attachedNetworks, containerFacts, probeFrom, WAN_NETWORK } from './harness/docker';
-import { ENDPOINTS, assertSchemaDeployed } from './harness/topology';
+import { assertSchemaDeployed } from './harness/topology';
 import { edgeQueueDepth } from './harness/edge-queue';
 import { WanControl } from './harness/wan-control';
 
